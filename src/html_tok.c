@@ -24,7 +24,11 @@ void if_tok_init(IfHtmlTok *t, IfArena *arena, IfStr input) {
     t->errors = 0;
 }
 
-void if_tok_set_raw(IfHtmlTok *t, u16 tag) { t->raw_tag = tag; }
+void if_tok_set_raw(IfHtmlTok *t, u16 tag) {
+    t->raw_tag = tag;
+    t->raw_rcdata = if_tag_is_rcdata(tag) ? 1 : 0;
+    t->strip_lf = (tag == IF_TAG_TEXTAREA) ? 1 : 0;
+}
 
 /* ---- 文字参照 ---- */
 
@@ -179,7 +183,10 @@ static u32 if_find_raw_end(IfHtmlTok *t) {
             }
             if (match) {
                 u32 after = i + 2 + name.n;
-                if (after >= t->len || if_hws(t->src[after]) || t->src[after] == '/' || t->src[after] == '>')
+                /* EOF は終端として認めない（仕様: rawtext 終了タグ名の後ろが
+                 * ファイル終端なら、それはテキスト。tests16 の採点結果で確認） */
+                if (after < t->len &&
+                    (if_hws(t->src[after]) || t->src[after] == '/' || t->src[after] == '>'))
                     return i;
             }
         }
@@ -189,12 +196,18 @@ static u32 if_find_raw_end(IfHtmlTok *t) {
 }
 
 static IfTok if_raw_token(IfHtmlTok *t) {
-    IfTok tok = { TOK_EOF, {0}, 0, {0}, NULL, 0, false };
+    IfTok tok = { .kind = TOK_EOF };
+    /* textarea の仕様: 開始タグ直後の LF 1 個は無視する */
+    if (t->strip_lf) {
+        t->strip_lf = 0;
+        if (t->pos < t->len && t->src[t->pos] == '\n') t->pos++;
+    }
     u32 end = if_find_raw_end(t);
     if (end > t->pos) {
         tok.kind = TOK_TEXT;
-        /* rawtext: 文字参照は解決しない（title/textarea の RCDATA 化は後日。文書化済みの偏差） */
-        tok.text = if_str((const char *)t->src + t->pos, end - t->pos);
+        /* RCDATA(title/textarea) は文字参照を解決する。rawtext(style/script) は生のまま。 */
+        tok.text = t->raw_rcdata ? if_resolved(t, t->pos, end)
+                                 : if_str((const char *)t->src + t->pos, end - t->pos);
         t->pos = end;
         return tok;
     }
@@ -205,7 +218,7 @@ static IfTok if_raw_token(IfHtmlTok *t) {
 /* ---- 本体 ---- */
 
 static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
-    IfTok tok = { TOK_EOF, {0}, 0, {0}, NULL, 0, false };
+    IfTok tok = { .kind = TOK_EOF };
     tok.kind = is_end ? TOK_END : TOK_START;
 
     IfAttr *attrs = NULL;
@@ -225,7 +238,7 @@ static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
     for (;;) {
         /* 空白スキップ */
         while (t->pos < t->len && if_hws(t->src[t->pos])) t->pos++;
-        if (t->pos >= t->len) { t->errors++; return (IfTok){ TOK_EOF, {0}, 0, {0}, NULL, 0, false }; }
+        if (t->pos >= t->len) { t->errors++; return (IfTok){ .kind = TOK_EOF }; }
         u8 c = t->src[t->pos];
         if (c == '>') { t->pos++; tok.attrs = attrs; tok.n_attrs = n_attrs; return tok; }
         if (c == '/') {
@@ -286,9 +299,74 @@ static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
     }
 }
 
+
+/* doctype 本体（"doctype" より後ろ）の解析。
+ * 形式: name [PUBLIC "pub" ["sys"] | SYSTEM "sys"] 。
+ * HTML 本流仕様より単純化しているが、tree-construction 期待串の生成に必要な
+ * 「name の lowercase 化 / pub・sys の有無と値」は仕様どおり拾う。 */
+static u8 if_dt_ws(u8 c) { return c == ' ' || c == '\t' || c == '\n' || c == '\f' || c == '\r'; }
+
+static bool if_dt_kw(IfStr rest, u32 off, const char *kw) {
+    u32 k = 0;
+    while (kw[k]) k++;
+    if (rest.n < off + k) return false;
+    return if_str_eq_ci(if_str(rest.p + off, k), if_str(kw, k));
+}
+
+static u32 if_dt_quoted(IfStr rest, u32 off, IfStr *out) {
+    u8 q = (u8)rest.p[off++];
+    u32 vs = off;
+    while (off < rest.n && (u8)rest.p[off] != q) off++;
+    *out = if_str(rest.p + vs, off - vs);
+    if (off < rest.n) off++; /* 閉じ引用符 */
+    return off;
+}
+
+static void if_parse_doctype_rest(IfHtmlTok *t, IfTok *tok, IfStr rest) {
+    u32 p = 0;
+    while (p < rest.n && if_dt_ws((u8)rest.p[p])) p++;
+    u32 ns = p;
+    while (p < rest.n && !if_dt_ws((u8)rest.p[p])) p++;
+    if (p > ns) {
+        char *lc = (char *)if_arena_alloc(t->arena, (u64)(p - ns));
+        for (u32 i = ns; i < p; i++) lc[i - ns] = (char)if_ascii_lower((u8)rest.p[i]);
+        tok->text = if_str(lc, p - ns);
+        tok->dt_has_name = 1;
+    }
+    while (p < rest.n && if_dt_ws((u8)rest.p[p])) p++;
+    if (p >= rest.n) return;
+    if (if_dt_kw(rest, p, "public")) {
+        p += 6;
+        while (p < rest.n && if_dt_ws((u8)rest.p[p])) p++;
+        if (p < rest.n && (rest.p[p] == '"' || rest.p[p] == '\'')) {
+            p = if_dt_quoted(rest, p, &tok->dt_pub);
+            tok->dt_has_pub = 1;
+            while (p < rest.n && if_dt_ws((u8)rest.p[p])) p++;
+            if (p < rest.n && (rest.p[p] == '"' || rest.p[p] == '\'')) {
+                p = if_dt_quoted(rest, p, &tok->dt_sys);
+                tok->dt_has_sys = 1;
+            }
+        } else {
+            t->errors++; /* missing public id */
+        }
+        return;
+    }
+    if (if_dt_kw(rest, p, "system")) {
+        p += 6;
+        while (p < rest.n && if_dt_ws((u8)rest.p[p])) p++;
+        if (p < rest.n && (rest.p[p] == '"' || rest.p[p] == '\'')) {
+            p = if_dt_quoted(rest, p, &tok->dt_sys);
+            tok->dt_has_sys = 1;
+        } else {
+            t->errors++; /* missing system id */
+        }
+        return;
+    }
+}
+
 /* "<!--" の後ろ。コメントまたは doctype/bogus */
 static IfTok if_markup_decl(IfHtmlTok *t) {
-    IfTok tok = { TOK_EOF, {0}, 0, {0}, NULL, 0, false };
+    IfTok tok = { .kind = TOK_EOF };
 
     if (t->pos + 1 < t->len && t->src[t->pos] == '-' && t->src[t->pos + 1] == '-') {
         t->pos += 2;
@@ -316,6 +394,26 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
         return tok;
     }
 
+    /* "<![CDATA[": foreign content 内ではテキスト、外では bogus comment */
+    if (t->cdata_foreign && t->pos + 7 <= t->len &&
+        memcmp(t->src + t->pos, "[CDATA[", 7) == 0) {
+        u32 start = t->pos + 7;
+        u32 j = start;
+        while (j + 2 < t->len &&
+               !(t->src[j] == ']' && t->src[j + 1] == ']' && t->src[j + 2] == '>')) j++;
+        IfTok cdt = { .kind = TOK_TEXT };
+        if (j + 2 < t->len) {
+            cdt.text = if_str((const char *)t->src + start, j - start);
+            t->pos = j + 3;
+        } else {
+            t->errors++; /* 閉じられない CDATA: 残り全部をテキストに */
+            cdt.text = if_str((const char *)t->src + start, t->len - start);
+            t->pos = t->len;
+        }
+        if (cdt.text.n == 0) return if_tok_next(t);
+        return cdt;
+    }
+
     /* doctype or bogus */
     u32 start = t->pos;
     while (t->pos < t->len && t->src[t->pos] != '>') t->pos++;
@@ -325,7 +423,7 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
     if (if_str_eq_ci(b7, IF_S("doctype"))) {
         tok.kind = TOK_DOCTYPE;
         IfStr rest = body.n > 7 ? if_str(body.p + 7, body.n - 7) : if_str("", 0);
-        tok.text = if_str_trim(rest);
+        if_parse_doctype_rest(t, &tok, rest);
         return tok;
     }
     t->errors++;
@@ -335,7 +433,15 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
 }
 
 IfTok if_tok_next(IfHtmlTok *t) {
-    IfTok tok = { TOK_EOF, {0}, 0, {0}, NULL, 0, false };
+    IfTok tok = { .kind = TOK_EOF };
+
+    /* <plaintext>: 残り全入力を 1 個の TEXT として返す（文字参照も解決しない） */
+    if (t->plaintext && t->pos < t->len) {
+        tok.kind = TOK_TEXT;
+        tok.text = if_str((const char *)t->src + t->pos, t->len - t->pos);
+        t->pos = t->len;
+        return tok;
+    }
 
     if (t->raw_tag && t->pos < t->len) return if_raw_token(t);
     if (t->pos >= t->len) return tok;
@@ -392,7 +498,63 @@ IfTok if_tok_next(IfHtmlTok *t) {
         return if_markup_decl(t);
     }
     if (c1 == '?') {
-        t->pos += 2;
+        /* Processing Instruction（WPT processing-instructions.dat が定義する文法）:
+         *   <? target ws* data >  target = [A-Za-z_] [A-Za-z0-9_-]* 、先頭が xml(CI) で始まらない
+         *   - data の終端は最初の '>'（"?>" 対である必要はない。'?' は data に残る）
+         *   - EOF で閉じられなかった PI は**トークンごと捨てる**（実データで確認済み）
+         *   - ターゲット妥当性違反は bogus comment（data は '?' を含め '>' まで。EOF でも出す）
+         */
+        u32 q = t->pos + 1; /* '?' の位置（bogus comment の data 先頭） */
+        u32 p = t->pos + 2;
+        if (p >= t->len) { /* "<?" で EOF: 何も出さない */
+            t->pos = t->len;
+            t->errors++;
+            return if_tok_next(t);
+        }
+        u8 c = t->src[p];
+        bool can_start = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+        if (can_start) {
+            u32 ts = p;
+            while (p < t->len) {
+                u8 d = t->src[p];
+                if ((d >= 'A' && d <= 'Z') || (d >= 'a' && d <= 'z') ||
+                    (d >= '0' && d <= '9') || d == '_' || d == '-') p++;
+                else break;
+            }
+            if (p >= t->len) { /* EOF in target: 捨てる */
+                t->pos = t->len;
+                t->errors++;
+                return if_tok_next(t);
+            }
+            IfStr target = if_str((const char *)t->src + ts, p - ts);
+            bool is_xml = target.n >= 3 &&
+                if_ascii_lower((u8)target.p[0]) == 'x' &&
+                if_ascii_lower((u8)target.p[1]) == 'm' &&
+                if_ascii_lower((u8)target.p[2]) == 'l';
+            u8 next = t->src[p];
+            bool term_ok = next == '>' || next == '?' || if_hws(next);
+            if (!is_xml && term_ok) {
+                while (p < t->len && if_hws(t->src[p])) p++;
+                u32 ds = p;
+                while (p < t->len && t->src[p] != '>') p++;
+                if (p >= t->len) { /* EOF in data: 捨てる */
+                    t->pos = t->len;
+                    t->errors++;
+                    return if_tok_next(t);
+                }
+                /* 終端が "?>" なら '?' は data に含めない（"? >" のように空白挟みは含める） */
+                u32 de = p;
+                if (de > ds && t->src[de - 1] == '?') de--;
+                tok.kind = TOK_COMMENT;
+                tok.is_pi = 1;
+                tok.pi_target = target;
+                tok.text = if_str((const char *)t->src + ds, de - ds);
+                t->pos = p + 1; /* '>' */
+                return tok;
+            }
+        }
+        /* bogus comment: data は '?' から '>' の手前まで。EOF なら残り全部で出す */
+        t->pos = q;
         u32 start = t->pos;
         while (t->pos < t->len && t->src[t->pos] != '>') t->pos++;
         tok.kind = TOK_COMMENT;

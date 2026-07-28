@@ -52,6 +52,7 @@ static void usage(FILE *f) {
           "  --dump-dom       print DOM tree\n"
           "  --dump-layout    print box tree\n"
           "  --dump-tokens    print HTML tokens\n"
+          "  --dump-wptdom    print DOM in html5lib tree-construction format\n"
           "  --links          print collected links\n"
           "  --stats          print timing/memory stats to stderr\n", f);
 }
@@ -59,7 +60,7 @@ static void usage(FILE *f) {
 int main(int argc, char **argv) {
     i32 width = 100;
     int ansi = 1, do_style = 1, links = 0, stats = 0;
-    enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS } mode = M_RENDER;
+    enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM } mode = M_RENDER;
     const char *path = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -69,6 +70,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dump-dom") == 0) mode = M_DOM;
         else if (strcmp(argv[i], "--dump-layout") == 0) mode = M_LAYOUT;
         else if (strcmp(argv[i], "--dump-tokens") == 0) mode = M_TOKENS;
+        else if (strcmp(argv[i], "--dump-wptdom") == 0) mode = M_WPTDOM;
         else if (strcmp(argv[i], "--links") == 0) links = 1;
         else if (strcmp(argv[i], "--stats") == 0) stats = 1;
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { usage(stdout); return 0; }
@@ -87,6 +89,11 @@ int main(int argc, char **argv) {
     IfDom *dom = if_parse_html(&a, input);
     double t2 = now_ms();
 
+    if (mode == M_WPTDOM) {
+        if_dom_serialize_wpt(dom, stdout);
+        if_arena_destroy(&a);
+        return 0;
+    }
     if (mode == M_TOKENS) {
         IfArena ta;
         if_arena_init(&ta, 1 << 16);

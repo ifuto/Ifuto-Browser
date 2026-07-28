@@ -31,7 +31,7 @@ $(BUILD)/run_tests: $(TESTSRC) $(ENGINE) | $(BUILD)
 $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_driver.c $(ENGINE) -lm
 
-.PHONY: test golden fuzz bench clean size
+.PHONY: test golden fuzz bench clean size conformance
 
 test: $(BUILD)/run_tests
 	./$(BUILD)/run_tests
@@ -44,6 +44,10 @@ fuzz: $(BUILD)/fuzz_html
 
 bench: $(BUILD)/ifuto
 	bench/bench.sh ./$(BUILD)/ifuto
+
+# tree-construction 適合採点（WPT resources/*.dat, PINNED.sha でピン留め）
+conformance: $(BUILD)/ifuto
+	python3 tests/run_html5lib.py ./$(BUILD)/ifuto tests/wpt-tree-construction
 
 size: $(BUILD)/ifuto
 	@ls -l $(BUILD)/ifuto | awk '{printf "binary bytes: %d\n", $$5}'

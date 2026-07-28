@@ -18,6 +18,8 @@ static IfDom *parse(IfArena *a, const char *html) {
 }
 
 void test_html(void) {
+    /* タグ表の宣言長さと strlen の整合（round-trip は n を信じるためこの誤りを検出できない）*/
+    CHECK(if_dom_tag_table_sane());
     /* タグ表の整合性（enum とテーブルのズレ検出） */
     for (u16 i = 1; i < IF_TAG_N_TAGS; i++) {
         const char *n = if_tag_name(i);
@@ -26,7 +28,7 @@ void test_html(void) {
         CHECK(if_tag_id(s) == i);
     }
     CHECK(if_tag_id(IF_S("DIV")) == IF_TAG_DIV);   /* CI 照合 */
-    CHECK(if_tag_id(IF_S("marquee")) == IF_TAG_UNKNOWN);
+    CHECK(if_tag_id(IF_S("zznotatag")) == IF_TAG_UNKNOWN);
     CHECK(if_tag_is_void(IF_TAG_BR) && if_tag_is_void(IF_TAG_IMG));
     CHECK(!if_tag_is_void(IF_TAG_DIV));
     CHECK(if_tag_is_rawtext(IF_TAG_STYLE) && if_tag_is_rawtext(IF_TAG_SCRIPT));

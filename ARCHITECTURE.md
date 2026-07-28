@@ -43,10 +43,15 @@
 | レイアウトは整数セル座標（8px×16px グリッド） | 端末では正確。Sub-px 表現不能 | px 精度レイアウトを GPU 化と同時に別経路で追加（IfBox API は維持） |
 | 縦マージン相殺は兄弟間のみ | 親子貫通ケースで ±1 行 | v0.2 |
 | マーカーは親 padding 帯に描画（2〜4 セル） | `list-style-position: inside` 未対応 | v0.2 |
-| テーブルは display:block として積む | 表が縦に崩れる | v0.2 で本テーブルレイアウト |
-| `<title>`/`<textarea>` は RAWTEXT（実体参照未デコード） | title に `&amp;` がそのまま出る | v0.2（RCDATA 化） |
-| `display:inline-block` → inline、table 系 display → block | 一部サイトで組版差 | v0.2+ |
-| 奇行系: quirks モードなし、foster parenting なし、adoption agency は近似 | 壊れた HTML でのツリー差異 | html5lib-tests の tree-construction で採点してから直す（v0.2） |
+| テーブルは display:block として積む（ツリー側も tbody/tr 暗黙挿入なし） | 表が縦に崩れる | table 挿入モード群（v0.2 継続課題） |
+| ~~`<title>`/`<textarea>` は RAWTEXT~~ → **RCDATA 化済み**（文字参照デコード + textarea 先頭 LF 規則） | 解消 | 済 |
+| `display:inline-block` → inline、table 系 display → block | 一部サイトで組版差 | v0.3+ |
+| ~~コメント/doctype は DOM に残さない~~ → **保持に変更**（PI `<?target data?>` も PI として区別） | 解消 | 済 |
+| foreign content（SVG/MathML） | コアは実装済み: ns 入域/復帰・integration points・breakout・case 調整・CDATA・serializer prefix。未実装: `<select>` 等の foreign 内特殊規則、annotation-xml の encoding 以外、`</br>` 等の細則 | v0.2 継続 |
+| template は通常要素（content フラグメント分離なし、serializer で擬似表示） | template.dat が取りこぼす | v0.2 継続課題（content 分離） |
+| 奇行系: quirks モードなし、foster parenting なし、adoption agency は近似 | 壊れた HTML でのツリー差異 | tree-construction 採点中（§6.1）。table modes + foster + AAA が最大の残塊 |
+| 入力 CR/CRLF → LF 正規化なし | `\r` 含む入力でツリー差異の可能性 | v0.2 継続（入力前処理に正規化層） |
+| isindex/`<title>` の body→head 移動等非推奨規則 | 該当テストのみ失敗 | 非推奨要素は後回し（実害なしと判断） |
 | フォントは端末依存・等幅のみ、斜体/太字は SGR 属性 | 実フォントレンダリングなし | v0.3（GPU/ソフトピクセル） |
 | 画像・メディアはプレースホルダ | 実デコードなし | v0.3 |
 | http/https 未取得（ファイルのみ） | ネットワークなし | v0.2: HTTP/1.1 → v0.3: TLS(BearSSL 等の battle-tested 物。自作 TLS は禁止） |
@@ -84,7 +89,7 @@ layout（座標系は差し替え可能）──→ [backend 境界: 矩形/文�
 | 版 | 内容 | 完了の客観基準 |
 |---|---|---|
 | v0.1 ✅ | 垂直スライス: パース〜端末描画。テスト・fuzz・ベンチ・ゴールデン | 本コミット |
-| v0.2 | **適合性マイルストーン**: html5lib-tests tree-construction ハーネスで採点 → 欠陥修正。RCDATA、foster parenting、マージン相殺親子貫通、テーブルレイアウト、HTTP/1.1 クライアント（plaintext のみ。防御的パーサ付き） | tree-construction 合格率を公開 (%) |
+| v0.2 | **適合性マイルストーン（進行中）**: WPT tree-construction 採点ハーネス `make conformance`（`tests/wpt-tree-construction/`、WPT@0acb81f ピン留め・ベンダー済 61 ファイル 1,934 テスト）。公開スコアの推移: 41.4%（714/1726, 初期採点）→ 49.0%（PI・RCDATA・comment/doctype・終了タグ規則）→ 56.5%（foreign content コア）→ **60.0%（1036/1726, 2026-07-28 現在）**。分母は fragment(#document-fragment) 208 件を skip した実行可能件数。残塊: table 挿入モード群+foster parenting+AAA（最大）、template content、frameset、script-escape 状態、select/option。以降: マージン相殺親子貫通、テーブルレイアウト、HTTP/1.1 クライアント（plaintext のみ。防御的パーサ付き） | 合格率の単調増加（後退は台帳に理由を記す） |
 | v0.3 | ソフトピクセルラスタ + backend 境界凍結 + 画像デコード（まず BMP/PNG 静的、ImageMagick には頼らない）+ Vulkan（このコンテナで headless 検証可能なら） | 同一文書のセル版・ピクセル版で視覚一貫 |
 | v0.4 | QuickJS 埋め込み（DOM 最小 API: querySelector・textContent・style 書換）。CI ホスト準備後 D3D12/Metal 4 | JS からのレイアウト再計算が end-to-end で動く |
 | v0.5 | プロセス分離（サイト分離）＋ seccomp サンドボックス。footprint/RSS への影響を数値で示してから適用 | 攻撃面評価を文書化、境界テスト追加 |
