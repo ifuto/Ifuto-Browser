@@ -1,0 +1,88 @@
+/* Ifuto — DOM。
+ *
+ * 設計:
+ *   - 全ノードはページ arena から確保。生存期間はページと一体。
+ *   - よく使う性質はタグ ID（列挙）で O(1) 判定し、未知タグは文字列で保持。
+ *   - class 照合はカスケード側で属性値を都度分割（文書規模なら十分速い。測定して悪ければ索引化）。
+ */
+#ifndef IFUTO_DOM_H
+#define IFUTO_DOM_H
+
+#include "common.h"
+#include "strutil.h"
+#include "arena.h"
+
+typedef enum {
+    IF_TAG_UNKNOWN = 0,
+    IF_TAG_HTML, IF_TAG_HEAD, IF_TAG_BODY, IF_TAG_TITLE, IF_TAG_META, IF_TAG_LINK,
+    IF_TAG_STYLE, IF_TAG_SCRIPT, IF_TAG_DIV, IF_TAG_SPAN, IF_TAG_P, IF_TAG_A,
+    IF_TAG_B, IF_TAG_I, IF_TAG_U, IF_TAG_S, IF_TAG_EM, IF_TAG_STRONG, IF_TAG_CODE,
+    IF_TAG_PRE, IF_TAG_BLOCKQUOTE, IF_TAG_H1, IF_TAG_H2, IF_TAG_H3, IF_TAG_H4,
+    IF_TAG_H5, IF_TAG_H6, IF_TAG_UL, IF_TAG_OL, IF_TAG_LI, IF_TAG_DL, IF_TAG_DT,
+    IF_TAG_DD, IF_TAG_TABLE, IF_TAG_THEAD, IF_TAG_TBODY, IF_TAG_TR, IF_TAG_TD,
+    IF_TAG_TH, IF_TAG_CAPTION, IF_TAG_IMG, IF_TAG_BR, IF_TAG_HR, IF_TAG_FORM,
+    IF_TAG_INPUT, IF_TAG_BUTTON, IF_TAG_SELECT, IF_TAG_OPTION, IF_TAG_LABEL,
+    IF_TAG_TEXTAREA, IF_TAG_HEADER, IF_TAG_FOOTER, IF_TAG_NAV, IF_TAG_MAIN,
+    IF_TAG_SECTION, IF_TAG_ARTICLE, IF_TAG_ASIDE, IF_TAG_FIGURE, IF_TAG_FIGCAPTION,
+    IF_TAG_ADDRESS, IF_TAG_SMALL, IF_TAG_BIG, IF_TAG_SUB, IF_TAG_SUP, IF_TAG_MARK,
+    IF_TAG_TIME, IF_TAG_Q, IF_TAG_CITE, IF_TAG_ABBR, IF_TAG_DFN, IF_TAG_KBD,
+    IF_TAG_SAMP, IF_TAG_VAR, IF_TAG_FONT, IF_TAG_CENTER, IF_TAG_STRIKE, IF_TAG_TT,
+    IF_TAG_WBR, IF_TAG_NOSCRIPT, IF_TAG_IFRAME, IF_TAG_OBJECT, IF_TAG_PARAM,
+    IF_TAG_SOURCE, IF_TAG_TRACK, IF_TAG_VIDEO, IF_TAG_AUDIO, IF_TAG_CANVAS,
+    IF_TAG_N_TAGS
+} IfTag;
+
+typedef struct {
+    IfStr name;   /* スライス（比較は CI） */
+    IfStr value;  /* 文字参照はデコード済み（ページ arena 所有 or 入力スライス） */
+} IfAttr;
+
+typedef enum { IF_NODE_DOCUMENT, IF_NODE_ELEMENT, IF_NODE_TEXT } IfNodeKind;
+
+struct IfStyle; /* css.h で定義（相互 include 回避） */
+
+typedef struct IfNode {
+    IfNodeKind kind;
+    u16 tag;             /* ELEMENT のみ有意 */
+    IfStr tag_name;      /* canonical（既知タグは静的 lowercase 名、未知は arena 複製） */
+    IfAttr *attrs;
+    u32 n_attrs;
+    IfStr text;          /* TEXT ノードの中身 */
+    struct IfStyle *style; /* カスケード後に付与（ページ arena 所有）。NULL = 未計算 */
+    struct IfNode *parent, *first_child, *last_child, *next_sibling;
+} IfNode;
+
+typedef struct {
+    IfArena *arena;      /* 所有 */
+    IfNode *root;        /* DOCUMENT ノード */
+    u32 n_nodes;
+    u32 n_errors;        /* パーサが回復したエラー数（統計用） */
+    bool quirks;         /* v0.1 は常に false（quirks モードなし方針） */
+    IfStr title;         /* <title> のテキスト（見つからなければ empty） */
+} IfDom;
+
+/* 入力はドキュメント寿命中生存していること（ページ arena にコピーして呼ぶのが安全）。 */
+IfDom *if_parse_html(IfArena *arena, IfStr input);
+
+const char *if_tag_name(u16 tag);                 /* canonical lowercase 名 or NULL */
+u16         if_tag_id(IfStr name);                /* 既知タグの ID、未知は IF_TAG_UNKNOWN */
+bool        if_tag_is_void(u16 tag);
+bool        if_tag_is_rawtext(u16 tag);
+
+IfStr       if_dom_attr(const IfNode *n, const char *name_ci); /* なければ empty */
+bool        if_dom_has_class(const IfNode *n, IfStr cls);
+
+/* 子要素をドキュメント順に列挙 */
+static inline IfNode *if_node_first_elem_child(IfNode *n) {
+    for (IfNode *c = n ? n->first_child : NULL; c; c = c->next_sibling)
+        if (c->kind == IF_NODE_ELEMENT) return c;
+    return NULL;
+}
+
+/* text ノードを UTF-8 のまま子孫から連結取得（dom.c）。arena に新規確保。 */
+IfStr if_dom_text_content(IfArena *a, const IfNode *n);
+
+/* デバッグ用のツリー印字（out は FILE*）。表示用のためポインタは void。 */
+void if_dom_dump(const IfDom *dom, void *out_FILE);
+
+#endif

@@ -1,0 +1,7 @@
+build/
+artifacts/
+*.o
+*.d
+core
+core.*
+bench/*.html

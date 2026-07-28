@@ -1,0 +1,51 @@
+/* Ifuto — ゼロコピー文字列スライス。
+ * 原則: 入力バッファを指すスライスをそのまま流通させ、文字列ごとの malloc を撲滅する。
+ * len は u32（ページ上限 64MB なので十分）。NUL 終端は期待しない。 */
+#ifndef IFUTO_STRUTIL_H
+#define IFUTO_STRUTIL_H
+
+#include "common.h"
+#include <string.h>
+
+typedef struct {
+    const char *p;
+    u32 n;
+} IfStr;
+
+#define IF_S(lit) ((IfStr){ (lit), (u32)(sizeof(lit) - 1) })
+
+static inline IfStr if_str(const char *p, u32 n) { IfStr s; s.p = p; s.n = n; return s; }
+static inline bool if_str_empty(IfStr s) { return s.n == 0; }
+
+static inline bool if_str_eq(IfStr a, IfStr b) {
+    return a.n == b.n && (a.n == 0 || memcmp(a.p, b.p, a.n) == 0);
+}
+
+static inline u8 if_ascii_lower(u8 c) {
+    return (u8)((c >= 'A' && c <= 'Z') ? (c + 32) : c);
+}
+
+/* ASCII 限定の大文字小文字無視比較（タグ名・属性名・HTTP ヘッダ用） */
+static inline bool if_str_eq_ci(IfStr a, IfStr b) {
+    if (a.n != b.n) return false;
+    for (u32 i = 0; i < a.n; i++)
+        if (if_ascii_lower((u8)a.p[i]) != if_ascii_lower((u8)b.p[i])) return false;
+    return true;
+}
+
+static inline bool if_str_is_ws_only(IfStr s) {
+    for (u32 i = 0; i < s.n; i++) {
+        char c = s.p[i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\f') return false;
+    }
+    return true;
+}
+
+static inline IfStr if_str_trim(IfStr s) {
+    u32 a = 0, b = s.n;
+    while (a < b && (s.p[a] == ' ' || s.p[a] == '\t' || s.p[a] == '\n' || s.p[a] == '\r' || s.p[a] == '\f')) a++;
+    while (b > a && (s.p[b-1] == ' ' || s.p[b-1] == '\t' || s.p[b-1] == '\n' || s.p[b-1] == '\r' || s.p[b-1] == '\f')) b--;
+    return if_str(s.p + a, b - a);
+}
+
+#endif

@@ -1,0 +1,116 @@
+/* Ifuto — CSS サブセット（パース + カスケード）
+ *
+ * スコープ（明示的に削る。H4「使わない機能は実装しない」）:
+ *   対応: type/class/id/universal セレクタ、子孫・子結合子、グループ化、
+ *         display/color/background-color/font-size/font-weight/font-style/
+ *         text-decoration/margin/padding/border(solid のみ)/width/height/
+ *         text-align/line-height/white-space、shorthand: margin/padding/border/background
+ *   非対応: @規則、pseudo、属性セレクタ、兄弟結合子、ショートハンド font/flex/grid/…
+ *           → ルールまたは宣言ごと安全側に棄却（n_dropped で可視化）
+ *
+ * カスケード: (important, origin, specificity, order) の辞書順。
+ *   origin: UA=0 < author=1 < inline=2 （author !important > inline 通常 を正しく表現できる）
+ *
+ * 偏差（spec-out。v0.1 受理）:
+ *   - text-decoration を継承扱い（本来は伝播だが近似）
+ *   - inline-block → inline、table 系 display → block に丸める
+ *   - bolder/lighter は bold/normal に丸める
+ */
+#ifndef IFUTO_CSS_H
+#define IFUTO_CSS_H
+
+#include "common.h"
+#include "strutil.h"
+#include "arena.h"
+#include "dom.h"
+
+/* ---- 値 ---- */
+typedef enum { IF_V_LEN, IF_V_IDENT, IF_V_COLOR, IF_V_RAW } IfValKind;
+typedef enum { IF_U_PX, IF_U_EM, IF_U_REM, IF_U_PT, IF_U_PCT, IF_U_AUTO } IfLenUnit;
+
+typedef struct { float v; u8 unit; } IfLen; /* unit=IF_U_AUTO は「auto」 */
+#define IF_LEN_AUTO ((IfLen){ 0.0f, IF_U_AUTO })
+
+typedef struct {
+    u16 prop;        /* IfPropId */
+    u8 important;
+    u8 vkind;        /* IfValKind */
+    u8 unit;         /* IfLenUnit (IF_V_LEN) */
+    float num;       /* IF_V_LEN の数値 */
+    u32 color;       /* IF_V_COLOR: 0xRRGGBBAA */
+    IfStr text;      /* IF_V_IDENT / IF_V_RAW */
+} IfDecl;
+
+enum {
+    IF_P_DISPLAY, IF_P_COLOR, IF_P_BACKGROUND_COLOR,
+    IF_P_FONT_SIZE, IF_P_FONT_WEIGHT, IF_P_FONT_STYLE, IF_P_TEXT_DECORATION,
+    IF_P_MARGIN_TOP, IF_P_MARGIN_RIGHT, IF_P_MARGIN_BOTTOM, IF_P_MARGIN_LEFT,
+    IF_P_PADDING_TOP, IF_P_PADDING_RIGHT, IF_P_PADDING_BOTTOM, IF_P_PADDING_LEFT,
+    IF_P_BORDER_TOP_WIDTH, IF_P_BORDER_RIGHT_WIDTH, IF_P_BORDER_BOTTOM_WIDTH, IF_P_BORDER_LEFT_WIDTH,
+    IF_P_BORDER_COLOR,
+    IF_P_WIDTH, IF_P_HEIGHT, IF_P_TEXT_ALIGN, IF_P_LINE_HEIGHT, IF_P_WHITE_SPACE,
+    IF_P_N
+};
+
+/* ---- セレクタ ---- */
+typedef enum { IF_CX_DESCENDANT, IF_CX_CHILD } IfCombinator;
+
+typedef struct {
+    bool has_tag;
+    u16 tag;         /* 既知タグなら ID。未知なら tag_name を CI 比較 */
+    IfStr tag_name;
+    IfStr *classes; u32 n_classes;
+    IfStr *ids;     u32 n_ids;
+} IfCompound;
+
+typedef struct {
+    IfCompound *comps;  /* 左→右 */
+    u8 *combs;          /* combs[i] = comps[i] と comps[i+1] の間の結合子 */
+    u32 n_comps;
+    u32 spec;           /* (ids<<16)|(classes<<8)|types で事前計算 */
+} IfSelector;
+
+typedef struct {
+    IfSelector *sels; u32 n_sels;
+    IfDecl *decls;    u32 n_decls;
+    u32 order;
+} IfRule;
+
+typedef struct IfStyleSheet {
+    IfRule *rules; u32 n_rules;
+    u32 n_dropped_rules;
+    u32 n_dropped_decls;
+} IfStyleSheet;
+
+/* ---- 計算済みスタイル ---- */
+enum { IF_D_INLINE, IF_D_BLOCK, IF_D_LIST_ITEM, IF_D_NONE };
+enum { IF_TA_LEFT, IF_TA_CENTER, IF_TA_RIGHT };
+enum { IF_WS_NORMAL, IF_WS_PRE };
+
+typedef struct IfStyle {
+    u32 color, bg;            /* RGBA8。bg の alpha 0 は透過 */
+    float font_size;          /* px（解決済み） */
+    float line_height;        /* px（0 = auto → font_size*1.2 相当） */
+    IfLen width, height;
+    IfLen margin[4], padding[4]; /* T R B L */
+    float border_w[4];        /* px */
+    u32 border_color;
+    u8 display;               /* IF_D_* */
+    u8 text_align;            /* IF_TA_* */
+    u8 white_space;           /* IF_WS_* */
+    bool bold, italic, underline, strike;
+} IfStyle;
+
+/* ---- API ---- */
+IfStyleSheet *if_css_parse(IfArena *a, IfStr css, u32 order_base);
+/* inline style 属性用: 宣言列のみパース */
+u32 if_css_parse_decls(IfArena *a, IfStr text, IfDecl **out);
+bool if_css_color(IfStr s, u32 *out);                    /* #hex/rgb()/色名 → RGBA8 */
+float if_css_resolve_len(IfLen l, float self_fs, float root_fs); /* px へ（PCT/EM は呼び出し側で分母を掛ける） */
+
+/* DOM に計算済みスタイルを付与する（UA シート + <style> 要素 + inline style）。 */
+void if_style_apply(IfArena *a, IfDom *dom);
+
+bool if_css_match_selector(const IfNode *n, const IfSelector *sel);
+
+#endif
