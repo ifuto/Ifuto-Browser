@@ -34,59 +34,64 @@ def read_cpu_ticks(pid):
     return int(parts[11]) + int(parts[12])
 
 
-def run_once(binpath, cols=100, rows=30):
+def run_once(binpath, cols=100, rows=30, env=None):
+    """1 回の計測。PTY の受信は常駐スレッドで連続ドレインする（TUI の
+    イベント単位の全画面 write が PTY バッファ満杯でブロックされるのを防ぐ。
+    tui_smoke.py と同じ教訓: ブロックされる and app が入力を読まない）。"""
+    import threading
     m, s = os.openpty()
     fcntl.ioctl(s, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     t0 = time_monotonic_ns()
     p = subprocess.Popen([binpath, "--ui"], stdin=s, stdout=s, stderr=s,
-                         close_fds=True, start_new_session=True)
+                         close_fds=True, start_new_session=True, env=env)
     os.close(s)
-    os.set_blocking(m, False)
+
+    state = {"got_first": False, "bytes": 0, "alive": True}
+
+    def drain():
+        import select as _sel
+        while state["alive"]:
+            r, _, _ = _sel.select([m], [], [], 0.05)
+            if not r:
+                continue
+            try:
+                chunk = os.read(m, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            if not state["got_first"]:
+                state["t_first"] = time_monotonic_ns()
+                state["got_first"] = True
+            state["bytes"] += len(chunk)
+
+    thr = threading.Thread(target=drain, daemon=True)
+    thr.start()
 
     # 初回描画 (最初の出力バイト) を待つ
-    t_first = None
+    import time as _t
     deadline = time_monotonic_ns() + 5_000_000_000
-    while time_monotonic_ns() < deadline and t_first is None:
-        r, _, _ = select.select([m], [], [], 0.05)
-        if r:
-            if os.read(m, 65536):
-                t_first = time_monotonic_ns()
-    if t_first is None:
+    while time_monotonic_ns() < deadline and not state["got_first"]:
+        _t.sleep(0.005)
+    if not state["got_first"]:
+        state["alive"] = False
         p.kill()
         p.wait()
         raise SystemExit("FAIL: no first paint within 5 s")
-    cold_ms = (t_first - t0) / 1e6
+    cold_ms = (state["t_first"] - t0) / 1e6
 
-    # 残りの描画を吸い切る
-    import time as _t
-    _t.sleep(0.1)
-    while True:
-        r, _, _ = select.select([m], [], [], 0.02)
-        if not r:
-            break
-        try:
-            os.read(m, 65536)
-        except OSError:
-            break
-
+    _t.sleep(0.15)  # 残りフレームを流す余裕
     vhwm_kb = read_vhwm_kb(p.pid)
 
     # idle CPU / idle 出力
     hz = os.sysconf("SC_CLK_TCK")
+    b0 = state["bytes"]
     c0 = read_cpu_ticks(p.pid)
     w0 = _t.monotonic()
     _t.sleep(1.2)
-    idle_bytes = 0
-    while True:
-        r, _, _ = select.select([m], [], [], 0.0)
-        if not r:
-            break
-        try:
-            idle_bytes += len(os.read(m, 65536))
-        except OSError:
-            break
     w1 = _t.monotonic()
     c1 = read_cpu_ticks(p.pid)
+    idle_bytes = state["bytes"] - b0
     idle_cpu = (c1 - c0) / hz / (w1 - w0) * 100.0
 
     # 空タブ開始時はオムニボックス入力モード (INV-1) なので、先に ESC で
@@ -99,9 +104,12 @@ def run_once(binpath, cols=100, rows=30):
     try:
         rc = p.wait(timeout=5)
     except subprocess.TimeoutExpired:
+        state["alive"] = False
         p.kill()
         p.wait()
         raise SystemExit("FAIL: quit hang")
+    state["alive"] = False
+    thr.join(timeout=1)
     os.close(m)
     return cold_ms, vhwm_kb, idle_cpu, rc, idle_bytes
 
@@ -113,16 +121,26 @@ def time_monotonic_ns():
 
 def main():
     binpath = sys.argv[1] if len(sys.argv) > 1 else "./build/ifuto"
+    import shutil
+    import tempfile
+    # ストアの書き込みは完全に封じ込める（実 $HOME を汚さない）。
+    # 空起動で毎回 session.txt が 1 度書かれる点は slice-2 以後の正しい動作。
+    sandbox = tempfile.mkdtemp(prefix="ifuto-tuibench-")
+    env = dict(os.environ)
+    env["IFUTO_HOME"] = sandbox
     reps = 7
     colds = []
-    for i in range(reps):
-        cold, vhwm, cpu, rc, idle_bytes = run_once(binpath)
-        colds.append(cold)
-        if i == reps // 2:
-            print("blank_tab_VmHWM_kB: %d" % vhwm)
-            print("idle_cpu_percent: %.2f" % cpu)
-            print("idle_output_bytes: %d" % idle_bytes)
-            print("quit_rc: %d" % rc)
+    try:
+        for i in range(reps):
+            cold, vhwm, cpu, rc, idle_bytes = run_once(binpath, env=env)
+            colds.append(cold)
+            if i == reps // 2:
+                print("blank_tab_VmHWM_kB: %d" % vhwm)
+                print("idle_cpu_percent: %.2f" % cpu)
+                print("idle_output_bytes: %d" % idle_bytes)
+                print("quit_rc: %d" % rc)
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
     colds.sort()
     print("cold_start_to_first_byte_ms: n=%d median=%.2f min=%.2f max=%.2f"
           % (reps, colds[reps // 2], colds[0], colds[-1]))

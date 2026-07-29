@@ -24,6 +24,8 @@
 static volatile sig_atomic_t g_winch = 0;
 static void on_winch(int sig) { (void)sig; g_winch = 1; }
 
+#define BMARK_OVERLAY_MAX 16 /* 画面は 1..9 選択なので 16 件制限でも表示域は十分 */
+
 typedef struct {
     struct termios saved;
     bool raw;
@@ -32,6 +34,11 @@ typedef struct {
     IfUiDecoder dec;
     char *buf;      /* 1 フレーム分の出力を組み立てて一括 write（ちらつき防止） */
     u64 buflen, bufcap;
+    /* overlay 専用 arena（engine_scratch と分離: ブックマーク snapshot の寿命管理） */
+    IfArena overlay_a;
+    IfStr bm_titles[BMARK_OVERLAY_MAX];
+    IfStr bm_urls[BMARK_OVERLAY_MAX];
+    i32 n_bmarks;
 } IfTui;
 
 /* ---- 出力バッファ ---- */
@@ -166,9 +173,22 @@ static void paint(IfTui *t, IfChrome *c, i32 vh) {
         char tpfx[8];
         int pn = snprintf(tpfx, sizeof tpfx, " %c%d ", act ? 'I' : ' ', c->tabs[i]->id);
         out_cat(t, tpfx, (u64)pn);
-        i32 room = t->cols - used - 22;
+        i32 gextra = 0;
+        if (c->tabs[i]->group && c->tabs[i]->group[0]) {
+            /* Spaces の最小表現: [grp] 接頭辞（#11 の TUI 最小形）。描画は
+             * "[smoke] Golden" — 空白は括弧の外に置く */
+            i32 groom = t->cols - used - 6;
+            if (groom > 3) {
+                out_cat(t, "\x1b[2m[", 5); /* dim [group] */
+                i32 gw = paint_text_cells(t, c->tabs[i]->group, groom);
+                out_s(t, "] \x1b[0m");
+                out_s(t, act ? "\x1b[7m" : "\x1b[0m");
+                gextra = 1 + gw + 2;
+            }
+        }
+        i32 room = t->cols - used - 22 - gextra;
         i32 w = room > 0 ? paint_text_cells(t, c->tabs[i]->title ? c->tabs[i]->title : "?", room) : 0;
-        used += 5 + w + 2;
+        used += 5 + w + 2 + gextra;
         if (used < t->cols) out_n(t, ' ', 2);
     }
     out_s(t, "\x1b[0m");
@@ -190,11 +210,41 @@ static void paint(IfTui *t, IfChrome *c, i32 vh) {
     clear_eol(t);
 
     /* content */
-    for (i32 vy = 0; vy < vh; vy++) {
-        goto_row(t, CHROME_ROWS_TOP + vy);
-        if (cur && cur->grid && cur->scroll + vy < cur->grid->h)
-            paint_grid_row(t, cur->grid, cur->scroll + vy, t->cols);
+    bool search_preview = (c->mode == CM_OMNIBOX && c->omni[0] == '?');
+    if (search_preview) {
+        /* タブ検索のライブ絞り込み（入力中）。commit 後は CM_SEARCH の overlay へ */
+        i32 hits[16];
+        i32 nq = if_chrome_find_tabs(c, c->omni + 1, hits,
+                                     (i32)(sizeof hits / sizeof hits[0]));
+        goto_row(t, CHROME_ROWS_TOP);
+        char hdr[128];
+        snprintf(hdr, sizeof hdr, "\x1b[2mtab search: %s\x1b[0m", c->omni + 1);
+        out_s(t, hdr);
         clear_eol(t);
+        for (i32 vi = 0; vi < nq && vi < vh - 1; vi++) {
+            goto_row(t, CHROME_ROWS_TOP + 1 + vi);
+            i32 idx = hits[vi];
+            if (idx < 0 || idx >= c->n_tabs) continue;
+            char ln[512];
+            int li = snprintf(ln, sizeof ln, " %d. %s%s%s — %s",
+                              vi + 1,
+                              c->tabs[idx]->group ? "[" : "",
+                              c->tabs[idx]->group ? c->tabs[idx]->group : "",
+                              c->tabs[idx]->group ? "] " : "",
+                              c->tabs[idx]->title);
+            if (li > 0) paint_text_cells(t, ln, t->cols - 4);
+        }
+        for (i32 vi = (nq < vh - 1 ? nq : vh - 1); vi < vh; vi++) {
+            goto_row(t, CHROME_ROWS_TOP + vi);
+            clear_eol(t); /* 前フレームの検索行の残滓を必ず掃除 */
+        }
+    } else {
+        for (i32 vy = 0; vy < vh; vy++) {
+            goto_row(t, CHROME_ROWS_TOP + vy);
+            if (cur && cur->grid && cur->scroll + vy < cur->grid->h)
+                paint_grid_row(t, cur->grid, cur->scroll + vy, t->cols);
+            clear_eol(t);
+        }
     }
 
     /* status */
@@ -258,7 +308,7 @@ static void open_href(IfChrome *c, IfTab *cur, i32 vw) {
     h[hn] = 0;
     if (h[0] == '#') return;
     if (strstr(h, "://") && strstr(h, "://") - h <= 8) {
-        snprintf(c->toast, sizeof c->toast, "network: v0.3 milestone (%s)", h);
+        snprintf(c->toast, sizeof c->toast, "network: v0.3 milestone (%.100s)", h);
         c->toast_len = (u8)strlen(c->toast);
         return;
     }
@@ -270,14 +320,14 @@ static void open_href(IfChrome *c, IfTab *cur, i32 vw) {
     }
     char joined[4096];
     const char *cand = h;
-    if (h[0] != '/') { snprintf(joined, sizeof joined, "%s/%s", dir, h); cand = joined; }
+    if (h[0] != '/') { snprintf(joined, sizeof joined, "%.2000s/%.2000s", dir, h); cand = joined; }
     if (!if_chrome_open(c, cand, vw)) {
         snprintf(c->toast, sizeof c->toast, "not found: %.80s", cand);
         c->toast_len = (u8)strlen(c->toast);
     }
 }
 
-static void apply_normal(IfChrome *c, IfUiEvent e, i32 vw, i32 vh, bool *running) {
+static void apply_normal(IfTui *t, IfChrome *c, IfUiEvent e, i32 vw, i32 vh, bool *running) {
     switch (e.act) {
     case UA_SCROLL_UP: if_chrome_scroll(c, -1, vh); break;
     case UA_SCROLL_DOWN: if_chrome_scroll(c, 1, vh); break;
@@ -298,12 +348,28 @@ static void apply_normal(IfChrome *c, IfUiEvent e, i32 vw, i32 vh, bool *running
         c->omni[0] = 0;
         break;
     case UA_NEW_TAB: if_chrome_new_blank(c); break;
-    case UA_CLOSE_TAB: if_chrome_close(c); break;
-    case UA_NEXT_TAB: if (c->n_tabs) if_chrome_switch(c, (c->active + 1) % c->n_tabs); break;
-    case UA_PREV_TAB: if (c->n_tabs) if_chrome_switch(c, (c->active + c->n_tabs - 1) % c->n_tabs); break;
+    case UA_CLOSE_TAB: if_chrome_close(c, vw); break;
+    case UA_NEXT_TAB: if (c->n_tabs) if_chrome_switch(c, (c->active + 1) % c->n_tabs, vw); break;
+    case UA_PREV_TAB: if (c->n_tabs) if_chrome_switch(c, (c->active + c->n_tabs - 1) % c->n_tabs, vw); break;
     case UA_RELOAD: if_chrome_reload(c, vw); break;
     case UA_HELP: c->mode = CM_HELP; break;
     case UA_QUIT: if (if_chrome_quit(c, (i64)time(NULL))) *running = false; break;
+    case UA_BOOKMARK_TOGGLE: if_chrome_bookmark_cur(c); break;
+    case UA_BOOKMARKS: {
+        /* メイン arena ではなく overlay 専用 arena にスナップショット（責務分離） */
+        if_arena_destroy(&t->overlay_a);
+        if_arena_init(&t->overlay_a, 1 << 16);
+        t->n_bmarks = if_store_bookmarks_list(&c->store, &t->overlay_a,
+                                              t->bm_titles, t->bm_urls,
+                                              BMARK_OVERLAY_MAX);
+        if (t->n_bmarks == 0) {
+            snprintf(c->toast, sizeof c->toast, "no bookmarks");
+            c->toast_len = (u8)strlen(c->toast);
+        } else {
+            c->mode = CM_BOOKMARKS;
+        }
+        break;
+    }
     case UA_ESC: {
         IfTab *cur = if_chrome_cur(c);
         if (cur) cur->link_idx = -1;
@@ -315,7 +381,7 @@ static void apply_normal(IfChrome *c, IfUiEvent e, i32 vw, i32 vh, bool *running
     default:
         if (e.act >= UA_TAB_1 && e.act <= UA_TAB_1 + 8) {
             i32 idx = e.act - UA_TAB_1;
-            if (idx < c->n_tabs) if_chrome_switch(c, idx);
+            if (idx < c->n_tabs) if_chrome_switch(c, idx, vw);
         }
         break;
     }
@@ -325,6 +391,25 @@ static void apply_omnibox(IfTui *t, IfChrome *c, IfUiEvent e, i32 vw) {
     (void)t;
     if (e.act == UA_ESC) { c->mode = CM_NORMAL; return; }
     if (e.act == UA_OPEN_LINK) { /* Enter */
+        /* '@名称': グループ割当（空白で解除）/ '?query': タブ検索（CM_SEARCH へ） */
+        if (c->omni[0] == '@') {
+            if_chrome_set_group(c, c->omni + 1);
+            c->mode = CM_NORMAL;
+            return;
+        }
+        if (c->omni[0] == '?') {
+            c->n_search_hits = if_chrome_find_tabs(c, c->omni + 1,
+                                                   c->search_hits,
+                                                   (i32)(sizeof c->search_hits
+                                                         / sizeof c->search_hits[0]));
+            if (c->n_search_hits == 0) {
+                snprintf(c->toast, sizeof c->toast, "no tab match: %.48s", c->omni + 1);
+                c->toast_len = (u8)strlen(c->toast);
+                return; /* 入力継続（query を消さない） */
+            }
+            c->mode = CM_SEARCH;
+            return;
+        }
         char resolved[4096];
         i32 rc = if_chrome_resolve(c, c->omni, t->cwd, resolved, sizeof resolved);
         if (rc == 0) { if_chrome_open(c, resolved, vw); return; }
@@ -347,17 +432,93 @@ static void apply_omnibox(IfTui *t, IfChrome *c, IfUiEvent e, i32 vw) {
     }
 }
 
+/* CM_SEARCH: '?' クエリの選択相。1..9 直ジャンプ / Enter=先頭 / Esc=戻る */
+static void apply_search(IfTui *t, IfChrome *c, IfUiEvent e, i32 vw) {
+    (void)t;
+    i32 pick = -1;
+    if (e.act == UA_ESC) { c->mode = CM_NORMAL; return; }
+    if (e.act == UA_OPEN_LINK) pick = 0;
+    else if (e.act >= UA_TAB_1 && e.act <= UA_TAB_1 + 8) pick = e.act - UA_TAB_1;
+    if (pick >= 0 && pick < c->n_search_hits) {
+        i32 idx = c->search_hits[pick];
+        c->mode = CM_NORMAL;
+        if (idx >= 0 && idx < c->n_tabs) if_chrome_switch(c, idx, vw);
+    }
+}
+
+/* CM_BOOKMARKS: B overlay の選択相。1..9 で開く / Esc=閉じる */
+static void apply_bookmarks(IfTui *t, IfChrome *c, IfUiEvent e, i32 vw) {
+    if (e.act == UA_ESC) { c->mode = CM_NORMAL; return; }
+    if (e.act == UA_OPEN_LINK || (e.act >= UA_TAB_1 && e.act <= UA_TAB_1 + 8)) {
+        i32 pick = (e.act == UA_OPEN_LINK) ? 0 : (e.act - UA_TAB_1);
+        if (pick < t->n_bmarks) {
+            IfStr u = t->bm_urls[pick];
+            char path[IF_URL_CAP];
+            u32 n = u.n < sizeof path - 1 ? u.n : (u32)sizeof path - 1;
+            memcpy(path, u.p, n);
+            path[n] = 0;
+            c->mode = CM_NORMAL;
+            if_chrome_open(c, path, vw);
+        }
+    }
+}
+
 static const char *HELP_LINES[] = {
     "Ifuto Browser — keys",
     "",
     "  j/k, ↑/↓  scroll    d/u, PgDn/PgUp  page    g/G, Home/End  top/bottom",
     "  Tab/S-Tab next/prev link              Enter  open focused link",
     "  o          omnibox (path open; network is v0.3)     r  reload",
+    "     in omnibox: @name set group (empty=clear)   ?query tab search",
+    "  b  bookmark toggle  B bookmark list (1..9 open)",
     "  t  new tab (blank)  w  close tab      ]/[    next/prev tab   1..9 jump",
     "  ?  this help        q  quit (x2 if tabs>1)          Esc cancel/back",
+    "  session/history/bookmarks: auto-saved atomically (--show-paths)",
     "",
     "press any key",
 };
+
+/* CM_SEARCH/COM_BOOKMARKS overlay の共通土台（commit 後の選択相） */
+static void paint_search(IfTui *t, IfChrome *c, i32 vh) {
+    goto_row(t, CHROME_ROWS_TOP);
+    char hdr[128];
+    snprintf(hdr, sizeof hdr, "\x1b[1mtab search\x1b[0m  %d hit%s — 1..9 jump · Enter first · Esc back",
+             (int)c->n_search_hits, c->n_search_hits == 1 ? "" : "s");
+    out_s(t, hdr);
+    clear_eol(t);
+    for (i32 i = 0; i < c->n_search_hits && i < vh - 1; i++) {
+        goto_row(t, CHROME_ROWS_TOP + 1 + i);
+        i32 idx = c->search_hits[i];
+        if (idx < 0 || idx >= c->n_tabs) continue;
+        char ln[512];
+        snprintf(ln, sizeof ln, " %d. %s%s%s — %s",
+                 i + 1,
+                 c->tabs[idx]->group ? "[" : "",
+                 c->tabs[idx]->group ? c->tabs[idx]->group : "",
+                 c->tabs[idx]->group ? "] " : "",
+                 c->tabs[idx]->title);
+        paint_text_cells(t, ln, t->cols - 4);
+        clear_eol(t);
+    }
+}
+
+static void paint_bookmarks(IfTui *t, i32 vh) {
+    goto_row(t, CHROME_ROWS_TOP);
+    out_s(t, "\x1b[1mbookmarks\x1b[0m  1..9 open · Esc back");
+    clear_eol(t);
+    for (i32 i = 0; i < t->n_bmarks && i < vh - 1; i++) {
+        goto_row(t, CHROME_ROWS_TOP + 1 + i);
+        char ln[512];
+        IfStr ti = t->bm_titles[i];
+        char tb[256];
+        u32 tn = ti.n < sizeof tb - 1 ? ti.n : (u32)sizeof tb - 1;
+        memcpy(tb, ti.p, tn);
+        tb[tn] = 0;
+        snprintf(ln, sizeof ln, " %d. %s", i + 1, tb);
+        paint_text_cells(t, ln, t->cols - 4);
+        clear_eol(t);
+    }
+}
 
 static void paint_help(IfTui *t, i32 vh) {
     goto_row(t, CHROME_ROWS_TOP);
@@ -378,8 +539,10 @@ int if_tui_run(const char *initial_path) {
     memset(&t, 0, sizeof t);
     if (!getcwd(t.cwd, sizeof t.cwd)) snprintf(t.cwd, sizeof t.cwd, ".");
     if_ui_dec_init(&t.dec);
+    if_arena_init(&t.overlay_a, 1 << 16);
 
-    IfFsOps fs = { if_fs_exists_real, if_fs_read_real, NULL };
+    IfFsOps fs = { if_fs_exists_real, if_fs_read_real, NULL,
+                   if_fs_write_real, if_fs_append_real, if_fs_mkpath_real };
     IfChrome c;
     if_chrome_init(&c, fs);
 
@@ -390,7 +553,13 @@ int if_tui_run(const char *initial_path) {
     tty_enter(&t);
     tty_size(&t);
     i32 vw = t.cols, vh = t.rows - CHROME_ROWS_TOP - CHROME_ROWS_BOTTOM;
-    if (initial_path) if_chrome_open(&c, initial_path, vw);
+    c.now = (i64)time(NULL);
+    if (initial_path) {
+        if_chrome_open(&c, initial_path, vw);
+    } else if (c.store.enabled) {
+        /* 前回セッションを遅延ロード付きで復元（無ければ空白タブ、INV-1 は不変） */
+        if (if_chrome_restore(&c, vw) == 0) { /* no session */ }
+    }
     if (!if_chrome_cur(&c)) if_chrome_new_blank(&c);
 
     bool running = true;
@@ -406,12 +575,15 @@ int if_tui_run(const char *initial_path) {
         if (cur && cur->dirty && cur->doc) if_chrome_relayout(&c, vw);
         paint(&t, &c, vh);
         if (c.mode == CM_HELP) paint_help(&t, vh);
+        else if (c.mode == CM_SEARCH) paint_search(&t, &c, vh);
+        else if (c.mode == CM_BOOKMARKS) paint_bookmarks(&t, vh);
         (void)!write(STDOUT_FILENO, t.buf, 0); /* flush 済みだが念のため */
 
         u8 byte;
         ssize_t r = read(STDIN_FILENO, &byte, 1);
         if (r < 0) { if (errno == EINTR) continue; break; }
         if (r == 0) break;
+        c.now = (i64)time(NULL); /* 時刻の注入は呼び出し側（モデル純粋性） */
         IfUiEvent e;
         t.dec.literal = (c.mode == CM_OMNIBOX) ? 1 : 0;
         if (!if_ui_dec_feed(&t.dec, byte, &e)) {
@@ -432,11 +604,16 @@ int if_tui_run(const char *initial_path) {
         if (e.act == UA_NONE) continue;
         if (c.mode == CM_HELP) { c.mode = CM_NORMAL; continue; }
         if (c.mode == CM_OMNIBOX) apply_omnibox(&t, &c, e, vw);
-        else apply_normal(&c, e, vw, vh, &running);
+        else if (c.mode == CM_SEARCH) apply_search(&t, &c, e, vw);
+        else if (c.mode == CM_BOOKMARKS) apply_bookmarks(&t, &c, e, vw);
+        else apply_normal(&t, &c, e, vw, vh, &running);
     }
 
+    /* 最後のスクロール位置も残す（終了時 1 回だけ。書込増幅には当たらない） */
+    if (c.store.enabled) if_store_session_save(&c.store, &c);
     tty_leave(&t);
     if_chrome_destroy(&c);
+    if_arena_destroy(&t.overlay_a);
     free(t.buf);
     return 0;
 }

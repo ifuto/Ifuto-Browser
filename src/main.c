@@ -10,6 +10,8 @@
 #include "layout.h"
 #include "render.h"
 #include "tui.h"
+#include "chrome.h"
+#include <sys/stat.h>
 #include "html_int.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,7 +58,31 @@ static void usage(FILE *f) {
           "  --dump-wptdom    print DOM in html5lib tree-construction format\n"
           "  --ui             interactive TUI (tabs, omnibox; needs a tty)\n"
           "  --links          print collected links\n"
-          "  --stats          print timing/memory stats to stderr\n", f);
+          "  --stats          print timing/memory stats to stderr\n"
+          "  --show-paths     list persisted-data paths (INV-9; no side effects)\n", f);
+}
+
+/* INV-9: 永続データの発見可能なパス一覧。--show-paths は副作用ゼロ（mkdir しない） */
+static int show_paths(void) {
+    IfFsOps fs = { if_fs_exists_real, if_fs_read_real, NULL,
+                   if_fs_write_real, if_fs_append_real, if_fs_mkpath_real };
+    IfStore s;
+    if (!if_store_init(&s, &fs, /*create=*/false)) {
+        fputs("ifuto: no data dir (IFUTO_HOME / XDG_DATA_HOME / HOME are unset)\n", stdout);
+        return 0;
+    }
+    const char *names[] = { IF_STORE_SESS_NAME, IF_STORE_HIST_NAME, IF_STORE_BMRK_NAME };
+    printf("data dir: %s\n", s.dir);
+    char p[IF_STORE_DIR_CAP + 64];
+    for (u32 i = 0; i < 3; i++) {
+        if_store_path(&s, names[i], p, sizeof p);
+        struct stat st;
+        if (stat(p, &st) == 0)
+            printf("  %-14s %s (%lld bytes)\n", names[i], p, (long long)st.st_size);
+        else
+            printf("  %-14s %s (absent)\n", names[i], p);
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -76,6 +102,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--ui") == 0) mode = M_UI;
         else if (strcmp(argv[i], "--links") == 0) links = 1;
         else if (strcmp(argv[i], "--stats") == 0) stats = 1;
+        else if (strcmp(argv[i], "--show-paths") == 0) return show_paths();
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { usage(stdout); return 0; }
         else if (argv[i][0] == '-' && argv[i][1] != 0) { usage(stderr); return 2; }
         else path = argv[i];

@@ -84,6 +84,8 @@ bool if_ui_dec_feed(IfUiDecoder *d, u8 c, IfUiEvent *out) {
     case ']': *out = ev(UA_NEXT_TAB, 0); return true;
     case '[': *out = ev(UA_PREV_TAB, 0); return true;
     case 'r': *out = ev(UA_RELOAD, 0); return true;
+    case 'b': *out = ev(UA_BOOKMARK_TOGGLE, 0); return true;
+    case 'B': *out = ev(UA_BOOKMARKS, 0); return true;
     case '?': *out = ev(UA_HELP, 0); return true;
     case 'q': *out = ev(UA_QUIT, 0); return true;
     }

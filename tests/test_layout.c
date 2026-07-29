@@ -1,6 +1,7 @@
 #include "tests.h"
 #include "../src/layout.h"
 #include "../src/render.h"
+#include "../src/utf8.h"
 #include <string.h>
 
 typedef struct { IfArena *a; IfGrid *g; IfLayout *l; IfDom *d; } IfFix;

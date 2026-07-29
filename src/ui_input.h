@@ -15,6 +15,7 @@ typedef enum {
     UA_OMNIBOX, UA_NEW_TAB, UA_CLOSE_TAB, UA_NEXT_TAB, UA_PREV_TAB,
     UA_TAB_1, /* … UA_TAB_9 = UA_TAB_1 + 8 */
     UA_RELOAD, UA_HELP, UA_QUIT, UA_ESC,
+    UA_BOOKMARK_TOGGLE, UA_BOOKMARKS,
     UA_CHAR,      /* omnibox 編集用: a1 にバイト値（UTF-8 はバイト列で届く） */
     UA_BACKSPACE
 } IfUiAction;

@@ -49,13 +49,17 @@ fuzz: $(BUILD)/fuzz_html
 bench: $(BUILD)/ifuto
 	bench/bench.sh ./$(BUILD)/ifuto
 
-# v-chrome 天井の実測検証（PTY 冷間開始/空タブ RSS/idle CPU + 50 タブメタ）
+# v-chrome 天井の実測検証（PTY 冷間開始/空タブ RSS/idle CPU + 50 タブメタ + セッション復元）
 $(BUILD)/bench_tabmeta: bench/bench_tabmeta.c $(ENGINE) | $(BUILD)
 	$(CC) $(BASE) $(REL) -o $@ bench/bench_tabmeta.c $(ENGINE) $(LDFLAGS_REL) -lm
 
-tuibench: $(BUILD)/ifuto $(BUILD)/bench_tabmeta
+$(BUILD)/bench_session: bench/bench_session.c $(ENGINE) | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ bench/bench_session.c $(ENGINE) $(LDFLAGS_REL) -lm
+
+tuibench: $(BUILD)/ifuto $(BUILD)/bench_tabmeta $(BUILD)/bench_session
 	python3 bench/bench_tui.py ./$(BUILD)/ifuto
 	./$(BUILD)/bench_tabmeta
+	./$(BUILD)/bench_session
 
 # tree-construction 適合採点（WPT resources/*.dat, PINNED.sha でピン留め）
 conformance: $(BUILD)/ifuto
