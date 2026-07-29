@@ -90,6 +90,7 @@ layout（座標系は差し替え可能）──→ [backend 境界: 矩形/文�
 |---|---|---|
 | v0.1 ✅ | 垂直スライス: パース〜端末描画。テスト・fuzz・ベンチ・ゴールデン | 本コミット |
 | v0.2 | **適合性マイルストーン（進行中）**: WPT tree-construction 採点ハーネス `make conformance`（`tests/wpt-tree-construction/`、WPT@0acb81f ピン留め・ベンダー済 61 ファイル 1,934 テスト）。公開スコアの推移: 41.4%（714/1726, 初期採点）→ 49.0%（PI・RCDATA・comment/doctype・終了タグ規則）→ 56.5%（foreign content コア）→ **60.0%（1036/1726, 2026-07-28 現在）**。分母は fragment(#document-fragment) 208 件を skip した実行可能件数。残塊: table 挿入モード群+foster parenting+AAA（最大）、template content、frameset、script-escape 状態、select/option。以降: マージン相殺親子貫通、テーブルレイアウト、HTTP/1.1 クライアント（plaintext のみ。防御的パーサ付き） | 合格率の単調増加（後退は台帳に理由を記す） |
+| v-chrome slice-1 | **TUI クローム（ユーザ決定で v0.2 より前倒し、2026-07-29）**: タブ・オムニボックス・スクロール・リンクフォーカス・ステータス帯（タブ別メモリ計装 = C1）。天井は CHROME_SCOPE.md §1（採択済）。slice-2: セッション永続化（C2 atomic rename+fsync）・ブックマーク・履歴・グループ（Spaces） | 天井全項目を実測で満たす + PTY e2e テスト緑 |
 | v0.3 | ソフトピクセルラスタ + backend 境界凍結 + 画像デコード（まず BMP/PNG 静的、ImageMagick には頼らない）+ Vulkan（このコンテナで headless 検証可能なら） | 同一文書のセル版・ピクセル版で視覚一貫 |
 | v0.4 | QuickJS 埋め込み（DOM 最小 API: querySelector・textContent・style 書換）。CI ホスト準備後 D3D12/Metal 4 | JS からのレイアウト再計算が end-to-end で動く |
 | v0.5 | プロセス分離（サイト分離）＋ seccomp サンドボックス。footprint/RSS への影響を数値で示してから適用 | 攻撃面評価を文書化、境界テスト追加 |

@@ -8,6 +8,7 @@ void test_utf8(void);
 void test_html(void);
 void test_css(void);
 void test_layout(void);
+void test_uichrome(void);
 
 int main(void) {
     fprintf(stderr, "[arena]\n");
@@ -20,6 +21,7 @@ int main(void) {
     RUN(test_css);
     fprintf(stderr, "[layout]\n");
     RUN(test_layout);
+    RUN(test_uichrome);
     fprintf(stderr, "----\nchecks: %d, failures: %d\n", g_if_test_checks, g_if_test_failures);
     return g_if_test_failures ? 1 : 0;
 }

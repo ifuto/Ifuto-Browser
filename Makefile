@@ -31,10 +31,14 @@ $(BUILD)/run_tests: $(TESTSRC) $(ENGINE) | $(BUILD)
 $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_driver.c $(ENGINE) -lm
 
-.PHONY: test golden fuzz bench clean size conformance
+.PHONY: test uitest golden fuzz bench tuibench clean size conformance
 
 test: $(BUILD)/run_tests
 	./$(BUILD)/run_tests
+
+# TUI を疑似端末(PTY)越しに駆動する e2e スモーク（tabstrip/scroll/quit 等）
+uitest: $(BUILD)/ifuto
+	python3 tests/tui_smoke.py ./$(BUILD)/ifuto
 
 golden: $(BUILD)/ifuto-asan
 	tests/run_golden.sh ./$(BUILD)/ifuto-asan
@@ -44,6 +48,14 @@ fuzz: $(BUILD)/fuzz_html
 
 bench: $(BUILD)/ifuto
 	bench/bench.sh ./$(BUILD)/ifuto
+
+# v-chrome 天井の実測検証（PTY 冷間開始/空タブ RSS/idle CPU + 50 タブメタ）
+$(BUILD)/bench_tabmeta: bench/bench_tabmeta.c $(ENGINE) | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ bench/bench_tabmeta.c $(ENGINE) $(LDFLAGS_REL) -lm
+
+tuibench: $(BUILD)/ifuto $(BUILD)/bench_tabmeta
+	python3 bench/bench_tui.py ./$(BUILD)/ifuto
+	./$(BUILD)/bench_tabmeta
 
 # tree-construction 適合採点（WPT resources/*.dat, PINNED.sha でピン留め）
 conformance: $(BUILD)/ifuto
