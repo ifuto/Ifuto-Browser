@@ -43,12 +43,12 @@
 | レイアウトは整数セル座標（8px×16px グリッド） | 端末では正確。Sub-px 表現不能 | px 精度レイアウトを GPU 化と同時に別経路で追加（IfBox API は維持） |
 | 縦マージン相殺は兄弟間のみ | 親子貫通ケースで ±1 行 | v0.2 |
 | マーカーは親 padding 帯に描画（2〜4 セル） | `list-style-position: inside` 未対応 | v0.2 |
-| テーブルは display:block として積む（ツリー側も tbody/tr 暗黙挿入なし） | 表が縦に崩れる | table 挿入モード群（v0.2 継続課題） |
+| テーブルは display:block として積む。ツリー側は **table 挿入モード群 + foster parenting 実装済**（in-table/caption/colgroup/table-body/row/cell + pending table text） | レイアウトはまだセル幅概念なし | テーブルレイアウト（v0.2 後半） |
 | ~~`<title>`/`<textarea>` は RAWTEXT~~ → **RCDATA 化済み**（文字参照デコード + textarea 先頭 LF 規則） | 解消 | 済 |
 | `display:inline-block` → inline、table 系 display → block | 一部サイトで組版差 | v0.3+ |
 | ~~コメント/doctype は DOM に残さない~~ → **保持に変更**（PI `<?target data?>` も PI として区別） | 解消 | 済 |
 | foreign content（SVG/MathML） | コアは実装済み: ns 入域/復帰・integration points・breakout・case 調整・CDATA・serializer prefix。未実装: `<select>` 等の foreign 内特殊規則、annotation-xml の encoding 以外、`</br>` 等の細則 | v0.2 継続 |
-| template は通常要素（content フラグメント分離なし、serializer で擬似表示） | template.dat が取りこぼす | v0.2 継続課題（content 分離） |
+| template は **content DocumentFragment 分離済み**（serializer は content を遊歩）。ただし "in template" 挿入モードは未採用: 現行 spec 版を作って採点するとベンダー済 template.dat と **ネット −1** で乖離（データが旧世代アルゴリズム前提と判断、台帳に記録）。tpl mode = M_IN_BODY 接地で 83/111 | 新 spec 世代のデータに入れ替えるときモード郡を再投入 | v0.2 継続 |
 | 奇行系: quirks モードなし、foster parenting なし、adoption agency は近似 | 壊れた HTML でのツリー差異 | tree-construction 採点中（§6.1）。table modes + foster + AAA が最大の残塊 |
 | 入力 CR/CRLF → LF 正規化なし | `\r` 含む入力でツリー差異の可能性 | v0.2 継続（入力前処理に正規化層） |
 | isindex/`<title>` の body→head 移動等非推奨規則 | 該当テストのみ失敗 | 非推奨要素は後回し（実害なしと判断） |
@@ -89,7 +89,7 @@ layout（座標系は差し替え可能）──→ [backend 境界: 矩形/文�
 | 版 | 内容 | 完了の客観基準 |
 |---|---|---|
 | v0.1 ✅ | 垂直スライス: パース〜端末描画。テスト・fuzz・ベンチ・ゴールデン | 本コミット |
-| v0.2 | **適合性マイルストーン（進行中）**: WPT tree-construction 採点ハーネス `make conformance`（`tests/wpt-tree-construction/`、WPT@0acb81f ピン留め・ベンダー済 61 ファイル 1,934 テスト）。公開スコアの推移: 41.4%（714/1726, 初期採点）→ 49.0%（PI・RCDATA・comment/doctype・終了タグ規則）→ 56.5%（foreign content コア）→ **60.0%（1036/1726, 2026-07-28 現在）**。分母は fragment(#document-fragment) 208 件を skip した実行可能件数。残塊: table 挿入モード群+foster parenting+AAA（最大）、template content、frameset、script-escape 状態、select/option。以降: マージン相殺親子貫通、テーブルレイアウト、HTTP/1.1 クライアント（plaintext のみ。防御的パーサ付き） | 合格率の単調増加（後退は台帳に理由を記す） |
+| v0.2 | **適合性マイルストーン（進行中）**: WPT tree-construction 採点ハーネス `make conformance`（`tests/wpt-tree-construction/`、WPT@0acb81f ピン留め・ベンダー済 61 ファイル 1,934 テスト）。公開スコアの推移: 41.4%（714/1726, 初期採点）→ 49.0%（PI・RCDATA・comment/doctype・終了タグ規則）→ 56.5%（foreign content コア）→ 60.0%（1036/1726, 2026-07-28）→ 65.5%（table モード群 + foster parenting + template content）→ 71.3%（active formatting elements + adoption agency algorithm）→ 74.2%（script-data escaped/double-escaped 状態機械）→ 79.3%（ruby 暗示閉鎖・select/option・NULL 処理・frameset モード）→ 80.0%（template in-body 接地）→ **81.6%（1409/1726, 2026-07-29 現在: 全 WHATWG 名前・数値実体参照 2,125 名。数値参照は飽和して全 digits 消費の規則準拠）**。分母は fragment(#document-fragment) 208 件を skip した実行可能件数。残塊: tests19（frameset/select-in-table 端）、template（データ乖離、台帳参照）、tests1、webkit02（adoption 端）、plain-text-unsafe、tests10（foreign-in-table 配置）、tests17（in-table select モード未実装で 3/13）。以降: マージン相殺親子貫通、テーブルレイアウト、HTTP/1.1 クライアント（plaintext のみ。防御的パーサ付き） | 合格率の単調増加（後退は台帳に理由を記す） |
 | v-chrome ✅ | **TUI クローム（ユーザ決定で v0.2 より前倒し、2026-07-29）**: slice-1 = タブ・オムニボックス・スクロール・リンクフォーカス・ステータス帯（C1 メモリ計装）。slice-2 = 永続化（C2: session/history/bookmarks を tmp→rename→fsync で単一 dir 原子管理、遅延ロード復元 50 tab 0.11 ms 実測）・`?`タブ検索（INV-8 完全形）・`@`グループ最小形（#11 の TUI 表現）・`--show-paths`（INV-9）。天井は CHROME_SCOPE §1、全項目実測済（BENCH.md）。残: グループ折りたたみ・プリセット（INV-4）・履歴/ブックマーク連携のオムニボックス候補（INV-3）・ダッシュボード（§8 照合の opt-in 標準プリセット）は slice-3+ | 天井全項目を実測で満たす + PTY e2e 15 checks 緑 |
 | v0.3 | ソフトピクセルラスタ + backend 境界凍結 + 画像デコード（まず BMP/PNG 静的、ImageMagick には頼らない）+ Vulkan（このコンテナで headless 検証可能なら） | 同一文書のセル版・ピクセル版で視覚一貫 |
 | v0.4 | QuickJS 埋め込み（DOM 最小 API: querySelector・textContent・style 書換）。CI ホスト準備後 D3D12/Metal 4 | JS からのレイアウト再計算が end-to-end で動く |

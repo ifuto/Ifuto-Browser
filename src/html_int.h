@@ -37,6 +37,7 @@ typedef struct {
     u8 strip_lf;       /* raw 内容の先頭 LF を 1 つ捨てる（textarea の仕様） */
     u8 cdata_foreign;  /* tree builder が設定: 現在位置が foreign content（CDATA 許可） */
     u8 plaintext;      /* <plaintext> 以降: 残り全入力を 1 個の TEXT にする */
+    u8 in_attr_ctx;    /* 属性値デコード中ほど立つ（名前参照の ambiguous-amp 規則用） */
     u32 errors;
 } IfHtmlTok;
 

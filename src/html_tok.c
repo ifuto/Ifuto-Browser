@@ -8,6 +8,7 @@
  */
 #include "html_int.h"
 #include "utf8.h"
+#include "entities_gen.h"
 
 #define IF_MAX_ATTRS 256u
 
@@ -40,20 +41,63 @@ static const u16 IF_C1_MAP[32] = {
     0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
 };
 
-static const struct { const char *name; u8 n; u16 cp; } IF_NAMED_REFS[] = {
-    {"amp", 3, 0x26}, {"lt", 2, 0x3C}, {"gt", 2, 0x3E}, {"quot", 4, 0x22},
-    {"apos", 4, 0x27}, {"nbsp", 4, 0xA0}, {"copy", 4, 0xA9}, {"reg", 3, 0xAE},
-    {"trade", 5, 0x2122}, {"hellip", 6, 0x2026}, {"mdash", 5, 0x2014},
-    {"ndash", 5, 0x2013}, {"laquo", 5, 0xAB}, {"raquo", 5, 0xBB},
-    {"times", 5, 0xD7}, {"divide", 6, 0xF7}, {"middot", 6, 0xB7},
-    {"bull", 4, 0x2022}, {"dagger", 6, 0x2020}, {"Dagger", 6, 0x2021},
-    {"permil", 6, 0x2030}, {"prime", 5, 0x2032}, {"Prime", 5, 0x2033},
-    {"lsaquo", 6, 0x2039}, {"rsaquo", 6, 0x203A}, {"oline", 5, 0x203E},
-    {"frasl", 5, 0x2044}, {"euro", 4, 0x20AC}, {"deg", 3, 0xB0},
-    {"plusmn", 6, 0xB1}, {"para", 4, 0xB6}, {"sect", 4, 0xA7},
-    {"larr", 4, 0x2190}, {"uarr", 4, 0x2191}, {"rarr", 4, 0x2192},
-    {"darr", 4, 0x2193}, {"harr", 4, 0x2194},
-};
+
+
+/* 名前参照の 2 コードポイント可能性を含む参照解決（WHATWG named character references） */
+typedef struct { u32 cp[2]; u8 n; } IfCps; /* n=0 で解決失敗 */
+
+static u32 ent_cp1(const IfEntNamed *e) {
+    return e->cp1 == 0xFFFFu ? IF_ENT_AUX32[e->cp2] : e->cp1;
+}
+static u32 ent_cp2(const IfEntNamed *e) {
+    /* cp2==0: 単一 cp。cp1==0xFFFF: astral 単一(cp2 は aux index)。2-cp は両方 BMP。 */
+    return (e->cp1 == 0xFFFFu || e->cp2 == 0) ? 0 : e->cp2;
+}
+
+static IfCps if_named_ref(IfHtmlTok *t, u32 amp_next, bool in_attr, u32 *out_pos) {
+    IfCps r = { {0, 0}, 0 };
+    u32 i = amp_next;
+    if (i >= t->len || !if_alnum(t->src[i])) return r;
+    /* alnum ランを収集（最長エンティティ名は 31 文字） */
+    u32 run = 0;
+    char buf[48];
+    while (i + run < t->len && if_alnum(t->src[i + run]) && run + 1 < sizeof buf) {
+        buf[run] = (char)t->src[i + run];
+        run++;
+    }
+    /* 1) 正式形: 長い n から下ろして "name;" 完全一致（flags bit0） */
+    for (u32 n = run; n >= 2; n--) {
+        i32 ei = if_ent_find(buf, n);
+        if (ei < 0) continue;
+        const IfEntNamed *e = &IF_ENT_NAMED[ei];
+        if (!(e->flags & 1)) continue;
+        if (i + n >= t->len || t->src[i + n] != ';') continue;
+        r.cp[0] = ent_cp1(e);
+        r.cp[1] = ent_cp2(e);
+        r.n = r.cp[1] ? 2 : 1;
+        *out_pos = i + n + 1;
+        return r;
+    }
+    /* 2) legacy（セミコロン無し）: 最長 prefix。属性値の中では後続が alnum か '='
+     *    なら不可とする（WHATWG の ambiguous-amp 規則に対応した確定的規則） */
+    {
+        i32 ei = if_ent_longest_legacy(buf, run);
+        if (ei >= 0) {
+            const IfEntNamed *e = &IF_ENT_NAMED[ei];
+            u8 next = (i + e->name_len < t->len) ? t->src[i + e->name_len] : 0;
+            bool blocked = in_attr && ((next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z')
+                                       || (next >= '0' && next <= '9') || next == '=');
+            if (!blocked) {
+                r.cp[0] = ent_cp1(e);
+                r.cp[1] = ent_cp2(e);
+                r.n = r.cp[1] ? 2 : 1;
+                *out_pos = i + e->name_len;
+                return r;
+            }
+        }
+    }
+    return r;
+}
 
 /* '&' の直後（pos は '&' の次）の参照をデコード。
  * 参照として成立すれば cp（または先頭 cp）を返し *out_pos を参照の次へ。
@@ -74,18 +118,10 @@ static u32 if_charref(IfHtmlTok *t, u32 amp_next, u32 *out_pos) {
             else if (hex && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
                 v = v * 16 + (u64)(c <= '9' ? c - '0' : (c | 32) - 'a' + 10);
             else break;
-            if (v > 0x7FFFFFFF) { v = 0x110000; break; } /* clamp: 以後の桁も消費のため継続 */
+            if (v > 0x110000) v = 0x110000; /* 飽和。数字自体は最後まで消費する（仕様: 可能な限り消費） */
             j++;
         }
-        if (j == start) return 0; /* '#' の後に桁がない: リテラル */
-        /* 残りの同種の桁を消費（clamp 時） */
-        while (j < t->len) {
-            u8 c = t->src[j];
-            bool dig = hex ? ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
-                           : (c >= '0' && c <= '9');
-            if (!dig) break;
-            j++;
-        }
+        if (j == start) { t->errors++; return 0; }
         if (j < t->len && t->src[j] == ';') j++;
         else t->errors++; /* セミコロン欠落は回復可能エラー */
         u32 cp = (u32)v;
@@ -96,19 +132,11 @@ static u32 if_charref(IfHtmlTok *t, u32 amp_next, u32 *out_pos) {
     }
 
     if (if_alnum(t->src[i])) {
-        /* 最長一致（前方一致でテーブルを線形走査。件数が小さいので分木不要） */
-        u32 best_len = 0, best_cp = 0;
-        for (u64 k = 0; k < sizeof(IF_NAMED_REFS) / sizeof(IF_NAMED_REFS[0]); k++) {
-            u32 n = IF_NAMED_REFS[k].n;
-            if (n <= best_len || i + n > t->len) continue;
-            if (memcmp(t->src + i, IF_NAMED_REFS[k].name, n) != 0) continue;
-            bool semi = (i + n < t->len && t->src[i + n] == ';');
-            if (!semi) continue; /* v0.1: 名前参照はセミコロン必須（回復は '&' リテラル側に倒す） */
-            best_len = n; best_cp = IF_NAMED_REFS[k].cp;
-        }
-        if (best_len) {
-            *out_pos = i + best_len + 1; /* ';' 込み */
-            return best_cp;
+        u32 np = i;
+        IfCps cps = if_named_ref(t, i, t->in_attr_ctx != 0, &np);
+        if (cps.n) {
+            *out_pos = np;
+            return cps.cp[0]; /* 2cp エントリの第 2 要素は if_named_ref_cps で直接取得する経路 */
         }
     }
     return 0;
@@ -122,13 +150,25 @@ static u32 if_decoded_len(IfHtmlTok *t, u32 start, u32 end, bool *had_ref) {
     while (i < end) {
         if (t->src[i] == '&') {
             u32 np = i + 1;
-            u32 cp = if_charref(t, i + 1, &np);
-            if (cp) {
-                *had_ref = true;
-                u8 tmp[4];
-                out += if_utf8_encode(cp, tmp);
-                i = np;
-                continue;
+            u8 tmp[4];
+            if (i + 1 < end && if_alnum(t->src[i + 1])) {
+                /* 名前参照: 2 コードポイント形まで正確に数える（&NotEqualTilde; 系） */
+                IfCps cps = if_named_ref(t, i + 1, t->in_attr_ctx != 0, &np);
+                if (cps.n) {
+                    *had_ref = true;
+                    out += if_utf8_encode(cps.cp[0], tmp);
+                    if (cps.n > 1) out += if_utf8_encode(cps.cp[1], tmp);
+                    i = np;
+                    continue;
+                }
+            } else {
+                u32 cp = if_charref(t, i + 1, &np);
+                if (cp) {
+                    *had_ref = true;
+                    out += if_utf8_encode(cp, tmp);
+                    i = np;
+                    continue;
+                }
             }
         }
         /* 不正バイト → FFFD(3B) など、デコード後 UTF-8 長は生長と一致しないので再エンコードして数える */
@@ -147,8 +187,18 @@ static void if_decode_into(IfHtmlTok *t, u32 start, u32 end, u8 *dst) {
     while (i < end) {
         if (t->src[i] == '&') {
             u32 np = i + 1;
-            u32 cp = if_charref(t, i + 1, &np);
-            if (cp) { w += if_utf8_encode(cp, dst + w); i = np; continue; }
+            if (i + 1 < end && if_alnum(t->src[i + 1])) {
+                IfCps cps = if_named_ref(t, i + 1, t->in_attr_ctx != 0, &np);
+                if (cps.n) {
+                    w += if_utf8_encode(cps.cp[0], dst + w);
+                    if (cps.n > 1) w += if_utf8_encode(cps.cp[1], dst + w);
+                    i = np;
+                    continue;
+                }
+            } else {
+                u32 cp = if_charref(t, i + 1, &np);
+                if (cp) { w += if_utf8_encode(cp, dst + w); i = np; continue; }
+            }
         }
         u32 np = i;
         u32 cp = if_utf8_decode(t->src, end, &np);
@@ -167,7 +217,78 @@ static IfStr if_resolved(IfHtmlTok *t, u32 start, u32 end) {
     return if_str((const char *)buf, olen);
 }
 
+/* U+0000 の規格処理（WHATWG の parse error つき規則）:
+ *   to_fffd=false: バイトを除去（in-body の data text は "ignore"）
+ *   to_fffd=true : U+FFFD ("\xEF\xBF\xBD") に置換（rawtext/script/plaintext/属性値）
+ * NUL が無ければ入力をそのまま返す（arena 確保なし）。 */
+static IfStr if_fix_nul(IfHtmlTok *t, IfStr s, bool to_fffd) {
+    bool has_nul = false;
+    for (u32 i = 0; i < s.n; i++)
+        if (s.p[i] == 0) { has_nul = true; break; }
+    if (!has_nul) return s;
+    u32 extra = to_fffd ? 0 : 0;
+    (void)extra;
+    u32 cap = s.n * (to_fffd ? 3 : 1) + 1;
+    char *buf = (char *)if_arena_alloc(t->arena, cap);
+    u32 w = 0;
+    for (u32 i = 0; i < s.n; i++) {
+        if (s.p[i] == 0) {
+            if (to_fffd) {
+                buf[w++] = (char)0xEF;
+                buf[w++] = (char)0xBF;
+                buf[w++] = (char)0xBD;
+            }
+            /* drop 時は何も書かない */
+        } else {
+            buf[w++] = s.p[i];
+        }
+    }
+    return if_str(buf, w);
+}
+
+
 /* ---- rawtext ---- */
+
+/* i に「<script」「</script」「<!--」「-->」のいずれかが始まるかを、
+ * 後続文字 (ws / '/' / '>' / EOF) まで含めて判定する補助。EOF は終端として認めない方針。 */
+static bool raw_at(const IfHtmlTok *t, u32 i, const char *lit, bool need_term) {
+    u32 n = (u32)strlen(lit);
+    if (i + n > t->len) return false;
+    for (u32 k = 0; k < n; k++)
+        if (if_ascii_lower(t->src[i + k]) != (u8)lit[k]) return false;
+    if (!need_term) return true;
+    u32 after = i + n;
+    if (after >= t->len) return false; /* EOF 直前は終端として認めない（tests16 採点規則と整合） */
+    return if_hws(t->src[after]) || t->src[after] == '/' || t->src[after] == '>';
+}
+
+/* script data のエスケープ状態機械（WHATWG 8.2.26-35）:
+ *   DATA: '-->' ではない。'<!--' で ESC へ、'</script' 正常終端で終わる。
+ *   ESC:  '-->' で DATA へ、'<script' 正常終端で DBL へ、'</script' 正常終端で終わる。
+ *   DBL:  '</script' 正常終端で ESC へ（終端ではない）、'<script' 正常終端で DBL 継続。
+ * 戻り値は真の終了タグの '<' の位置。見つからなければ len。 */
+static u32 if_find_script_end(IfHtmlTok *t) {
+    enum { S_DATA, S_ESC, S_DBL } st = S_DATA;
+    u32 i = t->pos;
+    while (i < t->len) {
+        if (st == S_DATA) {
+            if (raw_at(t, i, "<!--", false)) { st = S_ESC; i += 4; continue; }
+            if (raw_at(t, i, "</script", true)) return i;
+            i++;
+        } else if (st == S_ESC) {
+            if (raw_at(t, i, "-->", false)) { st = S_DATA; i += 3; continue; }
+            if (raw_at(t, i, "<script", true)) { st = S_DBL; i += 7; continue; }
+            if (raw_at(t, i, "</script", true)) return i;
+            i++;
+        } else {
+            if (raw_at(t, i, "</script", true)) { st = S_ESC; i += 8; continue; }
+            if (raw_at(t, i, "<script", true)) { i += 7; continue; }
+            if (raw_at(t, i, "-->", false)) { st = S_ESC; i += 3; continue; }
+            i++;
+        }
+    }
+    return t->len;
+}
 
 /* raw_tag の終了タグ "</name" (後続は ws, '/', '>') を探す。見つからなければ len を返す */
 static u32 if_find_raw_end(IfHtmlTok *t) {
@@ -202,12 +323,14 @@ static IfTok if_raw_token(IfHtmlTok *t) {
         t->strip_lf = 0;
         if (t->pos < t->len && t->src[t->pos] == '\n') t->pos++;
     }
-    u32 end = if_find_raw_end(t);
+    u32 end = (t->raw_tag == IF_TAG_SCRIPT) ? if_find_script_end(t) : if_find_raw_end(t);
     if (end > t->pos) {
         tok.kind = TOK_TEXT;
-        /* RCDATA(title/textarea) は文字参照を解決する。rawtext(style/script) は生のまま。 */
+        /* RCDATA(title/textarea) は文字参照を解決する。rawtext(style/script) は生のまま。
+         * どちらも U+0000 は U+FFFD に置換する（WHATWG rawtext/rcdata 規則） */
         tok.text = t->raw_rcdata ? if_resolved(t, t->pos, end)
                                  : if_str((const char *)t->src + t->pos, end - t->pos);
+        tok.text = if_fix_nul(t, tok.text, true);
         t->pos = end;
         return tok;
     }
@@ -273,13 +396,17 @@ static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
                     t->pos++;
                     u32 vs = t->pos;
                     while (t->pos < t->len && t->src[t->pos] != q) t->pos++;
-                    aval = if_resolved(t, vs, t->pos);
+                    t->in_attr_ctx = 1;
+                    aval = if_fix_nul(t, if_resolved(t, vs, t->pos), true);
+                    t->in_attr_ctx = 0;
                     if (t->pos < t->len) t->pos++; /* 閉じクォート */
                     else t->errors++;
                 } else {
                     u32 vs = t->pos;
                     while (t->pos < t->len && !if_hws(t->src[t->pos]) && t->src[t->pos] != '>') t->pos++;
-                    aval = if_resolved(t, vs, t->pos);
+                    t->in_attr_ctx = 1;
+                    aval = if_fix_nul(t, if_resolved(t, vs, t->pos), true);
+                    t->in_attr_ctx = 0;
                 }
             }
         }
@@ -435,10 +562,12 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
 IfTok if_tok_next(IfHtmlTok *t) {
     IfTok tok = { .kind = TOK_EOF };
 
-    /* <plaintext>: 残り全入力を 1 個の TEXT として返す（文字参照も解決しない） */
+    /* <plaintext>: 残り全入力を 1 個の TEXT として返す（文字参照も解決しない。
+     * U+0000 は U+FFFD へ置換（WHATWG plaintext 規則）） */
     if (t->plaintext && t->pos < t->len) {
         tok.kind = TOK_TEXT;
         tok.text = if_str((const char *)t->src + t->pos, t->len - t->pos);
+        tok.text = if_fix_nul(t, tok.text, true);
         t->pos = t->len;
         return tok;
     }
@@ -454,7 +583,9 @@ IfTok if_tok_next(IfHtmlTok *t) {
             t->pos++;
         }
         tok.kind = TOK_TEXT;
-        tok.text = if_resolved(t, start, t->pos);
+        /* data text の U+0000 は "ignore"（in-body の parse error 規則に一致）。
+         * NUL 除去は charset 正規化原則（CR は既に正規化済みの前提）と独立。 */
+        tok.text = if_fix_nul(t, if_resolved(t, start, t->pos), false);
         return tok;
     }
 

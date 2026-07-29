@@ -5,3 +5,4 @@ artifacts/
 core
 core.*
 bench/*.html
+__pycache__/

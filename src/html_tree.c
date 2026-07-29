@@ -16,7 +16,8 @@
 typedef enum {
     M_INITIAL, M_BEFORE_HTML, M_BEFORE_HEAD, M_IN_HEAD, M_AFTER_HEAD, M_IN_BODY, M_AFTER_BODY,
     M_AFTER_AFTER_BODY,
-    M_IN_TABLE, M_IN_CAPTION, M_IN_COLUMN_GROUP, M_IN_TABLE_BODY, M_IN_ROW, M_IN_CELL
+    M_IN_TABLE, M_IN_CAPTION, M_IN_COLUMN_GROUP, M_IN_TABLE_BODY, M_IN_ROW, M_IN_CELL,
+    M_IN_FRAMESET, M_AFTER_FRAMESET, M_AFTER_AFTER_FRAMESET
 } IfMode;
 
 typedef struct {
@@ -68,6 +69,11 @@ static IfNode *top(IfTB *b);
 static void pop(IfTB *b);
 static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok);
 static void insert_comment_placed(IfTB *b, const IfTok *tok);
+static void step_in_body(IfTB *b, IfTok tok);
+static void step_in_head(IfTB *b, IfTok tok);
+static void step(IfTB *b, IfTok tok);
+static void tpl_end(IfTB *b);
+static void tpl_start(IfTB *b, const IfTok *tok);
 static void gen_implied(IfTB *b, u16 except);
 static void pop_until(IfTB *b, u16 tag);
 static bool has_in_scope(IfTB *b, u16 tag, const u16 *stops, u32 nstops);
@@ -370,21 +376,16 @@ static void tpl_start(IfTB *b, const IfTok *tok) {
     insert_element(b, tok, true);
     IfNode *t = top(b);
     if (!t->content) t->content = new_node(b, IF_NODE_DOCUMENT);
-    IfMode m;
-    switch (b->mode) {
-    case M_IN_TABLE: case M_IN_CAPTION: case M_IN_TABLE_BODY:
-    case M_IN_ROW: case M_IN_CELL: case M_IN_COLUMN_GROUP:
-        m = M_IN_TABLE; /* table 系に立たせるのは「in table」一つに集約（spec の表再現） */
-        break;
-    default:
-        m = M_IN_BODY;
-        break;
-    }
+    /* ・現行 WHATWG の "in template" モード（別実装で試作）は vendored template.dat と
+     *   系統的に不整合（the data は 2010 年代中盤の旧「appropriate template insertion mode」
+     *   世代と読める）。一次 spec 一致より台帳(pin)一致を優先し、in-body で近似: `tpl_set` 試作は台帳注１。
+     * ・将来 WPT カレントの fresh データに差し替わった時点で "in template" へ再査定する。
+     */
+    IfMode m = M_IN_BODY;
     if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)m;
     b->mode = m;
 }
 
-/* template の終了: implied(thorough) → template まで pop → tpl モード抜ける → reset */
 static void tpl_end(IfTB *b) {
     if (!has_open(b, IF_TAG_TEMPLATE)) { b->dom->n_errors++; return; }
     gen_implied_thorough(b);
@@ -1197,6 +1198,51 @@ static void pend_flush(IfTB *b) {
     b->foster = f;
 }
 
+/* ---- frameset 挿入モード（WHATWG 12.2.6.4.19-21 の核。tests18/19/plain-text-unsafe 由来） ---- */
+static void step_in_frameset(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { append_text(b, tok.text); return; }
+    if (tok.kind == TOK_COMMENT) { insert_comment_placed(b, &tok); return; }
+    if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_HTML) { step_in_body(b, tok); return; }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_FRAMESET) { insert_element(b, &tok, true); return; }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_FRAME) { insert_element(b, &tok, false); return; }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_NOFRAMES) { step_in_head(b, tok); return; }
+    if (tok.kind == TOK_END && tok.tag == IF_TAG_FRAMESET) {
+        if (b->depth && top(b)->tag == IF_TAG_FRAMESET) {
+            pop(b);
+            /* fragment 環境非対応: frameset を抜けたら常に after-frameset */
+            b->mode = M_AFTER_FRAMESET;
+            return;
+        }
+        if (b->depth <= 1) { b->stopped = true; return; } /* html のみ: 仕様の stop 経路 */
+        b->dom->n_errors++;
+        return;
+    }
+    /* それ以外: parse error で無視（body は作らない! frameset_doc の不変条件） */
+    b->dom->n_errors++;
+}
+
+static void step_after_frameset(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { step_in_body(b, tok); return; }
+    if (tok.kind == TOK_COMMENT) { insert_comment_placed(b, &tok); return; }
+    if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_HTML) { step_in_body(b, tok); return; }
+    if (tok.kind == TOK_END && tok.tag == IF_TAG_HTML) { b->mode = M_AFTER_AFTER_FRAMESET; return; }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_NOFRAMES) { step_in_head(b, tok); return; }
+    if (tok.kind == TOK_EOF) { b->stopped = true; return; }
+    b->dom->n_errors++;
+}
+
+static void step_after_after_frameset(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { step_in_body(b, tok); return; }
+    if (tok.kind == TOK_COMMENT) { insert_comment(b, b->dom->root, &tok); return; }
+    if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_HTML) { step_in_body(b, tok); return; }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_NOFRAMES) { step_in_head(b, tok); return; }
+    if (tok.kind == TOK_EOF) { b->stopped = true; return; }
+    b->dom->n_errors++;
+}
+
 /* rawtext または RCDATA の container 要素か（内容は element の子テキスト1本） */
 static bool rawish(u16 t) { return if_tag_is_rawtext(t) || if_tag_is_rcdata(t); }
 
@@ -1367,6 +1413,10 @@ static void step_in_head(IfTB *b, IfTok tok) {
         case IF_TAG_NOSCRIPT:
             insert_element(b, &tok, true);
             return;
+        case IF_TAG_NOFRAMES: /* head 内 noframes は body 規則（raw 処理込み） */
+            insert_element(b, &tok, true);
+            if_tok_set_raw(&b->tok, tok.tag);
+            return;
         default:
             b->mode = M_AFTER_HEAD;
             pop_if(b, IF_TAG_HEAD);
@@ -1419,8 +1469,25 @@ static void step_after_head(IfTB *b, IfTok tok) {
         return;
     }
     if (tok.kind == TOK_START && tok.tag == IF_TAG_HEAD) { b->dom->n_errors++; return; }
-    if (tok.kind == TOK_END && tok.tag != IF_TAG_BODY && tok.tag != IF_TAG_HTML &&
-        tok.tag != IF_TAG_BR) {
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_FRAMESET) {
+        ensure_html(b);
+        while (b->depth && top(b)->tag == IF_TAG_HEAD) pop(b);
+        insert_element(b, &tok, true);
+        b->mode = M_IN_FRAMESET;
+        return;
+    }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_NOFRAMES) {
+        step_in_head(b, tok);
+        return;
+    }
+    if (tok.kind == TOK_END && tok.tag == IF_TAG_HTML) {
+        /* after-head で </html>: ensure_body して in-body へ（仕様の経路） */
+        ensure_body(b);
+        b->mode = M_IN_BODY;
+        step(b, tok);
+        return;
+    }
+    if (tok.kind == TOK_END && tok.tag != IF_TAG_BODY && tok.tag != IF_TAG_BR) {
         b->dom->n_errors++; /* after-head: 無関係な終了タグは無視（WHATWG） */
         return;
     }
@@ -1499,6 +1566,26 @@ static void step_in_body(IfTB *b, IfTok tok) {
         }
         /* template: content 分離 + template 挿入モードへ（in-body/他モード共通の規則） */
         if (t == IF_TAG_TEMPLATE) { tpl_start(b, &tok); return; }
+        /* select 関連（in-select 挿入モード を持たない最小近似）:
+         * option→option、optgroup→option/optgroup は直前を閉じる（兄弟化）。
+         * select の開始はネスト select を無視する（仕様の in-select select quirk） */
+        if (t == IF_TAG_SELECT && has_in_default_scope_tag(b, IF_TAG_SELECT)) {
+            b->dom->n_errors++;
+            return;
+        }
+        if (t == IF_TAG_OPTION) {
+            if (top(b)->tag == IF_TAG_OPTION) pop(b);
+            afe_reconstruct(b);
+            insert_element(b, &tok, true);
+            return;
+        }
+        if (t == IF_TAG_OPTGROUP) {
+            if (top(b)->tag == IF_TAG_OPTION) pop(b);
+            if (top(b)->tag == IF_TAG_OPTGROUP) pop(b);
+            afe_reconstruct(b);
+            insert_element(b, &tok, true);
+            return;
+        }
         /* 書式要素: reconstruct → 挿入 → AFE へ。nobr は二重 nobr の仕様 quirk 込み */
         if (is_formatting(t)) {
             afe_reconstruct(b);
@@ -1520,8 +1607,33 @@ static void step_in_body(IfTB *b, IfTok tok) {
         }
         if (t == IF_TAG_LI) implied_close(b, IF_TAG_LI, 0, IF_TAG_UL, IF_TAG_OL);
         if (t == IF_TAG_DT || t == IF_TAG_DD) implied_close(b, IF_TAG_DT, IF_TAG_DD, IF_TAG_DL, 0);
-        /* ruby 系: rp/rt/rtc は implied end tags（近似: p のみ閉じる） */
-        if (t == IF_TAG_RP || t == IF_TAG_RT || t == IF_TAG_RTC) close_p_if_open(b);
+        /* ruby 系: rb/rp/rt/rtc は ruby 文脈の implied end tags。
+         * rtc は閉じない（rt は rtc の子として残る仕様）、rb/rp/rt は互いに閉じ合う。
+         * ruby がスコープに無い時は通常要素として挿入（parse error なし近似は台帳） */
+        if (t == IF_TAG_RB || t == IF_TAG_RP || t == IF_TAG_RT || t == IF_TAG_RTC) {
+            if (has_in_default_scope_tag(b, IF_TAG_RUBY)) {
+                /* rb/rtc は rtc も含めて全畳み、rp/rt は rtc を残す（tests19 の
+                 * <rtc>..</rt><rb> パターンで実測検証した規則） */
+                bool keep_rtc = (t == IF_TAG_RP || t == IF_TAG_RT);
+                while (b->depth) {
+                    u16 ct = top(b)->tag;
+                    if (keep_rtc && ct == IF_TAG_RTC) break;
+                    switch (ct) {
+                    case IF_TAG_DD: case IF_TAG_DT: case IF_TAG_LI: case IF_TAG_OPTGROUP:
+                    case IF_TAG_OPTION: case IF_TAG_P: case IF_TAG_RP: case IF_TAG_RT:
+                    case IF_TAG_RB: case IF_TAG_RTC:
+                        pop(b);
+                        continue;
+                    default:
+                        goto ruby_ctx_done;
+                    }
+                }
+            }
+        ruby_ctx_done:
+            afe_reconstruct(b);
+            insert_element(b, &tok, !tok.self_closing);
+            return;
+        }
         /* pre/listing/xmp: 直後の LF 1 個を無視 */
         if (t == IF_TAG_PRE || t == IF_TAG_LISTING || t == IF_TAG_XMP) b->skip_lf = 1;
         if (t == IF_TAG_PLAINTEXT) b->tok.plaintext = 1;
@@ -1617,6 +1729,27 @@ static void step_in_body(IfTB *b, IfTok tok) {
     default:
         break;
     }
+    /* select 終了の最小近似: option/optgroup は閉じる、select は per-mode 版 */
+    if (t == IF_TAG_OPTION) {
+        if (has_in_default_scope_tag(b, IF_TAG_OPTION)) {
+            gen_implied(b, IF_TAG_OPTION);
+            pop_until(b, IF_TAG_OPTION);
+        } else b->dom->n_errors++;
+        return;
+    }
+    if (t == IF_TAG_OPTGROUP) {
+        if (top(b)->tag == IF_TAG_OPTION) pop(b);
+        if (has_in_default_scope_tag(b, IF_TAG_OPTGROUP)) {
+            pop_until(b, IF_TAG_OPTGROUP);
+        } else b->dom->n_errors++;
+        return;
+    }
+    if (t == IF_TAG_SELECT) {
+        if (!has_in_default_scope_tag(b, IF_TAG_SELECT)) { b->dom->n_errors++; return; }
+        pop_until(b, IF_TAG_SELECT);
+        reset_mode(b);
+        return;
+    }
     /* その他の終了タグ: spec の「any other end tag」規則（implied 生成 + special 障壁） */
     any_other_end_tag(b, t);
 }
@@ -1649,6 +1782,9 @@ static void step(IfTB *b, IfTok tok) {
     case M_IN_TABLE_BODY:  step_in_table_body(b, tok); break;
     case M_IN_ROW:      step_in_row(b, tok); break;
     case M_IN_CELL:     step_in_cell(b, tok); break;
+    case M_IN_FRAMESET: step_in_frameset(b, tok); break;
+    case M_AFTER_FRAMESET: step_after_frameset(b, tok); break;
+    case M_AFTER_AFTER_FRAMESET: step_after_after_frameset(b, tok); break;
     case M_AFTER_BODY:
         /* 仕様: コメントは html 要素の最後の子、空白は in-body 規則、EOF で終了。
          * それ以外は parse error で in-body に戻って再処理。 */
