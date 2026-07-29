@@ -19,7 +19,7 @@ typedef enum {
     IF_TAG_B, IF_TAG_I, IF_TAG_U, IF_TAG_S, IF_TAG_EM, IF_TAG_STRONG, IF_TAG_CODE,
     IF_TAG_PRE, IF_TAG_BLOCKQUOTE, IF_TAG_H1, IF_TAG_H2, IF_TAG_H3, IF_TAG_H4,
     IF_TAG_H5, IF_TAG_H6, IF_TAG_UL, IF_TAG_OL, IF_TAG_LI, IF_TAG_DL, IF_TAG_DT,
-    IF_TAG_DD, IF_TAG_TABLE, IF_TAG_THEAD, IF_TAG_TBODY, IF_TAG_TR, IF_TAG_TD,
+    IF_TAG_DD, IF_TAG_TABLE, IF_TAG_THEAD, IF_TAG_TBODY, IF_TAG_TFOOT, IF_TAG_TR, IF_TAG_TD,
     IF_TAG_TH, IF_TAG_CAPTION, IF_TAG_IMG, IF_TAG_BR, IF_TAG_HR, IF_TAG_FORM,
     IF_TAG_INPUT, IF_TAG_BUTTON, IF_TAG_SELECT, IF_TAG_OPTION, IF_TAG_LABEL,
     IF_TAG_TEXTAREA, IF_TAG_HEADER, IF_TAG_FOOTER, IF_TAG_NAV, IF_TAG_MAIN,
@@ -39,6 +39,7 @@ typedef enum {
     IF_TAG_BASE, IF_TAG_COL, IF_TAG_COLGROUP, IF_TAG_AREA, IF_TAG_MAP, IF_TAG_EMBED,
     IF_TAG_DIR, IF_TAG_MENU, IF_TAG_APPLET, IF_TAG_MARQUEE, IF_TAG_BASEFONT,
     IF_TAG_KEYGEN,
+    IF_TAG_TEMPLATE, /* WPT で頻出。末尾追加（既存タグ ID の安定性を守る） */
     IF_TAG_N_TAGS
 } IfTag;
 
@@ -72,6 +73,9 @@ typedef struct IfNode {
     IfDoctype *dtype;    /* DOCTYPE のみ非 NULL */
     struct IfStyle *style; /* カスケード後に付与（ページ arena 所有）。NULL = 未計算 */
     struct IfNode *parent, *first_child, *last_child, *next_sibling;
+    /* template のみ: 「content」文書フラグメント（子はここに入る。子リストは常空）。
+     * WPT serializer の "content" 行はこのノード経由で辿られる。 */
+    struct IfNode *content;
 } IfNode;
 
 typedef struct {

@@ -17,7 +17,7 @@ static const struct { const char *s; u8 n; u8 flags; } IF_TAGS[IF_TAG_N_TAGS] = 
     {"em",2,0}, {"strong",6,0}, {"code",4,0}, {"pre",3,0}, {"blockquote",10,0},
     {"h1",2,0}, {"h2",2,0}, {"h3",2,0}, {"h4",2,0}, {"h5",2,0}, {"h6",2,0},
     {"ul",2,0}, {"ol",2,0}, {"li",2,0}, {"dl",2,0}, {"dt",2,0}, {"dd",2,0},
-    {"table",5,0}, {"thead",5,0}, {"tbody",5,0}, {"tr",2,0}, {"td",2,0}, {"th",2,0},
+    {"table",5,0}, {"thead",5,0}, {"tbody",5,0}, {"tfoot",5,0}, {"tr",2,0}, {"td",2,0}, {"th",2,0},
     {"caption",7,0},
     {"img",3,F_VOID}, {"br",2,F_VOID}, {"hr",2,F_VOID},
     {"form",4,0}, {"input",5,F_VOID}, {"button",6,0}, {"select",6,0}, {"option",6,0},
@@ -62,6 +62,7 @@ static const struct { const char *s; u8 n; u8 flags; } IF_TAGS[IF_TAG_N_TAGS] = 
     {"marquee",7,0},
     {"basefont",8,F_VOID},
     {"keygen",6,F_VOID},
+    {"template",8,0},
 };
 
 const char *if_tag_name(u16 tag) {
@@ -264,7 +265,8 @@ static void ser_node(const IfNode *n, FILE *o, int depth) {
         if (n->tag_name.n == 8 && memcmp(n->tag_name.p, "template", 8) == 0) {
             fputc('|', o); fputc(' ', o); ser_indent(o, depth + 1);
             fputs("content\n", o);
-            ser_children(n, o, depth + 2);
+            /* content 分離実装後: 子は content フラグメント配下（要素子は常空） */
+            ser_children(n->content ? n->content : n, o, depth + 2);
         } else {
             ser_children(n, o, depth + 1);
         }

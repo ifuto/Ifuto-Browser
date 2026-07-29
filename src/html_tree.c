@@ -15,7 +15,8 @@
 
 typedef enum {
     M_INITIAL, M_BEFORE_HTML, M_BEFORE_HEAD, M_IN_HEAD, M_AFTER_HEAD, M_IN_BODY, M_AFTER_BODY,
-    M_AFTER_AFTER_BODY
+    M_AFTER_AFTER_BODY,
+    M_IN_TABLE, M_IN_CAPTION, M_IN_COLUMN_GROUP, M_IN_TABLE_BODY, M_IN_ROW, M_IN_CELL
 } IfMode;
 
 typedef struct {
@@ -27,9 +28,21 @@ typedef struct {
     u32 depth;
     u64 cap;
     IfNode *html, *head, *body;
+    IfNode *form;          /* form element pointer（<form> ネスト制御用。WPT の挙動根拠） */
     bool stopped;
     bool seen_doctype;
     u8 skip_lf; /* pre/listing/xmp 直後の LF 1 個を無視 */
+    /* foster parenting: table 系モードの "anything else" 転送時のみ立つ旗。
+     * place() は旗が立ち、かつ現在ノードが table/tbody/tfoot/thead/tr のときだけ
+     * 「table の兄」の位置を選ぶ（WHATWG 12.2.6.1 相当） */
+    bool foster;
+    /* in-table text の保留バッファ（非空白判定を遅延させるための仕様形） */
+    char *pend;
+    u32 pend_n, pend_cap;
+    bool pend_nonws;
+    /* stack of template insertion modes（template がネストするごとに積む平行スタック） */
+    u8 tpl_modes[64];
+    u32 n_tpl;
 } IfTB;
 
 static IfNode *new_node(IfTB *b, IfNodeKind kind) {
@@ -44,6 +57,72 @@ static void append_child(IfNode *parent, IfNode *child) {
     if (!parent->first_child) parent->first_child = child;
     if (parent->last_child) parent->last_child->next_sibling = child;
     parent->last_child = child;
+}
+
+/* ファイル前半のユーティリティで参照される下方定義の前方宣言群 */
+static IfNode *top(IfTB *b);
+static void pop(IfTB *b);
+static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok);
+static void insert_comment_placed(IfTB *b, const IfTok *tok);
+
+/* before の直前に挿入（foster parenting の「table の兄」経路で必要） */
+static void insert_child_before(IfNode *parent, IfNode *child, IfNode *before) {
+    if (!before) { append_child(parent, child); return; }
+    child->parent = parent;
+    child->next_sibling = before;
+    if (parent->first_child == before) {
+        parent->first_child = child;
+    } else {
+        IfNode *p = parent->first_child;
+        while (p && p->next_sibling != before) p = p->next_sibling;
+        if (p) p->next_sibling = child;
+    }
+    /* before が last_child のまま残る（insert は last を変えない） */
+    if (!parent->first_child) parent->first_child = child;
+}
+
+/* 適切な挿入位置: 通常は現在ノード末尾（現在ノードが template なら content
+ * フラグメントの末尾）。foster 時は (table の親, table の前) か template の content。 */
+typedef struct { IfNode *parent; IfNode *before; } IfPlace;
+static IfPlace place(IfTB *b) {
+    IfNode *target = top(b);
+    IfPlace r = { target, NULL };
+    if (!b->foster) {
+        if (target->tag == IF_TAG_TEMPLATE && target->content) r.parent = target->content;
+        return r;
+    }
+    switch (target->tag) {
+    case IF_TAG_TABLE: case IF_TAG_TBODY: case IF_TAG_TFOOT:
+    case IF_TAG_THEAD: case IF_TAG_TR:
+        break;
+    default:
+        if (target->tag == IF_TAG_TEMPLATE && target->content) r.parent = target->content;
+        return r;
+    }
+    i32 iti = -1, ita = -1;
+    for (i32 i = (i32)b->depth - 1; i >= 0; i--) {
+        if (iti < 0 && b->stack[i]->tag == IF_TAG_TEMPLATE) iti = i;
+        if (ita < 0 && b->stack[i]->tag == IF_TAG_TABLE) ita = i;
+    }
+    if (iti >= 0 && (ita < 0 || iti > ita)) {
+        IfNode *t = b->stack[iti];
+        r.parent = t->content ? t->content : t; /* foster 時は最新 template の content */
+        return r;
+    }
+    if (ita < 0) { /* table 不在: fragment 相当。body があれば body、無ければ html */
+        r.parent = b->body ? b->body : (b->html ? b->html : top(b));
+        return r;
+    }
+    IfNode *tab = b->stack[ita];
+    if (tab->parent) { r.parent = tab->parent; r.before = tab; return r; }
+    r.parent = ita > 0 ? b->stack[ita - 1] : b->dom->root;
+    return r;
+}
+
+static void append_placed(IfTB *b, IfNode *n) {
+    IfPlace pl = place(b);
+    if (pl.before) insert_child_before(pl.parent, n, pl.before);
+    else append_child(pl.parent, n);
 }
 
 static void push(IfTB *b, IfNode *n) {
@@ -77,7 +156,7 @@ static IfNode *make_element(IfTB *b, const IfTok *tok) {
 
 static void insert_element(IfTB *b, const IfTok *tok, bool do_push) {
     IfNode *n = make_element(b, tok);
-    append_child(top(b), n);
+    append_placed(b, n); /* foster 時は「table の兄」に置く（push 先は stack で不変） */
     if (do_push && b->depth < IF_MAX_STACK_DEPTH) push(b, n);
     else if (do_push) b->dom->n_errors++;
 }
@@ -135,21 +214,576 @@ static void close_heading_if_open(IfTB *b) {
 
 static void append_text(IfTB *b, IfStr text) {
     if (text.n == 0) return;
-    /* 直前が TEXT ノードなら連結（ノード数とメモリの節約。コピーは発生するが稀） */
-    IfNode *p = top(b);
-    IfNode *last = p->last_child;
-    if (last && last->kind == IF_NODE_TEXT) {
-        /* 隣接していればコピーなし拡張は不可能（別領域）なので、連結コピー */
-        u64 nn = (u64)last->text.n + text.n;
+    IfPlace pl = place(b);
+    /* before がある（foster の兄挿入）時は「直前の兄が TEXT ならそこに連結」。
+     * 無ければ親の末尾 TEXT に連結（従来の規則）。 */
+    IfNode *merge_to = NULL;
+    if (pl.before) {
+        IfNode *s = pl.parent->first_child;
+        while (s && s->next_sibling != pl.before) s = s->next_sibling;
+        if (s && s->kind == IF_NODE_TEXT) merge_to = s;
+    } else {
+        IfNode *last = pl.parent->last_child;
+        if (last && last->kind == IF_NODE_TEXT) merge_to = last;
+    }
+    if (merge_to) {
+        u64 nn = (u64)merge_to->text.n + text.n;
         char *buf = (char *)if_arena_alloc(b->arena, nn);
-        memcpy(buf, last->text.p, last->text.n);
-        memcpy(buf + last->text.n, text.p, text.n);
-        last->text = if_str(buf, (u32)nn);
+        memcpy(buf, merge_to->text.p, merge_to->text.n);
+        memcpy(buf + merge_to->text.n, text.p, text.n);
+        merge_to->text = if_str(buf, (u32)nn);
         return;
     }
     IfNode *n = new_node(b, IF_NODE_TEXT);
     n->text = text;
-    append_child(p, n);
+    if (pl.before) insert_child_before(pl.parent, n, pl.before);
+    else append_child(pl.parent, n);
+}
+
+/* in-table text の保留バッファ */
+static void pend_add(IfTB *b, IfStr text) {
+    if (!text.n) return;
+    if (b->pend_n + text.n > b->pend_cap) {
+        u32 ncap = b->pend_cap ? b->pend_cap : 64;
+        while (ncap < b->pend_n + text.n) ncap *= 2;
+        char *np = (char *)if_arena_alloc(b->arena, ncap);
+        if (b->pend_n) memcpy(np, b->pend, b->pend_n);
+        b->pend = np;
+        b->pend_cap = ncap;
+    }
+    memcpy(b->pend + b->pend_n, text.p, text.n);
+    b->pend_n += text.n;
+    if (!if_str_is_ws_only(text)) b->pend_nonws = true;
+}
+
+static void pend_reset(IfTB *b) { b->pend_n = 0; b->pend_nonws = false; }
+
+/* 保留テキストを実 DOM に流す（全空白 → 現在ノードへ。非空白混じり → foster で body 規則） */
+static void pend_flush(IfTB *b);
+
+/* ---- table 系モード用のユーティリティ（WHATWG 12.2.6.4.7 系の実装中核） ---- */
+
+static bool tag_in(u16 t, const u16 *a, u32 n) {
+    for (u32 i = 0; i < n; i++) if (a[i] == t) return true;
+    return false;
+}
+
+/* scope 判定: tag が stack 上で stops に遮られずに見えるか（下向き走査） */
+static bool has_in_scope(IfTB *b, u16 tag, const u16 *stops, u32 nstops) {
+    for (u32 i = b->depth; i > 0; i--) {
+        u16 t = b->stack[i - 1]->tag;
+        if (t == tag) return true;
+        if (tag_in(t, stops, nstops)) return false;
+    }
+    return false;
+}
+
+static bool has_in_table_scope(IfTB *b, u16 tag) {
+    static const u16 S[] = { IF_TAG_HTML, IF_TAG_TEMPLATE };
+    return has_in_scope(b, tag, S, 2);
+}
+
+static void clear_back(IfTB *b, const u16 *ctx, u32 n) {
+    while (b->depth && !tag_in(top(b)->tag, ctx, n)) pop(b);
+}
+
+static const u16 C_TABLE[] = { IF_TAG_TABLE, IF_TAG_TEMPLATE, IF_TAG_HTML };
+static const u16 C_TBODY[] = { IF_TAG_TBODY, IF_TAG_TFOOT, IF_TAG_THEAD, IF_TAG_TEMPLATE, IF_TAG_HTML };
+static const u16 C_TR[] = { IF_TAG_TR, IF_TAG_TEMPLATE, IF_TAG_HTML };
+#define C_TABLE_N ((u32)(sizeof C_TABLE / sizeof C_TABLE[0]))
+#define C_TBODY_N ((u32)(sizeof C_TBODY / sizeof C_TBODY[0]))
+#define C_TR_N    ((u32)(sizeof C_TR / sizeof C_TR[0]))
+
+static void pop_until(IfTB *b, u16 tag) {
+    while (b->depth) {
+        u16 t = top(b)->tag;
+        pop(b);
+        if (t == tag) break;
+    }
+}
+
+/* 「暗示終了タグを生成する」: dd/dt/li/optgroup/option/p/rp/rt が top の間 pop（except は除外） */
+static void gen_implied(IfTB *b, u16 except) {
+    while (b->depth) {
+        u16 t = top(b)->tag;
+        if (t == except) return;
+        switch (t) {
+        case IF_TAG_DD: case IF_TAG_DT: case IF_TAG_LI: case IF_TAG_OPTGROUP:
+        case IF_TAG_OPTION: case IF_TAG_P: case IF_TAG_RP: case IF_TAG_RT:
+            pop(b);
+            continue;
+        default:
+            return;
+        }
+    }
+}
+
+/* thorough 版: 上記に caption/colgroup/tbody/td/tfoot/th/thead/tr を加える
+ * （template 終了時の「generate implied end tags thoroughly」） */
+static void gen_implied_thorough(IfTB *b) {
+    while (b->depth) {
+        switch (top(b)->tag) {
+        case IF_TAG_CAPTION: case IF_TAG_COLGROUP: case IF_TAG_DD: case IF_TAG_DT:
+        case IF_TAG_LI: case IF_TAG_OPTGROUP: case IF_TAG_OPTION: case IF_TAG_P:
+        case IF_TAG_RP: case IF_TAG_RT: case IF_TAG_TBODY: case IF_TAG_TD:
+        case IF_TAG_TFOOT: case IF_TAG_TH: case IF_TAG_THEAD: case IF_TAG_TR:
+            pop(b);
+            continue;
+        default:
+            return;
+        }
+    }
+}
+
+/* reset_mode/pop_until はこのブロックの下方にあるため前方宣言 */
+static void reset_mode(IfTB *b);
+static void pop_until(IfTB *b, u16 tag);
+static bool has_open(IfTB *b, u16 tag);
+
+/* template の開始: 要素+content フラグメントを作り、template 挿入モードを推して遷移 */
+static void tpl_start(IfTB *b, const IfTok *tok) {
+    insert_element(b, tok, true);
+    IfNode *t = top(b);
+    if (!t->content) t->content = new_node(b, IF_NODE_DOCUMENT);
+    IfMode m;
+    switch (b->mode) {
+    case M_IN_TABLE: case M_IN_CAPTION: case M_IN_TABLE_BODY:
+    case M_IN_ROW: case M_IN_CELL: case M_IN_COLUMN_GROUP:
+        m = M_IN_TABLE; /* table 系に立たせるのは「in table」一つに集約（spec の表再現） */
+        break;
+    default:
+        m = M_IN_BODY;
+        break;
+    }
+    if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)m;
+    b->mode = m;
+}
+
+/* template の終了: implied(thorough) → template まで pop → tpl モード抜ける → reset */
+static void tpl_end(IfTB *b) {
+    if (!has_open(b, IF_TAG_TEMPLATE)) { b->dom->n_errors++; return; }
+    gen_implied_thorough(b);
+    if (top(b)->tag != IF_TAG_TEMPLATE) b->dom->n_errors++;
+    pop_until(b, IF_TAG_TEMPLATE);
+    /* AFE マーカー消去は B2 */
+    if (b->n_tpl) b->n_tpl--;
+    reset_mode(b);
+}
+
+/* reset the insertion mode appropriately（WHATWG アルゴリズムの非 fragment 版） */
+static void reset_mode(IfTB *b) {
+    for (i32 i = (i32)b->depth - 1; i >= 0; i--) {
+        u16 t = b->stack[i]->tag;
+        if (i == 0) { /* 基底 html: head 既出なら after-head、未出なら before-head */
+            b->mode = b->head ? M_AFTER_HEAD : M_BEFORE_HEAD;
+            return;
+        }
+        switch (t) {
+        case IF_TAG_TD: case IF_TAG_TH: b->mode = M_IN_CELL; return;
+        case IF_TAG_TR: b->mode = M_IN_ROW; return;
+        case IF_TAG_TBODY: case IF_TAG_THEAD: case IF_TAG_TFOOT:
+            b->mode = M_IN_TABLE_BODY; return;
+        case IF_TAG_CAPTION: b->mode = M_IN_CAPTION; return;
+        case IF_TAG_COLGROUP: b->mode = M_IN_COLUMN_GROUP; return;
+        case IF_TAG_TABLE: b->mode = M_IN_TABLE; return;
+        case IF_TAG_TEMPLATE:
+            /* template の挿入モードスタック先頭に戻す（空なら in-body） */
+            b->mode = b->n_tpl ? (IfMode)b->tpl_modes[b->n_tpl - 1] : M_IN_BODY;
+            return;
+        case IF_TAG_HEAD: b->mode = M_IN_HEAD; return;
+        case IF_TAG_BODY: b->mode = M_IN_BODY; return;
+        default: continue; /* それ以外の要素はさらに下を見る */
+        }
+    }
+    b->mode = b->head ? M_AFTER_HEAD : M_BEFORE_HEAD;
+}
+
+/* table セルを強制閉鎖して M_IN_ROW に戻す（"close the cell"） */
+static void close_cell(IfTB *b) {
+    if (has_in_table_scope(b, IF_TAG_TD)) {
+        gen_implied(b, IF_TAG_TD);
+        if (top(b)->tag != IF_TAG_TD) b->dom->n_errors++;
+        pop_until(b, IF_TAG_TD);
+    } else if (has_in_table_scope(b, IF_TAG_TH)) {
+        gen_implied(b, IF_TAG_TH);
+        if (top(b)->tag != IF_TAG_TH) b->dom->n_errors++;
+        pop_until(b, IF_TAG_TH);
+    }
+    b->mode = M_IN_ROW;
+}
+
+static IfTok synth_start(u16 tag) {
+    IfTok t;
+    memset(&t, 0, sizeof t);
+    t.kind = TOK_START;
+    t.tag = tag;
+    return t;
+}
+
+static bool attr_is_ci(const IfTok *tok, const char *name, const char *val) {
+    for (u32 i = 0; i < tok->n_attrs; i++)
+        if (if_str_eq_ci(tok->attrs[i].name, if_str(name, (u32)strlen(name)))
+            && if_str_eq_ci(tok->attrs[i].value, if_str(val, (u32)strlen(val))))
+            return true;
+    return false;
+}
+
+static void step_in_body(IfTB *b, IfTok tok);
+static void step_in_head(IfTB *b, IfTok tok);
+static void step(IfTB *b, IfTok tok);
+static void step_in_table(IfTB *b, IfTok tok);
+static void step_in_caption(IfTB *b, IfTok tok);
+static void step_in_colgroup(IfTB *b, IfTok tok);
+static void step_in_table_body(IfTB *b, IfTok tok);
+static void step_in_row(IfTB *b, IfTok tok);
+static void step_in_cell(IfTB *b, IfTok tok);
+
+static void step_in_table(IfTB *b, IfTok tok) {
+    pend_flush(b);
+    switch (tok.kind) {
+    case TOK_TEXT: pend_add(b, tok.text); return;
+    case TOK_COMMENT: insert_comment_placed(b, &tok); return; /* template top でも content へ */
+    case TOK_DOCTYPE: b->dom->n_errors++; return;
+    case TOK_EOF: step_in_body(b, tok); return; /* "anything else": body 規則で停止 */
+    default: break;
+    }
+
+    if (tok.kind == TOK_START) {
+        switch (tok.tag) {
+        case IF_TAG_CAPTION:
+            clear_back(b, C_TABLE, C_TABLE_N);
+            insert_element(b, &tok, true); /* AFE marker は B2 で挿入 */
+            b->mode = M_IN_CAPTION;
+            return;
+        case IF_TAG_COLGROUP:
+            clear_back(b, C_TABLE, C_TABLE_N);
+            insert_element(b, &tok, true);
+            b->mode = M_IN_COLUMN_GROUP;
+            return;
+        case IF_TAG_COL: {
+            clear_back(b, C_TABLE, C_TABLE_N);
+            IfTok cg = synth_start(IF_TAG_COLGROUP);
+            insert_element(b, &cg, true);
+            b->mode = M_IN_COLUMN_GROUP;
+            step_in_colgroup(b, tok);
+            return;
+        }
+        case IF_TAG_TBODY: case IF_TAG_THEAD: case IF_TAG_TFOOT:
+            clear_back(b, C_TABLE, C_TABLE_N);
+            insert_element(b, &tok, true);
+            b->mode = M_IN_TABLE_BODY;
+            return;
+        case IF_TAG_TR: {
+            clear_back(b, C_TABLE, C_TABLE_N);
+            IfTok tb = synth_start(IF_TAG_TBODY);
+            insert_element(b, &tb, true);
+            b->mode = M_IN_TABLE_BODY;
+            step_in_table_body(b, tok);
+            return;
+        }
+        case IF_TAG_TD: case IF_TAG_TH: {
+            b->dom->n_errors++;
+            clear_back(b, C_TABLE, C_TABLE_N);
+            IfTok tb = synth_start(IF_TAG_TBODY);
+            insert_element(b, &tb, true);
+            b->mode = M_IN_TABLE_BODY;
+            IfTok tr = synth_start(IF_TAG_TR);
+            step_in_table_body(b, tr);
+            step_in_row(b, tok);
+            return;
+        }
+        case IF_TAG_TABLE:
+            b->dom->n_errors++;
+            if (!has_in_table_scope(b, IF_TAG_TABLE)) return;
+            pop_until(b, IF_TAG_TABLE);
+            reset_mode(b);
+            step(b, tok); /* 閉じた外側の後ろで再処理 = HTML5 の「ネスト table は兄弟」規則 */
+            return;
+        case IF_TAG_STYLE: case IF_TAG_SCRIPT: case IF_TAG_TEMPLATE:
+            step_in_head(b, tok); /* in-table の style/script/template は head 規則 */
+            return;
+        case IF_TAG_INPUT:
+            if (attr_is_ci(&tok, "type", "hidden")) {
+                insert_element(b, &tok, false);
+                return;
+            }
+            goto foster_body; /* hidden 以外の input は foster 経路 */
+        case IF_TAG_FORM:
+            if (b->form) return; /* form pointer 2 重設定の禁止（template 判定線は B3） */
+            insert_element(b, &tok, true);
+            b->form = top(b);
+            pop(b); /* spec: in-table の form は push 後に即 pop して pointer のみ残す */
+            return;
+        default:
+            goto foster_body;
+        }
+    }
+
+    /* TOK_END */
+    if (tok.tag == IF_TAG_TABLE) {
+        if (!has_in_table_scope(b, IF_TAG_TABLE)) { b->dom->n_errors++; return; }
+        pop_until(b, IF_TAG_TABLE);
+        reset_mode(b);
+        return;
+    }
+    if (tok.tag == IF_TAG_TEMPLATE) { step_in_head(b, tok); return; }
+    switch (tok.tag) {
+    case IF_TAG_BODY: case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
+    case IF_TAG_HTML: case IF_TAG_TBODY: case IF_TAG_TD: case IF_TAG_TFOOT:
+    case IF_TAG_TH: case IF_TAG_THEAD: case IF_TAG_TR:
+        b->dom->n_errors++;
+        return; /* in-table で無視される終了タグ群（仕様表再現） */
+    default:
+        goto foster_body;
+    }
+
+foster_body:
+    b->dom->n_errors++;
+    b->foster = true;
+    step_in_body(b, tok);
+    b->foster = false;
+}
+
+static void step_in_caption(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_END && tok.tag == IF_TAG_CAPTION) {
+        if (!has_in_table_scope(b, IF_TAG_CAPTION)) { b->dom->n_errors++; return; }
+        pop_until(b, IF_TAG_CAPTION); /* AFE マーカー消去は B2 */
+        b->mode = M_IN_TABLE;
+        return;
+    }
+    if (tok.kind == TOK_START && tok.tag == IF_TAG_TABLE) {
+        if (!has_in_table_scope(b, IF_TAG_CAPTION)) { b->dom->n_errors++; return; }
+        pop_until(b, IF_TAG_CAPTION);
+        b->mode = M_IN_TABLE;
+        step(b, tok);
+        return;
+    }
+    if (tok.kind == TOK_END && tok.tag == IF_TAG_TABLE) {
+        if (!has_in_table_scope(b, IF_TAG_CAPTION)) { b->dom->n_errors++; return; }
+        pop_until(b, IF_TAG_CAPTION);
+        b->mode = M_IN_TABLE;
+        step(b, tok);
+        return;
+    }
+    if (tok.kind == TOK_END) {
+        switch (tok.tag) {
+        case IF_TAG_BODY: case IF_TAG_COL: case IF_TAG_COLGROUP: case IF_TAG_HTML:
+        case IF_TAG_TBODY: case IF_TAG_TD: case IF_TAG_TFOOT: case IF_TAG_TH:
+        case IF_TAG_THEAD: case IF_TAG_TR:
+            b->dom->n_errors++;
+            return;
+        default:
+            break;
+        }
+    }
+    step_in_body(b, tok);
+}
+
+static void step_in_colgroup(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { append_text(b, tok.text); return; }
+    if (tok.kind == TOK_COMMENT) { insert_comment_placed(b, &tok); return; }
+    if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
+    if (tok.kind == TOK_START) {
+        if (tok.tag == IF_TAG_HTML) { step_in_body(b, tok); return; }
+        if (tok.tag == IF_TAG_COL) { insert_element(b, &tok, false); return; }
+        if (tok.tag == IF_TAG_TEMPLATE) { step_in_head(b, tok); return; }
+        goto anything;
+    }
+    if (tok.kind == TOK_END) {
+        if (tok.tag == IF_TAG_COLGROUP) {
+            if (top(b)->tag == IF_TAG_COLGROUP) { pop(b); b->mode = M_IN_TABLE; }
+            else b->dom->n_errors++;
+            return;
+        }
+        if (tok.tag == IF_TAG_COL) { b->dom->n_errors++; return; }
+        if (tok.tag == IF_TAG_TEMPLATE) { step_in_head(b, tok); return; }
+        goto anything;
+    }
+anything:
+    /* "colgroup 抜け" は現在ノードが colgroup のときだけ。それ以外は無視（hole を防ぐ） */
+    if (top(b)->tag == IF_TAG_COLGROUP) {
+        pop(b);
+        b->mode = M_IN_TABLE;
+        step(b, tok);
+    } else {
+        b->dom->n_errors++;
+    }
+}
+
+static bool any_tbf_in_scope(IfTB *b) {
+    return has_in_table_scope(b, IF_TAG_TBODY) || has_in_table_scope(b, IF_TAG_THEAD)
+           || has_in_table_scope(b, IF_TAG_TFOOT);
+}
+
+/* tbody 系で「現在のセクションを閉じて M_IN_TABLE で再処理する」共通形 */
+static void leave_tbody_reprocess(IfTB *b, IfTok tok) {
+    clear_back(b, C_TBODY, C_TBODY_N);
+    pop(b);
+    b->mode = M_IN_TABLE;
+    step(b, tok);
+}
+
+static void step_in_table_body(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_START) {
+        switch (tok.tag) {
+        case IF_TAG_TR:
+            clear_back(b, C_TBODY, C_TBODY_N);
+            insert_element(b, &tok, true);
+            b->mode = M_IN_ROW;
+            return;
+        case IF_TAG_TD: case IF_TAG_TH: {
+            b->dom->n_errors++;
+            IfTok tr = synth_start(IF_TAG_TR);
+            step_in_table_body(b, tr); /* 合成 tr を入れてから本トークンを行規則で */
+            step_in_row(b, tok);
+            return;
+        }
+        case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
+        case IF_TAG_TBODY: case IF_TAG_THEAD: case IF_TAG_TFOOT:
+            if (!any_tbf_in_scope(b)) { b->dom->n_errors++; return; }
+            leave_tbody_reprocess(b, tok);
+            return;
+        default:
+            break;
+        }
+    } else if (tok.kind == TOK_END) {
+        switch (tok.tag) {
+        case IF_TAG_TBODY: case IF_TAG_THEAD: case IF_TAG_TFOOT:
+            if (!has_in_table_scope(b, tok.tag)) { b->dom->n_errors++; return; }
+            clear_back(b, C_TBODY, C_TBODY_N);
+            pop(b);
+            b->mode = M_IN_TABLE;
+            return;
+        case IF_TAG_TABLE:
+            if (!any_tbf_in_scope(b)) { b->dom->n_errors++; return; }
+            clear_back(b, C_TBODY, C_TBODY_N);
+            pop(b);
+            b->mode = M_IN_TABLE;
+            step(b, tok);
+            return;
+        case IF_TAG_BODY: case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
+        case IF_TAG_HTML: case IF_TAG_TR: case IF_TAG_TD: case IF_TAG_TH:
+            b->dom->n_errors++;
+            return;
+        default:
+            break;
+        }
+    }
+    step_in_body(b, tok);
+}
+
+/* tr を正當に終わらせて M_IN_TABLE_BODY に戻し、tok を再処理 */
+static void end_tr_reprocess(IfTB *b, IfTok tok) {
+    clear_back(b, C_TR, C_TR_N);
+    pop(b); /* tr */
+    b->mode = M_IN_TABLE_BODY;
+    step(b, tok);
+}
+
+static void step_in_row(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_START) {
+        switch (tok.tag) {
+        case IF_TAG_TD: case IF_TAG_TH:
+            clear_back(b, C_TR, C_TR_N);
+            insert_element(b, &tok, true); /* AFE marker は B2 */
+            b->mode = M_IN_CELL;
+            return;
+        case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
+        case IF_TAG_TBODY: case IF_TAG_THEAD: case IF_TAG_TFOOT:
+            if (!has_in_table_scope(b, IF_TAG_TR)) { b->dom->n_errors++; return; }
+            end_tr_reprocess(b, tok);
+            return;
+        case IF_TAG_TABLE:
+            b->dom->n_errors++; /* spec: in-row の table 開始は error 付き再処理 */
+            if (!has_in_table_scope(b, IF_TAG_TR)) return;
+            end_tr_reprocess(b, tok);
+            return;
+        default:
+            break;
+        }
+    } else if (tok.kind == TOK_END) {
+        switch (tok.tag) {
+        case IF_TAG_TR:
+            if (!has_in_table_scope(b, IF_TAG_TR)) { b->dom->n_errors++; return; }
+            clear_back(b, C_TR, C_TR_N);
+            pop(b);
+            b->mode = M_IN_TABLE_BODY;
+            return;
+        case IF_TAG_TABLE:
+            if (!has_in_table_scope(b, IF_TAG_TR)) { b->dom->n_errors++; return; }
+            end_tr_reprocess(b, tok);
+            return;
+        case IF_TAG_TBODY: case IF_TAG_THEAD: case IF_TAG_TFOOT:
+            if (!has_in_table_scope(b, tok.tag)) { b->dom->n_errors++; return; }
+            end_tr_reprocess(b, tok);
+            return;
+        case IF_TAG_BODY: case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
+        case IF_TAG_HTML: case IF_TAG_TD: case IF_TAG_TH:
+            b->dom->n_errors++;
+            return;
+        default:
+            break;
+        }
+    }
+    step_in_body(b, tok);
+}
+
+static void step_in_cell(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_END && (tok.tag == IF_TAG_TD || tok.tag == IF_TAG_TH)) {
+        if (!has_in_table_scope(b, tok.tag)) { b->dom->n_errors++; return; }
+        gen_implied(b, tok.tag);
+        if (top(b)->tag != tok.tag) b->dom->n_errors++;
+        pop_until(b, tok.tag);
+        b->mode = M_IN_ROW;
+        return;
+    }
+    if (tok.kind == TOK_START) {
+        switch (tok.tag) {
+        case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
+        case IF_TAG_TBODY: case IF_TAG_TD: case IF_TAG_TH:
+        case IF_TAG_THEAD: case IF_TAG_TFOOT: case IF_TAG_TR:
+            b->dom->n_errors++;
+            close_cell(b);
+            step(b, tok);
+            return;
+        default:
+            break;
+        }
+    }
+    if (tok.kind == TOK_END) {
+        switch (tok.tag) {
+        case IF_TAG_TABLE: case IF_TAG_TBODY: case IF_TAG_TFOOT: case IF_TAG_THEAD:
+        case IF_TAG_TR:
+            if (!has_in_table_scope(b, tok.tag)) { b->dom->n_errors++; return; }
+            close_cell(b);
+            step(b, tok);
+            return;
+        case IF_TAG_BODY: case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
+        case IF_TAG_HTML:
+            b->dom->n_errors++;
+            return;
+        default:
+            break;
+        }
+    }
+    step_in_body(b, tok);
+}
+
+static void pend_flush(IfTB *b) {
+    if (!b->pend_n) return;
+    IfStr t = if_str(b->pend, b->pend_n);
+    b->pend_n = 0;
+    if (!b->pend_nonws) {
+        append_text(b, t);
+        return;
+    }
+    b->pend_nonws = false;
+    /* 非空白混じりの table 直下テキストは「body 規則の other text」。
+     * foster を立てて流せば place() が「table の兄」へ導く（AFE 再構築は B2 で統合） */
+    bool f = b->foster;
+    b->foster = true;
+    step_in_body(b, (IfTok){ .kind = TOK_TEXT, .text = t });
+    b->foster = f;
 }
 
 /* rawtext または RCDATA の container 要素か（内容は element の子テキスト1本） */
@@ -160,6 +794,14 @@ static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok) {
     n->text = tok->text;
     if (tok->is_pi) n->tag_name = tok->pi_target; /* PI は target を tag_name に保持（comment では未使用の欄） */
     append_child(parent, n);
+}
+
+/* in-body 経路のコメント: foster フラグが立っていれば「table の兄」に置く */
+static void insert_comment_placed(IfTB *b, const IfTok *tok) {
+    IfNode *n = new_node(b, IF_NODE_COMMENT);
+    n->text = tok->text;
+    if (tok->is_pi) n->tag_name = tok->pi_target;
+    append_placed(b, n);
 }
 
 /* 2 個目の <body>/<html>: 不足している属性だけマージする（WHATWG 準拠） */
@@ -308,6 +950,9 @@ static void step_in_head(IfTB *b, IfTok tok) {
             return;
         case IF_TAG_HEAD:
             b->dom->n_errors++; return; /* 無視 */
+        case IF_TAG_TEMPLATE:
+            tpl_start(b, &tok);
+            return;
         case IF_TAG_NOSCRIPT:
             insert_element(b, &tok, true);
             return;
@@ -320,6 +965,7 @@ static void step_in_head(IfTB *b, IfTok tok) {
     }
     if (tok.kind == TOK_END) {
         if (tok.tag == IF_TAG_HEAD) { pop_if(b, IF_TAG_HEAD); b->mode = M_AFTER_HEAD; return; }
+        if (tok.tag == IF_TAG_TEMPLATE) { tpl_end(b); return; }
         if (tok.tag == IF_TAG_TITLE || tok.tag == IF_TAG_STYLE || tok.tag == IF_TAG_SCRIPT ||
             tok.tag == IF_TAG_TEXTAREA || tok.tag == IF_TAG_NOSCRIPT) {
             pop_if(b, tok.tag);
@@ -378,12 +1024,22 @@ static void step_in_body(IfTB *b, IfTok tok) {
         append_text(b, tok.text);
         return;
     case TOK_COMMENT:
-        insert_comment(b, top(b), &tok);
+        insert_comment_placed(b, &tok);
         return;
     case TOK_DOCTYPE:
         b->dom->n_errors++;
         return;
     case TOK_EOF:
+        /* spec: stack に template が残っていれば 1 枚ずつ畳んで EOF を再処理
+         * （各反復で template が必ず減るので有限停止する） */
+        if (has_open(b, IF_TAG_TEMPLATE)) {
+            b->dom->n_errors++;
+            pop_until(b, IF_TAG_TEMPLATE);
+            if (b->n_tpl) b->n_tpl--;
+            reset_mode(b);
+            step(b, tok);
+            return;
+        }
         b->stopped = true;
         return;
     case TOK_END:
@@ -412,6 +1068,25 @@ static void step_in_body(IfTB *b, IfTok tok) {
             return;
         }
         if (t == IF_TAG_BODY || t == IF_TAG_HEAD) { b->dom->n_errors++; return; }
+        /* table: 仕様どおり「p を閉じる → table を挿入・push → M_IN_TABLE」。
+         * frameset-ok の扱いは frameset モード実装時に台帳へ。 */
+        if (t == IF_TAG_TABLE) {
+            close_p_if_open(b);
+            insert_element(b, &tok, true);
+            pend_reset(b);
+            b->mode = M_IN_TABLE;
+            return;
+        }
+        /* form: pointer が既にあれば重複を無視（ネスト form は DOM に出さない WHATWG） */
+        if (t == IF_TAG_FORM) {
+            if (b->form) { b->dom->n_errors++; return; }
+            close_p_if_open(b);
+            insert_element(b, &tok, true);
+            b->form = top(b);
+            return;
+        }
+        /* template: content 分離 + template 挿入モードへ（in-body/他モード共通の規則） */
+        if (t == IF_TAG_TEMPLATE) { tpl_start(b, &tok); return; }
         if (closes_p(t)) close_p_if_open(b);
         if (t == IF_TAG_LI) implied_close(b, IF_TAG_LI, 0, IF_TAG_UL, IF_TAG_OL);
         if (t == IF_TAG_DT || t == IF_TAG_DD) implied_close(b, IF_TAG_DT, IF_TAG_DD, IF_TAG_DL, 0);
@@ -443,6 +1118,16 @@ static void step_in_body(IfTB *b, IfTok tok) {
         step_in_body(b, br);
         return;
     }
+    if (t == IF_TAG_FORM && b->form) {
+        /* 仕様簡約版: form pointer を解除し、開いていれば implied end tags を生成して畳む */
+        b->form = NULL;
+        if (!has_open(b, IF_TAG_FORM)) { b->dom->n_errors++; return; }
+        gen_implied(b, 0);
+        if (top(b)->tag != IF_TAG_FORM) b->dom->n_errors++;
+        pop_until(b, IF_TAG_FORM);
+        return;
+    }
+    if (t == IF_TAG_TEMPLATE) { tpl_end(b); return; }
     if (t == IF_TAG_P && !has_open(b, IF_TAG_P)) {
         /* 開いていない </p> → 空の p を挿入して閉じる（仕様準拠の小qirk） */
         IfTok p = { .kind = TOK_START, .tag = IF_TAG_P };
@@ -483,6 +1168,12 @@ static void step(IfTB *b, IfTok tok) {
     case M_IN_HEAD:     step_in_head(b, tok); break;
     case M_AFTER_HEAD:  step_after_head(b, tok); break;
     case M_IN_BODY:     step_in_body(b, tok); break;
+    case M_IN_TABLE:    step_in_table(b, tok); break;
+    case M_IN_CAPTION:  step_in_caption(b, tok); break;
+    case M_IN_COLUMN_GROUP: step_in_colgroup(b, tok); break;
+    case M_IN_TABLE_BODY:  step_in_table_body(b, tok); break;
+    case M_IN_ROW:      step_in_row(b, tok); break;
+    case M_IN_CELL:     step_in_cell(b, tok); break;
     case M_AFTER_BODY:
         /* 仕様: コメントは html 要素の最後の子、空白は in-body 規則、EOF で終了。
          * それ以外は parse error で in-body に戻って再処理。 */
@@ -708,7 +1399,7 @@ static void foreign_insert(IfTB *b, const IfTok *tok) {
     IfNode *n = make_element(b, tok);
     n->ns = top(b)->ns;
     foreign_adjust(b, n);
-    append_child(top(b), n);
+    append_placed(b, n); /* template top なら content へ、foster なら「table の兄」へ */
     if (!tok->self_closing) {
         if (b->depth < IF_MAX_STACK_DEPTH) push(b, n);
         else b->dom->n_errors++;
