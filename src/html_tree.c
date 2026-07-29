@@ -41,6 +41,9 @@ typedef struct {
     char *pend;
     u32 pend_n, pend_cap;
     bool pend_nonws;
+    /* frameset-ok flag（WHATWG 13.2.4.5）。「ok」のときのみ in-body の
+     * <frameset> が body を置き換える。テキスト(非空白)/各種要素で not-ok へ */
+    bool frameset_ok;
     /* stack of template insertion modes（template がネストするごとに積む平行スタック） */
     u8 tpl_modes[64];
     u32 n_tpl;
@@ -76,8 +79,10 @@ static void tpl_end(IfTB *b);
 static void tpl_start(IfTB *b, const IfTok *tok);
 static void gen_implied(IfTB *b, u16 except);
 static void pop_until(IfTB *b, u16 tag);
-static bool has_in_scope(IfTB *b, u16 tag, const u16 *stops, u32 nstops);
 static bool is_formatting(u16 t);
+typedef enum { SC_DEFAULT = 0, SC_BUTTON, SC_LIST_ITEM, SC_TABLE } IfScopeKind;
+static bool has_in_scope2(IfTB *b, u16 tag, IfScopeKind k);
+static bool scope_barrier(const IfNode *n, IfScopeKind k);
 static void afe_reconstruct(IfTB *b);
 static void afe_push(IfTB *b, IfNode *n);
 static void afe_insert_marker(IfTB *b);
@@ -216,9 +221,7 @@ static bool has_open(IfTB *b, u16 tag) {
  * で遮断。無ければ何もしない = 仕様の if-in-button-scope 条件）。閉じるときは
  * implied end tags を生成してから p まで畳む（WHATWG "close a p element"）。 */
 static void close_p_if_open(IfTB *b) {
-    static const u16 BS[] = { IF_TAG_HTML, IF_TAG_TEMPLATE, IF_TAG_MARQUEE,
-                              IF_TAG_OBJECT, IF_TAG_APPLET, IF_TAG_BUTTON };
-    if (!has_in_scope(b, IF_TAG_P, BS, (u32)(sizeof BS / sizeof BS[0]))) return;
+    if (!has_in_scope2(b, IF_TAG_P, SC_BUTTON)) return;
     gen_implied(b, IF_TAG_P); /* except=p（自身は畳まない） */
     if (top(b)->tag != IF_TAG_P) b->dom->n_errors++;
     pop_until(b, IF_TAG_P);
@@ -299,18 +302,50 @@ static bool tag_in(u16 t, const u16 *a, u32 n) {
 }
 
 /* scope 判定: tag が stack 上で stops に遮られずに見えるか（下向き走査） */
-static bool has_in_scope(IfTB *b, u16 tag, const u16 *stops, u32 nstops) {
+
+/* ---- scope 系の正式形（WHATWG "has an element in scope" 13.2.4.2 系） ----
+ * バリア集合は namespace 修飾つき: 既定スコープの遮断要素は
+ *   HTML: applet, caption, html, table, td, th, marquee, object, template
+ *   MathML: mi, mo, mn, ms, mtext, annotation-xml
+ *   SVG: foreignObject, desc, title
+ * で、これを button / list-item / table scope が拡張・置換する。
+ * マッチ対象は常に「HTML 名前空間の tag」要素（foreign 同名要素を誤検しない）。
+ * IfScopeKind 自体はファイル先頭で宣言済み。 */
+static bool scope_barrier(const IfNode *n, IfScopeKind k) {
+    if (k == SC_TABLE)
+        return n->ns == IF_NS_HTML && (n->tag == IF_TAG_HTML || n->tag == IF_TAG_TABLE ||
+                                       n->tag == IF_TAG_TEMPLATE);
+    if (n->ns == IF_NS_HTML) {
+        if (k == SC_BUTTON && n->tag == IF_TAG_BUTTON) return true;
+        if (k == SC_LIST_ITEM && (n->tag == IF_TAG_OL || n->tag == IF_TAG_UL)) return true;
+        switch (n->tag) {
+        case IF_TAG_APPLET: case IF_TAG_CAPTION: case IF_TAG_HTML: case IF_TAG_TABLE:
+        case IF_TAG_TD: case IF_TAG_TH: case IF_TAG_MARQUEE: case IF_TAG_OBJECT:
+        case IF_TAG_TEMPLATE:
+            return true;
+        default: return false;
+        }
+    }
+    if (n->ns == IF_NS_MATHML)
+        return n->tag == IF_TAG_MI || n->tag == IF_TAG_MO || n->tag == IF_TAG_MN ||
+               n->tag == IF_TAG_MS || n->tag == IF_TAG_MTEXT || n->tag == IF_TAG_ANNOTATION_XML;
+    if (n->ns == IF_NS_SVG)
+        return n->tag == IF_TAG_FOREIGNOBJECT || n->tag == IF_TAG_DESC ||
+               n->tag == IF_TAG_TITLE;
+    return false;
+}
+
+static bool has_in_scope2(IfTB *b, u16 tag, IfScopeKind k) {
     for (u32 i = b->depth; i > 0; i--) {
-        u16 t = b->stack[i - 1]->tag;
-        if (t == tag) return true;
-        if (tag_in(t, stops, nstops)) return false;
+        IfNode *x = b->stack[i - 1];
+        if (x->ns == IF_NS_HTML && x->tag == tag) return true;
+        if (scope_barrier(x, k)) return false;
     }
     return false;
 }
 
 static bool has_in_table_scope(IfTB *b, u16 tag) {
-    static const u16 S[] = { IF_TAG_HTML, IF_TAG_TEMPLATE };
-    return has_in_scope(b, tag, S, 2);
+    return has_in_scope2(b, tag, SC_TABLE);
 }
 
 static void clear_back(IfTB *b, const u16 *ctx, u32 n) {
@@ -504,22 +539,18 @@ static i32 stack_find_node(const IfTB *b, const IfNode *n) {
     return -1;
 }
 
-/* 既定スコープ: applet/caption/html/table/td/th/marquee/object/template で遮断 */
+/* 既定スコープ（namespace 修飾つき正式バリア集合: scope_barrier 参照） */
 static bool node_in_default_scope(const IfTB *b, const IfNode *n) {
-    static const u16 S[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
-                             IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT, IF_TAG_TEMPLATE };
     for (u32 i = b->depth; i > 0; i--) {
         IfNode *x = b->stack[i - 1];
         if (x == n) return true;
-        if (tag_in(x->tag, S, (u32)(sizeof S / sizeof S[0]))) return false;
+        if (scope_barrier(x, SC_DEFAULT)) return false;
     }
     return false;
 }
 
 static bool has_in_default_scope_tag(IfTB *b, u16 tag) {
-    static const u16 S[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
-                             IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT, IF_TAG_TEMPLATE };
-    return has_in_scope(b, tag, S, (u32)(sizeof S / sizeof S[0]));
+    return has_in_scope2(b, tag, SC_DEFAULT);
 }
 
 static bool attrs_equal(const IfNode *a, const IfNode *b2) {
@@ -715,8 +746,8 @@ static void any_other_end_tag(IfTB *b, u16 tag) {
 
 /* in-body 明示終了: scope で見えていれば implied end tags 生成 → そこまで畳む。
  * （address/div/ol/pre 等のブロック群・li・dd/dt の共通形） */
-static void end_in_scope(IfTB *b, u16 tag, const u16 *stops, u32 nstops, bool except_self) {
-    if (!has_in_scope(b, tag, stops, nstops)) { b->dom->n_errors++; return; }
+static void end_in_scope(IfTB *b, u16 tag, IfScopeKind k, bool except_self) {
+    if (!has_in_scope2(b, tag, k)) { b->dom->n_errors++; return; }
     gen_implied(b, except_self ? tag : 0);
     if (top(b)->tag != tag) b->dom->n_errors++;
     pop_until(b, tag);
@@ -1288,6 +1319,18 @@ static bool is_html_ip(const IfNode *n);
 static bool is_math_ip(const IfNode *n);
 static IfNode *make_element(IfTB *b, const IfTok *tok);
 
+/* 先頭の HTML 空白（TAB LF FF CR SPACE）ランを剥がして返す。入力スライスは残りに進む */
+static IfStr peel_leading_ws(IfStr *s) {
+    u32 n = 0;
+    while (n < s->n && (s->p[n] == ' ' || s->p[n] == '\t' || s->p[n] == '\n' ||
+                        s->p[n] == '\f' || s->p[n] == '\r'))
+        n++;
+    IfStr ws = if_str(s->p, n);
+    s->p += n;
+    s->n -= n;
+    return ws;
+}
+
 static void step_initial(IfTB *b, IfTok tok) {
     switch (tok.kind) {
     case TOK_DOCTYPE:
@@ -1305,9 +1348,15 @@ static void step_initial(IfTB *b, IfTok tok) {
         }
         return;
     case TOK_COMMENT: insert_comment(b, b->dom->root, &tok); return;
-    case TOK_TEXT:
-        if (if_str_is_ws_only(tok.text)) return;
-        /* fallthrough */
+    case TOK_TEXT: {
+        IfStr rest = tok.text;
+        peel_leading_ws(&rest); /* initial の先頭空白は捨てる（ws char → ignore） */
+        if (!rest.n) return;
+        tok.text = rest;
+        b->mode = M_BEFORE_HTML;
+        step(b, tok);
+        return;
+    }
     default:
         b->mode = M_BEFORE_HTML;
         step(b, tok);
@@ -1351,7 +1400,15 @@ static void ensure_body(IfTB *b) {
 
 static void step_before_html(IfTB *b, IfTok tok) {
     if (tok.kind == TOK_COMMENT) { insert_comment(b, b->dom->root, &tok); return; }
-    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) return;
+    if (tok.kind == TOK_TEXT) {
+        IfStr rest = tok.text;
+        peel_leading_ws(&rest); /* before-html も先頭空白のみ捨てる */
+        if (!rest.n) return;
+        tok.text = rest;
+        b->mode = M_BEFORE_HEAD;
+        step(b, tok);
+        return;
+    }
     if (tok.kind == TOK_START && tok.tag == IF_TAG_HTML) {
         if (!b->html) {
             b->html = make_element(b, &tok);
@@ -1366,7 +1423,16 @@ static void step_before_html(IfTB *b, IfTok tok) {
 }
 
 static void step_before_head(IfTB *b, IfTok tok) {
-    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) return;
+    if (tok.kind == TOK_TEXT) {
+        IfStr rest = tok.text;
+        peel_leading_ws(&rest); /* before-head: 先頭空白だけ捨てて残りは head 側へ */
+        if (!rest.n) return;
+        tok.text = rest;
+        b->mode = M_IN_HEAD;
+        ensure_head(b);
+        step(b, tok);
+        return;
+    }
     if (tok.kind == TOK_COMMENT) { insert_comment(b, b->html ? b->html : b->dom->root, &tok); return; }
     if (tok.kind == TOK_END && tok.tag != IF_TAG_HEAD && tok.tag != IF_TAG_HTML &&
         tok.tag != IF_TAG_BODY && tok.tag != IF_TAG_BR) {
@@ -1386,10 +1452,27 @@ static void step_before_head(IfTB *b, IfTok tok) {
     step(b, tok);
 }
 
+/* スタック中の指定ノードを（トップとは限らない位置から）除去。
+ * after-head の from-head 規則で head pointer を一時 push → in-head 処理 → 除去、に使う。
+ * 除去は index シフトで行い、子孫要素の DOM 位置には触れない。 */
+static void remove_from_stack(IfTB *b, IfNode *n) {
+    for (u32 i = b->depth; i > 0; i--) {
+        if (b->stack[i - 1] == n) {
+            memmove(&b->stack[i - 1], &b->stack[i], (size_t)(b->depth - i) * sizeof b->stack[0]);
+            b->depth--;
+            return;
+        }
+    }
+}
+
 static void step_in_head(IfTB *b, IfTok tok) {
     if (tok.kind == TOK_COMMENT) { insert_comment(b, top(b), &tok); return; }
     if (tok.kind == TOK_TEXT) {
-        if (if_str_is_ws_only(tok.text)) { append_text(b, tok.text); return; }
+        IfStr rest = tok.text;
+        IfStr ws = peel_leading_ws(&rest); /* head 内の先頭空白は head に挿入（13.2.6.4.5） */
+        if (ws.n) append_text(b, ws);
+        if (!rest.n) return;
+        tok.text = rest;
         b->mode = M_AFTER_HEAD;
         pop_if(b, IF_TAG_HEAD);
         step(b, tok);
@@ -1397,12 +1480,15 @@ static void step_in_head(IfTB *b, IfTok tok) {
     }
     if (tok.kind == TOK_START) {
         switch (tok.tag) {
-        case IF_TAG_TITLE: case IF_TAG_STYLE: case IF_TAG_SCRIPT: case IF_TAG_TEXTAREA:
+        case IF_TAG_TITLE: case IF_TAG_STYLE: case IF_TAG_SCRIPT:
             insert_element(b, &tok, true);
             if_tok_set_raw(&b->tok, tok.tag);
             return;
-        case IF_TAG_META: case IF_TAG_LINK: case IF_TAG_PARAM: case IF_TAG_SOURCE: case IF_TAG_TRACK:
-        case IF_TAG_WBR: case IF_TAG_INPUT: case IF_TAG_IMG:
+        /* in-head の void 集合は仕様どおり base/basefont/bgsound/link/meta のみ。
+         * img/input/wbr/param/source/track/textarea は in-head 項目ではなく
+         * body 側へ流れる（tests19 の want 木で実測検証済み） */
+        case IF_TAG_BASE: case IF_TAG_BASEFONT: case IF_TAG_BGSOUND:
+        case IF_TAG_META: case IF_TAG_LINK:
             insert_element(b, &tok, false);
             return;
         case IF_TAG_HEAD:
@@ -1450,12 +1536,24 @@ static void step_in_head(IfTB *b, IfTok tok) {
 
 static void step_after_head(IfTB *b, IfTok tok) {
     if (tok.kind == TOK_COMMENT) { insert_comment(b, top(b), &tok); return; }
-    /* 仕様: after-head の空白は「現在ノード（=html）に挿入」。body を勝手に作らない
-     * （これを作ると直後の明示 <body> で二重 body になる——実際に発生した欠陥） */
-    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { append_text(b, tok.text); return; }
+    /* 仕様 13.2.6.4.6: after-head の空白は「現在ノード（=html）に挿入」。
+     * 混在テキストは先頭空白ランだけ挿入し、残りを anything-else 経路へ */
+    if (tok.kind == TOK_TEXT) {
+        IfStr rest = tok.text;
+        IfStr ws = peel_leading_ws(&rest);
+        if (ws.n) append_text(b, ws);
+        if (!rest.n) return;
+        tok.text = rest;
+        ensure_body(b);
+        b->frameset_ok = true; /* 暗黙 body: spec/html5lib は ok に戻す */
+        b->mode = M_IN_BODY;
+        step(b, tok);
+        return;
+    }
     if (tok.kind == TOK_START && tok.tag == IF_TAG_BODY) {
         ensure_html(b);
         while (b->depth && top(b)->tag == IF_TAG_HEAD) pop(b);
+        b->frameset_ok = false; /* 明示 body: not-ok（13.2.6.4.6） */
         if (b->body) {
             b->dom->n_errors++;
             merge_attrs(b, b->body, &tok);
@@ -1476,8 +1574,28 @@ static void step_after_head(IfTB *b, IfTok tok) {
         b->mode = M_IN_FRAMESET;
         return;
     }
-    if (tok.kind == TOK_START && tok.tag == IF_TAG_NOFRAMES) {
-        step_in_head(b, tok);
+    /* from-head 集合: head pointer を一時 push → in-head 規則で処理 → スタックから除去 */
+    if (tok.kind == TOK_START &&
+        (tok.tag == IF_TAG_BASE || tok.tag == IF_TAG_BASEFONT || tok.tag == IF_TAG_BGSOUND ||
+         tok.tag == IF_TAG_LINK || tok.tag == IF_TAG_META || tok.tag == IF_TAG_NOFRAMES ||
+         tok.tag == IF_TAG_SCRIPT || tok.tag == IF_TAG_STYLE || tok.tag == IF_TAG_TEMPLATE ||
+         tok.tag == IF_TAG_TITLE)) {
+        b->dom->n_errors++;
+        if (b->head) {
+            push(b, b->head);
+            step_in_head(b, tok);
+            remove_from_stack(b, b->head);
+        } else {
+            step_in_head(b, tok);
+        }
+        return;
+    }
+    if (tok.kind == TOK_END && tok.tag == IF_TAG_TEMPLATE) {
+        if (b->head) {
+            push(b, b->head);
+            step_in_head(b, tok);
+            remove_from_stack(b, b->head);
+        } else step_in_head(b, tok);
         return;
     }
     if (tok.kind == TOK_END && tok.tag == IF_TAG_HTML) {
@@ -1499,8 +1617,15 @@ static void step_after_head(IfTB *b, IfTok tok) {
 static void step_in_body(IfTB *b, IfTok tok) {
     switch (tok.kind) {
     case TOK_TEXT:
+        if (in_foreign_text(b)) {
+            /* foreign 直下の文字（13.2.6.5）: AFE 再構築なし。非空白混じりは not-ok */
+            append_text(b, tok.text);
+            if (!if_str_is_ws_only(tok.text)) b->frameset_ok = false;
+            return;
+        }
         afe_reconstruct(b); /* 書式の誤ネストをテキスト挿入前に修復（<b>x<p>y → y は b の中） */
         append_text(b, tok.text);
+        if (!if_str_is_ws_only(tok.text)) b->frameset_ok = false; /* 非空白は not-ok */
         return;
     case TOK_COMMENT:
         insert_comment_placed(b, &tok);
@@ -1529,6 +1654,10 @@ static void step_in_body(IfTB *b, IfTok tok) {
 
     if (tok.kind == TOK_START) {
         u16 t = tok.tag;
+        if (t == IF_TAG_IMAGE) { /* quirk（仕様）: <image> は parse error のうえ img として扱う */
+            b->dom->n_errors++;
+            tok.tag = t = IF_TAG_IMG;
+        }
         if (in_foreign(b, &tok)) { foreign_step(b, &tok); return; }
         if (t == IF_TAG_SVG || t == IF_TAG_MATH) { /* foreign ルート入域（属性も調整） */
             IfNode *n = make_element(b, &tok);
@@ -1546,14 +1675,35 @@ static void step_in_body(IfTB *b, IfTok tok) {
             if (b->html) merge_attrs(b, b->html, &tok);
             return;
         }
-        if (t == IF_TAG_BODY || t == IF_TAG_HEAD) { b->dom->n_errors++; return; }
-        /* table: 仕様どおり「p を閉じる → table を挿入・push → M_IN_TABLE」。
-         * frameset-ok の扱いは frameset モード実装時に台帳へ。 */
+        if (t == IF_TAG_BODY || t == IF_TAG_HEAD) {
+            /* 仕様 in-body body: parse error。2番目が body で template 無しなら
+             * 属性マージ + frameset-ok = not-ok。head は無視のみ */
+            b->dom->n_errors++;
+            if (t == IF_TAG_BODY && b->depth >= 2 && b->stack[1]->tag == IF_TAG_BODY &&
+                !has_open(b, IF_TAG_TEMPLATE)) {
+                b->frameset_ok = false;
+                merge_attrs(b, b->stack[1], &tok);
+            }
+            return;
+        }
+        /* in-body frameset（13.2.6.4.7）: frameset-ok が立つときだけ body を置換 */
+        if (t == IF_TAG_FRAMESET) {
+            b->dom->n_errors++;
+            if (b->depth < 2 || b->stack[1]->tag != IF_TAG_BODY) return;
+            if (!b->frameset_ok) return;
+            detach(b->stack[1]);         /* body を DOM から除去（子孫ごと切り離し） */
+            b->body = NULL;
+            while (b->depth > 1) pop(b); /* html 以外を畳む */
+            insert_element(b, &tok, true);
+            b->mode = M_IN_FRAMESET;
+            return;
+        }
         if (t == IF_TAG_TABLE) {
             close_p_if_open(b);
             insert_element(b, &tok, true);
             pend_reset(b);
             b->mode = M_IN_TABLE;
+            b->frameset_ok = false;
             return;
         }
         /* form: pointer が既にあれば重複を無視（ネスト form は DOM に出さない WHATWG） */
@@ -1569,8 +1719,16 @@ static void step_in_body(IfTB *b, IfTok tok) {
         /* select 関連（in-select 挿入モード を持たない最小近似）:
          * option→option、optgroup→option/optgroup は直前を閉じる（兄弟化）。
          * select の開始はネスト select を無視する（仕様の in-select select quirk） */
-        if (t == IF_TAG_SELECT && has_in_default_scope_tag(b, IF_TAG_SELECT)) {
-            b->dom->n_errors++;
+        if (t == IF_TAG_SELECT) {
+            b->frameset_ok = false;
+            if (has_in_default_scope_tag(b, IF_TAG_SELECT)) {
+                /* in-select モード未実装の近似: ネスト select は「終了タグ」として畳む */
+                b->dom->n_errors++;
+                pop_until(b, IF_TAG_SELECT);
+                return;
+            }
+            afe_reconstruct(b);
+            insert_element(b, &tok, true);
             return;
         }
         if (t == IF_TAG_OPTION) {
@@ -1598,15 +1756,41 @@ static void step_in_body(IfTB *b, IfTok tok) {
             afe_push(b, top(b));
             return;
         }
+        /* in-body の from-head void 集合: in-head 規則（reconstruct なし）で void insert */
+        if (t == IF_TAG_BASE || t == IF_TAG_BASEFONT || t == IF_TAG_BGSOUND ||
+            t == IF_TAG_LINK || t == IF_TAG_META) {
+            insert_element(b, &tok, false);
+            return;
+        }
+        /* button（13.2.6.4.7）: scope 内の button を畳む → reconstruct → 挿入 → not-ok */
+        if (t == IF_TAG_BUTTON) {
+            if (has_in_scope2(b, IF_TAG_BUTTON, SC_DEFAULT)) {
+                b->dom->n_errors++;
+                gen_implied(b, 0);
+                pop_until(b, IF_TAG_BUTTON);
+            }
+            afe_reconstruct(b);
+            insert_element(b, &tok, true);
+            b->frameset_ok = false;
+            return;
+        }
+        /* plaintext（13.2.6.4.7）: p を閉じる → 挿入 → PLAINTEXT（reconstruct/not-ok 無し） */
+        if (t == IF_TAG_PLAINTEXT) {
+            close_p_if_open(b);
+            insert_element(b, &tok, true);
+            b->tok.plaintext = 1;
+            return;
+        }
         if (closes_p(t)) close_p_if_open(b);
         /* スコープ障壁となる要素（object/applet/marquee）の開始で AFE に marker を挿入 */
         if ((t == IF_TAG_OBJECT || t == IF_TAG_APPLET || t == IF_TAG_MARQUEE) && !tok.self_closing) {
             insert_element(b, &tok, true);
             afe_insert_marker(b);
+            b->frameset_ok = false;
             return;
         }
-        if (t == IF_TAG_LI) implied_close(b, IF_TAG_LI, 0, IF_TAG_UL, IF_TAG_OL);
-        if (t == IF_TAG_DT || t == IF_TAG_DD) implied_close(b, IF_TAG_DT, IF_TAG_DD, IF_TAG_DL, 0);
+        if (t == IF_TAG_LI) { b->frameset_ok = false; implied_close(b, IF_TAG_LI, 0, IF_TAG_UL, IF_TAG_OL); }
+        if (t == IF_TAG_DT || t == IF_TAG_DD) { b->frameset_ok = false; implied_close(b, IF_TAG_DT, IF_TAG_DD, IF_TAG_DL, 0); }
         /* ruby 系: rb/rp/rt/rtc は ruby 文脈の implied end tags。
          * rtc は閉じない（rt は rtc の子として残る仕様）、rb/rp/rt は互いに閉じ合う。
          * ruby がスコープに無い時は通常要素として挿入（parse error なし近似は台帳） */
@@ -1634,12 +1818,40 @@ static void step_in_body(IfTB *b, IfTok tok) {
             insert_element(b, &tok, !tok.self_closing);
             return;
         }
-        /* pre/listing/xmp: 直後の LF 1 個を無視 */
-        if (t == IF_TAG_PRE || t == IF_TAG_LISTING || t == IF_TAG_XMP) b->skip_lf = 1;
-        if (t == IF_TAG_PLAINTEXT) b->tok.plaintext = 1;
+        /* pre/listing/xmp/textarea: 直後の LF 1 個を無視（textarea も仕様どおり） */
+        if (t == IF_TAG_PRE || t == IF_TAG_LISTING || t == IF_TAG_XMP || t == IF_TAG_TEXTAREA)
+            b->skip_lf = 1;
+        /* not-ok 化（startTag 規則群、html5lib 1.1 との差分検証済み） */
+        if (t == IF_TAG_PRE || t == IF_TAG_LISTING || t == IF_TAG_XMP || t == IF_TAG_TEXTAREA ||
+            t == IF_TAG_IFRAME)
+            b->frameset_ok = false;
+        if (t == IF_TAG_XMP) afe_reconstruct(b); /* rawtext 系で xmp のみ spec が要求 */
         if (t >= IF_TAG_H1 && t <= IF_TAG_H6) close_heading_if_open(b);
 
-        if (if_tag_is_void(t)) { insert_element(b, &tok, false); return; }
+        if (if_tag_is_void(t)) {
+            /* input: select-scope 規則 + type=hidden 以外で not-ok、reconstruct あり */
+            if (t == IF_TAG_INPUT) {
+                if (has_in_default_scope_tag(b, IF_TAG_SELECT)) {
+                    b->dom->n_errors++;
+                    pop_until(b, IF_TAG_SELECT);
+                }
+                afe_reconstruct(b);
+                IfStr ty = if_str(NULL, 0);
+                for (u32 i = 0; i < tok.n_attrs; i++)
+                    if (if_str_eq_ci(tok.attrs[i].name, IF_S("type"))) { ty = tok.attrs[i].value; break; }
+                if (!if_str_eq_ci(ty, IF_S("hidden"))) b->frameset_ok = false;
+            } else {
+                /* area/br/embed/img/keygen/wbr は not-ok + reconstruct（spec の共通形） */
+                if (t == IF_TAG_AREA || t == IF_TAG_BR || t == IF_TAG_EMBED ||
+                    t == IF_TAG_IMG || t == IF_TAG_KEYGEN || t == IF_TAG_WBR) {
+                    b->frameset_ok = false;
+                    afe_reconstruct(b);
+                }
+                if (t == IF_TAG_HR) b->frameset_ok = false;
+            }
+            insert_element(b, &tok, false);
+            return;
+        }
         if (rawish(t)) {
             insert_element(b, &tok, true);
             if_tok_set_raw(&b->tok, t);
@@ -1676,9 +1888,7 @@ static void step_in_body(IfTB *b, IfTok tok) {
     if (is_formatting(t)) { adoption(b, t); return; }
     if (t == IF_TAG_P) {
         /* button スコープに p が無ければ空 p を挿入してから畳む（仕様の quirk 完結形） */
-        static const u16 BS[] = { IF_TAG_HTML, IF_TAG_TEMPLATE, IF_TAG_MARQUEE,
-                                  IF_TAG_OBJECT, IF_TAG_APPLET, IF_TAG_BUTTON };
-        if (!has_in_scope(b, IF_TAG_P, BS, (u32)(sizeof BS / sizeof BS[0]))) {
+        if (!has_in_scope2(b, IF_TAG_P, SC_BUTTON)) {
             b->dom->n_errors++;
             IfTok p = { .kind = TOK_START, .tag = IF_TAG_P };
             insert_element(b, &p, true);
@@ -1688,16 +1898,11 @@ static void step_in_body(IfTB *b, IfTok tok) {
     }
     /* li: list-item スコープ（既定 + ol/ul で遮断）・dd/dt: 既定スコープで except-self implied */
     if (t == IF_TAG_LI) {
-        static const u16 LS[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
-                                  IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT,
-                                  IF_TAG_TEMPLATE, IF_TAG_OL, IF_TAG_UL };
-        end_in_scope(b, t, LS, (u32)(sizeof LS / sizeof LS[0]), true);
+        end_in_scope(b, t, SC_LIST_ITEM, true);
         return;
     }
     if (t == IF_TAG_DD || t == IF_TAG_DT) {
-        static const u16 DS[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
-                                  IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT, IF_TAG_TEMPLATE };
-        end_in_scope(b, t, DS, (u32)(sizeof DS / sizeof DS[0]), true);
+        end_in_scope(b, t, SC_DEFAULT, true);
         return;
     }
     /* h1..h6: implied 生成 → どれかの heading まで畳む */
@@ -1720,12 +1925,9 @@ static void step_in_body(IfTB *b, IfTok tok) {
     case IF_TAG_MENU: case IF_TAG_NAV: case IF_TAG_OL: case IF_TAG_PRE:
     case IF_TAG_SECTION: case IF_TAG_UL:
     case IF_TAG_DETAILS: case IF_TAG_DIALOG: case IF_TAG_HGROUP: case IF_TAG_SEARCH:
-    case IF_TAG_SUMMARY: {
-        static const u16 DS[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
-                                  IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT, IF_TAG_TEMPLATE };
-        end_in_scope(b, t, DS, (u32)(sizeof DS / sizeof DS[0]), false);
+    case IF_TAG_SUMMARY:
+        end_in_scope(b, t, SC_DEFAULT, false);
         return;
-    }
     default:
         break;
     }
@@ -1824,6 +2026,7 @@ IfDom *if_parse_html(IfArena *arena, IfStr input) {
     b.arena = arena;
     b.dom = dom;
     b.mode = M_INITIAL;
+    b.frameset_ok = true; /* WHATWG: 初期値 "ok" */
     if_tok_init(&b.tok, arena, input);
 
     while (!b.stopped) {

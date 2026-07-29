@@ -69,6 +69,8 @@ static const struct { const char *s; u8 n; u8 flags; } IF_TAGS[IF_TAG_N_TAGS] = 
     {"hgroup",6,0},
     {"search",6,0},
     {"summary",7,0},
+    {"bgsound",7,F_VOID}, /* in-head の void。WPT tests19 */
+    {"image",5,0},        /* in-body で img へ改名される quirk 入力 */
 };
 
 const char *if_tag_name(u16 tag) {

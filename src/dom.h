@@ -42,6 +42,8 @@ typedef enum {
     IF_TAG_TEMPLATE, /* WPT で頻出。末尾追加（既存タグ ID の安定性を守る） */
     IF_TAG_NOBR,     /* AAA (adoption agency) の対象書式要素。末尾追加 */
     IF_TAG_DETAILS, IF_TAG_DIALOG, IF_TAG_HGROUP, IF_TAG_SEARCH, IF_TAG_SUMMARY,
+    IF_TAG_BGSOUND, /* in-head の void（tests19: <bgsound> は head の子） */
+    IF_TAG_IMAGE,   /* in-body で img へ改名（<image/> WPT quirk）。末尾追加 */
     IF_TAG_N_TAGS
 } IfTag;
 

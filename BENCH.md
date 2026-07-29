@@ -79,6 +79,8 @@ slice-2 のコスト分析（正直な注記）:
     （cp1==0xFFFF 時のみ cp2 を aux32 index とするエスケープ）+ NUL 除去 blob で
     **30.8 KB**（−25%）。bsearch 形は維持（正確性・監査性を速度無関係に優先）。
   - ストレス 2MB 文書 total 86 → 93〜94 ms（+8%）: AAA と実体参照解決のコスト。
+    88.1% 到達時点で 98 ms（+14% 累計）: scope バリアの ns 判定と frameset-ok 規則の追加。
+    render 支配項は不変で、parse 側の per-token 判定増が約 +4 ms。
     支配項は render フェーズのまま（変わらず）。parse 9.8 ms の増分は大きくない。
   - small 文書 avg は 1〜2 ms で揺れる（±1ms はこのコンテナのノイズ床）。
   - 空タブ VmHWM 1,428 → 1,732 KB: .rodata のエンティティ表への初回ページインと
