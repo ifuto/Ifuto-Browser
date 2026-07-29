@@ -224,14 +224,23 @@ static void paint(IfTui *t, IfChrome *c, i32 vh) {
     } else {
         out_s(t, " Ifuto Browser v0 — o: open · ?: keys");
     }
-    /* 右側: タブ文書メモリ（C1 正確計装）＋ RSS */
+    /* 右側: タブ文書メモリ（C1 正確計装）＋ RSS。
+     * RSS は整数 MB だと 0.88MB→"0MB" と見せてしまう（嘘に等しい）ので
+     * 10MB 未満は KB 表示とする */
     out_s(t, "\x1b[0m\x1b[7m");
     u64 db = if_chrome_cur_doc_bytes(c);
     out_s(t, " mem ");
     out_num(t, (i64)(db / 1024));
     out_s(t, "KB rss ");
-    out_num(t, (i64)(rss_hwm_kb() / 1024));
-    out_s(t, "MB tabs ");
+    u64 rss = rss_hwm_kb();
+    if (rss >= 10UL * 1024) {
+        out_num(t, (i64)(rss / 1024));
+        out_s(t, "MB");
+    } else {
+        out_num(t, (i64)rss);
+        out_s(t, "KB");
+    }
+    out_s(t, " tabs ");
     out_num(t, c->n_tabs);
     out_cat(t, " ", 1);
     clear_eol(t);
