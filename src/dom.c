@@ -63,6 +63,12 @@ static const struct { const char *s; u8 n; u8 flags; } IF_TAGS[IF_TAG_N_TAGS] = 
     {"basefont",8,F_VOID},
     {"keygen",6,F_VOID},
     {"template",8,0},
+    {"nobr",4,0},
+    {"details",7,0},
+    {"dialog",6,0},
+    {"hgroup",6,0},
+    {"search",6,0},
+    {"summary",7,0},
 };
 
 const char *if_tag_name(u16 tag) {

@@ -43,6 +43,10 @@ typedef struct {
     /* stack of template insertion modes（template がネストするごとに積む平行スタック） */
     u8 tpl_modes[64];
     u32 n_tpl;
+    /* list of active formatting elements（AFE）。marker=true はスコープ境界
+     * （td/th/caption/template/object/applet/marquee で挿入） */
+    struct IfAfE { IfNode *n; bool marker; } *afe;
+    u32 n_afe, afe_cap;
 } IfTB;
 
 static IfNode *new_node(IfTB *b, IfNodeKind kind) {
@@ -64,6 +68,18 @@ static IfNode *top(IfTB *b);
 static void pop(IfTB *b);
 static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok);
 static void insert_comment_placed(IfTB *b, const IfTok *tok);
+static void gen_implied(IfTB *b, u16 except);
+static void pop_until(IfTB *b, u16 tag);
+static bool has_in_scope(IfTB *b, u16 tag, const u16 *stops, u32 nstops);
+static bool is_formatting(u16 t);
+static void afe_reconstruct(IfTB *b);
+static void afe_push(IfTB *b, IfNode *n);
+static void afe_insert_marker(IfTB *b);
+static void afe_clear_to_marker(IfTB *b);
+static bool has_in_default_scope_tag(IfTB *b, u16 tag);
+static void adoption(IfTB *b, u16 tag);
+static void any_other_end_tag(IfTB *b, u16 tag);
+static bool has_open(IfTB *b, u16 tag);
 
 /* before の直前に挿入（foster parenting の「table の兄」経路で必要） */
 static void insert_child_before(IfNode *parent, IfNode *child, IfNode *before) {
@@ -175,6 +191,8 @@ static bool closes_p(u16 t) {
     case IF_TAG_FORM: case IF_TAG_FIGURE: case IF_TAG_FIGCAPTION: case IF_TAG_ADDRESS:
     case IF_TAG_ARTICLE: case IF_TAG_ASIDE: case IF_TAG_FOOTER: case IF_TAG_HEADER:
     case IF_TAG_HR: case IF_TAG_MAIN: case IF_TAG_NAV: case IF_TAG_SECTION: case IF_TAG_CENTER:
+    case IF_TAG_DETAILS: case IF_TAG_DIALOG: case IF_TAG_HGROUP: case IF_TAG_SEARCH:
+    case IF_TAG_SUMMARY:
     case IF_TAG_LISTING: case IF_TAG_PLAINTEXT: case IF_TAG_XMP: case IF_TAG_FIELDSET:
     case IF_TAG_DIR: case IF_TAG_MENU:
         return true;
@@ -188,10 +206,16 @@ static bool has_open(IfTB *b, u16 tag) {
     return false;
 }
 
+/* 「p を閉じる」: button スコープで p が見えるときのみ（html/template/marquee/object/applet
+ * で遮断。無ければ何もしない = 仕様の if-in-button-scope 条件）。閉じるときは
+ * implied end tags を生成してから p まで畳む（WHATWG "close a p element"）。 */
 static void close_p_if_open(IfTB *b) {
-    if (has_open(b, IF_TAG_P))
-        while (b->depth && top(b)->tag != IF_TAG_P) pop(b);
-    pop_if(b, IF_TAG_P);
+    static const u16 BS[] = { IF_TAG_HTML, IF_TAG_TEMPLATE, IF_TAG_MARQUEE,
+                              IF_TAG_OBJECT, IF_TAG_APPLET, IF_TAG_BUTTON };
+    if (!has_in_scope(b, IF_TAG_P, BS, (u32)(sizeof BS / sizeof BS[0]))) return;
+    gen_implied(b, IF_TAG_P); /* except=p（自身は畳まない） */
+    if (top(b)->tag != IF_TAG_P) b->dom->n_errors++;
+    pop_until(b, IF_TAG_P);
 }
 
 /* li/dt/dd の暗黙終了: 同名タグを積み遡り、バリアに当たらなければそこまで pop */
@@ -342,6 +366,7 @@ static bool has_open(IfTB *b, u16 tag);
 
 /* template の開始: 要素+content フラグメントを作り、template 挿入モードを推して遷移 */
 static void tpl_start(IfTB *b, const IfTok *tok) {
+    afe_insert_marker(b);
     insert_element(b, tok, true);
     IfNode *t = top(b);
     if (!t->content) t->content = new_node(b, IF_NODE_DOCUMENT);
@@ -365,7 +390,7 @@ static void tpl_end(IfTB *b) {
     gen_implied_thorough(b);
     if (top(b)->tag != IF_TAG_TEMPLATE) b->dom->n_errors++;
     pop_until(b, IF_TAG_TEMPLATE);
-    /* AFE マーカー消去は B2 */
+    afe_clear_to_marker(b);
     if (b->n_tpl) b->n_tpl--;
     reset_mode(b);
 }
@@ -409,7 +434,390 @@ static void close_cell(IfTB *b) {
         if (top(b)->tag != IF_TAG_TH) b->dom->n_errors++;
         pop_until(b, IF_TAG_TH);
     }
+    afe_clear_to_marker(b);
     b->mode = M_IN_ROW;
+}
+
+/* ================= AFE (active formatting elements) + AAA =================
+ * WHATWG 12.2.6.4 "active formatting elements" / 12.2.6.5 "adoption agency"。
+ * 書式要素 (a,b,big,code,em,font,i,nobr,s,small,strike,strong,tt,u) の
+ * 誤ネストを「クローンで再構成」し、終了タグでは adoption agency で修復する。
+ */
+
+static bool is_formatting(u16 t) {
+    switch (t) {
+    case IF_TAG_A: case IF_TAG_B: case IF_TAG_BIG: case IF_TAG_CODE: case IF_TAG_EM:
+    case IF_TAG_FONT: case IF_TAG_I: case IF_TAG_NOBR: case IF_TAG_S: case IF_TAG_SMALL:
+    case IF_TAG_STRIKE: case IF_TAG_STRONG: case IF_TAG_TT: case IF_TAG_U:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* "special element" カテゴリ（AAA の furthest block 判定・any-other-end の barrier） */
+static bool is_special(const IfNode *n) {
+    if (n->kind != IF_NODE_ELEMENT) return false;
+    if (n->ns == IF_NS_MATHML) {
+        switch (n->tag) {
+        case IF_TAG_MI: case IF_TAG_MO: case IF_TAG_MN: case IF_TAG_MS:
+        case IF_TAG_MTEXT: case IF_TAG_ANNOTATION_XML:
+            return true;
+        default: return false;
+        }
+    }
+    if (n->ns == IF_NS_SVG) {
+        return n->tag == IF_TAG_FOREIGNOBJECT || n->tag == IF_TAG_DESC || n->tag == IF_TAG_TITLE;
+    }
+    switch (n->tag) {
+    case IF_TAG_ADDRESS: case IF_TAG_APPLET: case IF_TAG_AREA: case IF_TAG_ARTICLE:
+    case IF_TAG_ASIDE: case IF_TAG_BASE: case IF_TAG_BASEFONT: case IF_TAG_BLOCKQUOTE:
+    case IF_TAG_BODY: case IF_TAG_BR: case IF_TAG_BUTTON: case IF_TAG_CAPTION:
+    case IF_TAG_CENTER: case IF_TAG_COL: case IF_TAG_COLGROUP: case IF_TAG_DD:
+    case IF_TAG_DIR: case IF_TAG_DIV: case IF_TAG_DL: case IF_TAG_DT: case IF_TAG_EMBED:
+    case IF_TAG_FIELDSET: case IF_TAG_FIGCAPTION: case IF_TAG_FIGURE: case IF_TAG_FOOTER:
+    case IF_TAG_FORM: case IF_TAG_FRAME: case IF_TAG_FRAMESET:
+    case IF_TAG_H1: case IF_TAG_H2: case IF_TAG_H3: case IF_TAG_H4: case IF_TAG_H5: case IF_TAG_H6:
+    case IF_TAG_HEAD: case IF_TAG_HEADER: case IF_TAG_HR: case IF_TAG_HTML:
+    case IF_TAG_IFRAME: case IF_TAG_IMG: case IF_TAG_INPUT: case IF_TAG_KEYGEN:
+    case IF_TAG_LI: case IF_TAG_LINK: case IF_TAG_LISTING: case IF_TAG_MAIN:
+    case IF_TAG_MARQUEE: case IF_TAG_MENU: case IF_TAG_META: case IF_TAG_NAV:
+    case IF_TAG_NOEMBED: case IF_TAG_NOFRAMES: case IF_TAG_NOSCRIPT: case IF_TAG_OBJECT:
+    case IF_TAG_OL: case IF_TAG_P: case IF_TAG_PARAM: case IF_TAG_PLAINTEXT:
+    case IF_TAG_PRE: case IF_TAG_SCRIPT: case IF_TAG_SECTION: case IF_TAG_SELECT:
+    case IF_TAG_SOURCE: case IF_TAG_STYLE: case IF_TAG_TABLE: case IF_TAG_TBODY:
+    case IF_TAG_TD: case IF_TAG_TEMPLATE: case IF_TAG_TEXTAREA: case IF_TAG_TFOOT:
+    case IF_TAG_DETAILS: case IF_TAG_DIALOG: case IF_TAG_HGROUP: case IF_TAG_SEARCH:
+    case IF_TAG_SUMMARY:
+    case IF_TAG_TH: case IF_TAG_THEAD: case IF_TAG_TITLE: case IF_TAG_TR:
+    case IF_TAG_TRACK: case IF_TAG_UL: case IF_TAG_WBR: case IF_TAG_XMP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static i32 stack_find_node(const IfTB *b, const IfNode *n) {
+    for (i32 i = (i32)b->depth - 1; i >= 0; i--)
+        if (b->stack[i] == n) return i;
+    return -1;
+}
+
+/* 既定スコープ: applet/caption/html/table/td/th/marquee/object/template で遮断 */
+static bool node_in_default_scope(const IfTB *b, const IfNode *n) {
+    static const u16 S[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
+                             IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT, IF_TAG_TEMPLATE };
+    for (u32 i = b->depth; i > 0; i--) {
+        IfNode *x = b->stack[i - 1];
+        if (x == n) return true;
+        if (tag_in(x->tag, S, (u32)(sizeof S / sizeof S[0]))) return false;
+    }
+    return false;
+}
+
+static bool has_in_default_scope_tag(IfTB *b, u16 tag) {
+    static const u16 S[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
+                             IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT, IF_TAG_TEMPLATE };
+    return has_in_scope(b, tag, S, (u32)(sizeof S / sizeof S[0]));
+}
+
+static bool attrs_equal(const IfNode *a, const IfNode *b2) {
+    if (a->n_attrs != b2->n_attrs) return false;
+    for (u32 i = 0; i < a->n_attrs; i++) {
+        bool hit = false;
+        for (u32 j = 0; j < b2->n_attrs; j++) {
+            if (if_str_eq_ci(a->attrs[i].name, b2->attrs[j].name)
+                && if_str_eq_ci(a->attrs[i].value, b2->attrs[j].value)) { hit = true; break; }
+        }
+        if (!hit) return false;
+    }
+    return true;
+}
+
+/* AFE 配列の容量確保（IfTB::afe_cap を単一の真実として grow に渡す） */
+static void afe_ensure(IfTB *b) {
+    if (b->n_afe < b->afe_cap) return;
+    u64 cap = b->afe_cap;
+    b->afe = (struct IfAfE *)if_arena_grow(b->arena, b->afe, &cap, b->n_afe + 1, sizeof b->afe[0]);
+    b->afe_cap = (u32)cap;
+}
+
+/* AFE リスト末尾へ push。Noah's Ark: 同一 tag/ns/attrs の未閉鎖が 3 件目で最古を除去 */
+static void afe_push(IfTB *b, IfNode *n) {
+    u32 eq = 0;
+    i32 oldest = -1;
+    for (i32 i = (i32)b->n_afe - 1; i >= 0; i--) {
+        if (b->afe[i].marker) break;
+        IfNode *x = b->afe[i].n;
+        if (x->tag == n->tag && x->ns == n->ns && attrs_equal(x, n)) {
+            eq++;
+            if (oldest < 0) oldest = i;
+            else oldest = i; /* 下へ行くほど古い */
+        }
+    }
+    if (eq >= 3) { /* 3 件規則: 最古（最小 index）を除去 */
+        memmove(&b->afe[oldest], &b->afe[oldest + 1], (size_t)(b->n_afe - (u32)oldest - 1) * sizeof b->afe[0]);
+        b->n_afe--;
+    }
+    afe_ensure(b);
+    b->afe[b->n_afe].n = n;
+    b->afe[b->n_afe].marker = false;
+    b->n_afe++;
+}
+
+static void afe_insert_marker(IfTB *b) {
+    IfNode *sentinel = b->dom->root; /* marker は「ノードではない」ので root を番兵に */
+    afe_ensure(b);
+    b->afe[b->n_afe].n = sentinel;
+    b->afe[b->n_afe].marker = true;
+    b->n_afe++;
+}
+
+static void afe_clear_to_marker(IfTB *b) {
+    while (b->n_afe && !b->afe[b->n_afe - 1].marker) b->n_afe--;
+    if (b->n_afe) b->n_afe--; /* marker 自体も除去 */
+}
+
+static i32 afe_find_tag(const IfTB *b, u16 tag) {
+    for (i32 i = (i32)b->n_afe - 1; i >= 0; i--) {
+        if (b->afe[i].marker) return -1;
+        if (b->afe[i].n->tag == tag) return i;
+    }
+    return -1;
+}
+
+static bool afe_has_node(const IfTB *b, const IfNode *n) {
+    for (i32 i = (i32)b->n_afe - 1; i >= 0; i--) {
+        if (b->afe[i].marker) return false;
+        if (b->afe[i].n == n) return true;
+    }
+    return false;
+}
+
+static void afe_remove_at(IfTB *b, u32 i) {
+    if (i >= b->n_afe) return;
+    memmove(&b->afe[i], &b->afe[i + 1], (size_t)(b->n_afe - i - 1) * sizeof b->afe[0]);
+    b->n_afe--;
+}
+
+/* 要素の浅コピー（clone 用）: tag/attrs を arena に複製。子・style は引き継がない */
+static IfNode *clone_element(IfTB *b, const IfNode *src) {
+    IfNode *c = new_node(b, IF_NODE_ELEMENT);
+    c->tag = src->tag;
+    c->ns = src->ns;
+    c->tag_name = src->tag_name;
+    if (src->n_attrs) {
+        c->attrs = (IfAttr *)if_arena_alloc(b->arena, (u64)src->n_attrs * sizeof(IfAttr));
+        memcpy(c->attrs, src->attrs, (u64)src->n_attrs * sizeof(IfAttr));
+        c->n_attrs = src->n_attrs;
+    }
+    return c;
+}
+
+/* DOM 上の親子リストから外す（AAA でノードを移動するときの detach） */
+static void detach(IfNode *n) {
+    IfNode *p = n->parent;
+    if (!p) return;
+    if (p->first_child == n) {
+        p->first_child = n->next_sibling;
+        if (p->last_child == n) p->last_child = NULL;
+    } else {
+        IfNode *x = p->first_child;
+        while (x && x->next_sibling != n) x = x->next_sibling;
+        if (x) x->next_sibling = n->next_sibling;
+        if (p->last_child == n) p->last_child = x;
+    }
+    n->parent = NULL;
+    n->next_sibling = NULL;
+}
+
+static void move_children(IfNode *src, IfNode *dst) {
+    IfNode *c = src->first_child;
+    while (c) {
+        IfNode *nx = c->next_sibling;
+        c->parent = NULL;
+        c->next_sibling = NULL;
+        append_child(dst, c);
+        c = nx;
+    }
+    src->first_child = src->last_child = NULL;
+}
+
+/* 適切な挿入位置を「任意 target に対して」計算（AAA の再 anchor で使用） */
+static IfPlace place_for(IfTB *b, IfNode *target) {
+    IfPlace r = { target, NULL };
+    if (target->tag == IF_TAG_TEMPLATE && target->content) r.parent = target->content;
+    switch (target->tag) {
+    case IF_TAG_TABLE: case IF_TAG_TBODY: case IF_TAG_TFOOT:
+    case IF_TAG_THEAD: case IF_TAG_TR: {
+        i32 iti = -1, ita = -1;
+        for (i32 i = (i32)b->depth - 1; i >= 0; i--) {
+            if (iti < 0 && b->stack[i]->tag == IF_TAG_TEMPLATE) iti = i;
+            if (ita < 0 && b->stack[i]->tag == IF_TAG_TABLE) ita = i;
+        }
+        if (iti >= 0 && (ita < 0 || iti > ita)) {
+            IfNode *t = b->stack[iti];
+            r.parent = t->content ? t->content : t;
+            r.before = NULL;
+            return r;
+        }
+        if (ita < 0) {
+            r.parent = b->body ? b->body : (b->html ? b->html : target);
+            return r;
+        }
+        IfNode *tab = b->stack[ita];
+        if (tab->parent) { r.parent = tab->parent; r.before = tab; return r; }
+        r.parent = ita > 0 ? b->stack[ita - 1] : b->dom->root;
+        return r;
+    }
+    default:
+        return r;
+    }
+}
+
+static void insert_at_place(IfPlace pl, IfNode *n) {
+    if (pl.before) insert_child_before(pl.parent, n, pl.before);
+    else append_child(pl.parent, n);
+}
+
+/* AFE の再構成: 未クローズ書式をクローンし直して現在位置に開き直す */
+static void afe_reconstruct(IfTB *b) {
+    if (!b->n_afe) return;
+    u32 i = b->n_afe - 1;
+    if (b->afe[i].marker || stack_find_node(b, b->afe[i].n) >= 0) return;
+    u32 start = 0;
+    for (i32 k = (i32)i - 1; k >= 0; k--) {
+        if (b->afe[k].marker || stack_find_node(b, b->afe[k].n) >= 0) { start = (u32)k + 1; break; }
+    }
+    for (u32 k = start; k < b->n_afe; k++) {
+        IfNode *c = clone_element(b, b->afe[k].n);
+        append_placed(b, c);
+        push(b, c);
+        b->afe[k].n = c;
+    }
+}
+
+/* any other end tag（AAA の step (a) と in-body fallback の共通形） */
+static void any_other_end_tag(IfTB *b, u16 tag) {
+    for (i32 i = (i32)b->depth - 1; i >= 0; i--) {
+        IfNode *node = b->stack[i];
+        if (node->tag == tag && node->ns == IF_NS_HTML) {
+            gen_implied(b, tag);
+            if (top(b)->tag != tag) b->dom->n_errors++;
+            while (b->depth > (u32)i) pop(b);
+            return;
+        }
+        if (is_special(node)) { b->dom->n_errors++; return; } /* barrier: 無視 */
+    }
+    b->dom->n_errors++;
+}
+
+/* in-body 明示終了: scope で見えていれば implied end tags 生成 → そこまで畳む。
+ * （address/div/ol/pre 等のブロック群・li・dd/dt の共通形） */
+static void end_in_scope(IfTB *b, u16 tag, const u16 *stops, u32 nstops, bool except_self) {
+    if (!has_in_scope(b, tag, stops, nstops)) { b->dom->n_errors++; return; }
+    gen_implied(b, except_self ? tag : 0);
+    if (top(b)->tag != tag) b->dom->n_errors++;
+    pop_until(b, tag);
+}
+
+static void end_hgroup(IfTB *b) {
+    static const u16 H[] = { IF_TAG_H1, IF_TAG_H2, IF_TAG_H3, IF_TAG_H4, IF_TAG_H5, IF_TAG_H6 };
+    bool any = false;
+    for (u32 k = 0; k < 6; k++) if (has_open(b, H[k])) { any = true; break; }
+    if (!any) { b->dom->n_errors++; return; }
+    gen_implied(b, 0);
+    u16 tt = top(b)->tag;
+    if (tt < IF_TAG_H1 || tt > IF_TAG_H6) b->dom->n_errors++;
+    for (u32 k = 0; k < 6 && b->depth; k++) {
+        /* h1..h6 のどれかが出るまで畳む */
+        if (top(b)->tag >= IF_TAG_H1 && top(b)->tag <= IF_TAG_H6) { pop(b); break; }
+        pop(b);
+    }
+}
+
+/* adoption agency algorithm（outer ≤ 8, inner ≤ 3 の仕様打ち切り込み） */
+static void adoption(IfTB *b, u16 tag) {
+    if (b->depth && top(b)->tag == tag && !afe_has_node(b, top(b))) { pop(b); return; }
+    for (u32 outer = 0; outer < 8; outer++) {
+        i32 fi = afe_find_tag(b, tag);
+        if (fi < 0) { any_other_end_tag(b, tag); return; }
+        IfNode *fe = b->afe[fi].n;
+        i32 fs = stack_find_node(b, fe);
+        if (fs < 0) { b->dom->n_errors++; afe_remove_at(b, (u32)fi); return; }
+        if (!node_in_default_scope(b, fe)) { b->dom->n_errors++; return; }
+        if (fe != top(b)) b->dom->n_errors++;
+        /* furthest block: fe より上（index 大）で最も遠い special 要素 */
+        i32 fb = -1;
+        for (u32 i = (u32)fs + 1; i < b->depth; i++)
+            if (is_special(b->stack[i])) fb = (i32)i;
+        if (fb < 0) {
+            while (b->depth > (u32)fs) pop(b);
+            afe_remove_at(b, (u32)fi);
+            return;
+        }
+        IfNode *furthest = b->stack[fb];
+        IfNode *ancestor = (fs > 0) ? b->stack[fs - 1] : b->dom->root;
+        IfNode *node = furthest, *lastNode = furthest;
+        u32 inner = 0;
+        i32 ni = fb;
+        while (1) {
+            inner++;
+            if (inner > 3) break; /* 仕様の打ち切り。残りの未処理は後段の共通処理で拾う */
+            /* node を formatting element 方向（index 減）へ一段進める */
+            ni--;
+            if (ni < 0) break;
+            node = b->stack[ni];
+            if (node == fe) break; /* inner loop 終端 */
+            i32 n_ai = -1;
+            for (i32 k = (i32)b->n_afe - 1; k >= 0; k--) {
+                if (b->afe[k].marker) break;
+                if (b->afe[k].n == node) { n_ai = k; break; }
+            }
+            if (inner > 3 && n_ai >= 0) { afe_remove_at(b, (u32)n_ai); n_ai = -1; }
+            if (n_ai < 0) {
+                /* list に無い node: stack から除いて inner 継続（lastNode は更新しない） */
+                memmove(&b->stack[ni], &b->stack[ni + 1],
+                        (size_t)(b->depth - (u32)ni - 1) * sizeof b->stack[0]);
+                b->depth--;
+                ni++; /* index ずれ補正 */
+                continue;
+            }
+            IfNode *clone = clone_element(b, node);
+            b->afe[n_ai].n = clone;
+            b->stack[ni] = clone;
+            node = clone;
+            /* lastNode を node の子に移す */
+            detach(lastNode);
+            append_child(node, lastNode);
+            lastNode = node;
+        }
+        /* lastNode を「common ancestor を起点にした適切位置」へ anchor し直す */
+        detach(lastNode);
+        insert_at_place(place_for(b, ancestor), lastNode);
+        /* formatting element のクローンを作り、furthest block の全子を移して furthest へ */
+        IfNode *fclone = clone_element(b, fe);
+        move_children(furthest, fclone);
+        append_child(furthest, fclone);
+        /* fe を AFE/stack から除去し、fclone を同步位置（furthest の直下）に入れる */
+        afe_remove_at(b, (u32)fi);
+        memmove(&b->stack[fs], &b->stack[fs + 1],
+                (size_t)(b->depth - (u32)fs - 1) * sizeof b->stack[0]);
+        b->depth--;
+        /* stack: furthest の直後（=id_x of furthest + 1）に fclone を挿入 */
+        i32 bi = stack_find_node(b, furthest);
+        if (bi < 0) bi = (i32)b->depth - 1;
+        /* push of stack below furthest は「furthest の一つ上」=furthest の子として扱う位置 */
+        (void)bi;
+        push(b, fclone);
+        /* AFE: fe の位置に fclone を挿入（bookmark 相当） */
+        afe_ensure(b);
+        u32 pos = (u32)fi <= b->n_afe ? (u32)fi : b->n_afe;
+        memmove(&b->afe[pos + 1], &b->afe[pos], (size_t)(b->n_afe - pos) * sizeof b->afe[0]);
+        b->afe[pos].n = fclone;
+        b->afe[pos].marker = false;
+        b->n_afe++;
+    }
 }
 
 static IfTok synth_start(u16 tag) {
@@ -452,7 +860,8 @@ static void step_in_table(IfTB *b, IfTok tok) {
         switch (tok.tag) {
         case IF_TAG_CAPTION:
             clear_back(b, C_TABLE, C_TABLE_N);
-            insert_element(b, &tok, true); /* AFE marker は B2 で挿入 */
+            afe_insert_marker(b);
+            insert_element(b, &tok, true);
             b->mode = M_IN_CAPTION;
             return;
         case IF_TAG_COLGROUP:
@@ -685,7 +1094,8 @@ static void step_in_row(IfTB *b, IfTok tok) {
         switch (tok.tag) {
         case IF_TAG_TD: case IF_TAG_TH:
             clear_back(b, C_TR, C_TR_N);
-            insert_element(b, &tok, true); /* AFE marker は B2 */
+            afe_insert_marker(b);
+            insert_element(b, &tok, true);
             b->mode = M_IN_CELL;
             return;
         case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
@@ -734,6 +1144,7 @@ static void step_in_cell(IfTB *b, IfTok tok) {
         gen_implied(b, tok.tag);
         if (top(b)->tag != tok.tag) b->dom->n_errors++;
         pop_until(b, tok.tag);
+        afe_clear_to_marker(b);
         b->mode = M_IN_ROW;
         return;
     }
@@ -1021,6 +1432,7 @@ static void step_after_head(IfTB *b, IfTok tok) {
 static void step_in_body(IfTB *b, IfTok tok) {
     switch (tok.kind) {
     case TOK_TEXT:
+        afe_reconstruct(b); /* 書式の誤ネストをテキスト挿入前に修復（<b>x<p>y → y は b の中） */
         append_text(b, tok.text);
         return;
     case TOK_COMMENT:
@@ -1087,7 +1499,25 @@ static void step_in_body(IfTB *b, IfTok tok) {
         }
         /* template: content 分離 + template 挿入モードへ（in-body/他モード共通の規則） */
         if (t == IF_TAG_TEMPLATE) { tpl_start(b, &tok); return; }
+        /* 書式要素: reconstruct → 挿入 → AFE へ。nobr は二重 nobr の仕様 quirk 込み */
+        if (is_formatting(t)) {
+            afe_reconstruct(b);
+            if (t == IF_TAG_NOBR && has_in_default_scope_tag(b, IF_TAG_NOBR)) {
+                b->dom->n_errors++;
+                adoption(b, IF_TAG_NOBR);
+                afe_reconstruct(b);
+            }
+            insert_element(b, &tok, true);
+            afe_push(b, top(b));
+            return;
+        }
         if (closes_p(t)) close_p_if_open(b);
+        /* スコープ障壁となる要素（object/applet/marquee）の開始で AFE に marker を挿入 */
+        if ((t == IF_TAG_OBJECT || t == IF_TAG_APPLET || t == IF_TAG_MARQUEE) && !tok.self_closing) {
+            insert_element(b, &tok, true);
+            afe_insert_marker(b);
+            return;
+        }
         if (t == IF_TAG_LI) implied_close(b, IF_TAG_LI, 0, IF_TAG_UL, IF_TAG_OL);
         if (t == IF_TAG_DT || t == IF_TAG_DD) implied_close(b, IF_TAG_DT, IF_TAG_DD, IF_TAG_DL, 0);
         /* ruby 系: rp/rt/rtc は implied end tags（近似: p のみ閉じる） */
@@ -1103,6 +1533,8 @@ static void step_in_body(IfTB *b, IfTok tok) {
             if_tok_set_raw(&b->tok, t);
             return;
         }
+        /* "anything else" start: spec は reconstruct → insert */
+        if (!tok.self_closing) afe_reconstruct(b);
         insert_element(b, &tok, !tok.self_closing);
         return;
     }
@@ -1128,22 +1560,65 @@ static void step_in_body(IfTB *b, IfTok tok) {
         return;
     }
     if (t == IF_TAG_TEMPLATE) { tpl_end(b); return; }
-    if (t == IF_TAG_P && !has_open(b, IF_TAG_P)) {
-        /* 開いていない </p> → 空の p を挿入して閉じる（仕様準拠の小qirk） */
-        IfTok p = { .kind = TOK_START, .tag = IF_TAG_P };
-        insert_element(b, &p, false);
+    /* 書式要素の終了: adoption agency（outer ≤8, inner ≤3 の打ち切り込み） */
+    if (is_formatting(t)) { adoption(b, t); return; }
+    if (t == IF_TAG_P) {
+        /* button スコープに p が無ければ空 p を挿入してから畳む（仕様の quirk 完結形） */
+        static const u16 BS[] = { IF_TAG_HTML, IF_TAG_TEMPLATE, IF_TAG_MARQUEE,
+                                  IF_TAG_OBJECT, IF_TAG_APPLET, IF_TAG_BUTTON };
+        if (!has_in_scope(b, IF_TAG_P, BS, (u32)(sizeof BS / sizeof BS[0]))) {
+            b->dom->n_errors++;
+            IfTok p = { .kind = TOK_START, .tag = IF_TAG_P };
+            insert_element(b, &p, true);
+        }
+        close_p_if_open(b);
         return;
     }
-    /* 一般終了タグ: スタックを遡って一致を探し、見つかればそこまで pop。見つからなければ無視 */
-    for (u32 i = b->depth; i > 0; i--) {
-        u16 st = b->stack[i - 1]->tag;
-        if (st == t) {
-            while (b->depth > i - 1) pop(b);
-            return;
-        }
-        if (st == IF_TAG_HTML) break;
+    /* li: list-item スコープ（既定 + ol/ul で遮断）・dd/dt: 既定スコープで except-self implied */
+    if (t == IF_TAG_LI) {
+        static const u16 LS[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
+                                  IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT,
+                                  IF_TAG_TEMPLATE, IF_TAG_OL, IF_TAG_UL };
+        end_in_scope(b, t, LS, (u32)(sizeof LS / sizeof LS[0]), true);
+        return;
     }
-    b->dom->n_errors++;
+    if (t == IF_TAG_DD || t == IF_TAG_DT) {
+        static const u16 DS[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
+                                  IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT, IF_TAG_TEMPLATE };
+        end_in_scope(b, t, DS, (u32)(sizeof DS / sizeof DS[0]), true);
+        return;
+    }
+    /* h1..h6: implied 生成 → どれかの heading まで畳む */
+    if (t >= IF_TAG_H1 && t <= IF_TAG_H6) { end_hgroup(b); return; }
+    /* applet/marquee/object: implied 生成 → 畳む → AFE marker 消去 */
+    if (t == IF_TAG_APPLET || t == IF_TAG_MARQUEE || t == IF_TAG_OBJECT) {
+        if (!has_open(b, t)) { b->dom->n_errors++; return; }
+        gen_implied(b, 0);
+        if (top(b)->tag != t) b->dom->n_errors++;
+        pop_until(b, t);
+        afe_clear_to_marker(b);
+        return;
+    }
+    /* ブロック群（address/div/ol/pre/...）: 既定スコープ + implied 生成で畳む */
+    switch (t) {
+    case IF_TAG_ADDRESS: case IF_TAG_ARTICLE: case IF_TAG_ASIDE: case IF_TAG_BLOCKQUOTE:
+    case IF_TAG_BUTTON: case IF_TAG_CENTER: case IF_TAG_DIR: case IF_TAG_DIV:
+    case IF_TAG_DL: case IF_TAG_FIELDSET: case IF_TAG_FIGCAPTION: case IF_TAG_FIGURE:
+    case IF_TAG_FOOTER: case IF_TAG_HEADER: case IF_TAG_LISTING: case IF_TAG_MAIN:
+    case IF_TAG_MENU: case IF_TAG_NAV: case IF_TAG_OL: case IF_TAG_PRE:
+    case IF_TAG_SECTION: case IF_TAG_UL:
+    case IF_TAG_DETAILS: case IF_TAG_DIALOG: case IF_TAG_HGROUP: case IF_TAG_SEARCH:
+    case IF_TAG_SUMMARY: {
+        static const u16 DS[] = { IF_TAG_APPLET, IF_TAG_CAPTION, IF_TAG_HTML, IF_TAG_TABLE,
+                                  IF_TAG_TD, IF_TAG_TH, IF_TAG_MARQUEE, IF_TAG_OBJECT, IF_TAG_TEMPLATE };
+        end_in_scope(b, t, DS, (u32)(sizeof DS / sizeof DS[0]), false);
+        return;
+    }
+    default:
+        break;
+    }
+    /* その他の終了タグ: spec の「any other end tag」規則（implied 生成 + special 障壁） */
+    any_other_end_tag(b, t);
 }
 
 static void step(IfTB *b, IfTok tok) {
