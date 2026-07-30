@@ -253,18 +253,10 @@ static void ser_node(const IfNode *n, FILE *o, int depth) {
             qsort(sorted, n->n_attrs, sizeof *sorted, attr_name_cmp);
             for (u32 i = 0; i < n->n_attrs; i++) {
                 fputc('|', o); fputc(' ', o); ser_indent(o, depth + 1);
+                /* 名前空間属性は調整時点で "prefix local" 表記に変換済み。
+                 * 調整対象外の接頭辞付き属性（xml:baaah 等）はリテラル保持が
+                 * vendored dataset の期待値なので、ここで勝手に分割しない。 */
                 IfStr an = sorted[i]->name;
-                if (n->ns != IF_NS_HTML) { /* xlink:href → xlink href */
-                    u32 colon = an.n;
-                    for (u32 k = 0; k < an.n; k++) if (an.p[k] == ':') { colon = k; break; }
-                    if (colon < an.n) {
-                        ser_str(o, if_str(an.p, colon));
-                        fputc(' ', o);
-                        ser_str(o, if_str(an.p + colon + 1, an.n - colon - 1));
-                        fputs("=\"", o); ser_str(o, sorted[i]->value); fputs("\"\n", o);
-                        continue;
-                    }
-                }
                 ser_str(o, an); fputs("=\"", o);
                 ser_str(o, sorted[i]->value); fputs("\"\n", o);
             }

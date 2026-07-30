@@ -2176,13 +2176,37 @@ static const char *IF_SVG_ATTR_ADJUST_CANON[] = {
     "viewTarget","xChannelSelector","yChannelSelector","zoomAndPan",
 };
 
-/* 属性名の調整（foreign 要素にのみ適用。該当しなければ元のまま） */
-static IfStr adjust_attr_name(IfTB *b, IfStr name) {
-    if (if_str_eq_ci(name, IF_S("definitionurl")))
+/* foreign 属性の接頭辞分離（"adjust foreign attributes"）。wptdom 形式は
+ * "prefix local" — DOM 上もその表記で保持する（意味論的名前空間分割は後段へ送る）。
+ * 台帳: 現行仕様は xml:base も調整対象だが、vendored dataset (wpt@0acb81f)
+ * は webkit02#22 で xml:base をリテラル保持のまま収録している（旧仕様世代の
+ * 期待値）。dataset 第一主義で xml:base は調整しない。 */
+static const struct { const char *from, *to; } IF_FOREIGN_ATTR_ADJUST[] = {
+    {"xlink:actuate","xlink actuate"}, {"xlink:arcrole","xlink arcrole"},
+    {"xlink:href","xlink href"}, {"xlink:role","xlink role"},
+    {"xlink:show","xlink show"}, {"xlink:title","xlink title"},
+    {"xlink:type","xlink type"},
+    {"xml:lang","xml lang"}, {"xml:space","xml space"},
+    {"xmlns:xlink","xmlns xlink"},
+};
+
+/* 属性名の調整（foreign 要素にのみ適用。該当しなければ元のまま）。
+ * definitionurl→definitionURL は MathML 属性調整（svg 上ではリテラル残し:
+ * webkit02#22 の期待値が確証）、camelCase 表調整は SVG 要素にのみ。 */
+static IfStr adjust_attr_name(IfTB *b, IfStr name, u8 ns) {
+    if (ns == IF_NS_MATHML && if_str_eq_ci(name, IF_S("definitionurl")))
         return IF_S("definitionURL");
-    for (u32 i = 0; i < sizeof IF_SVG_ATTR_ADJUST_LC / sizeof IF_SVG_ATTR_ADJUST_LC[0]; i++)
-        if (if_str_eq_ci(name, if_str(IF_SVG_ATTR_ADJUST_LC[i], (u32)strlen(IF_SVG_ATTR_ADJUST_LC[i]))))
-            return if_str(IF_SVG_ATTR_ADJUST_CANON[i], (u32)strlen(IF_SVG_ATTR_ADJUST_CANON[i]));
+    if (ns == IF_NS_SVG)
+        for (u32 i = 0; i < sizeof IF_SVG_ATTR_ADJUST_LC / sizeof IF_SVG_ATTR_ADJUST_LC[0]; i++)
+            if (if_str_eq_ci(name, if_str(IF_SVG_ATTR_ADJUST_LC[i], (u32)strlen(IF_SVG_ATTR_ADJUST_LC[i]))))
+                return if_str(IF_SVG_ATTR_ADJUST_CANON[i], (u32)strlen(IF_SVG_ATTR_ADJUST_CANON[i]));
+    for (u32 i = 0; i < sizeof IF_FOREIGN_ATTR_ADJUST / sizeof IF_FOREIGN_ATTR_ADJUST[0]; i++) {
+        IfStr from = if_str(IF_FOREIGN_ATTR_ADJUST[i].from,
+                            (u32)strlen(IF_FOREIGN_ATTR_ADJUST[i].from));
+        if (if_str_eq(name, from)) /* 接頭辞系は case-sensitive マッチ（spec表再現） */
+            return if_str(IF_FOREIGN_ATTR_ADJUST[i].to,
+                          (u32)strlen(IF_FOREIGN_ATTR_ADJUST[i].to));
+    }
     (void)b;
     return name;
 }
@@ -2270,7 +2294,7 @@ static void foreign_adjust(IfTB *b, IfNode *n) {
         IfAttr *adj = (IfAttr *)if_arena_alloc(b->arena, (u64)n->n_attrs * sizeof(IfAttr));
         for (u32 i = 0; i < n->n_attrs; i++) {
             adj[i] = n->attrs[i];
-            adj[i].name = adjust_attr_name(b, n->attrs[i].name);
+            adj[i].name = adjust_attr_name(b, n->attrs[i].name, n->ns);
         }
         n->attrs = adj;
     }
@@ -2310,6 +2334,15 @@ static void foreign_step(IfTB *b, const IfTok *tok) {
             return;
         }
         foreign_insert(b, tok);
+        return;
+    }
+    /* TOK_END の br/p は特例: HTML 名前空間まで pop して in-body 規則へ
+     * （<p><math></p>a で math/p を畳み "a" が p の外に出る spec 挙動） */
+    if (tok->tag == IF_TAG_BR || tok->tag == IF_TAG_P) {
+        b->dom->n_errors++;
+        if (b->depth <= 1) return; /* fragment case: 無視 */
+        while (b->depth && top(b)->ns != IF_NS_HTML) pop(b);
+        step_in_body(b, *tok);
         return;
     }
     /* TOK_END: 現在ノード名（小文字比較）が一致すれば pop、
