@@ -45,3 +45,8 @@ bool v8x_is_undefined(V8xVal v);
 const char *v8x_as_str(V8xRT *rt, V8xVal v, uint32_t *len);
 
 #endif
+
+/* 組込側責任の上限引上げ（0 は据置）。既定値はブラウザ製品値（台帳の击杀防止）。
+ * クロスエンジン比較ベンチのように「打ち切りなしで収束する同一ソース」を
+ * 走らせる用途でのみ既定から上げること。depth は固定（構造的保護）。 */
+void v8x_tune(V8xRT *rt, uint64_t insn, uint32_t heap_mb, uint32_t max_objs);

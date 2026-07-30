@@ -130,6 +130,8 @@ struct V8xRT {
     /* VM 作業領域 */
     V8xVal *stk; u32 cap_stk;
     u64 insn_budget_def;
+    u32 heap_mb;    /* 既定 V8X_MAX_HEAP_MB。v8x_tune で組込側責任で引上げ可 */
+    u32 max_objs;   /* 既定 V8X_MAX_OBJECTS。同上 */
     V8xVal last_val;
     char err[256];
     /* parse 作業の再利用バッファは eval ローカルで確保（再入安全） */
@@ -157,7 +159,7 @@ static void v8x_errf(V8xRT *rt, const char *fmt, ...) {
 }
 
 static u32 v8x_obj_new(V8xRT *rt) {
-    if (rt->n_objs >= V8X_MAX_OBJECTS) { v8x_errf(rt, "object budget exhausted"); return UINT32_MAX; }
+    if (rt->n_objs >= rt->max_objs) { v8x_errf(rt, "object budget exhausted"); return UINT32_MAX; }
     if (rt->n_objs == rt->cap_objs) {
         u32 nc = rt->cap_objs ? rt->cap_objs * 2 : 64;
         V8xObj *no = (V8xObj *)realloc(rt->objs, (u64)nc * sizeof(V8xObj));
@@ -171,7 +173,7 @@ static u32 v8x_obj_new(V8xRT *rt) {
 
 /* STR obj を新規作成（bytes はコピー）。失敗時 UINT32_MAX（err 設定済み） */
 static u32 v8x_mkstr(V8xRT *rt, const u8 *p, u32 n) {
-    if ((u64)rt->heap_bytes + n > (u64)V8X_MAX_HEAP_MB << 20) {
+    if ((u64)rt->heap_bytes + n > (u64)rt->heap_mb << 20) {
         v8x_errf(rt, "heap bytes budget exhausted");
         return UINT32_MAX;
     }
@@ -1712,7 +1714,7 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
             if (ia == UINT32_MAX || ib == UINT32_MAX) { free(frames); return false; }
             u32 la, lb;
             const u8 *pa = v8x_str(rt, ia, &la), *pb = v8x_str(rt, ib, &lb);
-            if ((u64)la + lb > (u64)V8X_MAX_HEAP_MB << 20) { v8x_errf(rt, "heap bytes budget exhausted"); free(frames); return false; }
+            if ((u64)la + lb > (u64)rt->heap_mb << 20) { v8x_errf(rt, "heap bytes budget exhausted"); free(frames); return false; }
             u8 *cat = (u8 *)malloc((u64)la + lb + 1);
             if (!cat) { v8x_errf(rt, "oom: concat"); free(frames); return false; }
             memcpy(cat, pa, la);
@@ -1937,6 +1939,8 @@ V8xRT *v8x_new(void) {
     rt->cap_stk = V8X_STK_INIT;
     if (rt->cap_stk > V8X_STK_MAX) rt->cap_stk = V8X_STK_MAX;
     rt->insn_budget_def = 10000000;
+    rt->heap_mb = V8X_MAX_HEAP_MB;
+    rt->max_objs = V8X_MAX_OBJECTS;
     rt->last_val = V8X_VAL_UNDEF;
     /* main 関数エントリ（entry 0。code 範囲は eval ごとの末尾まで） */
     if (v8x_obj_new(rt) == UINT32_MAX) { free(rt->stk); free(rt); return NULL; }
@@ -2081,4 +2085,11 @@ const char *v8x_as_str(V8xRT *rt, V8xVal v, uint32_t *len) {
      * len 参照 API なので NUL は返さない（bytes は len まで有効） */
     if (len) *len = o->len;
     return (const char *)o->bytes;
+}
+
+void v8x_tune(V8xRT *rt, uint64_t insn, uint32_t heap_mb, uint32_t max_objs) {
+    if (!rt) return;
+    if (insn) v8x_set_insn_budget(rt, insn);
+    if (heap_mb) rt->heap_mb = heap_mb;
+    if (max_objs) rt->max_objs = max_objs;
 }

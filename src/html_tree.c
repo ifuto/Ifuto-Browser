@@ -2005,8 +2005,9 @@ static void step_in_body(IfTB *b, IfTok tok) {
             }
         }
         if (closes_p(t)) close_p_if_open(b);
-        /* スコープ障壁となる要素（object/applet/marquee）の開始で AFE に marker を挿入 */
+        /* スコープ障壁となる要素（object/applet/marquee）: reconstruct → 挿入 → marker */
         if ((t == IF_TAG_OBJECT || t == IF_TAG_APPLET || t == IF_TAG_MARQUEE) && !tok.self_closing) {
+            afe_reconstruct(b);
             insert_element(b, &tok, true);
             afe_insert_marker(b);
             b->frameset_ok = false;
