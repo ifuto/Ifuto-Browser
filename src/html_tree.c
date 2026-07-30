@@ -1275,14 +1275,31 @@ static void pend_flush(IfTB *b) {
     IfStr t = if_str(keep, b->pend_n);
     b->pend_n = 0;
     if (!b->pend_nonws) {
+        /* 全空白: 現行 spec では pending-text に含まれるが、フラッシュ時「挿入位置に
+         * 直接追記」が正解（foster させない）。vendored データセット (#tests7 12:
+         * <table><tbody><script> が「 」を script の兄として tbody 内に置く) と
+         * html5lib の InTable spaceCharacters 規則で両側実証済み。append_text は
+         * place() 経由なので foster フラグが立っていない限り current node 直下。 */
+        bool f = b->foster;
+        b->foster = false;
         append_text(b, t);
+        b->foster = f;
         return;
     }
     b->pend_nonws = false;
-    /* 非空白混じりの table 直下テキストは「body 規則の other text」。
-     * foster を立てて流せば place() が「table の兄」へ導く（AFE 再構築は B2 で統合） */
+    /* 非空白混じり: spec の flush 規則は「current node が table 系(table/tbody/tfoot/
+     * thead/tr)なら foster、それ以外(script 内テキスト等)は foster なしで body 規則」。 */
+    bool tableish = false;
+    if (b->depth) {
+        switch (top(b)->tag) {
+        case IF_TAG_TABLE: case IF_TAG_TBODY: case IF_TAG_TFOOT:
+        case IF_TAG_THEAD: case IF_TAG_TR:
+            tableish = true; break;
+        default: break;
+        }
+    }
     bool f = b->foster;
-    b->foster = true;
+    b->foster = f || tableish;
     step_in_body(b, (IfTok){ .kind = TOK_TEXT, .text = t });
     b->foster = f;
 }
@@ -2232,6 +2249,17 @@ static void step(IfTB *b, IfTok tok) {
         top(b)->ns == IF_NS_HTML) {
         pop(b);
         return;
+    }
+    /* table 系モード横断の in-table-text 規則: 非テキストトークン到着時は、いかなる
+     * スタック変更より先に pend をフラッシュする（html5lib の InTableText と同相）。
+     * これを怠ると </table> で tbody/... を pop した後に " " が table の子へ落ちる
+     * （tests7#12: <table><TBODY><script> <tr>x </script> </table>）。 */
+    switch (b->mode) {
+    case M_IN_TABLE: case M_IN_CAPTION: case M_IN_COLUMN_GROUP:
+    case M_IN_TABLE_BODY: case M_IN_ROW: case M_IN_CELL:
+        if (tok.kind != TOK_TEXT) pend_flush(b);
+        break;
+    default: break;
     }
     switch (b->mode) {
     case M_INITIAL:     step_initial(b, tok); break;
