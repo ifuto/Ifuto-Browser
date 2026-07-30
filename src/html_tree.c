@@ -1312,7 +1312,17 @@ static void step_in_frameset(IfTB *b, IfTok tok) {
 }
 
 static void step_after_frameset(IfTB *b, IfTok tok) {
-    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { step_in_body(b, tok); return; }
+    if (tok.kind == TOK_TEXT) {
+        /* 文字は一括 ignore ではなく先頭の空白のみ挿入（残りは parse error で捨てる）。
+         * <frameset></frameset>\nfoo で "\n" が残り "foo" が捨てられる spec 挙動 */
+        IfStr t2 = tok.text;
+        u32 nws = 0;
+        while (nws < t2.n && (t2.p[nws] == ' ' || t2.p[nws] == '\t' || t2.p[nws] == '\n' ||
+                              t2.p[nws] == '\r' || t2.p[nws] == '\f')) nws++;
+        if (nws) append_text(b, if_str(t2.p, nws));
+        if (nws < t2.n) b->dom->n_errors++;
+        return;
+    }
     if (tok.kind == TOK_COMMENT) { insert_comment_placed(b, &tok); return; }
     if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
     if (tok.kind == TOK_START && tok.tag == IF_TAG_HTML) { step_in_body(b, tok); return; }
@@ -1983,12 +1993,22 @@ static void step_in_body(IfTB *b, IfTok tok) {
         return;
     }
     if (t == IF_TAG_FORM && b->form) {
-        /* 仕様簡約版: form pointer を解除し、開いていれば implied end tags を生成して畳む */
+        /* form pointer 規則（template 無し時）: pointer 解除 → implied ends →
+         * stack から node を「除去」（pop_until ではない — 中間要素は残る。
+         * <form><div></form><div> で 2 個目の div が 1 個目の中に入る根拠） */
+        IfNode *node = b->form;
         b->form = NULL;
-        if (!has_open(b, IF_TAG_FORM)) { b->dom->n_errors++; return; }
+        bool in_scope = false;
+        for (u32 i = b->depth; i > 0; i--) {
+            IfNode *s = b->stack[i - 1];
+            if (s == node) { in_scope = true; break; }
+            if (scope_barrier(s, SC_DEFAULT)) break;
+        }
+        if (!in_scope) { b->dom->n_errors++; return; }
         gen_implied(b, 0);
-        if (top(b)->tag != IF_TAG_FORM) b->dom->n_errors++;
-        pop_until(b, IF_TAG_FORM);
+        if (top(b) != node) b->dom->n_errors++;
+        for (u32 i = 0; i < b->depth; i++)
+            if (b->stack[i] == node) { stack_remove_at(b, i); break; }
         return;
     }
     if (t == IF_TAG_TEMPLATE) { tpl_end(b); return; }
