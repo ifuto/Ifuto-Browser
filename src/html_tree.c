@@ -451,6 +451,8 @@ static void reset_mode(IfTB *b) {
             /* template の挿入モードスタック先頭に戻す（空なら in-body） */
             b->mode = b->n_tpl ? (IfMode)b->tpl_modes[b->n_tpl - 1] : M_IN_BODY;
             return;
+        /* 現行仕様: reset は select 分岐を持たない（customizable-select 統合で
+         * "in select" / "in select in table" 挿入モードは廃止済み） */
         case IF_TAG_HEAD: b->mode = M_IN_HEAD; return;
         case IF_TAG_BODY: b->mode = M_IN_BODY; return;
         default: continue; /* それ以外の要素はさらに下を見る */
@@ -769,9 +771,48 @@ static void end_hgroup(IfTB *b) {
 }
 
 /* adoption agency algorithm（outer ≤ 8, inner ≤ 3 の仕様打ち切り込み） */
+/* AFE: spec の「bookmark 位置へ挿入」を正確に（fe の位置または inner loop で移動後） */
+static void afe_insert_at(IfTB *b, u32 pos, IfNode *n) {
+    afe_ensure(b);
+    if (pos > b->n_afe) pos = b->n_afe;
+    memmove(&b->afe[pos + 1], &b->afe[pos], (size_t)(b->n_afe - pos) * sizeof b->afe[0]);
+    b->afe[pos].n = n;
+    b->afe[pos].marker = false;
+    b->n_afe++;
+}
+
+static i32 afe_find_node(const IfTB *b, const IfNode *n) {
+    for (i32 i = (i32)b->n_afe - 1; i >= 0; i--) {
+        if (b->afe[i].marker) break;
+        if (b->afe[i].n == n) return i;
+    }
+    return -1;
+}
+
+/* stack[idx] を除去（idx < depth のみ、範囲外は到達不能の設計だが防御で無視） */
+static void stack_remove_at(IfTB *b, u32 idx) {
+    if (idx >= b->depth) return;
+    memmove(&b->stack[idx], &b->stack[idx + 1],
+            (size_t)(b->depth - idx - 1) * sizeof b->stack[0]);
+    b->depth--;
+}
+
+/* stack[idx] の直後へ挿入 */
+static void stack_insert_after(IfTB *b, u32 idx, IfNode *n) {
+    push(b, n); /* 容量確保は push に委譲し末尾に仮置き */
+    memmove(&b->stack[idx + 2], &b->stack[idx + 1],
+            (size_t)(b->depth - idx - 2) * sizeof b->stack[0]);
+    b->stack[idx + 1] = n;
+}
+
+/* Adoption Agency Algorithm（WHATWG HTML "adoption agency algorithm" 厳密版。
+ * subject = 終了タグ名。8 外回・3 内回の打ち切り・bookmark の移動まで spec の番号どおり。
+ * ポインタではなく位置を index/afe-index で保持し、splice 後も破綻しないようにする。 */
 static void adoption(IfTB *b, u16 tag) {
+    /* step 1: current node が subject と同名の HTML 要素で AFE に無い → pop して終了 */
     if (b->depth && top(b)->tag == tag && !afe_has_node(b, top(b))) { pop(b); return; }
     for (u32 outer = 0; outer < 8; outer++) {
+        /* step 4: AFE から subject の最後の要素（marker 手前まで） */
         i32 fi = afe_find_tag(b, tag);
         if (fi < 0) { any_other_end_tag(b, tag); return; }
         IfNode *fe = b->afe[fi].n;
@@ -779,76 +820,69 @@ static void adoption(IfTB *b, u16 tag) {
         if (fs < 0) { b->dom->n_errors++; afe_remove_at(b, (u32)fi); return; }
         if (!node_in_default_scope(b, fe)) { b->dom->n_errors++; return; }
         if (fe != top(b)) b->dom->n_errors++;
-        /* furthest block: fe より上（index 大）で最も遠い special 要素 */
+        /* step 8: furthest block = fe より上（index 大）の最後の special 要素 */
         i32 fb = -1;
         for (u32 i = (u32)fs + 1; i < b->depth; i++)
             if (is_special(b->stack[i])) fb = (i32)i;
+        /* step 9: 無ければ fe まで pop して AFE からも除去して終了 */
         if (fb < 0) {
             while (b->depth > (u32)fs) pop(b);
             afe_remove_at(b, (u32)fi);
             return;
         }
         IfNode *furthest = b->stack[fb];
+        /* step 10: common ancestor = fe の一つ上 */
         IfNode *ancestor = (fs > 0) ? b->stack[fs - 1] : b->dom->root;
+        /* step 11: bookmark = AFE 内 fe の直後（挿入位置として） */
+        u32 bookmark = (u32)fi + 1;
+        /* step 12 inner loop: node/lastNode = furthest から開始 */
         IfNode *node = furthest, *lastNode = furthest;
-        u32 inner = 0;
-        i32 ni = fb;
-        while (1) {
-            inner++;
-            if (inner > 3) break; /* 仕様の打ち切り。残りの未処理は後段の共通処理で拾う */
-            /* node を formatting element 方向（index 減）へ一段進める */
+        i32 ni = fb; /* stack[ni] == node の index */
+        for (u32 inner = 0;;) {
+            inner++; /* 12.1 */
+            /* 12.2: node の一つ上へ（fe 方向へ進む） */
+            if (ni <= 0) break;
             ni--;
-            if (ni < 0) break;
             node = b->stack[ni];
-            if (node == fe) break; /* inner loop 終端 */
-            i32 n_ai = -1;
-            for (i32 k = (i32)b->n_afe - 1; k >= 0; k--) {
-                if (b->afe[k].marker) break;
-                if (b->afe[k].n == node) { n_ai = k; break; }
+            if (node == fe) break; /* 12.3: fe に着いたら inner 終了 */
+            /* 12.4: inner>3 で AFE の node は除去 */
+            if (inner > 3) {
+                i32 rm = afe_find_node(b, node);
+                if (rm >= 0) afe_remove_at(b, (u32)rm);
             }
-            if (inner > 3 && n_ai >= 0) { afe_remove_at(b, (u32)n_ai); n_ai = -1; }
-            if (n_ai < 0) {
-                /* list に無い node: stack から除いて inner 継続（lastNode は更新しない） */
-                memmove(&b->stack[ni], &b->stack[ni + 1],
-                        (size_t)(b->depth - (u32)ni - 1) * sizeof b->stack[0]);
-                b->depth--;
-                ni++; /* index ずれ補正 */
-                continue;
-            }
+            /* 12.5: AFE に無い node は stack から除去して次へ（ni 補正は不要:
+             * 除去で上方要素が詰まり、次の ni-- が正しく一つ上を指す） */
+            i32 a2 = afe_find_node(b, node);
+            if (a2 < 0) { stack_remove_at(b, (u32)ni); continue; }
+            /* 12.6: node の clone で AFE/stack の当該箇所を置換 */
             IfNode *clone = clone_element(b, node);
-            b->afe[n_ai].n = clone;
+            b->afe[a2].n = clone;
             b->stack[ni] = clone;
             node = clone;
-            /* lastNode を node の子に移す */
+            /* 12.7: lastNode が furthest のまま（初回）なら bookmark を node の直後へ */
+            if (lastNode == furthest) bookmark = (u32)a2 + 1;
+            /* 12.8/12.9: lastNode を node の子に移し、lastNode = node */
             detach(lastNode);
             append_child(node, lastNode);
             lastNode = node;
         }
-        /* lastNode を「common ancestor を起点にした適切位置」へ anchor し直す */
+        /* step 13: lastNode を common ancestor 基点の「適切な挿入位置」へ（foster 含む） */
         detach(lastNode);
         insert_at_place(place_for(b, ancestor), lastNode);
-        /* formatting element のクローンを作り、furthest block の全子を移して furthest へ */
+        /* step 14: fe の clone を作り、furthest の全子を移して furthest に装着 */
         IfNode *fclone = clone_element(b, fe);
         move_children(furthest, fclone);
         append_child(furthest, fclone);
-        /* fe を AFE/stack から除去し、fclone を同步位置（furthest の直下）に入れる */
-        afe_remove_at(b, (u32)fi);
-        memmove(&b->stack[fs], &b->stack[fs + 1],
-                (size_t)(b->depth - (u32)fs - 1) * sizeof b->stack[0]);
-        b->depth--;
-        /* stack: furthest の直後（=id_x of furthest + 1）に fclone を挿入 */
-        i32 bi = stack_find_node(b, furthest);
-        if (bi < 0) bi = (i32)b->depth - 1;
-        /* push of stack below furthest は「furthest の一つ上」=furthest の子として扱う位置 */
-        (void)bi;
-        push(b, fclone);
-        /* AFE: fe の位置に fclone を挿入（bookmark 相当） */
-        afe_ensure(b);
-        u32 pos = (u32)fi <= b->n_afe ? (u32)fi : b->n_afe;
-        memmove(&b->afe[pos + 1], &b->afe[pos], (size_t)(b->n_afe - pos) * sizeof b->afe[0]);
-        b->afe[pos].n = fclone;
-        b->afe[pos].marker = false;
-        b->n_afe++;
+        /* step 15: fe を AFE から除き fclone を bookmark 位置へ */
+        if (afe_find_node(b, fe) >= 0) afe_remove_at(b, (u32)afe_find_node(b, fe));
+        if (bookmark > b->n_afe) bookmark = b->n_afe;
+        afe_insert_at(b, bookmark, fclone);
+        /* step 16: fe を stack から除き、fclone を furthest の直後へ */
+        i32 fs2 = stack_find_node(b, fe);
+        if (fs2 >= 0) stack_remove_at(b, (u32)fs2);
+        i32 fb2 = stack_find_node(b, furthest);
+        if (fb2 < 0) push(b, fclone); /* 構造上到達不能 */
+        else stack_insert_after(b, (u32)fb2, fclone);
     }
 }
 
@@ -992,12 +1026,20 @@ static void step_in_caption(IfTB *b, IfTok tok) {
         b->mode = M_IN_TABLE;
         return;
     }
-    if (tok.kind == TOK_START && tok.tag == IF_TAG_TABLE) {
-        if (!has_in_table_scope(b, IF_TAG_CAPTION)) { b->dom->n_errors++; return; }
-        pop_until(b, IF_TAG_CAPTION);
-        b->mode = M_IN_TABLE;
-        step(b, tok);
-        return;
+    if (tok.kind == TOK_START) {
+        switch (tok.tag) {
+        case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
+        case IF_TAG_TBODY: case IF_TAG_TD: case IF_TAG_TFOOT: case IF_TAG_TH:
+        case IF_TAG_THEAD: case IF_TAG_TR: case IF_TAG_TABLE:
+            /* caption を畳んで in-table で再処理（現行仕様の in-caption 規則） */
+            if (!has_in_table_scope(b, IF_TAG_CAPTION)) { b->dom->n_errors++; return; }
+            pop_until(b, IF_TAG_CAPTION);
+            b->mode = M_IN_TABLE;
+            step(b, tok);
+            return;
+        default:
+            break;
+        }
     }
     if (tok.kind == TOK_END && tok.tag == IF_TAG_TABLE) {
         if (!has_in_table_scope(b, IF_TAG_CAPTION)) { b->dom->n_errors++; return; }
@@ -1110,7 +1152,8 @@ static void step_in_table_body(IfTB *b, IfTok tok) {
             break;
         }
     }
-    step_in_body(b, tok);
+    /* anything else: in-table 規則へ（= foster + in-body / 保留テキスト経路） */
+    step_in_table(b, tok);
 }
 
 /* tr を正當に終わらせて M_IN_TABLE_BODY に戻し、tok を再処理 */
@@ -1167,7 +1210,8 @@ static void step_in_row(IfTB *b, IfTok tok) {
             break;
         }
     }
-    step_in_body(b, tok);
+    /* anything else: in-table 規則へ（= foster + in-body / 保留テキスト経路） */
+    step_in_table(b, tok);
 }
 
 static void step_in_cell(IfTB *b, IfTok tok) {
@@ -1716,30 +1760,41 @@ static void step_in_body(IfTB *b, IfTok tok) {
         }
         /* template: content 分離 + template 挿入モードへ（in-body/他モード共通の規則） */
         if (t == IF_TAG_TEMPLATE) { tpl_start(b, &tok); return; }
-        /* select 関連（in-select 挿入モード を持たない最小近似）:
-         * option→option、optgroup→option/optgroup は直前を閉じる（兄弟化）。
-         * select の開始はネスト select を無視する（仕様の in-select select quirk） */
+        /* select（現行仕様の in-body 規則: 挿入モード切替なし。
+         * 既定スコープに select があれば parse error + 畳んでトークン自体は無視） */
         if (t == IF_TAG_SELECT) {
-            b->frameset_ok = false;
             if (has_in_default_scope_tag(b, IF_TAG_SELECT)) {
-                /* in-select モード未実装の近似: ネスト select は「終了タグ」として畳む */
                 b->dom->n_errors++;
                 pop_until(b, IF_TAG_SELECT);
                 return;
             }
             afe_reconstruct(b);
             insert_element(b, &tok, true);
+            b->frameset_ok = false;
             return;
         }
+        /* option: select-scope 内なら implied end tags（except optgroup）で畳む。
+         * 外なら current==option の畳み込みのみ（現行仕様の二肢構造） */
         if (t == IF_TAG_OPTION) {
-            if (top(b)->tag == IF_TAG_OPTION) pop(b);
+            if (has_in_default_scope_tag(b, IF_TAG_SELECT)) {
+                gen_implied(b, IF_TAG_OPTGROUP);
+                if (has_in_default_scope_tag(b, IF_TAG_OPTION)) b->dom->n_errors++;
+            } else if (top(b)->tag == IF_TAG_OPTION) {
+                pop(b);
+            }
             afe_reconstruct(b);
             insert_element(b, &tok, true);
             return;
         }
+        /* optgroup: select-scope 内なら implied end tags で option/optgroup を畳む */
         if (t == IF_TAG_OPTGROUP) {
-            if (top(b)->tag == IF_TAG_OPTION) pop(b);
-            if (top(b)->tag == IF_TAG_OPTGROUP) pop(b);
+            if (has_in_default_scope_tag(b, IF_TAG_SELECT)) {
+                gen_implied(b, 0);
+                if (has_in_default_scope_tag(b, IF_TAG_OPTION) ||
+                    has_in_default_scope_tag(b, IF_TAG_OPTGROUP)) b->dom->n_errors++;
+            } else if (top(b)->tag == IF_TAG_OPTION) {
+                pop(b);
+            }
             afe_reconstruct(b);
             insert_element(b, &tok, true);
             return;
@@ -1780,6 +1835,22 @@ static void step_in_body(IfTB *b, IfTok tok) {
             insert_element(b, &tok, true);
             b->tok.plaintext = 1;
             return;
+        }
+        /* table 内部要素の開始タグ（caption/col/colgroup/frame/tbody/td/tfoot/th/thead/tr）:
+         * in-body 規則では parse error で無視。ただし template が stack にある文脈では
+         * WPT dataset（template.dat）が content 内保持を期待するので通常挿入に落とす
+         * （現行仕様は in-template で in-table-body/in-row へ re-dispatch するが、
+         * dataset は template 内 <td>/<tr> を content 内要素として保持する挙動で収録） */
+        if (!has_open(b, IF_TAG_TEMPLATE)) {
+            switch (t) {
+            case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP: case IF_TAG_FRAME:
+            case IF_TAG_TBODY: case IF_TAG_TD: case IF_TAG_TFOOT: case IF_TAG_TH:
+            case IF_TAG_THEAD: case IF_TAG_TR:
+                b->dom->n_errors++;
+                return;
+            default:
+                break;
+            }
         }
         if (closes_p(t)) close_p_if_open(b);
         /* スコープ障壁となる要素（object/applet/marquee）の開始で AFE に marker を挿入 */
@@ -1847,7 +1918,16 @@ static void step_in_body(IfTB *b, IfTok tok) {
                     b->frameset_ok = false;
                     afe_reconstruct(b);
                 }
-                if (t == IF_TAG_HR) b->frameset_ok = false;
+                if (t == IF_TAG_HR) {
+                    /* select-scope 規則（現行仕様）: option/optgroup を implied ends で畳み、
+                     * 畳み切れなければ parse error。hr 自体は select 内に void 挿入される */
+                    if (has_in_default_scope_tag(b, IF_TAG_SELECT)) {
+                        gen_implied(b, 0);
+                        if (has_in_default_scope_tag(b, IF_TAG_OPTION) ||
+                            has_in_default_scope_tag(b, IF_TAG_OPTGROUP)) b->dom->n_errors++;
+                    }
+                    b->frameset_ok = false;
+                }
             }
             insert_element(b, &tok, false);
             return;
@@ -1916,7 +1996,8 @@ static void step_in_body(IfTB *b, IfTok tok) {
         afe_clear_to_marker(b);
         return;
     }
-    /* ブロック群（address/div/ol/pre/...）: 既定スコープ + implied 生成で畳む */
+    /* ブロック群（address/div/ol/pre/... + select）: 既定スコープ + implied 生成で畳む。
+     * select は現行仕様でこの一覧 end-tag 規則に統合された（in-select モード廃止） */
     switch (t) {
     case IF_TAG_ADDRESS: case IF_TAG_ARTICLE: case IF_TAG_ASIDE: case IF_TAG_BLOCKQUOTE:
     case IF_TAG_BUTTON: case IF_TAG_CENTER: case IF_TAG_DIR: case IF_TAG_DIV:
@@ -1926,32 +2007,14 @@ static void step_in_body(IfTB *b, IfTok tok) {
     case IF_TAG_SECTION: case IF_TAG_UL:
     case IF_TAG_DETAILS: case IF_TAG_DIALOG: case IF_TAG_HGROUP: case IF_TAG_SEARCH:
     case IF_TAG_SUMMARY:
+    case IF_TAG_SELECT:
         end_in_scope(b, t, SC_DEFAULT, false);
         return;
     default:
         break;
     }
-    /* select 終了の最小近似: option/optgroup は閉じる、select は per-mode 版 */
-    if (t == IF_TAG_OPTION) {
-        if (has_in_default_scope_tag(b, IF_TAG_OPTION)) {
-            gen_implied(b, IF_TAG_OPTION);
-            pop_until(b, IF_TAG_OPTION);
-        } else b->dom->n_errors++;
-        return;
-    }
-    if (t == IF_TAG_OPTGROUP) {
-        if (top(b)->tag == IF_TAG_OPTION) pop(b);
-        if (has_in_default_scope_tag(b, IF_TAG_OPTGROUP)) {
-            pop_until(b, IF_TAG_OPTGROUP);
-        } else b->dom->n_errors++;
-        return;
-    }
-    if (t == IF_TAG_SELECT) {
-        if (!has_in_default_scope_tag(b, IF_TAG_SELECT)) { b->dom->n_errors++; return; }
-        pop_until(b, IF_TAG_SELECT);
-        reset_mode(b);
-        return;
-    }
+    /* option/optgroup の終了タグは専用規則を持たない — "any other end tag" の
+     * 下降探索で処理される（両者は special カテゴリ外なので降りて来られる） */
     /* その他の終了タグ: spec の「any other end tag」規則（implied 生成 + special 障壁） */
     any_other_end_tag(b, t);
 }

@@ -13,7 +13,7 @@ def main():
     path = sys.argv[1]
     want_idx = {int(x) for x in sys.argv[2:]} if len(sys.argv) > 2 else None
     binary = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "..", "build", "ifuto")
+                          "..", os.environ.get("IFUTO_BIN","build/ifuto"))
     tests = parse_dat(path)
     nfail = 0
     for i, t in enumerate(tests):
