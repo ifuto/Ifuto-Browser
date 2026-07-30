@@ -1258,7 +1258,12 @@ static void step_in_cell(IfTB *b, IfTok tok) {
 
 static void pend_flush(IfTB *b) {
     if (!b->pend_n) return;
-    IfStr t = if_str(b->pend, b->pend_n);
+    /* pend バッファは再利用されるため、そのまま DOM ノードに保持させると次回の
+     * pend_add で内容が破壊される（<table><a>1...</a>3 型で text が後続文字に
+     * 化ける実害があった）。pend 経由のテキストのみ arena に定着させる。 */
+    char *keep = (char *)if_arena_alloc(b->arena, b->pend_n);
+    memcpy(keep, b->pend, b->pend_n);
+    IfStr t = if_str(keep, b->pend_n);
     b->pend_n = 0;
     if (!b->pend_nonws) {
         append_text(b, t);
