@@ -1527,11 +1527,17 @@ static void step_initial(IfTB *b, IfTok tok) {
         peel_leading_ws(&rest); /* initial の先頭空白は捨てる（ws char → ignore） */
         if (!rest.n) return;
         tok.text = rest;
+        /* doctype 無し: spec の anything-else は quirks を立てて before-html へ */
+        b->dom->quirks = true;
+        b->dom->n_errors++;
         b->mode = M_BEFORE_HTML;
         step(b, tok);
         return;
     }
     default:
+        /* doctype 無し: spec の anything-else は quirks を立てて before-html へ */
+        b->dom->quirks = true;
+        b->dom->n_errors++;
         b->mode = M_BEFORE_HTML;
         step(b, tok);
         return;
@@ -2218,6 +2224,12 @@ static void step(IfTB *b, IfTok tok) {
      * これを挿入モード側の規則に紛れ込ませると <title> の中身が body に逃げる。 */
     if (tok.kind == TOK_TEXT && b->depth && rawish(top(b)->tag)) {
         append_text(b, tok.text);
+        return;
+    }
+    /* rawtext/RCDATA 要素の END は mode 問わず「top 一致で pop」のみ（text mode 規則）。 */
+    if (tok.kind == TOK_END && b->depth && rawish(top(b)->tag) && top(b)->tag == tok.tag &&
+        top(b)->ns == IF_NS_HTML) {
+        pop(b);
         return;
     }
     switch (b->mode) {

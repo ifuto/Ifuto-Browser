@@ -28,7 +28,7 @@ void if_tok_init(IfHtmlTok *t, IfArena *arena, IfStr input) {
 void if_tok_set_raw(IfHtmlTok *t, u16 tag) {
     t->raw_tag = tag;
     t->raw_rcdata = if_tag_is_rcdata(tag) ? 1 : 0;
-    t->strip_lf = (tag == IF_TAG_TEXTAREA) ? 1 : 0;
+    t->strip_lf = 0; /* LF-skip は tree の skip_lf が正本（二重 skip 防止） */
 }
 
 /* ---- 文字参照 ---- */
@@ -385,6 +385,17 @@ static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
             t->pos++;
         }
         IfStr aname = if_str((const char *)t->src + as, t->pos - as);
+        /* 属性名は tokenizer の attribute-name 章則どおり ASCII lowercase に正規化。
+         * （不変なら arena 割当を避けて原スライスのままにする省メモリ経路） */
+        for (u32 li = 0; li < aname.n; li++) {
+            u8 ac = (u8)aname.p[li];
+            if (ac >= 'A' && ac <= 'Z') {
+                char *lc = (char *)if_arena_alloc(t->arena, aname.n);
+                for (u32 lj = 0; lj < aname.n; lj++) lc[lj] = (char)if_ascii_lower((u8)aname.p[lj]);
+                aname = if_str(lc, aname.n);
+                break;
+            }
+        }
         while (t->pos < t->len && if_hws(t->src[t->pos])) t->pos++;
         IfStr aval = { NULL, 0 };
         if (t->pos < t->len && t->src[t->pos] == '=') {
