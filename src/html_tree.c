@@ -2021,7 +2021,7 @@ static void step_in_body(IfTB *b, IfTok tok) {
                 }
             }
         ruby_ctx_done:
-            afe_reconstruct(b);
+            /* spec の rb/rtc/rp/rt 規則は reconstruct を要求しない（純粋な挿入） */
             insert_element(b, &tok, !tok.self_closing);
             return;
         }
@@ -2035,6 +2035,28 @@ static void step_in_body(IfTB *b, IfTok tok) {
         if (t == IF_TAG_XMP) afe_reconstruct(b); /* rawtext 系で xmp のみ spec が要求 */
         if (t >= IF_TAG_H1 && t <= IF_TAG_H6) close_heading_if_open(b);
 
+        /* ブロック家系 + li/dd/dt + heading + ruby コンテキスト要素の共通挿入規則:
+         * AFE reconstruct を「行わない」HTML 要素挿入が仕様（ここへ到達するまでに
+         * close_p/implied_close/skip_lf/frameset-ok 等の個別規則は適用済み）。
+         * 従来は末尾の anything-else 経路へ落ちて reconstruct されてしまい、
+         * <p><font>..<p> 系で両方フォントが新 p を包む誤 DOM になっていた。 */
+        switch (t) {
+        case IF_TAG_P: case IF_TAG_DIV: case IF_TAG_UL: case IF_TAG_OL: case IF_TAG_DL:
+        case IF_TAG_PRE: case IF_TAG_LISTING: case IF_TAG_BLOCKQUOTE: case IF_TAG_ADDRESS:
+        case IF_TAG_ARTICLE: case IF_TAG_ASIDE: case IF_TAG_FOOTER: case IF_TAG_HEADER:
+        case IF_TAG_MAIN: case IF_TAG_NAV: case IF_TAG_SECTION: case IF_TAG_FIELDSET:
+        case IF_TAG_FIGURE: case IF_TAG_FIGCAPTION: case IF_TAG_CENTER:
+        case IF_TAG_DETAILS: case IF_TAG_DIALOG: case IF_TAG_DIR: case IF_TAG_MENU:
+        case IF_TAG_HGROUP: case IF_TAG_SEARCH: case IF_TAG_SUMMARY:
+        case IF_TAG_LI: case IF_TAG_DD: case IF_TAG_DT:
+        case IF_TAG_H1: case IF_TAG_H2: case IF_TAG_H3: case IF_TAG_H4:
+        case IF_TAG_H5: case IF_TAG_H6:
+        case IF_TAG_RB: case IF_TAG_RP: case IF_TAG_RT: case IF_TAG_RTC:
+            insert_element(b, &tok, true);
+            return;
+        default:
+            break;
+        }
         if (if_tag_is_void(t)) {
             /* input: select-scope 規則 + type=hidden 以外で not-ok、reconstruct あり */
             if (t == IF_TAG_INPUT) {
@@ -2373,6 +2395,9 @@ static bool in_foreign(const IfTB *b, const IfTok *tok) {
         if (is_math_ip(node) && tok->tag != IF_TAG_MGLYPH && tok->tag != IF_TAG_MALIGNMARK)
             return false;
         if (node->ns == IF_NS_MATHML && node->tag == IF_TAG_ANNOTATION_XML) {
+            /* annotation-xml 内の <svg> start は HTML content 扱い（spec の例外:
+             * "if token is a start tag whose tag name is 'svg'"） */
+            if (tok->tag == IF_TAG_SVG) return false;
             IfStr enc = if_dom_attr(node, "encoding");
             if (if_str_eq_ci(enc, IF_S("text/html")) ||
                 if_str_eq_ci(enc, IF_S("application/xhtml+xml"))) return false;
