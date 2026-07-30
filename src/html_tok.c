@@ -508,7 +508,7 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
         while (j + 2 < t->len) {
             if (t->src[j] == '-' && t->src[j + 1] == '-' && t->src[j + 2] == '>') {
                 tok.kind = TOK_COMMENT;
-                tok.text = if_str((const char *)t->src + start, j - start);
+                tok.text = if_fix_nul(t, if_str((const char *)t->src + start, j - start), true);
                 t->pos = j + 3;
                 return tok;
             }
@@ -516,7 +516,7 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
         }
         t->errors++; /* 閉じられないコメント: 残り全部をコメントに */
         tok.kind = TOK_COMMENT;
-        tok.text = if_str((const char *)t->src + start, t->len - start);
+        tok.text = if_fix_nul(t, if_str((const char *)t->src + start, t->len - start), true);
         t->pos = t->len;
         return tok;
     }
@@ -530,11 +530,11 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
                !(t->src[j] == ']' && t->src[j + 1] == ']' && t->src[j + 2] == '>')) j++;
         IfTok cdt = { .kind = TOK_TEXT };
         if (j + 2 < t->len) {
-            cdt.text = if_str((const char *)t->src + start, j - start);
+            cdt.text = if_fix_nul(t, if_str((const char *)t->src + start, j - start), true);
             t->pos = j + 3;
         } else {
             t->errors++; /* 閉じられない CDATA: 残り全部をテキストに */
-            cdt.text = if_str((const char *)t->src + start, t->len - start);
+            cdt.text = if_fix_nul(t, if_str((const char *)t->src + start, t->len - start), true);
             t->pos = t->len;
         }
         if (cdt.text.n == 0) return if_tok_next(t);
@@ -555,7 +555,7 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
     }
     t->errors++;
     tok.kind = TOK_COMMENT; /* bogus comment */
-    tok.text = body;
+    tok.text = if_fix_nul(t, body, true); /* U+0000 → U+FFFD（bogus comment 規則） */
     return tok;
 }
 
@@ -583,9 +583,10 @@ IfTok if_tok_next(IfHtmlTok *t) {
             t->pos++;
         }
         tok.kind = TOK_TEXT;
-        /* data text の U+0000 は "ignore"（in-body の parse error 規則に一致）。
-         * NUL 除去は charset 正規化原則（CR は既に正規化済みの前提）と独立。 */
-        tok.text = if_fix_nul(t, if_resolved(t, start, t->pos), false);
+        /* data text の U+0000: HTML content では "ignore"（in-body の parse error
+         * 規則）だが、foreign content では U+FFFD 挿入が規則。tree が立てる
+         * cdata_foreign 旗（foreign 内 text/CDATA で 1）で切り替える。 */
+        tok.text = if_fix_nul(t, if_resolved(t, start, t->pos), t->cdata_foreign != 0);
         return tok;
     }
 
@@ -689,7 +690,7 @@ IfTok if_tok_next(IfHtmlTok *t) {
         u32 start = t->pos;
         while (t->pos < t->len && t->src[t->pos] != '>') t->pos++;
         tok.kind = TOK_COMMENT;
-        tok.text = if_str((const char *)t->src + start, t->pos - start);
+        tok.text = if_fix_nul(t, if_str((const char *)t->src + start, t->pos - start), true);
         if (t->pos < t->len) t->pos++;
         t->errors++;
         return tok;
