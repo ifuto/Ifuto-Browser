@@ -33,6 +33,9 @@ typedef struct {
     bool stopped;
     bool seen_doctype;
     u8 skip_lf; /* pre/listing/xmp 直後の LF 1 個を無視 */
+    /* foreign end-tag が HTML 要素に到達した際の「現モード HTML 規則で再処理」を
+     * 1 トークン分だけ foreign 再判定から守る旗（<math></html> の相互再帰=SEGV 防止） */
+    bool no_foreign;
     /* foster parenting: table 系モードの "anything else" 転送時のみ立つ旗。
      * place() は旗が立ち、かつ現在ノードが table/tbody/tfoot/thead/tr のときだけ
      * 「table の兄」の位置を選ぶ（WHATWG 12.2.6.1 相当） */
@@ -1707,12 +1710,12 @@ static void step_in_body(IfTB *b, IfTok tok) {
             b->dom->n_errors++;
             tok.tag = t = IF_TAG_IMG;
         }
-        if (in_foreign(b, &tok)) { foreign_step(b, &tok); return; }
+        if (in_foreign(b, &tok) && !b->no_foreign) { foreign_step(b, &tok); return; }
         if (t == IF_TAG_SVG || t == IF_TAG_MATH) { /* foreign ルート入域（属性も調整） */
             IfNode *n = make_element(b, &tok);
             n->ns = (t == IF_TAG_SVG) ? IF_NS_SVG : IF_NS_MATHML;
             foreign_adjust(b, n);
-            append_child(top(b), n);
+            append_placed(b, n); /* foster 時は「table の兄」へ（<table><svg> 等） */
             if (!tok.self_closing) {
                 if (b->depth < IF_MAX_STACK_DEPTH) push(b, n);
                 else b->dom->n_errors++;
@@ -1963,7 +1966,7 @@ static void step_in_body(IfTB *b, IfTok tok) {
     }
 
     /* TOK_END */
-    if (in_foreign(b, &tok)) { foreign_step(b, &tok); return; }
+    if (in_foreign(b, &tok) && !b->no_foreign) { foreign_step(b, &tok); return; }
     u16 t = tok.tag;
     if (t == IF_TAG_BODY) { b->mode = M_AFTER_BODY; return; }
     if (t == IF_TAG_HTML) { b->mode = M_AFTER_AFTER_BODY; return; }
@@ -2359,18 +2362,25 @@ static void foreign_step(IfTB *b, const IfTok *tok) {
         step_in_body(b, *tok);
         return;
     }
-    /* TOK_END: 現在ノード名（小文字比較）が一致すれば pop、
-     * さもなくばスタックを遡って一致する要素まで pop（無ければ無視） */
+    /* TOK_END（spec 13.2.6.5 の厳密形）: top が一致すれば pop。
+     * 遡り中に foreign 要素の lowercase 一致があればそこまで pop。
+     * HTML 名前空間要素に到達したら無視ではなく「現行挿入モードの HTML 規則」で
+     * 再処理（<div><svg></div>a で div が畳まれ "a" が外に出る挙動の根拠） */
     IfStr name = tok_end_name(tok);
     if (b->depth && if_str_eq_ci(top(b)->tag_name, name)) { pop(b); return; }
+    b->dom->n_errors++; /* step 2: 先端のタグ名不一致 */
     for (u32 i = b->depth; i > 0; i--) {
         IfNode *e = b->stack[i - 1];
-        if (e->ns == IF_NS_HTML) break;
+        if (e->ns == IF_NS_HTML) {
+            b->no_foreign = true;        /* このトークンは foreign 再判定を飛ばす */
+            step(b, *tok);               /* html5lib の phase.processEndTag 直接呼出し相当 */
+            b->no_foreign = false;
+            return;
+        }
         if (if_str_eq_ci(e->tag_name, name)) {
-            b->dom->n_errors++;
             while (b->depth > i - 1) pop(b);
             return;
         }
     }
-    b->dom->n_errors++; /* 対応する要素がない: 無視 */
+    /* 対応する要素がない: 無視 */
 }
