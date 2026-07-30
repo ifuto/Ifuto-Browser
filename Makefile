@@ -4,6 +4,9 @@
 CC      ?= cc
 SRC     := $(wildcard src/*.c)
 ENGINE  := $(filter-out src/main.c,$(SRC))
+# V8x（自作 JS エンジン, C11/JIT なし）: v0.0 は DOM 未接続のため本体 ifuto には
+# リンクしない（200KB 天井維持。v0.4 統合時に実測で天井を再設定する — BENCH.md 台帳）。
+V8XSRC  := $(wildcard src/v8x/*.c)
 WFLAGS  := -std=c11 -Wall -Wextra -Wshadow -Wstrict-prototypes -Wwrite-strings
 BASE    := $(WFLAGS) -fno-strict-aliasing -fstack-protector-strong -D_FORTIFY_SOURCE=2
 REL     := -O2 -DNDEBUG -flto -ffunction-sections -fdata-sections
@@ -25,16 +28,24 @@ $(BUILD)/ifuto-asan: $(SRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -o $@ $(SRC) -lm
 
 TESTSRC := $(wildcard tests/*.c)
-$(BUILD)/run_tests: $(TESTSRC) $(ENGINE) | $(BUILD)
-	$(CC) $(BASE) $(SAN) -Itests -o $@ $(TESTSRC) $(ENGINE) -lm
+$(BUILD)/run_tests: $(TESTSRC) $(ENGINE) $(V8XSRC) | $(BUILD)
+	$(CC) $(BASE) $(SAN) -Itests -o $@ $(TESTSRC) $(ENGINE) $(V8XSRC) -lm
+
+# v8x の switch dispatch 側も丸ごと走査する双子バイナリ（片側だけの不具合を封殺）
+$(BUILD)/run_tests_switch: $(TESTSRC) $(ENGINE) $(V8XSRC) | $(BUILD)
+	$(CC) $(BASE) $(SAN) -DV8X_TEST_SWITCH_DISPATCH -Itests -o $@ $(TESTSRC) $(ENGINE) $(V8XSRC) -lm
 
 $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_driver.c $(ENGINE) -lm
 
+$(BUILD)/fuzz_v8x: fuzz/fuzz_v8x.c $(V8XSRC) | $(BUILD)
+	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_v8x.c $(V8XSRC) -lm
+
 .PHONY: test uitest golden fuzz bench tuibench clean size conformance
 
-test: $(BUILD)/run_tests
+test: $(BUILD)/run_tests $(BUILD)/run_tests_switch
 	./$(BUILD)/run_tests
+	./$(BUILD)/run_tests_switch
 
 # TUI を疑似端末(PTY)越しに駆動する e2e スモーク（tabstrip/scroll/quit 等）
 uitest: $(BUILD)/ifuto
@@ -43,8 +54,9 @@ uitest: $(BUILD)/ifuto
 golden: $(BUILD)/ifuto-asan
 	tests/run_golden.sh ./$(BUILD)/ifuto-asan
 
-fuzz: $(BUILD)/fuzz_html
+fuzz: $(BUILD)/fuzz_html $(BUILD)/fuzz_v8x
 	fuzz/run_fuzz.sh ./$(BUILD)/fuzz_html 500
+	fuzz/run_fuzz.sh ./$(BUILD)/fuzz_v8x 500
 
 bench: $(BUILD)/ifuto
 	bench/bench.sh ./$(BUILD)/ifuto
@@ -55,6 +67,17 @@ $(BUILD)/bench_tabmeta: bench/bench_tabmeta.c $(ENGINE) | $(BUILD)
 
 $(BUILD)/bench_session: bench/bench_session.c $(ENGINE) | $(BUILD)
 	$(CC) $(BASE) $(REL) -o $@ bench/bench_session.c $(ENGINE) $(LDFLAGS_REL) -lm
+
+# V8x dispatch 決定の根拠データ（結果は BENCH.md に中央値で公開）
+$(BUILD)/bench_v8x: bench/bench_v8x.c $(V8XSRC) | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ bench/bench_v8x.c $(V8XSRC) $(LDFLAGS_REL) -lm
+
+$(BUILD)/bench_v8x_switch: bench/bench_v8x.c $(V8XSRC) | $(BUILD)
+	$(CC) $(BASE) $(REL) -DV8X_TEST_SWITCH_DISPATCH -o $@ bench/bench_v8x.c $(V8XSRC) $(LDFLAGS_REL) -lm
+
+v8xbench: $(BUILD)/bench_v8x $(BUILD)/bench_v8x_switch
+	./$(BUILD)/bench_v8x
+	./$(BUILD)/bench_v8x_switch
 
 tuibench: $(BUILD)/ifuto $(BUILD)/bench_tabmeta $(BUILD)/bench_session
 	python3 bench/bench_tui.py ./$(BUILD)/ifuto

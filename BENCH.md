@@ -85,3 +85,46 @@ slice-2 のコスト分析（正直な注記）:
   - small 文書 avg は 1〜2 ms で揺れる（±1ms はこのコンテナのノイズ床）。
   - 空タブ VmHWM 1,428 → 1,732 KB: .rodata のエンティティ表への初回ページインと
     パーサ増分コード（ピーク計測なので初回フォルトが乗る）。天井内のため後追いのみ。
+
+## 2026-07-29: V8x v0.0（自作 JS エンジン、C11・JIT なし）初回測定
+
+採用仕様: 字句→recursive-descent（AST プール）→one-pass codegen→**全検証 verifier**
+→スタック VM。値は NaN-box 8B、ヒープ参照は obj 配列への u32 index、命令・呼出深度・
+解析深度・ヒープバイト・ノード数・引数列・ソース長の全 budget を fail-stop で管理。
+JIT は構造的に不在（W^X 全域、実行可能書き込みページ 0）。
+
+### dispatch 実測（bench/bench_v8x.c, REL, 7 プロセス×7 回の median-of-medians, 本コンテナ）
+| workload | computed-goto | switch | goto/switch |
+|---|---|---|---|
+| fib(22) recursive | 2.567 ms | 3.324 ms | **1.295×** |
+| arith loop 100k | 9.198 ms | 10.418 ms | **1.133×** |
+| mixed stmt loop 20k | 2.583 ms | 2.902 ms | **1.123×** |
+| str concat 2k | 0.391 ms | 0.393 ms | 1.005× |
+
+裁定: **computed-goto を既定**（GCC/Clang で有効、他は switch フォールバック。
+`V8X_TEST_SWITCH_DISPATCH` で強制切替可）。dispatch 支配の算術系で +12〜30%。
+文字列系はインターンハッシュ支配で差なし。理論（間接分岐の局所化）と一致。
+両モードとも同一単体テスト全緑（run_tests / run_tests_switch の双子運用で固定）。
+
+### サイズ会計（実測）
+- スタンドアロン差分（空 main との diff, stripped/LTO/gc-sections）: **45,392 B**。
+- ifuto（195,192 B）に全 v8x シンボル保持で仮リンク: **244,376 B（+49,184 B）**。
+- 内訳（-O2 単体 .o）: .text.vm_exec 18,919 B（42%）、lex_next 2,816、
+  p_stmt 2,674、cg_stmt 2,436、v8x_eval 2,221、p_unary 1,862、他 ≈16 KB。
+- **200 KB 天井との関係**: v0.0 は本体未リンクで天井維持（195,192 B 不変）。
+  v0.4 統合時に天井を再設定する。削減材料の候補（未実施・見積もりも未計測）:
+  dtoa の自前化で %g/%.0f printf 経路を剥がす、エラーメッセージの ID 化、
+  vm_exec の命令削減。再設定するときはこの 3 案の実測値を添えて判断する。
+
+### 検証
+- 単体: **1,813 checks / 0 fail**（v8x 追加分 118。1695 → 1813）。
+  NaN canonical、±Inf、int32→double 境界、INT32_MIN % -1 の UB 回避、
+  短絡評価の生値、0.1+0.2 の厳密 binary64、ToInt なし連結 ToString（往復最短精度）、
+  グローバル定数 NaN/Infinity の const 保護、parse depth・命令・深度・ヒープの
+  各 budget の fail-stop、budget 枯渇後の eval 健全性、rt 間のグローバル独立性。
+- fuzz: fuzz_html 500 + **fuzz_v8x 500** = 1,000 iter / 0 crash（ASAN/UBSAN）。
+- WPT tree-construction: **88.1%（1,521/1,726）不変**（エンジン側差分ゼロの確認）。
+- 既知の v0.0 境界（台帳）: 配列/オブジェクトリテラル、三項 `?:`、`++`/`--`、
+  複合代入 `+=`、arguments/this/new/prototype、ASI 完全形。let/const は関数スコープ近似。
+  dtoa は往復最短精度（15→17g 探索）で JS と整数帯・最短表記を一致させたが、
+  指数非化帯の境界（1e21 前後の形式）までの完全一致は未保証。
