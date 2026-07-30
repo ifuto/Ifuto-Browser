@@ -1288,8 +1288,28 @@ static void pend_flush(IfTB *b) {
 }
 
 /* ---- frameset 挿入モード（WHATWG 12.2.6.4.19-21 の核。tests18/19/plain-text-unsafe 由来） ---- */
+/* frameset 系モード（in/after/after-after）の character 規則共通部:
+ * テキスト中の ws 文字(TAB/LF/FF/CR/SP)のみ挿入。非 ws は parse error で捨てる
+ * （トークン丸ごと捨てではない — "<frameset> te st" → "  " が残る spec 挙動） */
+static void frameset_text(IfTB *b, IfStr s) {
+    u32 nws = 0;
+    for (u32 i = 0; i < s.n; i++) {
+        char c = s.p[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') nws++;
+    }
+    if (nws == s.n) { append_text(b, s); return; }
+    char *buf = (char *)if_arena_alloc(b->arena, nws);
+    u32 w = 0;
+    for (u32 i = 0; i < s.n; i++) {
+        char c = s.p[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') buf[w++] = c;
+    }
+    append_text(b, if_str(buf, w));
+    b->dom->n_errors++;
+}
+
 static void step_in_frameset(IfTB *b, IfTok tok) {
-    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { append_text(b, tok.text); return; }
+    if (tok.kind == TOK_TEXT) { frameset_text(b, tok.text); return; }
     if (tok.kind == TOK_COMMENT) { insert_comment_placed(b, &tok); return; }
     if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
     if (tok.kind == TOK_START && tok.tag == IF_TAG_HTML) { step_in_body(b, tok); return; }
@@ -1312,17 +1332,7 @@ static void step_in_frameset(IfTB *b, IfTok tok) {
 }
 
 static void step_after_frameset(IfTB *b, IfTok tok) {
-    if (tok.kind == TOK_TEXT) {
-        /* 文字は一括 ignore ではなく先頭の空白のみ挿入（残りは parse error で捨てる）。
-         * <frameset></frameset>\nfoo で "\n" が残り "foo" が捨てられる spec 挙動 */
-        IfStr t2 = tok.text;
-        u32 nws = 0;
-        while (nws < t2.n && (t2.p[nws] == ' ' || t2.p[nws] == '\t' || t2.p[nws] == '\n' ||
-                              t2.p[nws] == '\r' || t2.p[nws] == '\f')) nws++;
-        if (nws) append_text(b, if_str(t2.p, nws));
-        if (nws < t2.n) b->dom->n_errors++;
-        return;
-    }
+    if (tok.kind == TOK_TEXT) { frameset_text(b, tok.text); return; }
     if (tok.kind == TOK_COMMENT) { insert_comment_placed(b, &tok); return; }
     if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
     if (tok.kind == TOK_START && tok.tag == IF_TAG_HTML) { step_in_body(b, tok); return; }
@@ -1333,7 +1343,7 @@ static void step_after_frameset(IfTB *b, IfTok tok) {
 }
 
 static void step_after_after_frameset(IfTB *b, IfTok tok) {
-    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { step_in_body(b, tok); return; }
+    if (tok.kind == TOK_TEXT) { frameset_text(b, tok.text); return; }
     if (tok.kind == TOK_COMMENT) { insert_comment(b, b->dom->root, &tok); return; }
     if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
     if (tok.kind == TOK_START && tok.tag == IF_TAG_HTML) { step_in_body(b, tok); return; }
@@ -1996,8 +2006,16 @@ static void step_in_body(IfTB *b, IfTok tok) {
             b->frameset_ok = false;
             return;
         }
-        if (t == IF_TAG_LI) { b->frameset_ok = false; implied_close(b, IF_TAG_LI, 0, IF_TAG_UL, IF_TAG_OL); }
-        if (t == IF_TAG_DT || t == IF_TAG_DD) { b->frameset_ok = false; implied_close(b, IF_TAG_DT, IF_TAG_DD, IF_TAG_DL, 0); }
+        if (t == IF_TAG_LI) {
+            b->frameset_ok = false;
+            implied_close(b, IF_TAG_LI, 0, IF_TAG_UL, IF_TAG_OL);
+            close_p_if_open(b);
+        }
+        if (t == IF_TAG_DT || t == IF_TAG_DD) {
+            b->frameset_ok = false;
+            implied_close(b, IF_TAG_DT, IF_TAG_DD, IF_TAG_DL, 0);
+            close_p_if_open(b);
+        }
         /* ruby 系: rb/rp/rt/rtc は ruby 文脈の implied end tags。
          * rtc は閉じない（rt は rtc の子として残る仕様）、rb/rp/rt は互いに閉じ合う。
          * ruby がスコープに無い時は通常要素として挿入（parse error なし近似は台帳） */
