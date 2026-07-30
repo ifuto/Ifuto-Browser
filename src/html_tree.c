@@ -1806,6 +1806,20 @@ static void step_in_body(IfTB *b, IfTok tok) {
         }
         /* 書式要素: reconstruct → 挿入 → AFE へ。nobr は二重 nobr の仕様 quirk 込み */
         if (is_formatting(t)) {
+            if (t == IF_TAG_A) {
+                /* 同名 AFE が残っているなら parse error: AAA を走らせ、
+                 * AAA が畳み損ねた場合でも旧 a を AFE/stack から確実に除去する
+                 * （<a><p>X<a>Y… で旧 a が p の外に出て空で残る spec 挙動） */
+                i32 fi = afe_find_tag(b, IF_TAG_A);
+                if (fi >= 0) {
+                    IfNode *old = b->afe[fi].n;
+                    b->dom->n_errors++;
+                    adoption(b, IF_TAG_A);
+                    if (afe_find_node(b, old) >= 0) afe_remove_at(b, (u32)afe_find_node(b, old));
+                    for (u32 i = 0; i < b->depth; i++)
+                        if (b->stack[i] == old) { stack_remove_at(b, i); break; }
+                }
+            }
             afe_reconstruct(b);
             if (t == IF_TAG_NOBR && has_in_default_scope_tag(b, IF_TAG_NOBR)) {
                 b->dom->n_errors++;
