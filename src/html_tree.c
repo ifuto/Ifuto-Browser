@@ -823,10 +823,16 @@ static void adoption(IfTB *b, u16 tag) {
         if (fs < 0) { b->dom->n_errors++; afe_remove_at(b, (u32)fi); return; }
         if (!node_in_default_scope(b, fe)) { b->dom->n_errors++; return; }
         if (fe != top(b)) b->dom->n_errors++;
-        /* step 8: furthest block = fe より上（index 大）の最後の special 要素 */
+        /* step 8: furthest block = fe より上（index が大きい側）で最初に現れる
+         * special 要素。仕様の "topmost node lower in the stack than the
+         * formatting element"（stack は current node が bottommost）を素直に読むと
+         * この向きで、「最後の」ではなく「fe に最も近い」が正解。逆方向を取ると
+         * 外周ループによる ladder 化（div1→div2 順に包む）が起きず、
+         * adoption01 の <a>1<div>2<div>3</a>… 系が全面不一致になる実測あり
+         * （html5lib 計装で div→a の reparent が 2 段で起きることを確認済み） */
         i32 fb = -1;
         for (u32 i = (u32)fs + 1; i < b->depth; i++)
-            if (is_special(b->stack[i])) fb = (i32)i;
+            if (is_special(b->stack[i])) { fb = (i32)i; break; }
         /* step 9: 無ければ fe まで pop して AFE からも除去して終了 */
         if (fb < 0) {
             while (b->depth > (u32)fs) pop(b);
