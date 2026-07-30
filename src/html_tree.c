@@ -1399,10 +1399,106 @@ static IfStr peel_leading_ws(IfStr *s) {
     return ws;
 }
 
+
+/* ---- quirks モード判定（WHATWG 13.2.5.1 DOCTYPE 規則の完全表） ---- */
+static bool if_quirks_pub_prefix(const char *pub) {
+    static const char *P[] = {
+        "+//silmaril//dtd html pro v0r11 19970101//",
+        "-//advasoft ltd//dtd html 3.0 aswedit + extensions//",
+        "-//as//dtd html 3.0 aswedit + extensions//",
+        "-//ietf//dtd html 2.0 level 1//", "-//ietf//dtd html 2.0 level 2//",
+        "-//ietf//dtd html 2.0 strict level 1//", "-//ietf//dtd html 2.0 strict level 2//",
+        "-//ietf//dtd html 2.0 strict//", "-//ietf//dtd html 2.0//", "-//ietf//dtd html 2.1e//",
+        "-//ietf//dtd html 3.0//", "-//ietf//dtd html 3.2 final//", "-//ietf//dtd html 3.2//",
+        "-//ietf//dtd html 3//", "-//ietf//dtd html level 0//", "-//ietf//dtd html level 1//",
+        "-//ietf//dtd html level 2//", "-//ietf//dtd html level 3//",
+        "-//ietf//dtd html strict level 0//", "-//ietf//dtd html strict level 1//",
+        "-//ietf//dtd html strict level 2//", "-//ietf//dtd html strict level 3//",
+        "-//ietf//dtd html strict//", "-//ietf//dtd html//",
+        "-//metrius//dtd metrius presentational//",
+        "-//microsoft//dtd internet explorer 2.0 html strict//",
+        "-//microsoft//dtd internet explorer 2.0 html//",
+        "-//microsoft//dtd internet explorer 2.0 tables//",
+        "-//microsoft//dtd internet explorer 3.0 html strict//",
+        "-//microsoft//dtd internet explorer 3.0 html//",
+        "-//microsoft//dtd internet explorer 3.0 tables//",
+        "-//netscape comm. corp.//dtd html//", "-//netscape comm. corp.//dtd strict html//",
+        "-//o'reilly and associates//dtd html 2.0//",
+        "-//o'reilly and associates//dtd html extended 1.0//",
+        "-//o'reilly and associates//dtd html extended relaxed 1.0//",
+        "-//softquad software//dtd hotmetal pro 6.0::19990601::extensions to html 4.0//",
+        "-//softquad//dtd hotmetal pro 4.0::19971010::extensions to html 4.0//",
+        "-//spyglass//dtd html 2.0 extended//", "-//sq//dtd html 2.0 hotmetal + extensions//",
+        "-//sun microsystems corp.//dtd hotjava html//",
+        "-//sun microsystems corp.//dtd hotjava strict html//",
+        "-//w3c//dtd html 3 1995-03-24//", "-//w3c//dtd html 3.2 draft//",
+        "-//w3c//dtd html 3.2 final//", "-//w3c//dtd html 3.2//", "-//w3c//dtd html 3.2s draft//",
+        "-//w3c//dtd html 4.0 frameset//", "-//w3c//dtd html 4.0 transitional//",
+        "-//w3c//dtd html experimental 19960712//", "-//w3c//dtd html experimental 970421//",
+        "-//w3c//dtd w3 html//", "-//w3o//dtd w3 html 3.0//",
+        "-//webtechs//dtd mozilla html 2.0//", "-//webtechs//dtd mozilla html//"
+    };
+    for (u32 i = 0; i < sizeof P / sizeof *P; i++) {
+        const char *p = P[i];
+        u32 k = 0;
+        while (p[k] && (char)(pub[k] | 0x20) == p[k]) k++; /* pub は ascii-insensitive 前方一致 */
+        if (p[k] == 0) return true;
+    }
+    return false;
+}
+
+static bool if_quirks_pub_exact(const char *pub) {
+    static const char *E[] = {
+        "-//w3o//dtd w3 html strict 3.0//en//",
+        "-/w3c/dtd html 4.0 transitional/en",
+        "html"
+    };
+    char buf[96];
+    u32 n = 0;
+    for (const char *s = pub; *s && n < sizeof buf - 1; s++) buf[n++] = (char)(*s | 0x20);
+    buf[n] = 0;
+    for (u32 i = 0; i < sizeof E / sizeof *E; i++)
+        if (strcmp(buf, E[i]) == 0) return true;
+    return false;
+}
+
+static bool if_doctype_is_quirks(const IfTok *tok) {
+    /* name 無し / name != "html" → quirks */
+    if (!tok->dt_has_name) return true;
+    if (!if_str_eq_ci(tok->text, IF_S("html"))) return true;
+    if (tok->dt_has_pub) {
+        char *pub = (char *)tok->dt_pub.p;
+        /* arena 内文字列は NUL 終端保証がない → 長さ限定コピー */
+        static char pb[512];
+        u32 n = tok->dt_pub.n < sizeof pb - 1 ? tok->dt_pub.n : (u32)sizeof pb - 1;
+        memcpy(pb, pub, n); pb[n] = 0;
+        pub = pb;
+        if (if_quirks_pub_prefix(pub) || if_quirks_pub_exact(pub)) return true;
+        /* system id 無しで 4.01 frameset/transitional → quirks */
+        if (!tok->dt_has_sys) {
+            if (strncmp((const char *)pub, "-//W3C//DTD HTML 4.01 Frameset//", 33) == 0 ||
+                strncmp((const char *)pub, "-//w3c//dtd html 4.01 frameset//", 33) == 0 ||
+                strncmp((const char *)pub, "-//W3C//DTD HTML 4.01 Transitional//", 37) == 0 ||
+                strncmp((const char *)pub, "-//w3c//dtd html 4.01 transitional//", 37) == 0)
+                return true;
+        }
+    }
+    if (tok->dt_has_sys) {
+        IfStr s = tok->dt_sys;
+        IfStr ibm = IF_S("http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd");
+        if (if_str_eq_ci(s, ibm)) return true;
+    }
+    if (tok->dt_has_pub && !tok->dt_has_sys) {
+        /* public あり system 無しは quirks（spec 条項） */
+        return true;
+    }
+    return false;
+}
+
 static void step_initial(IfTB *b, IfTok tok) {
     switch (tok.kind) {
     case TOK_DOCTYPE:
-        b->dom->quirks = false; /* quirks 判定は行わない（no-quirks 固定方針）。 */
+        b->dom->quirks = if_doctype_is_quirks(&tok); /* 完全表による spec 準拠判定 */
         if (!b->seen_doctype) {
             b->seen_doctype = true;
             IfNode *d = new_node(b, IF_NODE_DOCTYPE);
@@ -1767,7 +1863,9 @@ static void step_in_body(IfTB *b, IfTok tok) {
             return;
         }
         if (t == IF_TAG_TABLE) {
-            close_p_if_open(b);
+            /* quirks モードでは p を畳まない（spec: "If the Document is NOT set to
+             * quirks mode, and ... has a p element in button scope" の条件） */
+            if (!b->dom->quirks) close_p_if_open(b);
             insert_element(b, &tok, true);
             pend_reset(b);
             b->mode = M_IN_TABLE;
