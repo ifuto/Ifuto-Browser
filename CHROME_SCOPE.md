@@ -14,6 +14,19 @@
 - ストリーミング: 「最適化してから処理する」一段構えの禁止。解析・レイアウト・描画は到着データで逐次進める
   （現行 token 駆動 parser は既にこの形）。
 
+## 0.2 v0.2 GUI マイルストーン実績（2026-07-31 記録）
+
+§0.1 の最終形宣言に対する第一段を実装・検証した（詳細な計測は BENCH.md 冒頭節）。
+- `build/ifuto-gui`（195,088 B、ldd = vdso/libc/ld のみ）: 生 X11 プロトコル直接実装
+  （Xlib/XCB 不使用。CreateWindow/PutImage/GetKeyboardMapping 等、Xauthority 対応）。
+- 自前 5x7 ビットマップフォント + 8 セル行ストリップのストリーミング描画（全面バックバッファ非保持）。
+- タブ帯/オムニボックス/ステータスバー + キー駆動。IfChrome モデルは TUI と同一（二重実装なし）。
+- grid は viewport 窓のみ（`if_render_grid_rows_into`）: 1 万行文書で grid 保有は 38.4 KB。
+- chrome ロード経路で **slim-DOM 既定 ON**（script/template 配下は DOM に構築しない）。
+- ヘッドレス検証: `--shot OUT.ppm PAGE`（`make guismoke`、17 checks）＋ PNG 目視 QA。
+- 台帳（未達、優先度順）: CJK フォント（現 tofu 表示）、italic 傾斜、リンクのマウスクリック、
+  セッション復元の GUI 配線、HTTP 取得（v0.2 後半〜）。
+
 ## 0. 位置づけ
 
 現状の ifuto は**エンジンのみ**でクロームを持たない（`HTML → DOM → CSS → layout → セルグリッド → ANSI/plain`、単一文書、設定は CLI フラグ）。

@@ -2,19 +2,24 @@
 
 史上最強の軽量ブラウザを目指す、全部自作のブラウザエンジンプロジェクト（C11・依存ゼロ。
 **Chromium 由来コードは 0 バイト**。リンクするのは libc と libm のみ）。
-現在地: **v-chrome slice-2** — エンジン + TUI クローム（タブ/オムニボックス/検索）+
+現在地: **v0.2** — エンジン + TUI クローム + **GUI（`build/ifuto-gui`: 生 X11、Xlib 不使用、
+自前 5x7 フォント、ストリップ・ストリーミング描画）** + Markdown 表示（`.md` 自動検出）+
+**slim-DOM**（画面描画に関係ない script/template 配下は DOM に構築しない。実ブラウズ経路で既定）+
+**viewport 窓グリッド**（grid は文書全体ではなく可視窓のみ materialize）+
 ローカル永続化（セッション・履歴・ブックマーク。全て tmp→rename→fsync の原子書換）。
 
 ```
-HTML(untrusted) → tokenizer → DOM → CSS cascade → layout → cell-grid render → ANSI
-                                          ↑ 1 タブ 1 arena（C1: 閉じる=destroy、正確なメモリ表示）
+HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS cascade → layout
+      → cell-grid render ─→ ANSI (TUI/CLI)
+                          └→ 5x7 raster strip → XPutImage (GUI)   ↑ 1 タブ 1 arena
 ```
 
 ## 実測（計測法: BENCH.md / `make bench` / `make tuibench`）
 
-| 指標 | v0.1 (CLI) | v-chrome slice-2 (TUI + ストア込み) |
+| 指標 | v0.1 (CLI) | 現在（v0.2, TUI + ストア込み） |
 |---|---|---|
-| バイナリ（stripped・LTO） | 80 KB | **134 KB**（天井 200 KB） |
+| バイナリ ifuto（stripped・LTO） | 80 KB | **214.6 KB**（219,776 B。新天井 240 KB。増分主体は md.c） |
+| バイナリ ifuto-gui（同上 GUI） | — | **190.5 KB**（195,088 B。ldd は vdso/libc/ld のみ） |
 | コールドスタート | 1.1 ms（spawn 込み） | **1.55 ms**（fork/exec→TUI 初描画、median） |
 | 空タブ UI 常駐 RSS | — | **1.43 MB**（天井 4 MB） |
 | アンロード済み 50 タブ メタ | — | **14.7 KB**（天井 2 MB） |
@@ -27,13 +32,20 @@ HTML(untrusted) → tokenizer → DOM → CSS cascade → layout → cell-grid r
 
 ```sh
 make            # build/ifuto（リリース: -O2 LTO stripped）
-make test       # 単体テスト 1640 checks（ASan+UBSan+LSan 常時）
+make gui        # build/ifuto-gui（GUI v0.2。X11 実機ではそのまま起動）
+make test       # 単体テスト 1989 checks ×2 dispatch（ASan+UBSan+LSan 常時）
 make uitest     # TUI を疑似端末越しに駆動する e2e スモーク（15 checks）
+make guismoke   # GUI を X なしで検証（--shot ラスタ + 画素検査、17 checks）
 make golden     # 描画の厳密 diff テスト
 make fuzz       # mutation fuzz + ASan
 make bench      # サイズ/起動/時間/RSS の測定（CLI）
 make tuibench   # v-chrome 天井の実測検証（冷間開始/RSS/idle/タブメタ/セッション復元）
 make conformance # WPT tree-construction 採点（現 97.3%, 1679/1726, 2026-07-31）
+
+./build/ifuto-gui local_page.html          # GUI 起動（X11 必要。Ctrl+L/T/W/Q, 矢印, PgUp/PgDn）
+./build/ifuto-gui --shot out.ppm page.md   # ヘッドレス: 同パイプラインでフルラスタ PPM
+./build/ifuto notes.md                     # Markdown は拡張子で自動検出（--md で強制）
+./build/ifuto --slim-dom --no-ansi p.html  # CLI で slim-DOM（既定は full/適合保証）
 
 ./build/ifuto --ui                       # 対話 TUI（前回セッション復元 or 空タブ。tty 必要）
 ./build/ifuto --ui file.html             # ファイルをロードして開始

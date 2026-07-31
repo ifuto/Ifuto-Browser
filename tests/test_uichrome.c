@@ -167,12 +167,12 @@ static void test_chrome_model(void) {
     CHECK(if_chrome_open(&c, "/tmp/x/a.html", 100));
     CHECK(c.n_tabs == 1);
     IfTab *t = if_chrome_cur(&c);
-    CHECK(t && t->doc && t->lay && t->grid);
+    CHECK(t && t->doc && t->lay && t->doc_h > 0); /* grid は持たない（viewport 窓は paint 時） */
     CHECK(strcmp(t->title, "Alpha") == 0);
     CHECK(if_chrome_cur_doc_bytes(&c) > 0);
 
     /* スクロールはクランプされる */
-    i32 maxs = t->grid->h;
+    i32 maxs = t->doc_h;
     CHECK(if_chrome_scroll(&c, 10000, 4) <= maxs);
     CHECK(if_chrome_scroll(&c, -100000, 4) == 0);
 
@@ -293,7 +293,7 @@ static void test_chrome_store(void) {
     CHECK(c2.next_id > c2.tabs[0]->id && c2.next_id > c2.tabs[1]->id);
     /* 遅延ロード: 切替で doc が構築される */
     if_chrome_switch(&c2, 0, 100);
-    CHECK(c2.tabs[0]->doc != NULL && c2.tabs[0]->grid != NULL);
+    CHECK(c2.tabs[0]->doc != NULL && c2.tabs[0]->lay != NULL);
     /* 新規タブが既存 id と衝突しない */
     IfTab *nb = if_chrome_new_blank(&c2);
     CHECK(nb != NULL && nb->id != c2.tabs[0]->id && nb->id != c2.tabs[1]->id);

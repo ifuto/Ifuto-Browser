@@ -27,6 +27,17 @@ $(BUILD)/ifuto: $(SRC) | $(BUILD)
 $(BUILD)/ifuto-asan: $(SRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -o $@ $(SRC) -lm
 
+# GUI フロントエンド（raw X11 クライアント + ソフトラスタ。依存は libc/libm のみを維持）
+GUISRC := $(filter-out src/main.c,$(SRC)) $(wildcard src/gui/*.c)
+$(BUILD)/ifuto-gui: $(GUISRC) | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ $(GUISRC) $(LDFLAGS_REL) -lm
+
+gui: $(BUILD)/ifuto-gui
+
+# ヘッドレス GUI 検証（X 不要: --shot のラスタパイプライン + 画素検査）
+guismoke: $(BUILD)/ifuto-gui
+	python3 tests/gui_smoke.py ./$(BUILD)/ifuto-gui
+
 TESTSRC := $(wildcard tests/*.c)
 $(BUILD)/run_tests: $(TESTSRC) $(ENGINE) $(V8XSRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -Itests -o $@ $(TESTSRC) $(ENGINE) $(V8XSRC) -lm
@@ -41,7 +52,7 @@ $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 $(BUILD)/fuzz_v8x: fuzz/fuzz_v8x.c $(V8XSRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_v8x.c $(V8XSRC) -lm
 
-.PHONY: test uitest golden fuzz bench tuibench clean size conformance guard vsx v8xbench
+.PHONY: test uitest golden fuzz bench tuibench clean size conformance guard vsx v8xbench gui guismoke
 
 test: $(BUILD)/run_tests $(BUILD)/run_tests_switch
 	./$(BUILD)/run_tests

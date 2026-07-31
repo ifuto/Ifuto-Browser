@@ -31,7 +31,9 @@ typedef struct IfTab {
     IfArena *view; /* layout+grid（再レイアウトで破棄・再構築） */
     IfDom *dom;
     IfLayout *lay;
-    IfGrid *grid;
+    /* v0.2: 全面 grid は保持しない（viewport 相対方式、render.h の規約参照）。
+     * 迷子の代わりに doc 全体の総行高をキャッシュする（scroll clamp 用） */
+    i32 doc_h;
     i32 scroll;    /* 表示先頭行 */
     i32 link_idx;  /* フォーカス中リンク（-1=なし） */
     bool dirty;    /* リサイズで再レイアウトが必要 */

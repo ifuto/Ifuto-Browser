@@ -6,6 +6,7 @@
 #include "common.h"
 #include "arena.h"
 #include "dom.h"
+#include "md.h"
 #include "css.h"
 #include "layout.h"
 #include "render.h"
@@ -57,6 +58,8 @@ static void usage(FILE *f) {
           "  --dump-tokens    print HTML tokens\n"
           "  --dump-wptdom    print DOM in html5lib tree-construction format\n"
           "  --ui             interactive TUI (tabs, omnibox; needs a tty)\n"
+          "  --md             force Markdown parsing (auto for .md/.markdown files)\n"
+          "  --slim-dom       drop display-irrelevant subtrees (script/template) from DOM\n"
           "  --links          print collected links\n"
           "  --stats          print timing/memory stats to stderr\n"
           "  --show-paths     list persisted-data paths (INV-9; no side effects)\n", f);
@@ -87,7 +90,7 @@ static int show_paths(void) {
 
 int main(int argc, char **argv) {
     i32 width = 100;
-    int ansi = 1, do_style = 1, links = 0, stats = 0;
+    int ansi = 1, do_style = 1, links = 0, stats = 0, force_md = 0;
     enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM, M_UI } mode = M_RENDER;
     const char *path = NULL;
 
@@ -102,6 +105,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--ui") == 0) mode = M_UI;
         else if (strcmp(argv[i], "--links") == 0) links = 1;
         else if (strcmp(argv[i], "--stats") == 0) stats = 1;
+        else if (strcmp(argv[i], "--md") == 0) force_md = 1;
+        else if (strcmp(argv[i], "--slim-dom") == 0) if_dom_slim = true;
         else if (strcmp(argv[i], "--show-paths") == 0) return show_paths();
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { usage(stdout); return 0; }
         else if (argv[i][0] == '-' && argv[i][1] != 0) { usage(stderr); return 2; }
@@ -117,6 +122,10 @@ int main(int argc, char **argv) {
     IfStr input = read_all(&a, path);
 
     double t1 = now_ms();
+    /* v0.2: Markdown（+GFM 表/脚注。表示テキストは MD 以上の情報密度を持つ方針）
+     * は HTML に前段変換してから単一の WHATWG パーサへ（多層防御） */
+    IfStr md_html;
+    if (force_md || if_path_is_md(path)) { if_md_to_html(&a, input, &md_html); input = md_html; }
     IfDom *dom = if_parse_html(&a, input);
     double t2 = now_ms();
 

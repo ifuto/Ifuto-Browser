@@ -2,6 +2,51 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-07-31: v0.2 — GUI（生 X11）+ Markdown + slim-DOM + viewport 窓グリッド
+
+構成（このターンの到達点）:
+- **ifuto-gui v0.2**: 生 X11 プロトコル実装（Xlib/XCB 不使用、ヘッダも不要）。自前 5x7
+  ビットマップフォント、全面バックバッファ非保持の **8 セル行ストリップ・ストリーミング描画**。
+  タブ帯/オムニボックス（フォーカス+キャレット）/ステータスバー、キー駆動（Ctrl+L/T/W/Q、
+  Ctrl+Tab、矢印/jk、PgUp/PgDn）。`--shot OUT.ppm PAGE` = X 不要の同一ラスタ検証経路。
+- **Markdown 変換器 `src/md.c`**（ink level = Markdown 以上の法則）: 見出し/段落/強勢/
+  コード/リンク/引用/リスト/罫線/フェンスコード/GFM テーブル/脚注。生 HTML 素通し禁止
+  （全テキスト escape＝多層防御は共通パーサの規則に委譲）。再帰は index 窓、深度上限つき。
+- **slim-DOM**（法則「画面描画に関係ないものは DOM しない」、`if_dom_slim`）:
+  script/template の子孫・本文を DOM に構築しない（状態機械は完全に回す。root は marker
+  として残す。style は cascade が本文を読むので残す＝描画に関係あるため）。実ブラウズ経路
+  （chrome＝TUI/GUI）で既定 ON、CLI は `--slim-dom`、適合ハーネスは従来通り full DOM。
+- **viewport 窓グリッド**（`if_render_grid_rows_into` + `IfGrid.y_off`）: grid は
+  `[scroll, scroll+vh)` だけ materialize。文書長に比例しない（TUI/GUI 共通、容量はキャッシュ再利用）。
+
+### 実測（このコンテナ、2026-07-31）
+| 指標 | 値 | 注 |
+|---|---|---|
+| バイナリ build/ifuto | **219,776 B** | v0.2-pre 195,192 比 +24,584 B（md.c 24,993 B 源＝本体） |
+| バイナリ build/ifuto-gui | **195,088 B** | ldd: linux-vdso/libc/ld のみ（不変条件維持。libm も gc-sections 剥落） |
+| IfCell / IfNode | 8 B / 112 B | sizeof 実測（構造体会計の基礎値） |
+| viewport 窓 grid | 10,000 行×120 桁文書≙ フル 9.6 MB → 窓 vh=40 で **38.4 KB（1/250）** | 計算会計（8 B/cell）。文書長不変 |
+| slim-DOM（合成 1.89 MB 頁: script×2000 + template×2000） | dump DOM 行 10,012→**8,012（−20%）**、RSS 13.0→12.5 MB（−4%）、wall 31.2→30.7 ms | `/tmp` 上合成頁、python resource 計測 |
+| GUI ラスタ決定性 | sha256 2 回一致（gui_smoke 17 checks PASS） | tests/gui_smoke.py |
+
+**正直な分析（slim-DOM の効きの境界）**: テキストノードは入力バッファへのゼロコピー参照のため、
+剃った script 本文のバイトは入力 arena がタブ寿命で保持し続ける＝現状の剃りは**ノードヘッダ
+（112 B/個）と下流通過（layout/cascade/dump の走査回避）**に効く。script 巨大 1 本の頁では
+tokenizer のトークン緩衝がピークを支配し RSS 差は出ない（16 MB 単一 script で 55.8 MB 同値を実測）。
+**入力 compaction（可視参照だけ新 arena に写し旧 arena を破棄＋ポインタ付替）が次の本丸**で、
+script 比重の大きい実在頁で 10 MB 級の削減が見込める。v0.3 台帳へ。
+また fuzz は full DOM 経路中心なので slim 変異系統（script/template 混じり構造）の追加も台帳。
+
+### 検証（このターン）
+- 単体 **1,989 checks×2 dispatch 0 fail**（slim-DOM 16 checks、md 〜40、uichrome 追従）。
+- fuzz 500+500 iter 0 crash（ASAN/UBSAN）。guard ALL PASS。tuibench 系は不変。
+- WPT tree-construction **1,679/1,726（97.3%）不変**（slim は適合ハーネス非適用を確認）。
+- tui_smoke PASS、gui_smoke PASS、GUI 実ラスタ PNG 目視 QA（グリフ鏡像バグ修正済）。
+- bench_v8x 値不変（fib22=17711 / arith=905003 / mixed=7.9996e+07）。
+- 天井監視: ifuto 219,776 B は旧 TUI 天井 200 KB を **+19,776 B 超過**。成因は md.c 追加で
+  機能マイルストーンに伴うもの（悪化ではないが）— v0.2 系の新天井 240 KB をここに設定し、
+  以後のコミットはこれに拘束される。
+
 ## 2026-07-31: V8x v0.1（GC + ROPE + 融合命令）— QuickJS 比「軽さ・速さ」全軸クリア、V8 --jitless 比も全軸クリア
 
 構成: mark-sweep GC（adaptive pacing, ルート=VM スタックスナップショット+globals+nursery+last_val）、

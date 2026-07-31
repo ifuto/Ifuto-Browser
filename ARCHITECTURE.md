@@ -53,6 +53,10 @@
 | 入力 CR/CRLF → LF 正規化なし | `\r` 含む入力でツリー差異の可能性 | v0.2 継続（入力前処理に正規化層） |
 | isindex/`<title>` の body→head 移動等非推奨規則 | 該当テストのみ失敗 | 非推奨要素は後回し（実害なしと判断） |
 | フォントは端末依存・等幅のみ、斜体/太字は SGR 属性 | 実フォントレンダリングなし | v0.3（GPU/ソフトピクセル） |
+| GUI v0.2: 生 X11 プロトコル（Xlib/XCB 不リンク）、自前 5x7 フォント、8 セル行ストリップ描画（全面バックバッファ非保持）。ldd は vdso/libc/ld のみ | 台帳: ASCII 外形のみ（CJK は tofu）、斜体の傾斜未実装、sup/sub なし、リンクのマウスクリック未接続、セッション復元なし | CJK フォント戦略（v0.3）、italic/mouse（v0.2 継続） |
+| slim-DOM（法則「画面描画に関係ないものは DOM しない」）: script/template 配下を DOM 非構築。**style は cascade が本文を読むので剃らない**。構築状態機械は完全実行、root は marker 残置 | 剃りバイト分はゼロコピー入力 arena がタブ寿命で保持するため現状はノードヘッダ+走査回避に限定（BENCH.md 実測） | 入力 compaction（v0.3 本丸）、slim 変異 fuzz、attrs 側の tokenizer 層剃り |
+| レンダ grid は viewport 窓のみ materialize（`IfGrid.y_off`、TUI/GUI 共用ビルダ） | 窓再構築はスクロール/リサイズ/タブ切替ごとに O(boxes) クリップ走査 | 差分ペイント（v0.3 候補） |
+| Markdown 表示: `.md` は md.c が多層防御つき HTML に変換して共通パイプラインへ（生 HTML 素通し禁止） | MD の入れ子深度上限で飽和（quote 8 / list 16） | MD 全構文網羅（v0.3 継続） |
 | 画像・メディアはプレースホルダ | 実デコードなし | v0.3 |
 | http/https 未取得（ファイルのみ） | ネットワークなし | v0.2: HTTP/1.1 → v0.3: TLS(BearSSL 等の battle-tested 物。自作 TLS は禁止） |
 

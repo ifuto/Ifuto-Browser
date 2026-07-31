@@ -34,8 +34,8 @@ static void grid_max_walk(const IfBox *b, i32 *mx, i32 *my) {
 }
 
 static IfCell *grid_at(IfGrid *g, i32 x, i32 y) {
-    if (x < 0 || y < 0 || x >= g->w || y >= g->h) return NULL;
-    return &g->cells[(i64)y * g->w + x];
+    if (x < 0 || y < g->y_off || x >= g->w || y >= g->y_off + g->h) return NULL;
+    return &g->cells[(i64)(y - g->y_off) * g->w + x];
 }
 
 static void put_cp(IfGrid *g, i32 x, i32 y, u32 cp, const IfStyle *st, u32 bg_override) {
@@ -169,7 +169,7 @@ IfGrid *if_render_grid(IfArena *arena, const IfLayout *lay) {
     /* pre のはみ出し等で広がるのは許す。上限は暴力的な文書への防御 */
     if ((i64)mx * my > 64LL * 1024 * 1024) if_fatal("grid too large");
     IfGrid *g = (IfGrid *)if_arena_calloc(arena, sizeof(IfGrid));
-    g->w = mx; g->h = my;
+    g->w = mx; g->h = my; g->y_off = 0;
     g->cells = (IfCell *)if_arena_alloc(arena, (u64)mx * (u64)my * sizeof(IfCell));
     for (i64 i = 0; i < (i64)mx * my; i++) {
         g->cells[i].cp = ' ';
@@ -179,6 +179,21 @@ IfGrid *if_render_grid(IfArena *arena, const IfLayout *lay) {
     }
     if (lay->root) paint_box(g, lay->root);
     return g;
+}
+
+void if_render_grid_rows_into(const IfLayout *lay, i32 row0, i32 row1, IfGrid *out) {
+    out->w = lay->width;
+    out->h = row1 > row0 ? row1 - row0 : 0;
+    out->y_off = row0;
+    if (out->h <= 0) return;
+    /* 既定セル充填＝フルビルダと同一規約（space + DEFAULT 色） */
+    for (i64 i = 0; i < (i64)out->w * out->h; i++) {
+        out->cells[i].cp = ' ';
+        out->cells[i].fg = (u8)IF_CELL_DEFAULT;
+        out->cells[i].bg = (u8)IF_CELL_DEFAULT;
+        out->cells[i].flags = 0;
+    }
+    if (lay->root) paint_box(out, lay->root); /* grid_at が窓外をクリップ */
 }
 
 /* ---------- 発行 ---------- */

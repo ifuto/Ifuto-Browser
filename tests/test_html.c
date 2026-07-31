@@ -17,6 +17,26 @@ static IfDom *parse(IfArena *a, const char *html) {
     return if_parse_html(a, if_str(html, (u32)strlen(html)));
 }
 
+/* slim-DOM テスト用: 本文中に needle を含む TEXT ノードが居るか（content 辺も潜る） */
+static bool sl_tree_text_has(const IfNode *n, const char *needle) {
+    size_t nl = strlen(needle);
+    if (n->kind == IF_NODE_TEXT && n->text.n >= nl) {
+        for (u32 i = 0; i + nl <= n->text.n; i++)
+            if (memcmp(n->text.p + i, needle, nl) == 0) return true;
+    }
+    for (const IfNode *c = n->first_child; c; c = c->next_sibling)
+        if (sl_tree_text_has(c, needle)) return true;
+    if (n->content && sl_tree_text_has(n->content, needle)) return true;
+    return false;
+}
+static bool sl_tree_tag_exists(const IfNode *n, u16 tag) {
+    if (n->kind == IF_NODE_ELEMENT && n->tag == tag) return true;
+    for (const IfNode *c = n->first_child; c; c = c->next_sibling)
+        if (sl_tree_tag_exists(c, tag)) return true;
+    if (n->content && sl_tree_tag_exists(n->content, tag)) return true;
+    return false;
+}
+
 void test_html(void) {
     /* タグ表の宣言長さと strlen の整合（round-trip は n を信じるためこの誤りを検出できない）*/
     CHECK(if_dom_tag_table_sane());
@@ -141,6 +161,52 @@ void test_html(void) {
         CHECK(d != NULL);
         free(buf);
         if_arena_destroy(&ha);
+    }
+
+    /* ---- slim-DOM（法則: 画面描画に関係ないものは DOM しない） ---- */
+    {
+        const char *doc =
+            "<!doctype html><title>KeepMe</title><p>alpha</p>"
+            "<script>var x = 'script-body-vanish';</script>"
+            "<style>.keep { color: red }</style>"
+            "<template><div>t-body-vanish</div></template>"
+            "<p>omega <b>bold-stays</b></p>";
+        u32 full_nodes;
+        { /* full との差分測定 */
+            IfArena fa; if_arena_init(&fa, 1 << 16);
+            IfDom *d = if_parse_html(&fa, if_str(doc, (u32)strlen(doc)));
+            CHECK(d != NULL);
+            CHECK(sl_tree_text_has(d->root, "script-body-vanish")); /* full では居る */
+            CHECK(sl_tree_tag_exists(d->root, IF_TAG_DIV));
+            full_nodes = d->n_nodes;
+            if_arena_destroy(&fa);
+        }
+        CHECK(!if_dom_slim);
+        if_dom_slim = true;
+        IfArena sa; if_arena_init(&sa, 1 << 16);
+        IfDom *d = if_parse_html(&sa, if_str(doc, (u32)strlen(doc)));
+        CHECK(d != NULL);
+        /* title は tab 表示情報 → 残る。style 本文は cascade が読む → 残る */
+        CHECK(if_str_eq(d->title, IF_S("KeepMe")));
+        CHECK(sl_tree_tag_exists(d->root, IF_TAG_SCRIPT)); /* root は marker として残る */
+        CHECK(sl_tree_tag_exists(d->root, IF_TAG_TEMPLATE));
+        CHECK(sl_tree_text_has(d->root, "alpha") && sl_tree_text_has(d->root, "bold-stays"));
+        /* script の本文・template の子孫は DOM に存在しない（content 辺も探索済み） */
+        CHECK(!sl_tree_text_has(d->root, "script-body-vanish"));
+        CHECK(!sl_tree_text_has(d->root, "t-body-vanish"));
+        CHECK(sl_tree_text_has(d->root, ".keep"));         /* style 本文は残す設計 */
+        CHECK(!sl_tree_tag_exists(d->root, IF_TAG_DIV));   /* template 下 div 無し */
+        /* ノード数は full より厳密に少ない（剃りの証跡を数値で） */
+        CHECK(d->n_nodes < full_nodes);
+        if_arena_destroy(&sa);
+        if_dom_slim = false;
+        { /* グローバル復元後は full と一致することを証明 */
+            IfArena ra; if_arena_init(&ra, 1 << 16);
+            IfDom *d2 = if_parse_html(&ra, if_str(doc, (u32)strlen(doc)));
+            CHECK(d2 && d2->n_nodes == full_nodes);
+            CHECK(sl_tree_text_has(d2->root, "script-body-vanish"));
+            if_arena_destroy(&ra);
+        }
     }
 
     if_arena_destroy(&a);

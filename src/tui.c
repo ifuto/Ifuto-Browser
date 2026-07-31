@@ -36,6 +36,10 @@ typedef struct {
     u64 buflen, bufcap;
     /* overlay 専用 arena（engine_scratch と分離: ブックマーク snapshot の寿命管理） */
     IfArena overlay_a;
+    /* viewport 相対グリッドの作業バッファ（w×vh 分を paint ごとに再利用。
+     * 全面グリッド（文書長比例）は保持しない — v0.2 メモリ則） */
+    IfCell *wcells;
+    u64 wcap;
     IfStr bm_titles[BMARK_OVERLAY_MAX];
     IfStr bm_urls[BMARK_OVERLAY_MAX];
     i32 n_bmarks;
@@ -102,7 +106,7 @@ static void sgr_run(IfTui *t, u8 fg, u8 bg, u8 fl) {
     if (bg != IF_CELL_DEFAULT) { char s2[16]; int m = snprintf(s2, sizeof s2, "\x1b[48;5;%um", bg); out_cat(t, s2, (u64)m); }
 }
 
-/* grid の 1 行を幅 w で SGR run を繋げて塗る。末尾は既定色+消去で残りを埋める */
+/* grid の 1 行を幅 w で SGR run を繋げて塗る。gy はグリッドローカル行（窓は呼出側が換算） */
 static void paint_grid_row(IfTui *t, const IfGrid *g, i32 gy, i32 w) {
     if (!g || gy < 0 || gy >= g->h) return;
     const IfCell *row = g->cells + (u64)gy * (u64)g->w;
@@ -239,10 +243,28 @@ static void paint(IfTui *t, IfChrome *c, i32 vh) {
             clear_eol(t); /* 前フレームの検索行の残滓を必ず掃除 */
         }
     } else {
+        /* v0.2: viewport 相対グリッド — [scroll, scroll+vh) の窓だけを materialize
+         * （grid bytes は viewport に比例。文書長には比例しない: 「表示しない分は持たない」）。
+         * 窓構築コストは O(boxes) のクリップつき走査でスクロール連打でも線形・JIT 不要。 */
+        IfGrid win;
+        win.cells = NULL;
+        if (cur && cur->lay) {
+            i32 wpx = cur->lay->width > t->cols ? cur->lay->width : t->cols;
+            if (wpx < 1) wpx = 1;
+            u64 need = (u64)wpx * (u64)(vh > 0 ? vh : 1);
+            if (need > t->wcap) {
+                free(t->wcells);
+                t->wcells = (IfCell *)malloc(need * sizeof(IfCell));
+                if (!t->wcells) if_fatal("oom: tui viewport grid");
+                t->wcap = need;
+            }
+            win.cells = t->wcells;
+            if_render_grid_rows_into(cur->lay, cur->scroll, cur->scroll + vh, &win);
+        }
         for (i32 vy = 0; vy < vh; vy++) {
             goto_row(t, CHROME_ROWS_TOP + vy);
-            if (cur && cur->grid && cur->scroll + vy < cur->grid->h)
-                paint_grid_row(t, cur->grid, cur->scroll + vy, t->cols);
+            if (win.cells && cur->scroll + vy < cur->doc_h)
+                paint_grid_row(t, &win, vy, t->cols);
             clear_eol(t);
         }
     }
@@ -253,8 +275,8 @@ static void paint(IfTui *t, IfChrome *c, i32 vh) {
     if (c->toast_len) {
         out_cat(t, " ", 1);
         paint_text_cells(t, c->toast, t->cols - 20);
-    } else if (cur && cur->grid) {
-        i32 maxs = cur->grid->h > vh ? cur->grid->h - vh : 0;
+    } else if (cur && cur->lay) {
+        i32 maxs = cur->doc_h > vh ? cur->doc_h - vh : 0;
         i32 pct = maxs ? (i32)((i64)cur->scroll * 100 / maxs) : 100;
         out_cat(t, " ", 1);
         out_num(t, pct);

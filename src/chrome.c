@@ -4,6 +4,7 @@
  * reload 失敗時タブ保持/switch で toast 消去）は一切変えない（git diff で照合済）。 */
 #include "chrome.h"
 #include "css.h"
+#include "md.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,7 +153,7 @@ static void tab_build_view(IfTab *t, i32 width) {
     if (!t->view) if_fatal("oom: view arena");
     if_arena_init(t->view, 1 << 18);
     t->lay = if_layout_build(t->view, t->dom, width);
-    t->grid = if_render_grid(t->view, t->lay);
+    t->doc_h = t->lay ? t->lay->height : 0; /* grid は paint 時に viewport 分だけ構築 */
     t->dirty = false;
 }
 
@@ -169,6 +170,10 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
         free(doc);
         return false;
     }
+    /* v0.2: .md は HTML に前段変換（CLI と同一ゲート。多層防御は共通パーサ側） */
+    IfStr md_html;
+    if (if_path_is_md(path)) { if_md_to_html(doc, input, &md_html); input = md_html; }
+    if_dom_slim = true; /* 実ブラウズ法則: 画面描画に関係ないものは DOM しない */
     t->dom = if_parse_html(doc, input);
     if_style_apply(doc, t->dom);
     if (t->doc) if_arena_destroy(t->doc);
@@ -324,7 +329,7 @@ void if_chrome_relayout(IfChrome *c, i32 width) {
     IfTab *t = if_chrome_cur(c);
     if (t && t->doc) {
         tab_build_view(t, width);
-        i32 maxs = t->grid && t->grid->h > 0 ? t->grid->h : 0;
+        i32 maxs = t->doc_h > 0 ? t->doc_h : 0;
         if (t->scroll > maxs) t->scroll = maxs;
     }
     /* autosave なし: リサイズは構造変化ではなく、SIGWINCH 連打での書込増幅を避ける */
@@ -333,8 +338,8 @@ void if_chrome_relayout(IfChrome *c, i32 width) {
 /* ---- スクロール（slice-1 のクランプ規則そのまま: max = h - vh） ---- */
 i32 if_chrome_scroll(IfChrome *c, i32 delta, i32 vh) {
     IfTab *t = if_chrome_cur(c);
-    if (!t || !t->grid) return 0;
-    i32 maxs = t->grid->h > vh ? t->grid->h - vh : 0;
+    if (!t || !t->lay) return 0;
+    i32 maxs = t->doc_h > vh ? t->doc_h - vh : 0;
     t->scroll += delta;
     if (t->scroll < 0) t->scroll = 0;
     if (t->scroll > maxs) t->scroll = maxs;
@@ -343,8 +348,8 @@ i32 if_chrome_scroll(IfChrome *c, i32 delta, i32 vh) {
 
 void if_chrome_scroll_to(IfChrome *c, i32 pos, i32 vh) {
     IfTab *t = if_chrome_cur(c);
-    if (!t || !t->grid) return;
-    i32 maxs = t->grid->h > vh ? t->grid->h - vh : 0;
+    if (!t || !t->lay) return;
+    i32 maxs = t->doc_h > vh ? t->doc_h - vh : 0;
     t->scroll = pos < 0 ? 0 : (pos > maxs ? maxs : pos);
 }
 

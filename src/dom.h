@@ -65,11 +65,21 @@ typedef struct IfDoctype {
     u8 has_name, has_pub, has_sys;
 } IfDoctype;
 
+/* IfNode.flags ビット */
+#define IF_NF_SLIM 0x01 /* slim-DOM で剃られた領域の印（接続・本文を構築しない） */
+
+/* 法則「画面描画に関係ないものは DOM しない」の実装スイッチ（dom.c）。
+ * true のとき script / template 配下の子孫・本文を DOM に構築しない
+ * （tree 構築の状態機械は完全に回す: stack 規則不変。適合性 Track B は
+ * false=full DOM が既定。実ブラウズ経路 TUI/GUI は true）。
+ * style は cascade が本文を読むため残す（描画に関係する）。 */
+extern bool if_dom_slim;
+
 typedef struct IfNode {
     IfNodeKind kind;
     u16 tag;             /* ELEMENT のみ有意 */
     u8 ns;               /* ELEMENT: IF_NS_* */
-    u8 _pad0;
+    u8 flags;            /* IF_NF_* */
     IfStr tag_name;      /* canonical（既知タグは静的 lowercase 名、未知は arena 複製） */
     IfAttr *attrs;
     u32 n_attrs;

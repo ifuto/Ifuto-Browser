@@ -71,6 +71,20 @@ static void append_child(IfNode *parent, IfNode *child) {
     parent->last_child = child;
 }
 
+/* ---- slim-DOM（法則「画面描画に関係ないものは DOM しない」、dom.h 参照） ----
+ * 剃るのは script / template の *子孫と本文のみ*。style は cascade が読むので残す。
+ * root 要素自体は marker として接続する（構造の可観測性・パース規則の不変性のため）。
+ * 子孫の生成ノードは stack 規則のため生成自体は行うが木に接続しない
+ * （stack/pop/scope 系は全て stack 走査なので挙動不変）。
+ * 判定は stack 走査（foster/insertion-mode で parent 鎖がずれても current で正しい）。 */
+static bool under_slim(IfTB *b) {
+    if (!if_dom_slim) return false;
+    for (u32 i = b->depth; i > 0; i--)
+        if (b->stack[i - 1]->flags & IF_NF_SLIM) return true;
+    return false;
+}
+static bool slim_root_tag(u16 t) { return t == IF_TAG_SCRIPT || t == IF_TAG_TEMPLATE; }
+
 /* ファイル前半のユーティリティで参照される下方定義の前方宣言群 */
 static IfNode *top(IfTB *b);
 static void pop(IfTB *b);
@@ -187,7 +201,14 @@ static IfNode *make_element(IfTB *b, const IfTok *tok) {
 
 static void insert_element(IfTB *b, const IfTok *tok, bool do_push) {
     IfNode *n = make_element(b, tok);
-    append_placed(b, n); /* foster 時は「table の兄」に置く（push 先は stack で不変） */
+    if (if_dom_slim) {
+        bool u = under_slim(b);
+        if (u || slim_root_tag(tok->tag)) n->flags |= IF_NF_SLIM;
+        /* 剃り領域の子孫は木に接続しない（node は stack 規則のため残る）。 */
+        if (!u) append_placed(b, n);
+    } else {
+        append_placed(b, n); /* foster 時は「table の兄」に置く（push 先は stack で不変） */
+    }
     if (do_push && b->depth < IF_MAX_STACK_DEPTH) push(b, n);
     else if (do_push) b->dom->n_errors++;
 }
@@ -251,6 +272,7 @@ static void close_heading_if_open(IfTB *b) {
 
 static void append_text(IfTB *b, IfStr text) {
     if (text.n == 0) return;
+    if (under_slim(b)) return; /* 表示しない subtree の本文は arena 確保すらしない */
     IfPlace pl = place(b);
     /* before がある（foster の兄挿入）時は「直前の兄が TEXT ならそこに連結」。
      * 無ければ親の末尾 TEXT に連結（従来の規則）。 */
@@ -280,6 +302,7 @@ static void append_text(IfTB *b, IfStr text) {
 /* in-table text の保留バッファ */
 static void pend_add(IfTB *b, IfStr text) {
     if (!text.n) return;
+    if (under_slim(b)) return; /* 保留 buffer にすら溜めない（append_text でも落ちる） */
     if (b->pend_n + text.n > b->pend_cap) {
         u32 ncap = b->pend_cap ? b->pend_cap : 64;
         while (ncap < b->pend_n + text.n) ncap *= 2;
@@ -1374,6 +1397,7 @@ static void step_after_after_frameset(IfTB *b, IfTok tok) {
 static bool rawish(u16 t) { return if_tag_is_rawtext(t) || if_tag_is_rcdata(t); }
 
 static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok) {
+    if (under_slim(b)) return;
     IfNode *n = new_node(b, IF_NODE_COMMENT);
     n->text = tok->text;
     if (tok->is_pi) n->tag_name = tok->pi_target; /* PI は target を tag_name に保持（comment では未使用の欄） */
@@ -1382,6 +1406,7 @@ static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok) {
 
 /* in-body 経路のコメント: foster フラグが立っていれば「table の兄」に置く */
 static void insert_comment_placed(IfTB *b, const IfTok *tok) {
+    if (under_slim(b)) return;
     IfNode *n = new_node(b, IF_NODE_COMMENT);
     n->text = tok->text;
     if (tok->is_pi) n->tag_name = tok->pi_target;

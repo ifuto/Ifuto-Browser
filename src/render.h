@@ -23,10 +23,17 @@ typedef struct {
 
 typedef struct {
     i32 w, h;
-    IfCell *cells; /* cells[y*w+x] */
+    i32 y_off;          /* 窓グリッドの文書行オフセット（フルグリッドは 0） */
+    IfCell *cells;      /* cells[(y - y_off)*w + x]（y は文書行） */
 } IfGrid;
 
 IfGrid *if_render_grid(IfArena *arena, const IfLayout *lay);
+
+/* viewport 相対グリッド（v0.2 メモリ則の中核）: row0..row1 の範囲だけを埋める。
+ * cells は呼出側が (row1-row0) * lay->width 分確保する（本関数はアロケートしない）。
+ * AI チャット型の長文書で全面グリッドを保持しないための規約:
+ * 「表示しないメモリは持たない」（grid bytes は viewport に比例、文書長に非比例）。 */
+void if_render_grid_rows_into(const IfLayout *lay, i32 row0, i32 row1, IfGrid *out);
 
 /* 発行: ansi=1 で 256 色 SGR つき、0 でプレーンテキスト。戻り値は arena 文字列。 */
 IfStr if_render_emit(IfArena *arena, const IfGrid *grid, int ansi);

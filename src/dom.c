@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+bool if_dom_slim = false; /* 既定 full DOM（適合ハーネス）。実ブラウズ経路が true にする */
+
 /* dom.h の IfTag 列挙と 1:1 対応。順序ズレは test_html の round-trip テストが検出する。 */
 #define F_VOID 1u
 #define F_RAW  2u
