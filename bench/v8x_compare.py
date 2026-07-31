@@ -15,7 +15,7 @@ BENCHES = ["empty", "tiny", "fib30", "arith", "branch", "strcat_flat", "strcat_g
 
 def find_engines():
     e = {"v8x": [os.path.join(ROOT, "build", "v8x_cli")]}
-    qjs = os.environ.get("QJS", "/tmp/qjs-official/qjs")
+    qjs = os.environ.get("QJS", "/home/user/ref/quickjs/qjs")
     if os.path.isfile(qjs) and os.access(qjs, os.X_OK):
         e["qjs"] = [qjs]
     node = shutil.which("node")

@@ -1,11 +1,12 @@
-/* Ifuto — HTML ツリービルダ（簡易 insertion modes）
+/* Ifuto — HTML ツリービルダ（WHATWG insertion modes 実装）
  *
- * 仕様からの意図的な偏差（すべて文書化・v0.1 では受理）:
- *   - quirks モードなし（常に no-quirks 相当）
- *   - foster parenting なし（table 内迷子テキストは現在地に置く）
- *   - <table> 内部構造の強制（tbody 暗黙挿入など）は行わない（レイアウト側で block として扱う）
- *   - adoption agency（<b><i></b></i> の修復）は近似: 単純な「積み遡り pop」
- *   - frameset は無視
+ * 実装済み: quirks モード判定（DOCTYPE 完全表。limited-quirks は no-quirks 同効）、
+ * foster parenting、table 挿入モード群、active formatting elements + adoption agency、
+ * frameset モード群、foreign content。
+ *
+ * 現存する偏差（ARCHITECTURE.md 台帳に集約）:
+ *   - \"in template\" 挿入モードは未採用（vendored dataset 世代との乖離、台帳注）
+ *   - \"in select\" 系は現行仕様の in-body 統合規則に追従済み
  *
  * 敵対防御: 深さ上限・ノード総数上限・単調進行の保証は tokenizer 側が請け負う。
  */
@@ -1526,6 +1527,9 @@ static void step_initial(IfTB *b, IfTok tok) {
     switch (tok.kind) {
     case TOK_DOCTYPE:
         b->dom->quirks = if_doctype_is_quirks(&tok); /* 完全表による spec 準拠判定 */
+        b->mode = M_BEFORE_HTML; /* spec: initial の DOCTYPE 受理後は before html へ。
+                                  * これが無いと次トークンが M_INITIAL の anything-else に
+                                  * 落ちて quirks が強制上書きされる（quirks01#0 回帰の根因） */
         if (!b->seen_doctype) {
             b->seen_doctype = true;
             IfNode *d = new_node(b, IF_NODE_DOCTYPE);

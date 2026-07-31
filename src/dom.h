@@ -87,7 +87,7 @@ typedef struct {
     IfNode *root;        /* DOCUMENT ノード */
     u32 n_nodes;
     u32 n_errors;        /* パーサが回復したエラー数（統計用） */
-    bool quirks;         /* v0.1 は常に false（quirks モードなし方針） */
+    bool quirks;         /* DOCTYPE 完全表で判定（limited-quirks は false＝spec 上 no-quirks 同効） */
     IfStr title;         /* <title> のテキスト（見つからなければ empty） */
 } IfDom;
 

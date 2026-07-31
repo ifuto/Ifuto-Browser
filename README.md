@@ -33,7 +33,7 @@ make golden     # 描画の厳密 diff テスト
 make fuzz       # mutation fuzz + ASan
 make bench      # サイズ/起動/時間/RSS の測定（CLI）
 make tuibench   # v-chrome 天井の実測検証（冷間開始/RSS/idle/タブメタ/セッション復元）
-make conformance # WPT tree-construction 採点（現 60.0%, 1036/1726）
+make conformance # WPT tree-construction 採点（現 97.3%, 1679/1726, 2026-07-31）
 
 ./build/ifuto --ui                       # 対話 TUI（前回セッション復元 or 空タブ。tty 必要）
 ./build/ifuto --ui file.html             # ファイルをロードして開始
