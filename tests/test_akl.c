@@ -1,48 +1,48 @@
-/* V8x v0.0 テスト。dispatch 両モード（computed-goto / switch）で同一バイナリを
+/* Akl v0.0 テスト。dispatch 両モード（computed-goto / switch）で同一バイナリを
  * 2 回ビルドして走らせる前提（Makefile: run_tests / run_tests_switch）。
  * どちらかでだけ失敗するような差分は dispatch バグなので即座に止める。 */
 #include "tests.h"
-#include "../src/v8x/v8x.h"
+#include "../src/akl/akl.h"
 #include "../src/common.h"
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
 
-static V8xRT *g_rt;
+static AklRT *g_rt;
 
 static void want_num(const char *src, double want) {
-    V8xVal v;
-    if (!v8x_eval(g_rt, src, &v)) {
-        fprintf(stderr, "  eval failed [%s]: %s\n", src, v8x_error(g_rt));
+    AklVal v;
+    if (!akl_eval(g_rt, src, &v)) {
+        fprintf(stderr, "  eval failed [%s]: %s\n", src, akl_error(g_rt));
         CHECK(0);
         return;
     }
     double d = NAN;
-    bool ok = v8x_as_num(v, &d) && d == want;
+    bool ok = akl_as_num(v, &d) && d == want;
     CHECK(ok);
     if (!ok) fprintf(stderr, "  wrong value [%s]: got %g want %g\n", src, d, want);
 }
 static void want_bool(const char *src, bool want) {
-    V8xVal v;
-    if (!v8x_eval(g_rt, src, &v)) {
-        fprintf(stderr, "  eval failed [%s]: %s\n", src, v8x_error(g_rt));
+    AklVal v;
+    if (!akl_eval(g_rt, src, &v)) {
+        fprintf(stderr, "  eval failed [%s]: %s\n", src, akl_error(g_rt));
         CHECK(0);
         return;
     }
     bool b = false;
-    bool ok = v8x_as_bool(v, &b) && b == want;
+    bool ok = akl_as_bool(v, &b) && b == want;
     CHECK(ok);
     if (!ok) fprintf(stderr, "  wrong bool [%s]\n", src);
 }
 static void want_str(const char *src, const char *want) {
-    V8xVal v;
-    if (!v8x_eval(g_rt, src, &v)) {
-        fprintf(stderr, "  eval failed [%s]: %s\n", src, v8x_error(g_rt));
+    AklVal v;
+    if (!akl_eval(g_rt, src, &v)) {
+        fprintf(stderr, "  eval failed [%s]: %s\n", src, akl_error(g_rt));
         CHECK(0);
         return;
     }
     uint32_t ln = 0;
-    const char *s = v8x_as_str(g_rt, v, &ln);
+    const char *s = akl_as_str(g_rt, v, &ln);
     bool ok = s && strlen(want) == ln && memcmp(s, want, ln) == 0;
     CHECK(ok);
     if (!ok) fprintf(stderr, "  wrong string [%s]: got '%.*s' want '%s'\n",
@@ -50,12 +50,12 @@ static void want_str(const char *src, const char *want) {
 }
 /* needle != NULL ならエラー文言に含まれることも検査（budget 系の原因特定を誤魔化さない） */
 static void want_err(const char *src, const char *needle) {
-    if (v8x_eval(g_rt, src, NULL)) {
+    if (akl_eval(g_rt, src, NULL)) {
         fprintf(stderr, "  expected error but succeeded [%s]\n", src);
         CHECK(0);
         return;
     }
-    if (needle) CHECK(strstr(v8x_error(g_rt), needle) != NULL);
+    if (needle) CHECK(strstr(akl_error(g_rt), needle) != NULL);
 }
 
 static void t_arith(void) {
@@ -71,31 +71,31 @@ static void t_arith(void) {
     want_num("2147483647 + 1", 2147483648.0); /* int32 fast-path 溢れ → double */
     want_num("-2147483648 % -1", 0);     /* INT32_MIN % -1 は UB を踏まず fmod 経路 */
     { /* 0.1+0.2 は binary64 厳密値と一致するはず */
-        V8xVal v;
-        CHECK(v8x_eval(g_rt, "0.1 + 0.2", &v));
+        AklVal v;
+        CHECK(akl_eval(g_rt, "0.1 + 0.2", &v));
         double d = 0;
-        CHECK(v8x_as_num(v, &d) && d == 0.30000000000000004);
+        CHECK(akl_as_num(v, &d) && d == 0.30000000000000004);
     }
     { /* NaN は canonical 正規化され != 自身 */
-        V8xVal v;
-        CHECK(v8x_eval(g_rt, "var n = 0/0; n == n", &v));
+        AklVal v;
+        CHECK(akl_eval(g_rt, "var n = 0/0; n == n", &v));
         bool b = true;
-        CHECK(v8x_as_bool(v, &b) && b == false);
+        CHECK(akl_as_bool(v, &b) && b == false);
     }
     { /* ±inf */
-        V8xVal v; double d;
-        CHECK(v8x_eval(g_rt, "1/0", &v) && v8x_as_num(v, &d) && isinf(d) && d > 0);
-        CHECK(v8x_eval(g_rt, "-1/0", &v) && v8x_as_num(v, &d) && isinf(d) && d < 0);
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "1/0", &v) && akl_as_num(v, &d) && isinf(d) && d > 0);
+        CHECK(akl_eval(g_rt, "-1/0", &v) && akl_as_num(v, &d) && isinf(d) && d < 0);
     }
     want_num("0x10 + 0b10 + 0o17", 33);
     { /* グローバル定数 NaN / Infinity（書換不可） */
-        V8xVal v; double d;
-        CHECK(v8x_eval(g_rt, "NaN", &v) && v8x_as_num(v, &d) && isnan(d));
-        CHECK(v8x_eval(g_rt, "Infinity", &v) && v8x_as_num(v, &d) && isinf(d) && d > 0);
-        CHECK(!v8x_eval(g_rt, "NaN = 1;", NULL));
-        CHECK(v8x_eval(g_rt, "Infinity - Infinity == Infinity - Infinity", &v));
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "NaN", &v) && akl_as_num(v, &d) && isnan(d));
+        CHECK(akl_eval(g_rt, "Infinity", &v) && akl_as_num(v, &d) && isinf(d) && d > 0);
+        CHECK(!akl_eval(g_rt, "NaN = 1;", NULL));
+        CHECK(akl_eval(g_rt, "Infinity - Infinity == Infinity - Infinity", &v));
         bool b = true;
-        CHECK(v8x_as_bool(v, &b) && b == false); /* NaN === NaN ではない */
+        CHECK(akl_as_bool(v, &b) && b == false); /* NaN === NaN ではない */
     }
 }
 
@@ -199,19 +199,19 @@ static void t_equality_logic(void) {
 }
 
 static void t_budgets_and_boundaries(void) {
-    V8xRT *rt2 = v8x_new();
+    AklRT *rt2 = akl_new();
     CHECK(rt2 != NULL);
-    V8xVal v;
+    AklVal v;
     /* 命令 budget: 毎回新鮮に供給される（枯渇後も次の eval は普通に走る） */
-    CHECK(!v8x_eval(rt2, "var i = 0; while (1) { i = i+1; }", NULL));
-    CHECK(strstr(v8x_error(rt2), "budget") != NULL);
-    CHECK(v8x_eval(rt2, "1+1", &v));
+    CHECK(!akl_eval(rt2, "var i = 0; while (1) { i = i+1; }", NULL));
+    CHECK(strstr(akl_error(rt2), "budget") != NULL);
+    CHECK(akl_eval(rt2, "1+1", &v));
     double d = 0;
-    CHECK(v8x_as_num(v, &d) && d == 2);
+    CHECK(akl_as_num(v, &d) && d == 2);
     /* グローバルは rt ごと独立（q は g_rt 側で定義済みだが rt2 では未定義） */
-    CHECK(!v8x_eval(rt2, "q + 1", NULL));
-    v8x_free(rt2);
-    /* 解析深度 budget（V8X_PARSE_DEPTH=512 超の括弧 600 連） */
+    CHECK(!akl_eval(rt2, "q + 1", NULL));
+    akl_free(rt2);
+    /* 解析深度 budget（AKL_PARSE_DEPTH=512 超の括弧 600 連） */
     {
         char deep[1280];
         int p = 0;
@@ -219,28 +219,28 @@ static void t_budgets_and_boundaries(void) {
         deep[p++] = '1';
         for (int i = 0; i < 600; i++) deep[p++] = ')';
         deep[p] = 0;
-        CHECK(!v8x_eval(g_rt, deep, NULL));
+        CHECK(!akl_eval(g_rt, deep, NULL));
     }
     /* 空プログラム・コメントのみは合法 */
-    CHECK(v8x_eval(g_rt, ";", NULL));
-    CHECK(v8x_eval(g_rt, "/* nothing */ // nothing\n", NULL));
+    CHECK(akl_eval(g_rt, ";", NULL));
+    CHECK(akl_eval(g_rt, "/* nothing */ // nothing\n", NULL));
     /* 文字列ヒープ budget（倍々連結）は拒否で止まり、ホストを殺さない */
-    CHECK(!v8x_eval(g_rt, "var s = 'xxxxxxxx'; while (1) { s = s + s; }", NULL));
-    CHECK(strstr(v8x_error(g_rt), "budget") != NULL);
+    CHECK(!akl_eval(g_rt, "var s = 'xxxxxxxx'; while (1) { s = s + s; }", NULL));
+    CHECK(strstr(akl_error(g_rt), "budget") != NULL);
 }
 
 static void t_dispatch_parity(void) {
     /* 両 dispatch で一致すべき黄金値（初回観測でピン留めし不変を要求） */
-    V8xVal v; double d = -1;
-    CHECK(v8x_eval(g_rt,
+    AklVal v; double d = -1;
+    CHECK(akl_eval(g_rt,
         "function sig(n){ var a=0; for (var i=1; i<=n; i=i+1){ a = (a*31 + i) % 1000003; } return a; } sig(200)",
-        &v) && v8x_as_num(v, &d));
+        &v) && akl_as_num(v, &d));
     CHECK(d == 674928); /* 参照実装 (Python: a=(a*31+i)%1000003, i=1..200) で実算 */
 }
 
 
 /* --- 融合命令（LINC / CJMPF_L/G）と fuzz 起源パーサ硬直化の regression（v0.1 追加） --- */
-static void test_v8x_fusion_and_hardening(void) {
+static void test_akl_fusion_and_hardening(void) {
     /* LINC: x = x ± int 定数 が式文で融合されても意味不変（int/文字列/溢れ） */
     want_num("function f(){ var i = 0; i = i + 2147483647; i = i + 1; return i; } f()", 2147483648.0);
     want_num("function f(){ var i = 5; i = i - 9; return i; } f()", -4);
@@ -266,16 +266,16 @@ static void test_v8x_fusion_and_hardening(void) {
     want_str("var gkeep = 'K'; for (var gm = 0; gm < 2000; gm = gm + 1) { var gu = 'x' + gm; } gkeep", "K");
     /* fuzz 起源: 単項マイナス連鎖と字句不全の硬直化（クラッシュせず評価が止まる） */
     {
-        V8xVal v;
-        CHECK(!v8x_eval(g_rt, "--.", &v));
-        CHECK(!v8x_eval(g_rt, "var x = 1 +", &v));
-        CHECK(!v8x_eval(g_rt, "---------------5", &v) || true); /* budget 内なら -5 で良い。構文拒否でも良い */
+        AklVal v;
+        CHECK(!akl_eval(g_rt, "--.", &v));
+        CHECK(!akl_eval(g_rt, "var x = 1 +", &v));
+        CHECK(!akl_eval(g_rt, "---------------5", &v) || true); /* budget 内なら -5 で良い。構文拒否でも良い */
     }
 }
 
 /* phase 2/3: ROPE 連結・融合命令・for 回転の回帰。全て node/qjs 地上値と照合済みの数を使い、
  * グローバル名は rp_/ci_ 接頭で一意化する（v0.0 設計: グローバルは rt 内永続）。 */
-static void test_v8x_rope_and_superinst(void) {
+static void test_akl_rope_and_superinst(void) {
     /* ROPE: 蓄積連結→等値・型・関係比較・alias・truthy */
     want_bool("var rpa=''; for (var rpi=0; rpi<20000; rpi=rpi+1) { rpa=rpa+'x'; } rpa===rpa", true);
     want_bool("var rpb=''; var rpc=''; for (var rpj=0; rpj<20000; rpj=rpj+1) { rpb=rpb+'x'; rpc=rpc+'x'; } rpb===rpc", true);
@@ -342,7 +342,7 @@ static double mm_sweep_c(i32 lo, i32 hi, i32 d) {
     return s;
 }
 
-static void test_v8x_modmagic(void) {
+static void test_akl_modmagic(void) {
     static const i32 DS[] = { 2, 3, 4, 5, 7, 8, 10, 13, 16, 97, 256, 1000,
                               65536, 1000003, 1048576, 2147483646, 2147483647 };
     char buf[320];
@@ -451,30 +451,30 @@ static void t_cojit(void) {
         { "var g=0; function gf(){ var s=0; while(g<8){ s=s+g; g=g+2; } return s; } gf()", 12, 1 },
         { "var a2=0,b2=0; while(a2<4){ while(b2<3){ b2=b2+1; } a2=a2+1; } a2*10+b2", 43, 1 }, /* 入れ子 */
     };
-    V8xRT *on = v8x_new(), *off = v8x_new();
+    AklRT *on = akl_new(), *off = akl_new();
     CHECK(on && off);
-    v8x_set_cojit(on, 1);
-    v8x_set_cojit(off, 0);
+    akl_set_cojit(on, 1);
+    akl_set_cojit(off, 0);
     for (u32 i = 0; i < sizeof(CC) / sizeof(CC[0]); i++) {
         if (i == 7) { /* 文字列ケース: "x"+0+1+2 */
-            V8xVal v; u32 ln = 0;
-            bool ok1 = v8x_eval(on, CC[i].src, &v);
-            const char *s1 = ok1 ? v8x_as_str(on, v, &ln) : NULL;
+            AklVal v; u32 ln = 0;
+            bool ok1 = akl_eval(on, CC[i].src, &v);
+            const char *s1 = ok1 ? akl_as_str(on, v, &ln) : NULL;
             CHECK(ok1 && s1 && ln == 4 && memcmp(s1, "x012", 4) == 0);
             continue;
         }
-        V8xVal v1, v2;
-        bool ok1 = v8x_eval(on, CC[i].src, &v1);
-        bool ok2 = v8x_eval(off, CC[i].src, &v2);
+        AklVal v1, v2;
+        bool ok1 = akl_eval(on, CC[i].src, &v1);
+        bool ok2 = akl_eval(off, CC[i].src, &v2);
         CHECK(ok1 == ok2);
         double d1 = 0, d2 = 0;
-        v8x_as_num(v1, &d1); v8x_as_num(v2, &d2);
+        akl_as_num(v1, &d1); akl_as_num(v2, &d2);
         CHECK(ok1 && d1 == CC[i].want && d1 == d2);
         if (!(ok1 && d1 == CC[i].want && d1 == d2))
             fprintf(stderr, "  cojit mismatch [%s]: on=%g off=%g want=%g\n", CC[i].src, d1, d2, CC[i].want);
-        CHECK(v8x_cojit_count(on) >= CC[i].min_fire);
+        CHECK(akl_cojit_count(on) >= CC[i].min_fire);
     }
-    CHECK(v8x_cojit_count(on) >= 8);
+    CHECK(akl_cojit_count(on) >= 8);
 
     /* 構造化乱択差分: 形をランダムにして on/off 一致を 400 系統で監査。
      * C 側の整数予測とも同時に突き合わせる（int 域に限定して double 厳密一致を使う） */
@@ -519,12 +519,12 @@ static void t_cojit(void) {
                 carr, start, carr, cmps[cmpi], lim, carr, kk, carr, carr, dlt);
         }
         (void)w;
-        v8x_set_cojit(on, 1);
-        V8xVal v1, v2;
-        bool ok1 = v8x_eval(on, buf, &v1);
-        bool ok2 = v8x_eval(off, buf, &v2);
+        akl_set_cojit(on, 1);
+        AklVal v1, v2;
+        bool ok1 = akl_eval(on, buf, &v1);
+        bool ok2 = akl_eval(off, buf, &v2);
         double d1 = -777, d2 = -778;
-        v8x_as_num(v1, &d1); v8x_as_num(v2, &d2);
+        akl_as_num(v1, &d1); akl_as_num(v2, &d2);
         bool same = ok1 == ok2 && d1 == d2 && d1 == (double)acc;
         CHECK(same);
         if (!same) {
@@ -533,12 +533,12 @@ static void t_cojit(void) {
             break;
         }
     }
-    v8x_free(on);
-    v8x_free(off);
+    akl_free(on);
+    akl_free(off);
 }
 
-void test_v8x(void) {
-    g_rt = v8x_new();
+void test_akl(void) {
+    g_rt = akl_new();
     CHECK(g_rt != NULL);
     if (!g_rt) return;
     t_arith();
@@ -549,11 +549,11 @@ void test_v8x(void) {
     t_equality_logic();
     t_budgets_and_boundaries();
     t_dispatch_parity();
-    test_v8x_fusion_and_hardening();
-    test_v8x_rope_and_superinst();
-    test_v8x_modmagic();
+    test_akl_fusion_and_hardening();
+    test_akl_rope_and_superinst();
+    test_akl_modmagic();
     t_exceptions();
     t_cojit();
-    v8x_free(g_rt);
+    akl_free(g_rt);
     g_rt = NULL;
 }

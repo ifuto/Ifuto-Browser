@@ -1,10 +1,10 @@
-/* V8 API ファサード（src/v8x/v8.h）の実動スモーク。
+/* V8 API ファサード（src/akl/v8.h）の実動スモーク。
  * 2 つの証明: (1) V8 形状 API が実際に計算を駆動する、
  *            (2) このテストバイナリが libstdc++ を動的リンクしない（Makefile が検査）。
  * 「V8 互換」の範囲は docs/V8_COMPAT.md が唯一の定義。 */
 #include <cstdio>
 #include <cstring>
-#include "../../src/v8x/v8.h"
+#include "../../src/akl/v8.h"
 
 static int g_checks = 0, g_fails = 0;
 #define CK(cond) do { g_checks++; if (!(cond)) { g_fails++; \
@@ -13,7 +13,7 @@ static int g_checks = 0, g_fails = 0;
 int main() {
     using namespace v8;
 
-    /* Isolate ≈ V8xRT */
+    /* Isolate ≈ AklRT */
     Isolate *iso = Isolate::New();
     CK(iso != NULL);
     {

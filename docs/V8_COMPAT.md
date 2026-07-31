@@ -10,14 +10,14 @@
   ICU・プラットフォーム層を前提とする。akl の製品法則（100% self-made C11、
   JIT なし、ldd = linux-vdso/libc/(libm)/ld、libstdc++ 不導入）の下で
   ABI 互換は構造的に不可能であり非目標。
-- したがって互換は **概念・型形状の C++ ヘッダ互換**（src/v8x/v8.h、namespace v8）。
+- したがって互換は **概念・型形状の C++ ヘッダ互換**（src/akl/v8.h、namespace v8）。
   header-only かつ libstdc++ シンボル不使用（`make cxxtest` が ldd を機械検査）。
 
 ## Coverage map
 
 | V8 API | akl 側 | 状態 |
 |---|---|---|
-| `Isolate::New()/Dispose()` | 同名（V8xRT を保持） | **形状互換**（CreateParams は未対応） |
+| `Isolate::New()/Dispose()` | 同名（AklRT を保持） | **形状互換**（CreateParams は未対応） |
 | `Context::New(isolate)` / `Context::Scope` | 同名 | **形状互換**（単一 realm のため Scope はノーオペ） |
 | `Local<T>`（IsEmpty/As） | 同名 | **形状互換**（8B cell 即値。ヒープ確保ゼロ） |
 | `HandleScope` | 同名 | **形状のみ（RAII ノーオペ）**。根拠: akl の Local は GC ルートを張らない |
@@ -51,5 +51,5 @@ Template/FunctionTemplate/ObjectTemplate、host Function 束縛・C++ コール�
 
 - `tests/cpp/v8_compat_smoke.cc`（33 checks）: 値往復・realm 独立性（別 Isolate の var は
   ReferenceError）・TryCatch 起動・Reset・Script 連続実行・失敗後の健全性を g++ C++11 で実動検証。
-- 持込みで同定・修正した事前バグ: `v8x_as_str` が前回 eval の残留 err で黙殺され
+- 持込みで同定・修正した事前バグ: `akl_as_str` が前回 eval の残留 err で黙殺され
   ホストが読めなくなる問題（読取 API は自身の成否のみで報告する契約に修正）。

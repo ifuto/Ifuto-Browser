@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""V8x vs QuickJS(軽さ) / vs V8(速さ: --jitless と full) の実測比較ハーネス。
+"""Akl vs QuickJS(軽さ) / vs V8(速さ: --jitless と full) の実測比較ハーネス。
 推定値は一切使わない。全数値はローカル実測のみ。
 
 通常モード: 表を表示し bench/results/latest.json に保存。
-guard モード: bench/v8x_guards.json の閾値と照合し、1件でも超過があれば
+guard モード: bench/akl_guards.json の閾値と照合し、1件でも超過があれば
 「ANOMALY: ...」を表示して exit 1（常時監視アラーム）。
 参照エンジンが見つからない相対閾値は SKIP と明示表示（PASS とは数えない）。"""
 import argparse, json, os, shutil, statistics, subprocess, sys, time
@@ -14,7 +14,7 @@ RESULTS = os.path.join(ROOT, "bench", "results")
 BENCHES = ["empty", "tiny", "fib30", "arith", "branch", "strcat_flat", "strcat_grow"]
 
 def find_engines():
-    e = {"v8x": [os.path.join(ROOT, "build", "v8x_cli")]}
+    e = {"akl": [os.path.join(ROOT, "build", "akl_cli")]}
     qjs = os.environ.get("QJS", "/home/user/ref/quickjs/qjs")
     if os.path.isfile(qjs) and os.access(qjs, os.X_OK):
         e["qjs"] = [qjs]
@@ -67,8 +67,8 @@ def main():
     args = ap.parse_args()
 
     eng = find_engines()
-    if "v8x" not in eng or not os.path.isfile(eng["v8x"][0]):
-        print("build/v8x_cli がありません: make build/v8x_cli"); return 2
+    if "akl" not in eng or not os.path.isfile(eng["akl"][0]):
+        print("build/akl_cli がありません: make build/akl_cli"); return 2
     print("engines:", {k: " ".join(v) for k, v in eng.items()})
 
     res = {"time_ms": {}, "rss_kb": {}, "size_bytes": {}}
@@ -89,7 +89,7 @@ def main():
         subprocess.run(["strip", "--strip-all", qjs_stripped], check=False)
         res["size_bytes"]["qjs_stripped"] = os.path.getsize(qjs_stripped)
         res["size_bytes"]["qjs_raw"] = os.path.getsize(eng["qjs"][0])
-    res["size_bytes"]["v8x_cli"] = os.path.getsize(eng["v8x"][0])
+    res["size_bytes"]["akl_cli"] = os.path.getsize(eng["akl"][0])
 
     hdr = "%-12s" % "bench" + "".join("%12s" % n for n in eng)
     print(hdr); print("-" * len(hdr))
@@ -102,19 +102,19 @@ def main():
             print("%-12s" % b + "".join("%10dKB" % row[n] for n in eng))
     print("\nsize:", {k: ("%d KB" % (v // 1024)) for k, v in res["size_bytes"].items()})
     if "qjs" in eng:
-        print("\nratio vs qjs (time, >1 は v8x が遅い):")
+        print("\nratio vs qjs (time, >1 は akl が遅い):")
         for b in BENCHES:
-            a, c = res["time_ms"][b]["v8x"], res["time_ms"][b]["qjs"]
+            a, c = res["time_ms"][b]["akl"], res["time_ms"][b]["qjs"]
             print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
     if "nodejit" in eng:
         print("ratio vs V8 --jitless:")
         for b in BENCHES:
-            a, c = res["time_ms"][b]["v8x"], res["time_ms"][b]["nodejit"]
+            a, c = res["time_ms"][b]["akl"], res["time_ms"][b]["nodejit"]
             print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
     if "node" in eng:
         print("ratio vs V8 full (JIT)")
         for b in BENCHES:
-            a, c = res["time_ms"][b]["v8x"], res["time_ms"][b]["node"]
+            a, c = res["time_ms"][b]["akl"], res["time_ms"][b]["node"]
             print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
 
     if args.json:
@@ -136,16 +136,16 @@ def main():
             fails.append("%s: %s" % (label, detail))
     # 絶対閾値（参照エンジン不要。常時有効）
     ab = g.get("absolute", {})
-    if "v8x_cli_max_bytes" in ab:
-        chk(res["size_bytes"]["v8x_cli"] <= ab["v8x_cli_max_bytes"],
-            "ABS v8x_cli size", "%d > %d" % (res["size_bytes"]["v8x_cli"], ab["v8x_cli_max_bytes"]))
+    if "akl_cli_max_bytes" in ab:
+        chk(res["size_bytes"]["akl_cli"] <= ab["akl_cli_max_bytes"],
+            "ABS akl_cli size", "%d > %d" % (res["size_bytes"]["akl_cli"], ab["akl_cli_max_bytes"]))
     if "time_ms_max" in ab:
         for b, lim in ab["time_ms_max"].items():
-            chk(res["time_ms"][b]["v8x"] <= lim, "ABS v8x time %s" % b, "%.3f > %s" % (res["time_ms"][b]["v8x"], lim))
+            chk(res["time_ms"][b]["akl"] <= lim, "ABS akl time %s" % b, "%.3f > %s" % (res["time_ms"][b]["akl"], lim))
     if res["rss_kb"] and "rss_kb_max" in ab:
         for b, lim in ab["rss_kb_max"].items():
             if b in res["rss_kb"]:
-                chk(res["rss_kb"][b]["v8x"] <= lim, "ABS v8x RSS %s" % b, "%d > %d" % (res["rss_kb"][b]["v8x"], lim))
+                chk(res["rss_kb"][b]["akl"] <= lim, "ABS akl RSS %s" % b, "%d > %d" % (res["rss_kb"][b]["akl"], lim))
     # 相対閾値（参照エンジンが要る）
     rel = g.get("relative", {})
     for axis, spec in rel.items():
@@ -156,16 +156,16 @@ def main():
             continue
         for b, lim in spec.get("max_ratio", {}).items():
             if kind == "time":
-                va, vb = res["time_ms"][b].get("v8x"), res["time_ms"][b].get(ref)
+                va, vb = res["time_ms"][b].get("akl"), res["time_ms"][b].get(ref)
                 v = (va / vb) if (va is not None and vb) else float("inf")
             elif kind == "rss":
                 if not res["rss_kb"] or b not in res["rss_kb"]:
                     skips.append("REL %s %s (rss 未測定: --rss を付ける)" % (axis, b)); continue
-                v = res["rss_kb"][b]["v8x"] / res["rss_kb"][b][ref]
+                v = res["rss_kb"][b]["akl"] / res["rss_kb"][b][ref]
             elif kind == "size":
                 if "qjs_stripped" not in res["size_bytes"]:
                     skips.append("REL %s (qjs_stripped 不在)" % axis); continue
-                v = res["size_bytes"]["v8x_cli"] / res["size_bytes"]["qjs_stripped"]
+                v = res["size_bytes"]["akl_cli"] / res["size_bytes"]["qjs_stripped"]
             else:
                 continue
             chk(v <= lim, "REL %s %s" % (axis, b), "ratio %.3f > %.3f" % (v, lim))

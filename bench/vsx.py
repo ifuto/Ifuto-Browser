@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vsx — V8x vs QuickJS(lightness) vs V8>=9(speed) クロスエンジン計測・番兵。
+"""vsx — Akl vs QuickJS(lightness) vs V8>=9(speed) クロスエンジン計測・番兵。
 
 設計原則（CHROME_SCOPE の掟）:
   * 推定値は書かない。全数値はこのマシンこの瞬間の実測（median of N 子プロセス）。
@@ -11,7 +11,7 @@
   python3 bench/vsx.py report [--quick] [--bench NAME]   ... 表を出すだけ（exit 0）
   python3 bench/vsx.py guard  [--quick]                  ... 不成立なら ANOMALY 行 + exit 1
 
-環境変数: V8X_CLI(既定 build/v8x_cli) QJS(既定 /tmp/qjs-official/qjs, 無ければ qjs 系軸 SKIP)
+環境変数: AKL_CLI(既定 build/akl_cli) QJS(既定 /tmp/qjs-official/qjs, 無ければ qjs 系軸 SKIP)
           NODE(既定 node)
 """
 import json, os, statistics, subprocess, sys, shutil
@@ -91,7 +91,7 @@ def norm(out):
         return ("str", tail if len(tail) < 4096 else (len(tail), tail[:64], tail[-64:]))
 
 def get_engines():
-    cli = os.environ.get("V8X_CLI", os.path.join(ROOT, "build", "v8x_cli"))
+    cli = os.environ.get("AKL_CLI", os.path.join(ROOT, "build", "akl_cli"))
     qjs = os.environ.get("QJS", "/tmp/qjs-official/qjs")
     node = os.environ.get("NODE", shutil.which("node") or "node")
     src_cache = {}
@@ -103,7 +103,7 @@ def get_engines():
     eng = {}
     if os.path.isfile(cli) and os.access(cli, os.X_OK):
         # 製品既定値（budget 打切りあり）のまま走らせる。bench/js は全て既定内に収束する。
-        eng["v8x"] = lambda b: [cli, os.path.join(JSDIR, b + ".js"), "1"]
+        eng["akl"] = lambda b: [cli, os.path.join(JSDIR, b + ".js"), "1"]
     if os.path.isfile(qjs) and os.access(qjs, os.X_OK):
         eng["qjs"] = lambda b: [qjs, "-e", src_of(b) + "\nprint(typeof __R==='undefined'?0:__R);"]
     eng["v8jitless"] = lambda b: [node, "--jitless", "--no-warnings", "-e",
@@ -131,8 +131,8 @@ def main():
         only = sys.argv[sys.argv.index("--bench") + 1]
     benches = [only] if only else BENCHES
     eng = get_engines()
-    if "v8x" not in eng:
-        print("FATAL: build/v8x_cli not found (run: make build/v8x_cli)"); return 2
+    if "akl" not in eng:
+        print("FATAL: build/akl_cli not found (run: make build/akl_cli)"); return 2
     have_qjs = "qjs" in eng
     if not have_qjs:
         print("NOTE: QuickJS not found -> qjs 軸は SKIP (QJS=/path/to/qjs で有効化)")
@@ -153,12 +153,12 @@ def main():
     print("\n=== correctness cross-check (stdout last line, normalized) ===")
     for b in benches:
         keys = {e: norm(R[b][e]["out"]) for e in eng if R[b][e]["out"] is not None}
-        ref = keys.get("v8x")
+        ref = keys.get("akl")
         ok = all(k == ref for k in keys.values()) and ref is not None
         stat = "OK " if ok else "MISMATCH"
-        print("  %-8s %-8s ref(v8x)=%r others=%s" %
+        print("  %-8s %-8s ref(akl)=%r others=%s" %
               (b, stat, ref if ref and len(repr(ref)) < 48 else repr(ref)[:48],
-               {e: (k if k == ref else k) for e, k in keys.items() if e != "v8x"}))
+               {e: (k if k == ref else k) for e, k in keys.items() if e != "akl"}))
         if not ok:
             # 正確性異常は最優先 ANOMALY（どのエンジンが壊れたかの切り分けは出力で行う）
             anomalies.append("correctness mismatch on %s: %s" % (b, keys))
@@ -204,21 +204,21 @@ def main():
             row += ("%13dK" % r) if r is not None else "%14s" % "ERR"
         print(row)
 
-    # ---- 比率（対 v8x）----
-    print("\n=== ratio vs v8x (net wall / rss; >1 on wall 以外... rss>1 => v8x が軽い) ===")
+    # ---- 比率（対 akl）----
+    print("\n=== ratio vs akl (net wall / rss; >1 on wall 以外... rss>1 => akl が軽い) ===")
     for b in benches:
         cells = []
-        v = R[b]["v8x"]
+        v = R[b]["akl"]
         for e in eng:
-            if e == "v8x" or v["wall"] in (None, 0) or R[b][e]["wall"] is None:
+            if e == "akl" or v["wall"] in (None, 0) or R[b][e]["wall"] is None:
                 continue
-            nv, ne = netwall(b, "v8x"), netwall(b, e)
+            nv, ne = netwall(b, "akl"), netwall(b, e)
             ntxt = " net %.2fx" % (ne / nv) if (nv and ne) else ""
             cells.append("%s%s rss %.2fx" % (e, ntxt, (R[b][e]["rss"] or 1) / (v["rss"] or 1)))
         print("  %-8s %s" % (b, " | ".join(cells)))
 
     # ---- バイナリサイズ ----
-    sizes = {"v8x_cli": stripped_size(os.environ.get("V8X_CLI", os.path.join(ROOT, "build", "v8x_cli")), "v8x"),
+    sizes = {"akl_cli": stripped_size(os.environ.get("AKL_CLI", os.path.join(ROOT, "build", "akl_cli")), "akl"),
              "qjs": stripped_size(os.environ.get("QJS", "/tmp/qjs-official/qjs"), "qjs") if have_qjs else None,
              "node": stripped_size(os.environ.get("NODE", shutil.which("node") or "node"), "node")}
     print("\n=== stripped binary size ===")
@@ -231,43 +231,43 @@ def main():
     def chk(name, ok, detail):
         G.append((name, ok, detail))
         print("  [%s] %-52s %s" % ("PASS" if ok else "FAIL", name, detail))
-    v8xsz, qjssz = sizes["v8x_cli"], sizes["qjs"]
+    aklsz, qjssz = sizes["akl_cli"], sizes["qjs"]
     if qjssz:
-        chk("C1 size(v8x_cli) <= 0.40*size(qjs)", v8xsz <= 0.40 * qjssz,
-            "%d vs 0.40*%d=%d" % (v8xsz, qjssz, int(0.40 * qjssz)))
+        chk("C1 size(akl_cli) <= 0.40*size(qjs)", aklsz <= 0.40 * qjssz,
+            "%d vs 0.40*%d=%d" % (aklsz, qjssz, int(0.40 * qjssz)))
     else:
-        chk("C1 size absolute floor: size(v8x_cli) <= 300 KiB", v8xsz <= 300 * 1024,
-            "%d B" % (v8xsz or 0))
+        chk("C1 size absolute floor: size(akl_cli) <= 300 KiB", aklsz <= 300 * 1024,
+            "%d B" % (aklsz or 0))
     for b in benches:
-        if R[b]["v8x"]["wall"] is None:
-            anomalies.append("v8x crashed/failed on bench %s: %s" % (b, R[b]["v8x"]["err"]))
+        if R[b]["akl"]["wall"] is None:
+            anomalies.append("akl crashed/failed on bench %s: %s" % (b, R[b]["akl"]["err"]))
             continue
     for b in benches:
-        if wall(b, "v8x") is None:
+        if wall(b, "akl") is None:
             continue
         if have_qjs and rss(b, "qjs") is not None:
-            chk("C2 %-6s rss(v8x) <= rss(qjs)" % b, rss(b, "v8x") <= rss(b, "qjs"),
-                "%dK vs %dK" % (rss(b, "v8x"), rss(b, "qjs")))
+            chk("C2 %-6s rss(akl) <= rss(qjs)" % b, rss(b, "akl") <= rss(b, "qjs"),
+                "%dK vs %dK" % (rss(b, "akl"), rss(b, "qjs")))
         if rss(b, "v8jitless") is not None:
-            chk("C3 %-6s rss(v8x) <= 0.50*rss(v8)" % b, rss(b, "v8x") <= 0.5 * rss(b, "v8jitless"),
-                "%dK vs 0.5*%dK" % (rss(b, "v8x"), rss(b, "v8jitless")))
-        if b in HOT and netwall(b, "v8jitless") is not None and netwall(b, "v8x") is not None:
-            chk("C4 %-6s net(v8x) <= 1.05*net(v8 --jitless)" % b,
-                netwall(b, "v8x") <= 1.05 * netwall(b, "v8jitless"),
-                "%.1fms vs %.1fms (net)" % (netwall(b, "v8x"), netwall(b, "v8jitless")))
-        if b in HOT and have_qjs and netwall(b, "qjs") is not None and netwall(b, "v8x") is not None:
-            chk("C5 %-6s net(v8x) <= 1.05*net(qjs)" % b,
-                netwall(b, "v8x") <= 1.05 * netwall(b, "qjs"),
-                "%.1fms vs %.1fms (net)" % (netwall(b, "v8x"), netwall(b, "qjs")))
+            chk("C3 %-6s rss(akl) <= 0.50*rss(v8)" % b, rss(b, "akl") <= 0.5 * rss(b, "v8jitless"),
+                "%dK vs 0.5*%dK" % (rss(b, "akl"), rss(b, "v8jitless")))
+        if b in HOT and netwall(b, "v8jitless") is not None and netwall(b, "akl") is not None:
+            chk("C4 %-6s net(akl) <= 1.05*net(v8 --jitless)" % b,
+                netwall(b, "akl") <= 1.05 * netwall(b, "v8jitless"),
+                "%.1fms vs %.1fms (net)" % (netwall(b, "akl"), netwall(b, "v8jitless")))
+        if b in HOT and have_qjs and netwall(b, "qjs") is not None and netwall(b, "akl") is not None:
+            chk("C5 %-6s net(akl) <= 1.05*net(qjs)" % b,
+                netwall(b, "akl") <= 1.05 * netwall(b, "qjs"),
+                "%.1fms vs %.1fms (net)" % (netwall(b, "akl"), netwall(b, "qjs")))
         if b in STARTUP and wall(b, "v8full"):
-            chk("C6 %-6s wall(v8x) <= wall(v8 full) [startup axis]" % b,
-                wall(b, "v8x") <= wall(b, "v8full"),
-                "%.1fms vs %.1fms" % (wall(b, "v8x"), wall(b, "v8full")))
+            chk("C6 %-6s wall(akl) <= wall(v8 full) [startup axis]" % b,
+                wall(b, "akl") <= wall(b, "v8full"),
+                "%.1fms vs %.1fms" % (wall(b, "akl"), wall(b, "v8full")))
     print("\n=== report-only (aspirational, NOT currently gating) ===")
     for b in HOT:
-        if b in R and netwall(b, "v8x") and netwall(b, "v8full"):
-            gap = netwall(b, "v8x") / netwall(b, "v8full")
-            print("  R1 %-6s net(v8x)/net(v8 full JIT) = %.2fx  (parity => 1.0; %s)"
+        if b in R and netwall(b, "akl") and netwall(b, "v8full"):
+            gap = netwall(b, "akl") / netwall(b, "v8full")
+            print("  R1 %-6s net(akl)/net(v8 full JIT) = %.2fx  (parity => 1.0; %s)"
                   % (b, gap, "OPEN — no-JIT physics; attack steps ledgered in BENCH.md"
                      if gap > 1.0 else "MET"))
 

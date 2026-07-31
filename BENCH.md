@@ -32,7 +32,7 @@
 - バイナリ: ifuto 223,872 B（天井 240KB 内、索引・audit 追加で +4,096 B）、ifuto-gui 199,192 B、
   ldd 不変条件維持。
 
-## 2026-07-31: V8x v0.2 — JS 例外 + CoJIT（検証駆動 AOT 特化）+ cold 分離回帰ポストモーテム
+## 2026-07-31: Akl v0.2 — JS 例外 + CoJIT（検証駆動 AOT 特化）+ cold 分離回帰ポストモーテム
 
 構成（このターンの到達点）:
 - **JS 例外 v0.1**: `throw` / `try` / `catch(e)` / `catch`（ES2019 束縛省略）/ `finally`。
@@ -47,27 +47,27 @@
   （実行可能書き込みページは依然ゼロ、profile 収集もゼロ、生成物は検証済みの既存命令のみ）。
   **ハッキング耐性（利用者要求「色々してもろて」の回答としての構造）**:
   1. 特化器は失敗しても致命的にならない（検出しなければ汎用命令のまま残る＝安全側）;
-  2. 特化後ストリームは必ず `v8x_verify` whole-scan を再通過（事後セルフチェック。
+  2. 特化後ストリームは必ず `akl_verify` whole-scan を再通過（事後セルフチェック。
      実際この自己検査が trampoline の local-slot 領域違反を一度摘発して設計を修正）;
   3. テストに on/off 2 インスタンスの差分オラクル＋ C 側独立予測との三方向一致
      （xorshift32 構造化ランダム 400 seed。特化器が意味を変えた瞬間に赤くなる機械監査）。
   適用 tail は A: `LINC/GINC;JMP`、B: 関数内 global 更新列、C: local 更新列。
-  発火数は `v8x_cojit_count`、kill switch は `v8x_set_cojit`。
+  発火数は `akl_cojit_count`、kill switch は `akl_set_cojit`。
 - **cold 分離（回帰ポストモーテム）**: 例外機構を dispatch マクロで inline 展開した初版は
   バイトコード列が完全同一（op 名列 diff=0）にもかかわらず **arith +24% / branch +42% /
   fib30 +11% 悪化**（新旧バイナリ交互計測で確定、nodejit 側はほぼ不変）。原因は冷コードが
   vm_exec の I$/分岐予測/インライン予算を侵食する機械語レイアウト問題（下記 121→138→111ms
-  前例と同型）。`v8x_vm_unwind/ret_step/try_push/try_leave/fin_end` を noinline+cold に
+  前例と同型）。`akl_vm_unwind/ret_step/try_push/try_leave/fin_end` を noinline+cold に
   隔離（RET は `n_tries==0` の旧来完全 inline 高速経路を保持）して回復。
 
 ### 実測（このコンテナ、2026-07-31、cold 分離後・交互計測 median、base=c00528b）
-| 指標 | v8x | 対 base | 対 node --jitless（guard） |
+| 指標 | akl | 対 base | 対 node --jitless（guard） |
 |---|---|---|---|
 | arith 5M loop | 115.1-123.7 ms | **1.000×**（回復。悪化版は 1.235×） | 0.967 / 1.039（閾 1.05 PASS） |
 | branch 5M | 59.2-59.8 ms | 1.058×（悪化版は 1.422×） | 0.721 / 0.704（PASS） |
 | fib30 | 69.8-78.8 ms | 0.958× | 0.714 台（PASS） |
-| bench_v8x arith 100k | **2.413 ms**（前セッション 3.048） | 自前基準で改善 | — |
-| bench_v8x fib(22) | **1.494 ms**（同 1.670） | 改善 | — |
+| bench_akl arith 100k | **2.413 ms**（前セッション 3.048） | 自前基準で改善 | — |
+| bench_akl fib(22) | **1.494 ms**（同 1.670） | 改善 | — |
 
 CoJIT の正直な効き（-O2、while 形・関数内形に限る）: while_arith(global) ±1.01×、
 while_fib 1.02×、関数内 1.05〜1.18×。**天井破りではなくカバレッジ一般化**（canonical-for 由来の
@@ -84,7 +84,7 @@ AST 融合と同等速度に while 形を引き上げる）。vs V8 full JIT の
 - 単体 **2,440 checks×2 dispatch 0 fail**（例外 19、CoJIT 行列+400 seed oracle、カンマ回帰等）。
 - fuzz 500+500 0 crash、guard ALL PASS（qjs 相対は参照バイナリ不在で SKIP 明示）、
   conformance 97.3% 不変、tui/gui smoke PASS。
-- bench_v8x 計算値不変（fib22=17711 / arith=905003 / mixed=7.9996e+07）。
+- bench_akl 計算値不変（fib22=17711 / arith=905003 / mixed=7.9996e+07）。
 
 ## 2026-07-31: v0.2 — GUI（生 X11）+ Markdown + slim-DOM + viewport 窓グリッド
 
@@ -126,26 +126,26 @@ script 比重の大きい実在頁で 10 MB 級の削減が見込める。v0.3 �
 - fuzz 500+500 iter 0 crash（ASAN/UBSAN）。guard ALL PASS。tuibench 系は不変。
 - WPT tree-construction **1,679/1,726（97.3%）不変**（slim は適合ハーネス非適用を確認）。
 - tui_smoke PASS、gui_smoke PASS、GUI 実ラスタ PNG 目視 QA（グリフ鏡像バグ修正済）。
-- bench_v8x 値不変（fib22=17711 / arith=905003 / mixed=7.9996e+07）。
+- bench_akl 値不変（fib22=17711 / arith=905003 / mixed=7.9996e+07）。
 - 天井監視: ifuto 219,776 B は旧 TUI 天井 200 KB を **+19,776 B 超過**。成因は md.c 追加で
   機能マイルストーンに伴うもの（悪化ではないが）— v0.2 系の新天井 240 KB をここに設定し、
   以後のコミットはこれに拘束される。
 
-## 2026-07-31: V8x v0.1（GC + ROPE + 融合命令）— QuickJS 比「軽さ・速さ」全軸クリア、V8 --jitless 比も全軸クリア
+## 2026-07-31: Akl v0.1（GC + ROPE + 融合命令）— QuickJS 比「軽さ・速さ」全軸クリア、V8 --jitless 比も全軸クリア
 
 構成: mark-sweep GC（adaptive pacing, ルート=VM スタックスナップショット+globals+nursery+last_val）、
-ROPE 文字列（`V8X_OK_ROPE`、償却 O(1) 連結・遅延 flatten・深さ 4096 上限）、
+ROPE 文字列（`AKL_OK_ROPE`、償却 O(1) 連結・遅延 flatten・深さ 4096 上限）、
 融合命令群（LINC/GINC、CJMPF_L/G、CJMPF_MODG/L/GG、CJMPF_MULGG、GMULC/LMULC、*CI、
 *CI+store 再融合 `*_G/_L`、3 アドレス `*_GX/_LX`、GADD_P/LADD_P/GADD_G、LADD_LL、
 RET_L、STORE_PV 系、`for` ループ回転 + LOOPINC_G）。
 融合の意味保持は「汎用路が非融合命令列と同じ関数を同順序で呼ぶ」構造共有で証明
-（v8x_cist_compute / v8x_binfv_compute を単独命令と再融合命令が always_inline で共有）。
-検証: 単体 1,875 checks×2 dispatch 0 fail・fuzz_v8x 500 0 crash・WPT 97.0% 不変・tui_smoke PASS。
+（akl_cist_compute / akl_binfv_compute を単独命令と再融合命令が always_inline で共有）。
+検証: 単体 1,875 checks×2 dispatch 0 fail・fuzz_akl 500 0 crash・WPT 97.0% 不変・tui_smoke PASS。
 
 ### 比較表（実測・同一実行セットの median。±10% 程度の実行間変動あり）
 
 時間（プロセス wall ms、起動込み。小さいほど良い）:
-| bench | v8x | qjs | node --jitless | node(full JIT) |
+| bench | akl | qjs | node --jitless | node(full JIT) |
 |---|---|---|---|---|
 | empty | **1.16** | 1.45 | 24.9 | 23.6 |
 | tiny | **1.20** | 1.55 | 22.7 | 24.6 |
@@ -159,10 +159,10 @@ RET_L、STORE_PV 系、`for` ループ回転 + LOOPINC_G）。
 vs V8 full JIT = 起動/小仕事 0.05〜0.09×、文字列 0.09〜0.16× で勝ち、
 ホット数値ループのみ 1.9〜2.3× で負け（下記台帳）。
 
-RSS（rssrun 子 rusage）: v8x **2.0〜2.2 MB** / qjs 2.8〜3.0 MB / nodejit 41.5 MB / node 41.8〜46 MB。
-バイナリ（stripped）: v8x_cli **98 KB** / qjs 1,027 KB（0.095×）/ node 107 MB。
+RSS（rssrun 子 rusage）: akl **2.0〜2.2 MB** / qjs 2.8〜3.0 MB / nodejit 41.5 MB / node 41.8〜46 MB。
+バイナリ（stripped）: akl_cli **98 KB** / qjs 1,027 KB（0.095×）/ node 107 MB。
 
-guard（常時アラーム）: `make guard`（bench/v8x_guards.json。絶対閾値: バイナリ ≤128KB・
+guard（常時アラーム）: `make guard`（bench/akl_guards.json。絶対閾値: バイナリ ≤128KB・
 RSS ≤3.5MB・時間天井。相対閾値: vs qjs ≤1.05 全軸・vs nodejit ≤1.05 全軸）。1 件逸脱で exit 1。
 兄弟 harness `bench/vsx.py`（C1-C6）も **VERDICT: PASS ×3 連続**（RSS 軸は rssrun 化、
 net 軸は rep 内ペア減算に改修済み。下記「測定工学」参照）。
@@ -189,7 +189,7 @@ net 軸は rep 内ペア減算に改修済み。下記「測定工学」参照�
 - **net（起動差分）は「独立 median 同士の引き算」で取ってはいけない**: 負荷ドリフト時に
   empty 中央値（node ~26-31ms）が ±4ms 揺れ、2.5-6.6ms の偽 net 揺らぎで false FAIL する。
   各 rep で empty→bench を連続実行し rep 内で差を取ってから median（vsx.py 改修済み）。
-- v8x_cist_compute のような共有ヘルパは `__attribute__((always_inline)) inline` を
+- akl_cist_compute のような共有ヘルパは `__attribute__((always_inline)) inline` を
   付けないと -O2 でも関数呼出し化され、arith で +17% の回帰になった（実測 121→138→111ms）。
 
 全数値は「このコンテナ（2 core / 4GB / Debian 12 / gcc 12.2）での実測」。他環境との絶対比較は無意味。
@@ -277,14 +277,14 @@ slice-2 のコスト分析（正直な注記）:
   - 空タブ VmHWM 1,428 → 1,732 KB: .rodata のエンティティ表への初回ページインと
     パーサ増分コード（ピーク計測なので初回フォルトが乗る）。天井内のため後追いのみ。
 
-## 2026-07-29: V8x v0.0（自作 JS エンジン、C11・JIT なし）初回測定
+## 2026-07-29: Akl v0.0（自作 JS エンジン、C11・JIT なし）初回測定
 
 採用仕様: 字句→recursive-descent（AST プール）→one-pass codegen→**全検証 verifier**
 →スタック VM。値は NaN-box 8B、ヒープ参照は obj 配列への u32 index、命令・呼出深度・
 解析深度・ヒープバイト・ノード数・引数列・ソース長の全 budget を fail-stop で管理。
 JIT は構造的に不在（W^X 全域、実行可能書き込みページ 0）。
 
-### dispatch 実測（bench/bench_v8x.c, REL, 7 プロセス×7 回の median-of-medians, 本コンテナ）
+### dispatch 実測（bench/bench_akl.c, REL, 7 プロセス×7 回の median-of-medians, 本コンテナ）
 | workload | computed-goto | switch | goto/switch |
 |---|---|---|---|
 | fib(22) recursive | 2.567 ms | 3.324 ms | **1.295×** |
@@ -293,27 +293,27 @@ JIT は構造的に不在（W^X 全域、実行可能書き込みページ 0）�
 | str concat 2k | 0.391 ms | 0.393 ms | 1.005× |
 
 裁定: **computed-goto を既定**（GCC/Clang で有効、他は switch フォールバック。
-`V8X_TEST_SWITCH_DISPATCH` で強制切替可）。dispatch 支配の算術系で +12〜30%。
+`AKL_TEST_SWITCH_DISPATCH` で強制切替可）。dispatch 支配の算術系で +12〜30%。
 文字列系はインターンハッシュ支配で差なし。理論（間接分岐の局所化）と一致。
 両モードとも同一単体テスト全緑（run_tests / run_tests_switch の双子運用で固定）。
 
 ### サイズ会計（実測）
 - スタンドアロン差分（空 main との diff, stripped/LTO/gc-sections）: **45,392 B**。
-- ifuto（195,192 B）に全 v8x シンボル保持で仮リンク: **244,376 B（+49,184 B）**。
+- ifuto（195,192 B）に全 akl シンボル保持で仮リンク: **244,376 B（+49,184 B）**。
 - 内訳（-O2 単体 .o）: .text.vm_exec 18,919 B（42%）、lex_next 2,816、
-  p_stmt 2,674、cg_stmt 2,436、v8x_eval 2,221、p_unary 1,862、他 ≈16 KB。
+  p_stmt 2,674、cg_stmt 2,436、akl_eval 2,221、p_unary 1,862、他 ≈16 KB。
 - **200 KB 天井との関係**: v0.0 は本体未リンクで天井維持（195,192 B 不変）。
   v0.4 統合時に天井を再設定する。削減材料の候補（未実施・見積もりも未計測）:
   dtoa の自前化で %g/%.0f printf 経路を剥がす、エラーメッセージの ID 化、
   vm_exec の命令削減。再設定するときはこの 3 案の実測値を添えて判断する。
 
 ### 検証
-- 単体: **1,813 checks / 0 fail**（v8x 追加分 118。1695 → 1813）。
+- 単体: **1,813 checks / 0 fail**（akl 追加分 118。1695 → 1813）。
   NaN canonical、±Inf、int32→double 境界、INT32_MIN % -1 の UB 回避、
   短絡評価の生値、0.1+0.2 の厳密 binary64、ToInt なし連結 ToString（往復最短精度）、
   グローバル定数 NaN/Infinity の const 保護、parse depth・命令・深度・ヒープの
   各 budget の fail-stop、budget 枯渇後の eval 健全性、rt 間のグローバル独立性。
-- fuzz: fuzz_html 500 + **fuzz_v8x 500** = 1,000 iter / 0 crash（ASAN/UBSAN）。
+- fuzz: fuzz_html 500 + **fuzz_akl 500** = 1,000 iter / 0 crash（ASAN/UBSAN）。
 - WPT tree-construction: **88.1%（1,521/1,726）不変**（エンジン側差分ゼロの確認）。
 - 既知の v0.0 境界（台帳）: 配列/オブジェクトリテラル、三項 `?:`、`++`/`--`、
   複合代入 `+=`、arguments/this/new/prototype、ASI 完全形。let/const は関数スコープ近似。

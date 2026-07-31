@@ -1,6 +1,6 @@
 {
   "absolute": {
-    "v8x_cli_max_bytes": 131072,
+    "akl_cli_max_bytes": 131072,
     "time_ms_max": {
       "empty": 4.0, "tiny": 4.0, "fib30": 140.0, "arith": 220.0,
       "branch": 140.0, "strcat_flat": 12.0, "strcat_grow": 8.0

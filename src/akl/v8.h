@@ -1,19 +1,19 @@
-/* V8x — V8 API ファサード（C++ 形状互換, header-only）
+/* Akl — V8 API ファサード（C++ 形状互換, header-only）
  *
- * 目的: V8x（src/v8x/v8x.c, C11, JIT なし）を V8 API と同じ型形状で C++ から使う。
+ * 目的: Akl（src/akl/akl.c, C11, JIT なし）を V8 API と同じ型形状で C++ から使う。
  * **互換範囲の唯一の定義は docs/V8_COMPAT.md の coverage map**。これは概念・型形状の
  * サブセット互換であり、V8 の ABI・完全挙動互換ではない。
  *
  * 設計の骨格:
- *   - Isolate ≈ V8xRT（単一 realm。Context は Isolate への参照でしかない）
+ *   - Isolate ≈ AklRT（単一 realm。Context は Isolate への参照でしかない）
  *   - Local<T> は 8B cell を値で保持。T（Value/Number/Boolean/String/Context/Script）
  *     は空タグクラスで、メソッドは this を cell へのポインタとして読む
  *     （V8 が Local<T> を handle スロットへのポインタとして実装するのと同型。
- *       値の cell は V8xVal、Context は Isolate*、Script は ScriptRec* を格納）
- *   - **HandleScope は RAII ノーオペ**: V8x の Local は GC ルートを張らない
- *     （V8x はヒープ参照を API に出さない設計の帰結）。未参照ヒープ値は次回 GC で
+ *       値の cell は AklVal、Context は Isolate*、Script は ScriptRec* を格納）
+ *   - **HandleScope は RAII ノーオペ**: Akl の Local は GC ルートを張らない
+ *     （Akl はヒープ参照を API に出さない設計の帰結）。未参照ヒープ値は次回 GC で
  *     回収され得る → Utf8Value へ写すか即時使用が利用者側責務
- *   - TryCatch: eval 失敗の捕捉。V8x は例外「値」を API に出さないため
+ *   - TryCatch: eval 失敗の捕捉。Akl は例外「値」を API に出さないため
  *     Exception() 相当は ExceptionString()（engine err 文字列、TryCatch 所有）
  *   - IsString だけは V8 形状からの明示偏差: 文字列判定は engine の obj 表を読む
  *     ため v->IsString(isolate) 形を取る
@@ -32,7 +32,7 @@
 /* <new>（libstdc++）を引かないための最小配置 new（非置換形の再宣言は合法） */
 inline void *operator new(std::size_t, void *p) throw() { return p; }
 
-#include "v8x/v8x.h"
+#include "akl/akl.h"
 
 namespace v8 {
 
@@ -75,11 +75,11 @@ private:
 
 class Value {
 public:
-    bool IsNumber() const { double d; return v8x_as_num(cell(), &d); }
+    bool IsNumber() const { double d; return akl_as_num(cell(), &d); }
     bool IsString(Isolate *isolate) const;   /* 形状偏差（上部参照） */
-    bool IsBoolean() const { bool b; return v8x_as_bool(cell(), &b); }
-    bool IsNull() const { return v8x_is_null(cell()); }
-    bool IsUndefined() const { return v8x_is_undefined(cell()); }
+    bool IsBoolean() const { bool b; return akl_as_bool(cell(), &b); }
+    bool IsNull() const { return akl_is_null(cell()); }
+    bool IsUndefined() const { return akl_is_undefined(cell()); }
     Maybe<double> NumberValue(const Local<Context> &context) const;
     Maybe<bool> BooleanValue(const Local<Context> &context) const;
 protected:
@@ -132,7 +132,7 @@ public:
 class Script {
 public:
     static Local<Script> Compile(const Local<Context> &context, const Local<String> &source);
-    /* V8 偏差: V8x は parse+run 一体のため構文エラーは Compile ではなく Run で
+    /* V8 偏差: Akl は parse+run 一体のため構文エラーは Compile ではなく Run で
      * 顕在化する。失敗すると empty を返し、稼働中の TryCatch が捕捉する */
     Local<Value> Run(const Local<Context> &context);
 };
@@ -174,7 +174,7 @@ public:
 private:
     struct ScriptRec { ScriptRec *next; char *src; };
     struct Impl {
-        V8xRT *rt;
+        AklRT *rt;
         TryCatch *tc;
         ScriptRec *scripts;
         Impl() : rt(NULL), tc(NULL), scripts(NULL) {}
@@ -201,14 +201,14 @@ inline Isolate *Isolate::New() {
     Isolate *iso = new (mem) Isolate();
     iso->impl_ = new (std::malloc(sizeof(Impl))) Impl();
     if (!iso->impl_) { std::free(iso); return NULL; }
-    iso->impl_->rt = v8x_new();
+    iso->impl_->rt = akl_new();
     if (!iso->impl_->rt) { std::free(iso->impl_); std::free(iso); return NULL; }
     return iso;
 }
 
 inline void Isolate::Dispose() {
     if (!impl_) { std::free(this); return; }
-    if (impl_->rt) v8x_free(impl_->rt);
+    if (impl_->rt) akl_free(impl_->rt);
     while (impl_->scripts) {
         ScriptRec *n = impl_->scripts->next;
         std::free(impl_->scripts->src);
@@ -222,8 +222,8 @@ inline void Isolate::Dispose() {
 
 inline bool Isolate::Eval(const char *source, Local<Value> *out) {
     uint64_t v = 0;
-    bool ok = v8x_eval(impl_->rt, source, &v);
-    if (!ok && impl_->tc) impl_->tc->steal(v8x_error(impl_->rt));
+    bool ok = akl_eval(impl_->rt, source, &v);
+    if (!ok && impl_->tc) impl_->tc->steal(akl_error(impl_->rt));
     if (out) *out = ok ? Local<Value>::from(v, true) : Local<Value>();
     return ok;
 }
@@ -236,37 +236,37 @@ inline Isolate *Context::GetIsolate() const {
 }
 
 inline bool Value::IsString(Isolate *isolate) const {
-    return isolate && v8x_is_string(isolate->impl_->rt, cell());
+    return isolate && akl_is_string(isolate->impl_->rt, cell());
 }
 inline Maybe<double> Value::NumberValue(const Local<Context> &) const {
     double d;
-    return v8x_as_num(cell(), &d) ? Maybe<double>(d) : Maybe<double>();
+    return akl_as_num(cell(), &d) ? Maybe<double>(d) : Maybe<double>();
 }
 inline Maybe<bool> Value::BooleanValue(const Local<Context> &) const {
     bool b;
-    return v8x_as_bool(cell(), &b) ? Maybe<bool>(b) : Maybe<bool>();
+    return akl_as_bool(cell(), &b) ? Maybe<bool>(b) : Maybe<bool>();
 }
 
 inline Local<Number> Number::New(Isolate *, double value) {
-    return Local<Number>::from(v8x_mknum(value), true);
+    return Local<Number>::from(akl_mknum(value), true);
 }
 inline Local<Boolean> Boolean::New(Isolate *, bool value) {
-    return Local<Boolean>::from(v8x_mkbool(value), true);
+    return Local<Boolean>::from(akl_mkbool(value), true);
 }
-inline Local<Value> Undefined(Isolate *) { return Local<Value>::from(v8x_mkundefined(), true); }
-inline Local<Value> Null(Isolate *) { return Local<Value>::from(v8x_mknull(), true); }
+inline Local<Value> Undefined(Isolate *) { return Local<Value>::from(akl_mkundefined(), true); }
+inline Local<Value> Null(Isolate *) { return Local<Value>::from(akl_mknull(), true); }
 
 inline Local<String> String::NewFromUtf8(Isolate *isolate, const char *data, int length) {
     if (!isolate || !data) return Local<String>();
     uint32_t n = length >= 0 ? (uint32_t)length : (uint32_t)std::strlen(data);
-    uint64_t v = v8x_mkstring(isolate->impl_->rt, data, n);
-    if (v8x_is_undefined(v)) return Local<String>();  /* err 設定済（budget/oom） */
+    uint64_t v = akl_mkstring(isolate->impl_->rt, data, n);
+    if (akl_is_undefined(v)) return Local<String>();  /* err 設定済（budget/oom） */
     return Local<String>::from(v, true);
 }
 inline String::Utf8Value::Utf8Value(Isolate *isolate, const Local<Value> &v) : str_(NULL), len_(0) {
     if (!isolate || v.IsEmpty()) return;
     uint32_t n = 0;
-    const char *s = v8x_as_str(isolate->impl_->rt, v.cell_bits(), &n);
+    const char *s = akl_as_str(isolate->impl_->rt, v.cell_bits(), &n);
     if (!s) return;
     str_ = (char *)std::malloc((size_t)n + 1);
     if (!str_) return;
@@ -310,8 +310,8 @@ inline Local<Value> Script::Run(const Local<Context> &context) {
     if (!rec || context.IsEmpty()) return Local<Value>();
     Isolate *iso = context->GetIsolate();
     uint64_t v = 0;
-    if (!v8x_eval(iso->impl_->rt, rec->src, &v)) {
-        if (iso->impl_->tc) iso->impl_->tc->steal(v8x_error(iso->impl_->rt));
+    if (!akl_eval(iso->impl_->rt, rec->src, &v)) {
+        if (iso->impl_->tc) iso->impl_->tc->steal(akl_error(iso->impl_->rt));
         return Local<Value>();
     }
     return Local<Value>::from(v, true);

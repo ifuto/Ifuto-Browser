@@ -1,9 +1,9 @@
-/* V8x dispatch 方式の実測比較ベンチ（computed-goto vs switch）。
- * Makefile で 2 バイナリ（bench_v8x / bench_v8x_switch）に分けてビルドし、
+/* Akl dispatch 方式の実測比較ベンチ（computed-goto vs switch）。
+ * Makefile で 2 バイナリ（bench_akl / bench_akl_switch）に分けてビルドし、
  * 同一ワークロードの中央値を BENCH.md に公開する。これは「ユーザに dispatch 選択が
  * 委任された」ことへの回答の根拠データであり、推定値は書かない。 */
 #define _POSIX_C_SOURCE 200809L
-#include "../src/v8x/v8x.h"
+#include "../src/akl/akl.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -37,7 +37,7 @@ static const Wk W[] = {
 #define REPS 7
 
 int main(void) {
-#ifdef V8X_TEST_SWITCH_DISPATCH
+#ifdef AKL_TEST_SWITCH_DISPATCH
     printf("dispatch: switch\n");
 #else
     printf("dispatch: computed-goto\n");
@@ -47,21 +47,21 @@ int main(void) {
         double d = 0;
         bool oknum = true;
         for (int r = 0; r < REPS; r++) {
-            V8xRT *rt = v8x_new();
+            AklRT *rt = akl_new();
             if (!rt) return 2;
-            V8xVal v;
+            AklVal v;
             double t0 = now_ms();
-            bool ok = v8x_eval(rt, W[w].src, &v);
+            bool ok = akl_eval(rt, W[w].src, &v);
             ts[r] = now_ms() - t0;
-            if (!ok) { fprintf(stderr, "eval failed: %s\n", v8x_error(rt)); v8x_free(rt); return 1; }
-            oknum = v8x_as_num(v, &d);
+            if (!ok) { fprintf(stderr, "eval failed: %s\n", akl_error(rt)); akl_free(rt); return 1; }
+            oknum = akl_as_num(v, &d);
             if (r == 0 && W[w].want != -2 && (!oknum || d != W[w].want)) {
                 fprintf(stderr, "want mismatch for %s: got %g want %g (fix want or engine)\n",
                         W[w].name, oknum ? d : -9999.0, W[w].want);
-                v8x_free(rt);
+                akl_free(rt);
                 return 1;
             }
-            v8x_free(rt);
+            akl_free(rt);
         }
         qsort(ts, REPS, sizeof *ts, cmp_d);
         printf("%-22s median %8.3f ms  min %8.3f  max %8.3f  (value %g)\n",
