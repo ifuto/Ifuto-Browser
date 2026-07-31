@@ -7,6 +7,7 @@ void test_arena(void);
 void test_utf8(void);
 void test_html(void);
 void test_css(void);
+void test_css_ruleset_oracle(void);
 void test_layout(void);
 void test_uichrome(void);
 void test_v8x(void);
@@ -21,6 +22,7 @@ int main(void) {
     RUN(test_html);
     fprintf(stderr, "[css]\n");
     RUN(test_css);
+    RUN(test_css_ruleset_oracle);
     fprintf(stderr, "[layout]\n");
     RUN(test_layout);
     RUN(test_uichrome);

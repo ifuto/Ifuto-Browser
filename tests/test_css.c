@@ -1,5 +1,5 @@
 #include "tests.h"
-#include "../src/css.h"
+#include "../src/css_blink.h"
 #include <string.h>
 
 static IfNode *find_tag(IfNode *n, u16 tag) {
@@ -160,5 +160,207 @@ void test_css(void) {
         if_arena_destroy(&ha);
     }
 
+    /* ---- RuleSet 索引: 決定的ケース ---- */
+    {
+        IfArena ha; if_arena_init(&ha, 1 << 16);
+
+        /* cascade order の一意化（旧バグ: rule++ 刻みで decl order がルール間衝突し、
+         * 同 spec 同重要度のタイで後勝ちが成立しなかった。索引差分監査が炙り出し） */
+        {
+            const char *doc =
+                "<style>.a{background-color:#111;color:red}.b{color:blue}</style>"
+                "<p class='a b'>x</p>";
+            IfDom *d = if_parse_html(&ha, if_str(doc, (u32)strlen(doc)));
+            if_style_apply(&ha, d);
+            IfNode *p = find_tag(d->root, IF_TAG_P);
+            CHECK(p && p->style);
+            CHECK(p->style->color == 0x0000FFFF); /* 後規則 .b の blue が勝つ（旧: 衝突で red） */
+        }
+
+        /* 未知タグの CI 照合（selector 大文字 × DOM 小文字、bucket は lowercase 正規化で一致） */
+        {
+            const char *doc =
+                "<style>XFOO{color:rgb(1,2,3)}</style><xfoo>t</xfoo><xbar>u</xbar>";
+            IfDom *d = if_parse_html(&ha, if_str(doc, (u32)strlen(doc)));
+            if_style_apply(&ha, d);
+            IfNode *xf = NULL, *xb = NULL;
+            for (IfNode *nd = d->root; nd; nd = NULL) { break; } /* placeholder */
+            /* preorder 走査で拾う */
+            IfNode *stk[64]; u32 sn = 0; stk[sn++] = d->root;
+            while (sn) {
+                IfNode *nd = stk[--sn];
+                if (nd->kind == IF_NODE_ELEMENT && nd->tag == IF_TAG_UNKNOWN) {
+                    if (nd->tag_name.n == 4 && memcmp(nd->tag_name.p, "xfoo", 4) == 0) xf = nd;
+                    if (nd->tag_name.n == 4 && memcmp(nd->tag_name.p, "xbar", 4) == 0) xb = nd;
+                }
+                for (IfNode *c = nd->first_child; c; c = c->next_sibling)
+                    if (sn < 64) stk[sn++] = c;
+            }
+            CHECK(xf && xf->style && xf->style->color == 0x010203FF);
+            CHECK(xb && xb->style && xb->style->color != 0x010203FF);
+        }
+
+        /* 複数セレクタが別バケツに散る 1 ルール: 両経路で同じ decl が届く */
+        {
+            const char *doc =
+                "<style>div#m, .k1.z2{color:rgb(7,8,9)}</style>"
+                "<div id=m>a</div><span class='k1 z2'>b</span><span class=k1>c</span>";
+            IfDom *d = if_parse_html(&ha, if_str(doc, (u32)strlen(doc)));
+            if_style_apply(&ha, d);
+            IfNode *dv = find_tag(d->root, IF_TAG_DIV);
+            CHECK(dv && dv->style->color == 0x070809FF);
+            /* span: .k1.z2 を持つ方だけ届く（class バケツ経由） */
+            u32 nhit = 0, nmiss = 0;
+            for (IfNode *nd = d->root; nd;) { break; }
+            IfNode *stk2[64]; u32 sn2 = 0; stk2[sn2++] = d->root;
+            while (sn2) {
+                IfNode *nd = stk2[--sn2];
+                if (nd->kind == IF_NODE_ELEMENT && nd->tag == IF_TAG_SPAN && nd->style) {
+                    if (nd->style->color == 0x070809FF) nhit++; else nmiss++;
+                }
+                for (IfNode *c = nd->first_child; c; c = c->next_sibling)
+                    if (sn2 < 64) stk2[sn2++] = c;
+            }
+            CHECK(nhit == 1 && nmiss == 1);
+        }
+
+        /* Blink ファサード（概念・形状互換層）の実動: recalc→computed style→照合 */
+        {
+            const char *doc = "<style>.fx{color:rgb(5,6,7)}</style><p class=fx>t</p>";
+            IfutoDocument *d = if_parse_html(&ha, if_str(doc, (u32)strlen(doc)));
+            ifuto_style_recalc(&ha, d);
+            IfutoElement *p = find_tag(d->root, IF_TAG_P);
+            const IfutoComputedStyle *cst = ifuto_computed_style(p);
+            CHECK(cst && cst->color == 0x050607FF);
+            IfutoStyleSheetContents *one =
+                ifuto_stylesheet_create_and_parse(&ha, IF_S(".fx{color:red}"), 0);
+            CHECK(one && one->rs.n_pool == 1);
+            CHECK(ifuto_selector_matches(p, &one->rules[0].sels[0]));
+            ifuto_ruleset_set_naive_matching(0);
+        }
+
+        /* universal のみのルールは常時スキャン区画から届く */
+        {
+            const char *doc = "<style>*{font-weight:bold}</style><p>t</p>";
+            IfDom *d = if_parse_html(&ha, if_str(doc, (u32)strlen(doc)));
+            if_style_apply(&ha, d);
+            IfNode *p = find_tag(d->root, IF_TAG_P);
+            CHECK(p && p->style && p->style->bold);
+        }
+        if_arena_destroy(&ha);
+    }
+
     if_arena_destroy(&a);
+}
+
+/* ---- RuleSet 索引の差分オラクル（on/off 機械監査。CoJIT oracle と同型） ----
+ * 構造化ランダム sheet × DOM に対し naive 全走査と索引候補走査の計算済みスタイルが
+ * 全ノードでビット一致することを検証する。索引が意味を変えた瞬間ここが赤くなる。 */
+typedef struct { u32 tag; IfStyle st; } CssSnap;
+static u32 css_snapshot(IfNode *n, CssSnap *out, u32 cap, u32 cnt) {
+    if (n->kind == IF_NODE_ELEMENT && n->style && cnt < cap) {
+        out[cnt].tag = n->tag;
+        out[cnt].st = *n->style;
+        cnt++;
+    }
+    for (IfNode *c = n->first_child; c && cnt < cap; c = c->next_sibling)
+        cnt = css_snapshot(c, out, cap, cnt);
+    return cnt;
+}
+
+static u32 css_rng(u32 *st) {
+    u32 x = *st;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    return *st = x;
+}
+
+void test_css_ruleset_oracle(void) {
+    static const char *tags[]  = { "div", "span", "p", "b" };
+    static const char *props[] = {
+        "color:rgb(%u,%u,%u)", "background-color:rgb(%u,%u,%u)",
+        "font-weight:%s", "font-style:%s", "text-decoration:%s"
+    };
+    enum { MAXE = 96 };
+    CssSnap *sa = (CssSnap *)malloc(sizeof(CssSnap) * MAXE);
+    CssSnap *sb = (CssSnap *)malloc(sizeof(CssSnap) * MAXE);
+    CHECK(sa && sb);
+
+    for (u32 seed = 1; seed <= 220; seed++) {
+        u32 st = seed * 2654435761u + 12345u;
+        char sheet[4600]; u32 sp = 0;
+        u32 nr = 4 + css_rng(&st) % 24;
+        if (seed % 17 == 0) nr = 1;         /* 極小シート系 */
+        for (u32 r = 0; r < nr && sp < sizeof(sheet) - 220; r++) {
+            u32 comps = 1 + css_rng(&st) % 2;
+            for (u32 c = 0; c < comps; c++) {
+                u32 feat = css_rng(&st) % 5;
+                switch (feat) {
+                case 0: sp += (u32)sprintf(sheet + sp, "#i%u", css_rng(&st) % 4); break;
+                case 1: sp += (u32)sprintf(sheet + sp, ".c%u", css_rng(&st) % 8); break;
+                case 2: sp += (u32)sprintf(sheet + sp, "%s", tags[css_rng(&st) % 4]); break;
+                case 3: sp += (u32)sprintf(sheet + sp, "%s.c%u", tags[css_rng(&st) % 4], css_rng(&st) % 8); break;
+                default: sp += (u32)sprintf(sheet + sp, "*"); break;
+                }
+                if (c + 1 < comps)
+                    sp += (u32)sprintf(sheet + sp, (css_rng(&st) & 1) ? ">" : " ");
+            }
+            if ((css_rng(&st) % 3) == 0) sp += (u32)sprintf(sheet + sp, ",.c%u", css_rng(&st) % 8); /* 複合リスト */
+            u32 nd = 1 + css_rng(&st) % 3;
+            sp += (u32)sprintf(sheet + sp, "{");
+            for (u32 dd = 0; dd < nd; dd++) {
+                u32 pi = css_rng(&st) % 5;
+                switch (pi) {
+                case 0: case 1:
+                    sp += (u32)sprintf(sheet + sp, props[pi], css_rng(&st) % 256, css_rng(&st) % 256, css_rng(&st) % 256); break;
+                case 2: sp += (u32)sprintf(sheet + sp, props[pi], (css_rng(&st) & 1) ? "bold" : "normal"); break;
+                case 3: sp += (u32)sprintf(sheet + sp, props[pi], (css_rng(&st) & 1) ? "italic" : "normal"); break;
+                default: sp += (u32)sprintf(sheet + sp, props[pi], (css_rng(&st) & 1) ? "underline" : "none"); break;
+                }
+                sp += (u32)sprintf(sheet + sp, ";");
+            }
+            sp += (u32)sprintf(sheet + sp, "}");
+        }
+
+        char dom[12288]; u32 dp = 0;
+        dp += (u32)snprintf(dom + dp, sizeof(dom) - dp, "<style>%s</style>", sheet);
+        CHECK(dp < sizeof(dom) - 512);
+        u32 ne = 8 + css_rng(&st) % 28;
+        u32 open = 0;
+        for (u32 e = 0; e < ne && dp < sizeof(dom) - 160; e++) {
+            const char *tg = tags[css_rng(&st) % 4];
+            dp += (u32)sprintf(dom + dp, "<%s", tg);
+            if ((css_rng(&st) % 3) == 0) dp += (u32)sprintf(dom + dp, " id=i%u", css_rng(&st) % 4);
+            u32 nc = css_rng(&st) % 3;
+            if (nc) {
+                dp += (u32)sprintf(dom + dp, " class=\"");
+                for (u32 k = 0; k < nc; k++)
+                    dp += (u32)sprintf(dom + dp, "%sc%u", k ? " " : "", css_rng(&st) % 8);
+                dp += (u32)sprintf(dom + dp, "\"");
+            }
+            dp += (u32)sprintf(dom + dp, ">x");
+            open++;
+            if (open > 1 && (css_rng(&st) % 2) == 0) { dp += (u32)sprintf(dom + dp, "</%s>", "div"); open--; } /* 近似クローズ */
+        }
+        /* 生成 HTML は恣意的に壊れ得るが、parser は敵対的入力に規律で応答する = oracle 対象として適格 */
+
+        IfArena ha; if_arena_init(&ha, 1 << 20);
+        IfDom *d = if_parse_html(&ha, if_str(dom, (u32)strlen(dom)));
+
+        if_css_set_naive_matching(1);
+        if_style_apply(&ha, d);
+        u32 na = css_snapshot(d->root, sa, MAXE, 0);
+
+        if_css_set_naive_matching(0);
+        if_style_apply(&ha, d);
+        u32 nb = css_snapshot(d->root, sb, MAXE, 0);
+
+        CHECK(na == nb);
+        for (u32 i = 0; i < na && i < nb; i++) {
+            CHECK(sa[i].tag == sb[i].tag);
+            CHECK(memcmp(&sa[i].st, &sb[i].st, sizeof(IfStyle)) == 0);
+        }
+        if_arena_destroy(&ha);
+    }
+    if_css_set_naive_matching(0); /* 後続スイートの既定を汚染しない */
+    free(sa); free(sb);
 }

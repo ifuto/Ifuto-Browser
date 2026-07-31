@@ -3,6 +3,7 @@
  */
 #include "css.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ================= レキサ的補助 ================= */
 
@@ -644,6 +645,122 @@ static u32 parse_selector_list(IfArena *a, IfStr raw, IfSelector **out) {
 
 /* ================= スタイルシートパース ================= */
 
+/* ================= RuleSet 風インデックス =================
+ * 戦略は Blink RuleSet と同一: 右端 compound の最強特徴（id > class > tag > universal）
+ * をキーに (rule, sel) を単一バケツへ。要素マッチ時は自身の特徴のバケツ + universal のみ
+ * 全マッチする。正しさの骨格: selector が要素 n にマッチするなら右端 compound が成立し、
+ * n はそのキーのバケツを必ず引く（バケツ外エントリの右端は必ず不成立）⇒ 候補集合は
+ * 全走査のマッチ集合と一致。カスケードの勝者決定は (important, origin, spec, order) の
+ * 厳密全順序で反復順序に依存しないため、結論も一致。差分 audit: if_css_set_naive_matching。 */
+
+static u32 rs_hash(IfStr s) {
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < s.n; i++) { h ^= (u8)s.p[i]; h *= 16777619u; }
+    return h;
+}
+static u8 rs_lower(u8 c) { return (c >= 'A' && c <= 'Z') ? (u8)(c - 'A' + 'a') : c; }
+
+/* 右端 compound のキー。戻り 0=id 1=class 2=tag 3=universal（tag 未知名は CI 照合に
+ * 合わせ ASCII-lowercase 複製に正規化する。既知タグは canonical 静的名を借用） */
+static int rs_entry_key(IfArena *a, const IfSelector *sel, IfStr *key_out) {
+    const IfCompound *cp = &sel->comps[sel->n_comps - 1];
+    *key_out = if_str(NULL, 0); /* universal は無キー（cmp の規則を破らせない） */
+    if (cp->n_ids) { *key_out = cp->ids[0]; return 0; }
+    if (cp->n_classes) { *key_out = cp->classes[0]; return 1; }
+    if (cp->has_tag) {
+        if (cp->tag != IF_TAG_UNKNOWN) {
+            const char *nm = if_tag_name(cp->tag);
+            *key_out = if_str(nm, nm ? (u32)strlen(nm) : 0);
+        } else {
+            u8 *buf = (u8 *)if_arena_alloc(a, cp->tag_name.n ? cp->tag_name.n : 1);
+            for (u32 i = 0; i < cp->tag_name.n; i++) buf[i] = rs_lower((u8)cp->tag_name.p[i]);
+            *key_out = if_str((const char *)buf, cp->tag_name.n);
+        }
+        return 2;
+    }
+    return 3;
+}
+
+typedef struct { u32 hash; IfStr key; u32 rule, sel; u16 type, pad; } RsItem;
+
+static int rs_item_cmp(const void *x, const void *y) {
+    const RsItem *a = (const RsItem *)x, *b = (const RsItem *)y;
+    if (a->type != b->type) return a->type < b->type ? -1 : 1;
+    if (a->hash != b->hash) return a->hash < b->hash ? -1 : 1;
+    u32 n = a->key.n < b->key.n ? a->key.n : b->key.n;
+    int c = n ? memcmp(a->key.p, b->key.p, n) : 0;
+    if (c) return c < 0 ? -1 : 1;
+    if (a->key.n != b->key.n) return a->key.n < b->key.n ? -1 : 1;
+    if (a->rule != b->rule) return a->rule < b->rule ? -1 : 1;
+    if (a->sel != b->sel) return a->sel < b->sel ? -1 : 1;
+    return 0;
+}
+
+static bool rs_same_key(const RsItem *x, const RsItem *y) {
+    return x->type == y->type && x->hash == y->hash && x->key.n == y->key.n &&
+           (!x->key.n || memcmp(x->key.p, y->key.p, x->key.n) == 0);
+}
+
+static void css_build_ruleset(IfArena *a, IfStyleSheet *sh) {
+    IfRuleSet *rs = &sh->rs;
+    u32 total = 0;
+    for (u32 r = 0; r < sh->n_rules; r++) total += sh->rules[r].n_sels;
+    rs->pool = NULL; rs->n_pool = 0;
+    rs->id_b = NULL; rs->n_id = 0; rs->cl_b = NULL; rs->n_cl = 0; rs->tg_b = NULL; rs->n_tg = 0;
+    rs->univ_start = 0; rs->univ_len = 0;
+    if (!total) return;
+    RsItem *items = (RsItem *)malloc((u64)total * sizeof(RsItem));
+    IfSelEntry *pool = (IfSelEntry *)if_arena_alloc(a, (u64)total * sizeof(IfSelEntry));
+    if (!items) return; /* OOM: n_pool=0 のまま = 呼出し側が naive 全走査へフォールバック（安全側） */
+    u32 ni = 0;
+    for (u32 r = 0; r < sh->n_rules; r++)
+        for (u32 s = 0; s < sh->rules[r].n_sels; s++) {
+            IfStr key; int t = rs_entry_key(a, &sh->rules[r].sels[s], &key);
+            items[ni].type = (u16)t; items[ni].pad = 0;
+            items[ni].key = key;
+            items[ni].hash = (t == 3) ? 0 : rs_hash(key);
+            items[ni].rule = r; items[ni].sel = s;
+            ni++;
+        }
+    qsort(items, total, sizeof(RsItem), rs_item_cmp);
+
+    /* distinct key 数を片っ端から数え、バケツ配列をぴったり確保（slack ゼロ = 軽さの法則） */
+    u32 distinct[3] = { 0, 0, 0 };
+    for (u32 i = 0; i < total && items[i].type < 3; i++)
+        if (i == 0 || !rs_same_key(&items[i], &items[i - 1])) distinct[items[i].type]++;
+    rs->id_b = distinct[0] ? (IfSelBucket *)if_arena_alloc(a, (u64)distinct[0] * sizeof(IfSelBucket)) : NULL;
+    rs->cl_b = distinct[1] ? (IfSelBucket *)if_arena_alloc(a, (u64)distinct[1] * sizeof(IfSelBucket)) : NULL;
+    rs->tg_b = distinct[2] ? (IfSelBucket *)if_arena_alloc(a, (u64)distinct[2] * sizeof(IfSelBucket)) : NULL;
+    IfSelBucket *btab[3] = { rs->id_b, rs->cl_b, rs->tg_b };
+    u32 *bnum[3] = { &rs->n_id, &rs->n_cl, &rs->n_tg };
+
+    u32 pos = 0; /* pool カーソル（id → class → tag → universal の順で連続配置） */
+    u32 i = 0;
+    while (i < total && items[i].type < 3) {
+        u32 t = items[i].type;
+        IfSelBucket *b = &btab[t][(*bnum[t])++];
+        b->hash = items[i].hash; b->key = items[i].key; b->start = pos; b->len = 0;
+        do {
+            pool[pos].rule = items[i].rule; pool[pos].sel = items[i].sel; pos++;
+            b->len++; i++;
+        } while (i < total && rs_same_key(&items[i], &items[i - 1]));
+    }
+    rs->univ_start = pos;
+    while (i < total) { pool[pos].rule = items[i].rule; pool[pos].sel = items[i].sel; pos++; i++; }
+    rs->univ_len = pos - rs->univ_start;
+    free(items);
+    rs->pool = pool; rs->n_pool = total;
+}
+
+/* バケツは hash 昇順。同 hash は memcmp 順の連続区画（build のソート規約） */
+static const IfSelBucket *rs_find(const IfSelBucket *b, u32 n, u32 h, IfStr key) {
+    u32 lo = 0, hi = n;
+    while (lo < hi) { u32 m = lo + ((hi - lo) >> 1); if (b[m].hash < h) lo = m + 1; else hi = m; }
+    for (; lo < n && b[lo].hash == h; lo++)
+        if (b[lo].key.n == key.n && (!key.n || memcmp(b[lo].key.p, key.p, key.n) == 0)) return &b[lo];
+    return NULL;
+}
+
 IfStyleSheet *if_css_parse(IfArena *a, IfStr css, u32 order_base) {
     IfStyleSheet *sh = (IfStyleSheet *)if_arena_calloc(a, sizeof(IfStyleSheet));
     IfRule *rules = NULL; u32 nr = 0; u64 cap = 0;
@@ -721,11 +838,17 @@ IfStyleSheet *if_css_parse(IfArena *a, IfStr css, u32 order_base) {
         rules[nr].n_sels = nsels;
         rules[nr].decls = sink.decls;
         rules[nr].n_decls = sink.n_decls;
-        rules[nr].order = order++;
+        /* order は decl 単位で一意に単調（旧: rule 単位 ++ は order=rule_base+decl_idx が
+         * ルール間で衝突し、同 spec 同重要度のタイで「後勝ち」が成立しないことがあった。
+         * 索引化の差分監査がこの不成立を実測で炙り出したため、CSS 仕様の後勝ちへ修正） */
+        rules[nr].order = order;
+        order += sink.n_decls;
         nr++;
     }
     sh->rules = rules;
     sh->n_rules = nr;
+    sh->order_end = order;
+    css_build_ruleset(a, sh);
     return sh;
 }
 
@@ -823,7 +946,7 @@ static bool winner_beats(const IfWinner *w, const IfWinner *cur) {
     return w->order > cur->order; /* 後勝ち */
 }
 
-static void collect_from_sheet(const IfNode *n, const IfStyleSheet *sh, u8 origin, IfWinner win[]) {
+static void collect_from_sheet_naive(const IfNode *n, const IfStyleSheet *sh, u8 origin, IfWinner win[]) {
     for (u32 r = 0; r < sh->n_rules; r++) {
         const IfRule *rule = &sh->rules[r];
         u32 best_spec = 0; bool matched = false;
@@ -840,6 +963,69 @@ static void collect_from_sheet(const IfNode *n, const IfStyleSheet *sh, u8 origi
             if (winner_beats(&w, &win[decl->prop])) win[decl->prop] = w;
         }
     }
+}
+
+/* 1 エントリの全マッチ + 勝者収集（naive と同一の winner 規則、spec はその selector 自身） */
+static void collect_apply(const IfNode *n, const IfStyleSheet *sh, const IfSelEntry *e,
+                          u8 origin, IfWinner win[]) {
+    const IfRule *rule = &sh->rules[e->rule];
+    const IfSelector *sel = &rule->sels[e->sel];
+    if (!if_css_match_selector(n, sel)) return;
+    for (u32 d = 0; d < rule->n_decls; d++) {
+        const IfDecl *decl = &rule->decls[d];
+        IfWinner w = { true, sel->spec, rule->order + d, decl->important, origin, decl };
+        if (winner_beats(&w, &win[decl->prop])) win[decl->prop] = w;
+    }
+}
+
+static void collect_slice(const IfNode *n, const IfStyleSheet *sh,
+                          const IfSelBucket *b, u8 origin, IfWinner win[]) {
+    if (!b) return;
+    for (u32 i = 0; i < b->len; i++)
+        collect_apply(n, sh, &sh->rs.pool[b->start + i], origin, win);
+}
+
+static int g_css_naive = 0;
+void if_css_set_naive_matching(int enabled) { g_css_naive = enabled != 0; }
+
+static bool c_class_ws(u8 c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
+
+static void collect_from_sheet(IfArena *a, const IfNode *n, const IfStyleSheet *sh, u8 origin, IfWinner win[]) {
+    if (g_css_naive || !sh->rs.pool) { collect_from_sheet_naive(n, sh, origin, win); return; }
+    if (n->kind != IF_NODE_ELEMENT) return; /* 非要素は右端 compound が必ず不成立（matcher と同値） */
+    const IfRuleSet *rs = &sh->rs;
+
+    /* id（照合は memcmp 完全一致 = matcher の cp->ids と同規則） */
+    IfStr id = if_dom_attr(n, "id");
+    if (id.n) collect_slice(n, sh, rs_find(rs->id_b, rs->n_id, rs_hash(id), id), origin, win);
+
+    /* class（トークン化規則は dom.c if_dom_has_class と同一の空白集合 = matcher 同値） */
+    IfStr cv = if_dom_attr(n, "class");
+    u32 ci = 0;
+    while (ci < cv.n) {
+        while (ci < cv.n && c_class_ws((u8)cv.p[ci])) ci++;
+        u32 start = ci;
+        while (ci < cv.n && !c_class_ws((u8)cv.p[ci])) ci++;
+        if (ci == start) break;
+        IfStr tok = if_str(cv.p + start, ci - start);
+        collect_slice(n, sh, rs_find(rs->cl_b, rs->n_cl, rs_hash(tok), tok), origin, win);
+    }
+
+    /* tag（既知 = canonical 静的名、未知 = ASCII-lowercase 複製。索引側と同じ正規化） */
+    IfStr tkey = if_str(NULL, 0);
+    if (n->tag != IF_TAG_UNKNOWN) {
+        const char *nm = if_tag_name(n->tag);
+        if (nm) tkey = if_str(nm, (u32)strlen(nm));
+    } else if (n->tag_name.n) {
+        u8 *buf = (u8 *)if_arena_alloc(a, n->tag_name.n);
+        for (u32 i = 0; i < n->tag_name.n; i++) buf[i] = rs_lower((u8)n->tag_name.p[i]);
+        tkey = if_str((const char *)buf, n->tag_name.n);
+    }
+    if (tkey.n) collect_slice(n, sh, rs_find(rs->tg_b, rs->n_tg, rs_hash(tkey), tkey), origin, win);
+
+    /* universal（特徴なし右端）は常時スキャン */
+    for (u32 i = 0; i < rs->univ_len; i++)
+        collect_apply(n, sh, &rs->pool[rs->univ_start + i], origin, win);
 }
 
 float if_css_resolve_len(IfLen l, float self_fs, float root_fs) {
@@ -900,7 +1086,7 @@ static void compute_node(IfArena *a, IfNode *n, const IfStyle *parent_st, float 
     IfWinner win[IF_P_N];
     memset(win, 0, sizeof win);
     for (u32 s = 0; s < n_sheets; s++)
-        collect_from_sheet(n, sheets[s], s == 0 ? IF_ORIGIN_UA : IF_ORIGIN_AUTHOR, win);
+        collect_from_sheet(a, n, sheets[s], s == 0 ? IF_ORIGIN_UA : IF_ORIGIN_AUTHOR, win);
 
     /* 3) inline style */
     IfStr style_attr = if_dom_attr(n, "style");
@@ -1085,7 +1271,7 @@ static void collect_author_sheets(IfArena *a, IfNode *n, const IfStyleSheet ***a
         IfStr css = if_dom_text_content(a, n);
         if (css.n) {
             IfStyleSheet *sh = if_css_parse(a, css, *order);
-            *order += sh->n_rules * 64 + 1024; /* シート間の order 衝突回避の余裕 */
+            *order = sh->order_end + 1; /* シート間の order 衝突回避（消費分を正確に積む。旧 64/rule 見積もりは decl 多数で破綻し得た） */
             *arr = (const IfStyleSheet **)if_arena_grow(a, (void *)*arr, cap, *count + 1, sizeof(IfStyleSheet *));
             (*arr)[(*count)++] = sh;
         }

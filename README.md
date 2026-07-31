@@ -33,7 +33,7 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 ```sh
 make            # build/ifuto（リリース: -O2 LTO stripped）
 make gui        # build/ifuto-gui（GUI v0.2。X11 実機ではそのまま起動）
-make test       # 単体テスト 1989 checks ×2 dispatch（ASan+UBSan+LSan 常時）
+make test       # 単体テスト 17,543 checks ×2 dispatch（ASan+UBSan+LSan 常時）
 make uitest     # TUI を疑似端末越しに駆動する e2e スモーク（15 checks）
 make guismoke   # GUI を X なしで検証（--shot ラスタ + 画素検査、17 checks）
 make golden     # 描画の厳密 diff テスト

@@ -290,7 +290,7 @@ static void test_v8x_rope_and_superinst(void) {
     want_str("var cib='q'; cib = cib + 1; cib", "q1");
     want_str("'a' + 1", "a1");
     want_str("1 + 'a'", "1a");
-    /* GMULC/LMULC/*CI int fast・溢れ・左定数 MUL（交換の丸め一致） */
+    /* GMULC/LMULC/乗算定数 int fast・溢れ・左定数 MUL（交換の丸め一致） */
     want_num("var cic=6; cic*3", 18);
     want_num("var cid=6; 3*cid", 18);
     want_num("var cie=5; (2+3)*4 + cie", 25);
@@ -381,6 +381,162 @@ static void test_v8x_modmagic(void) {
     want_num("7 % -3", 1);
 }
 
+/* ---- JS 例外（throw/try/catch/finally）。JS 規則の要点:
+ *   finally は正常・throw・return の全経路で走る。catch 束縛は例外値。
+ *   未捕捉はホストエラー（budget/OOM と同じ致命的扱い = 製品安全側）。 */
+static void t_exceptions(void) {
+    /* 基本捕捉 */
+    want_num("var r=0; try { throw 5; } catch(e) { r=e; } r", 5);
+    want_num("var r=0; try { r=1; } catch(e) { r=99; } r", 1); /* 投げなしは素通し */
+    /* catch 束縛なし（ES2019） */
+    want_num("var r=0; try { throw 7; } catch { r=3; } r", 3);
+    /* finally は正常経路でも走る */
+    want_str("var s=''; try { s=s+'a'; } finally { s=s+'b'; } s", "ab");
+    /* finally は throw 経路でも走る（連鎖: 内側 finally → 外側 catch） */
+    want_str("var s=''; try { try { throw 1; } finally { s=s+'f'; } } catch(e) { s=s+'c'; } s", "fc");
+    /* catch+finally 両方（順序: try→catch→finally） */
+    want_str("var s='x'; try { throw 'e1'; } catch(e) { s=s+e; } finally { s=s+'F'; } s", "xe1F");
+    /* rethrow（catch からの再送出 → 外側が捕捉） */
+    want_num("var r=0; try { try { throw 2; } catch(e) { throw e+1; } } catch(e2) { r=e2; } r", 3);
+    /* finally の中からの throw は元の保留を破棄して新例外が勝つ */
+    want_num("var r=0; try { try { throw 1; } finally { throw 2; } } catch(e) { r=e; } r", 2);
+    /* 関数呼出しを跨ぐ巻き戻し: callee が投げて caller が捕まえる */
+    want_num("function xg(){ throw 42; } var r=0; try { xg(); } catch(e){ r=e; } r", 42);
+    /* return 経路でも finally が走り、返り値は finally 実行前に確定した値 */
+    want_num("var rfc=0; function xf(){ try { return 1; } finally { rfc=rfc+1; } }"
+             " var rq=xf(); rq*10+rfc", 11);
+    /* 深い関数連鎖の中間で catch */
+    want_num("function xa(){ throw 5; } function xb(){ xa(); } function xc(){ xb(); }"
+             " var r=0; try { xc(); } catch(e){ r=e; } r", 5);
+    /* 未捕捉はホストエラー（致命的。文字列化される） */
+    want_err("throw 123", "uncaught exception");
+    want_err("throw 'boom'", "uncaught exception: boom");
+    want_err("function xh(){ throw 1; } xh()", "uncaught exception");
+    /* try 越境 break/continue は v0.1 では明白な compile エラー（誤動作より拒否） */
+    want_err("var iw=0; while(iw<3){ try { break; } catch(e){} iw=iw+1; }", "boundary");
+    want_err("for(var ic=0;ic<3;ic=ic+1){ try { continue; } finally {} }", "boundary");
+    /* loop INSIDE try（跨がない）は合法 */
+    want_num("var rlp=0; try { for(var ilp=0;ilp<4;ilp=ilp+1){ if(ilp==2){ break; } rlp=rlp+1; } } catch(e){} rlp", 2);
+    /* ネスト深度: try は lex 的に積める（上限以内） */
+    want_num("var r=0; try{ try{ try{ throw 9; }catch(e){ r=r+1; } }finally{ r=r+2; } }finally{ r=r+4; } r", 7);
+    /* 例外を catch して値が残るとき stack は破壊されない（後続 eval が独立に動く） */
+    want_num("var zz=1; try { throw 0; } catch(e){} zz+1", 2);
+    /* カンマ宣言の保持（旧バグ: 2 個目以降しか残らなかった。CoJIT 検証中に同定） */
+    want_num("var ca=1,cb=2; ca*10+cb", 12);
+    want_num("var cc=1,cd2=2,ce=3; cc*100+cd2*10+ce", 123);
+}
+
+/* ---- CoJIT（検証駆動 AOT 特化）の差分オラクル。
+ * 等価性は「on/off の 2 インスタンスで結果が一致する」で機械監査する
+ * （ハッキング耐性の中核: 特化器が意味を変えた瞬間、ここが赤くなる）。
+ * さらに数値ケースは C 側の独立予測とも突き合わせる（diff 以上の強度）。 */
+static u32 xor32(u32 *st) {
+    u32 x = *st;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    *st = x;
+    return x;
+}
+
+static void t_cojit(void) {
+    /* 決定的コーパス: 発火の有無と結果の一致 */
+    static const struct { const char *src; double want; u32 min_fire; } CC[] = {
+        { "var i=0; while(i<5){ i=i+1; } i", 5, 1 },
+        { "var i=0; var s=0; while(i<7){ s=s+i*2; i=i+1; } s", 42, 1 },
+        { "function wf(){ var i=0; var s=1; while(i<4){ s=s*2; i=i+1; } return s; } wf()", 16, 1 },
+        { "var i=0; while(i<100){ if(i==50){ break; } i=i+1; } i", 50, 1 },
+        { "var i=0; var cd=0; while(i<10){ i=i+1; if(i%3==0){ continue; } cd=cd+1; } cd", 7, 0 },
+        { "var i=10; while(i>0){ i=i-3; } i", -2, 1 },
+        { "var i=0; while(i<5){ i=i+1; }", 5, 1 },     /* last_val 保持の検証（末尾） */
+        { "var so='x'; var i=0; while(i<3){ so=so+i; i=i+1; } so", 0, 1 }, /* 数値評価不可→下で別検査 */
+        { "var g=0; function gf(){ var s=0; while(g<8){ s=s+g; g=g+2; } return s; } gf()", 12, 1 },
+        { "var a2=0,b2=0; while(a2<4){ while(b2<3){ b2=b2+1; } a2=a2+1; } a2*10+b2", 43, 1 }, /* 入れ子 */
+    };
+    V8xRT *on = v8x_new(), *off = v8x_new();
+    CHECK(on && off);
+    v8x_set_cojit(on, 1);
+    v8x_set_cojit(off, 0);
+    for (u32 i = 0; i < sizeof(CC) / sizeof(CC[0]); i++) {
+        if (i == 7) { /* 文字列ケース: "x"+0+1+2 */
+            V8xVal v; u32 ln = 0;
+            bool ok1 = v8x_eval(on, CC[i].src, &v);
+            const char *s1 = ok1 ? v8x_as_str(on, v, &ln) : NULL;
+            CHECK(ok1 && s1 && ln == 4 && memcmp(s1, "x012", 4) == 0);
+            continue;
+        }
+        V8xVal v1, v2;
+        bool ok1 = v8x_eval(on, CC[i].src, &v1);
+        bool ok2 = v8x_eval(off, CC[i].src, &v2);
+        CHECK(ok1 == ok2);
+        double d1 = 0, d2 = 0;
+        v8x_as_num(v1, &d1); v8x_as_num(v2, &d2);
+        CHECK(ok1 && d1 == CC[i].want && d1 == d2);
+        if (!(ok1 && d1 == CC[i].want && d1 == d2))
+            fprintf(stderr, "  cojit mismatch [%s]: on=%g off=%g want=%g\n", CC[i].src, d1, d2, CC[i].want);
+        CHECK(v8x_cojit_count(on) >= CC[i].min_fire);
+    }
+    CHECK(v8x_cojit_count(on) >= 8);
+
+    /* 構造化乱択差分: 形をランダムにして on/off 一致を 400 系統で監査。
+     * C 側の整数予測とも同時に突き合わせる（int 域に限定して double 厳密一致を使う） */
+    u32 st = 0xC0117u;
+    char buf[512];
+    for (u32 t = 0; t < 400; t++) {
+        u32 feat = xor32(&st);
+        bool in_func = feat & 1;
+        bool is_local = (feat >> 1) & 1;
+        i32 dlt = (i32[] ){ 1, 2, -1, -3, 97 }[(feat >> 2) % 5];
+        u8 cmpi = (u8)((feat >> 5) % 4);
+        const char *cmps[] = { "<", "<=", ">", ">=" };
+        i32 start = (i32)(xor32(&st) % 200) - 100;
+        i32 lim = (i32)(xor32(&st) % 200) - 100;
+        /* 収束を保証する向きに揃える */
+        if (dlt > 0) { if (cmpi >= 2) cmpi = 0; if (start >= lim) lim = start + 1; }
+        else { if (cmpi < 2) cmpi = 2; if (start <= lim) start = lim + 1; }
+        i32 kk = (i32)(xor32(&st) % 5);
+        /* 期待値を C で直接計算（i32 域に留める。99m 回踏まないよう回数は収束式で） */
+        i64 acc = 0, i = start;
+        i64 guard = 0;
+        while (guard++ < 100000) {
+            bool r = cmpi == 0 ? i < lim : cmpi == 1 ? i <= lim : cmpi == 2 ? i > lim : i >= lim;
+            if (!r) break;
+            acc += i * kk;
+            i += dlt;
+            if (i > 1000000000 || i < -1000000000) break; /* double 厳密域超過回避 */
+        }
+        if (guard >= 100000 || i > 100000000 || i < -100000000) { t--; continue; }
+        const char *carr = is_local ? "ci" : "cg";
+        int w;
+        if (in_func) {
+            w = snprintf(buf, sizeof buf,
+                "function cjf(){ var %s=%d; var acc=0; while(%s%s%d){ acc=acc+%s*%d; %s=%s+%d; } return acc; } cjf()",
+                carr, start, carr, cmps[cmpi], lim, carr, kk, carr, carr, dlt);
+        } else if (is_local) {
+            /* main にローカルは catch 以外無いので is_local は関数内のみ有意 */
+            t--; continue;
+        } else {
+            w = snprintf(buf, sizeof buf,
+                "var %s=%d; var acc=0; while(%s%s%d){ acc=acc+%s*%d; %s=%s+%d; } acc",
+                carr, start, carr, cmps[cmpi], lim, carr, kk, carr, carr, dlt);
+        }
+        (void)w;
+        v8x_set_cojit(on, 1);
+        V8xVal v1, v2;
+        bool ok1 = v8x_eval(on, buf, &v1);
+        bool ok2 = v8x_eval(off, buf, &v2);
+        double d1 = -777, d2 = -778;
+        v8x_as_num(v1, &d1); v8x_as_num(v2, &d2);
+        bool same = ok1 == ok2 && d1 == d2 && d1 == (double)acc;
+        CHECK(same);
+        if (!same) {
+            fprintf(stderr, "  cojit randomized diff t=%u [%s]: on(%d,%g) off(%d,%g) want %lld\n",
+                    t, buf, ok1, d1, ok2, d2, (long long)acc);
+            break;
+        }
+    }
+    v8x_free(on);
+    v8x_free(off);
+}
+
 void test_v8x(void) {
     g_rt = v8x_new();
     CHECK(g_rt != NULL);
@@ -396,6 +552,8 @@ void test_v8x(void) {
     test_v8x_fusion_and_hardening();
     test_v8x_rope_and_superinst();
     test_v8x_modmagic();
+    t_exceptions();
+    t_cojit();
     v8x_free(g_rt);
     g_rt = NULL;
 }

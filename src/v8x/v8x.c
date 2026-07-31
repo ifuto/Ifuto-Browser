@@ -149,9 +149,32 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_RET_L,               /* slot u32 : return locals[slot]（LLOAD;RET 融合） */
     OP_ADD_GX, OP_SUB_GX, OP_MUL_GX, OP_MOD_GX, /* gdst u32 | gsrc u32 : gdst = TOS op globals[gsrc] + last_val */
     OP_ADD_LX, OP_SUB_LX, OP_MUL_LX, OP_MOD_LX, /* ldst u32 | lsrc u32 : ldst = TOS op locals[lsrc] + last_val */
+    OP_TRY_PUSH,            /* catch_pc u32 | finally_pc u32 | catch_slot u32（0xFFFFFFFF=無）: try 入口 */
+    OP_TRY_LEAVE,           /* resume u32 : try/catch の正常完了 → finally 連鎖 or resume へ */
+    OP_FIN_END,             /* finally 末端: mode で normal/throw/return に分岐 */
+    OP_THROW,               /* TOS の値を投げる（巻き戻し → 捕捉 or uncaught 致命的エラー） */
+    OP_LOOPINC_L,           /* lslot u32 | delta i32 | lim i32 | cmp u8 | tgt u32 : LOOPINC_G のローカル版 */
+    OP_LOOPINC_GV,          /* LOOPINC_G + last_val 更新（回転元の「文としての更新」の意味を正確に保持。CoJIT 由来） */
+    OP_LOOPINC_LV,          /* LOOPINC_L 同上 */
+    OP_NOP,                 /* CoJIT の書換埋め（セマンティクス的到達不能のみ出現。実行時は透過） */
     OP_HALT,
     OP_COUNT
 };
+
+/* JS 例外の実行時エントリ。kind: TRY（捕捉候補）/ FIN（finally 実行中＝保留状態）。
+ * in_catch: TRY で catch 本体実行中（この状態への throw では finally だけを残して pop）。
+ * mode（FIN）: 0=normal, 1=throw, 2=return。pending に例外/返り値を保持（GC ルート）。 */
+enum { V8X_TE_TRY = 0, V8X_TE_FIN = 1 };
+#define V8X_PC_NONE 0xFFFFFFFFu
+#define V8X_SLOT_NONE 0xFFFFFFFFu
+typedef struct {
+    V8xVal pending;
+    u32 frame;       /* 属する呼出し深さ（main=0, 1回目の callee=1, ...） */
+    u32 sp;
+    u32 catch_pc, finally_pc, catch_slot;
+    u32 resume_pc;   /* FIN: mode 0 の継続先 */
+    u8 kind, mode, in_catch, _p;
+} V8xTryEnt;
 
 struct V8xRT {
     /* ヒープ（obj index 参照。mark-sweep GC: スイープは index 不変・穴再利用。
@@ -180,6 +203,10 @@ struct V8xRT {
     u64 insn_budget_def;
     u32 heap_mb;    /* 硬上限 = heap_mb<<20。既定 V8X_MAX_HEAP_MB。v8x_tune で組込側責任で引上げ可 */
     u32 max_objs;   /* オブジェクト数硬上限。既定 V8X_MAX_OBJECTS。同上 */
+    /* JS 例外スタック（frames とは別系。push/pop は lex 領域に LIFO 対応） */
+    V8xTryEnt *tries; u32 n_tries, cap_tries;
+    bool cojit_off;     /* CoJIT（検証駆動 AOT 特化）の kill-switch。既定 ON */
+    u32 cojit_applied;  /* S1 回転の累積適用数（観測用） */
     V8xVal last_val;
     char err[256];
     /* 定数除数の剰余を magic-multiply に強度削減する直写メモ（8 エントリ）。
@@ -231,6 +258,8 @@ static u32 v8x_gc(V8xRT *rt) {
         for (u32 i = 0; i < lim; i++) v8x_gc_mark_val(rt, rt->stk[i], mk);
     }
     v8x_gc_mark_val(rt, rt->last_val, mk);
+    for (u32 i = 0; i < rt->n_tries; i++)
+        if (rt->tries[i].kind == V8X_TE_FIN) v8x_gc_mark_val(rt, rt->tries[i].pending, mk);
     for (u32 i = 0; i < rt->n_globals; i++) v8x_gc_mark_val(rt, rt->globals[i].v, mk);
     for (u32 i = 0; i < rt->n_nury; i++) {
         u32 oi = rt->nury[i];
@@ -446,10 +475,12 @@ typedef struct {
 
 enum { KW_VAR, KW_LET, KW_CONST, KW_FUNCTION, KW_RETURN, KW_IF, KW_ELSE, KW_WHILE,
        KW_FOR, KW_BREAK, KW_CONTINUE, KW_TRUE, KW_FALSE, KW_NULL, KW_UNDEFINED, KW_TYPEOF,
+       KW_THROW, KW_TRY, KW_CATCH, KW_FINALLY,
        KW_N };
 static const char *const V8X_KWS[KW_N] = {
     "var", "let", "const", "function", "return", "if", "else", "while",
-    "for", "break", "continue", "true", "false", "null", "undefined", "typeof"
+    "for", "break", "continue", "true", "false", "null", "undefined", "typeof",
+    "throw", "try", "catch", "finally"
 };
 
 enum { P_LP, P_RP, P_LC, P_RC, P_SEMI, P_COMMA, P_ASSIGN, P_PLUS, P_MINUS, P_STAR,
@@ -691,6 +722,7 @@ enum {
     N_UNARY, N_BIN, N_ASSIGN,
     N_CALL, N_FUNC, N_VAR,
     N_EXPRSTMT, N_IF, N_WHILE, N_FOR, N_BLOCK, N_RET, N_BREAK, N_CONTINUE, N_PROG,
+    N_THROW, N_TRY,
     N_NONE = 0xFFFFFFFFu
 };
 
@@ -1082,24 +1114,44 @@ static u32 p_stmt(P *p) {
     if (p_is_kw(p, KW_VAR) || p_is_kw(p, KW_LET) || p_is_kw(p, KW_CONST)) {
         u8 is_const = p->lx.pk == KW_CONST;
         lex_next(&p->lx);
+        /* カンマ宣言は全宣言を保持する（旧実装は最後の宣言しか返さず、
+         * `var a=0,b=0; a` が ReferenceError になる実在バグだった。テストで同定） */
+        U32Vec sc = { NULL, 0, 0 };
         for (;;) {
-            if (p->lx.kind != TK_IDENT) { p->fail = "expected variable name"; goto out; }
+            if (p->lx.kind != TK_IDENT) { p->fail = "expected variable name"; goto out_fail; }
             u32 name = p_intern(p, p->lx.str_p, p->lx.str_len);
-            if (name == UINT32_MAX) goto out;
+            if (name == UINT32_MAX) goto out_fail;
             lex_next(&p->lx);
             u32 init = N_NONE;
             if (p_eat_punct(p, P_ASSIGN)) {
                 init = p_expr(p);
-                if (init == N_NONE) goto out;
-            } else if (is_const) { p->fail = "const declaration requires initializer"; goto out; }
-            ni = p_node(p, N_VAR);
-            if (ni == N_NONE) goto out;
-            p->nodes[ni].flags = is_const;
-            p->nodes[ni].a = name;
-            p->nodes[ni].b = init;
+                if (init == N_NONE) goto out_fail;
+            } else if (is_const) { p->fail = "const declaration requires initializer"; goto out_fail; }
+            u32 vn = p_node(p, N_VAR);
+            if (vn == N_NONE) goto out_fail;
+            p->nodes[vn].flags = is_const;
+            p->nodes[vn].a = name;
+            p->nodes[vn].b = init;
+            if (p_scratch(p, &sc, vn) < 0) goto out_fail;
             if (!p_eat_punct(p, P_COMMA)) break;
         }
-        if (!p_eat_punct(p, P_SEMI) && p->lx.kind != TK_EOF && !p_is_punct(p, P_RC)) { p->fail = "expected ';'"; ni = N_NONE; }
+        if (!p_eat_punct(p, P_SEMI) && p->lx.kind != TK_EOF && !p_is_punct(p, P_RC)) {
+            p->fail = "expected ';'";
+            goto out_fail;
+        }
+        if (sc.n == 1) {
+            ni = sc.v[0];
+        } else {
+            u32 first = p_list_commit(p, &sc);
+            ni = p_node(p, N_BLOCK);
+            if (ni != N_NONE && first != N_NONE) { p->nodes[ni].a = first; p->nodes[ni].c = sc.n; }
+            else { free(sc.v); goto out; }
+        }
+        free(sc.v);
+        goto out;
+    out_fail:
+        free(sc.v);
+        ni = N_NONE;
         goto out;
     }
     if (p_is_kw(p, KW_FUNCTION)) {
@@ -1203,6 +1255,47 @@ static u32 p_stmt(P *p) {
     }
     if (p_is_kw(p, KW_BREAK))    { lex_next(&p->lx); p_eat_punct(p, P_SEMI); ni = p_node(p, N_BREAK); goto out; }
     if (p_is_kw(p, KW_CONTINUE)) { lex_next(&p->lx); p_eat_punct(p, P_SEMI); ni = p_node(p, N_CONTINUE); goto out; }
+    if (p_is_kw(p, KW_THROW)) {
+        lex_next(&p->lx);
+        u32 e = p_expr(p);
+        if (e == N_NONE) goto out;
+        if (!p_eat_punct(p, P_SEMI) && p->lx.kind != TK_EOF && !p_is_punct(p, P_RC)) { p->fail = "expected ';'"; goto out; }
+        ni = p_node(p, N_THROW);
+        if (ni != N_NONE) p->nodes[ni].a = e;
+        goto out;
+    }
+    if (p_is_kw(p, KW_TRY)) {
+        lex_next(&p->lx);
+        if (!p_expect_punct(p, P_LC, "expected '{' after try")) goto out;
+        u32 body = p_block_tail(p);
+        if (body == N_NONE) goto out;
+        u32 cname = UINT32_MAX; /* catch 束縛名（無ければ NONE 扱い） */
+        u32 cbody = N_NONE, fbody = N_NONE;
+        bool has_catch = p_is_kw(p, KW_CATCH);
+        if (!has_catch && !p_is_kw(p, KW_FINALLY)) { p->fail = "try requires catch or finally"; goto out; }
+        if (has_catch) {
+            lex_next(&p->lx);
+            if (p_eat_punct(p, P_LP)) { /* ES2019 束縛なし catch も許容 */
+                if (p->lx.kind != TK_IDENT) { p->fail = "expected catch binding name"; goto out; }
+                cname = p_intern(p, p->lx.str_p, p->lx.str_len);
+                if (cname == UINT32_MAX) goto out;
+                lex_next(&p->lx);
+                if (!p_expect_punct(p, P_RP, "expected ')'")) goto out;
+            }
+            if (!p_expect_punct(p, P_LC, "expected '{' after catch")) goto out;
+            cbody = p_block_tail(p);
+            if (cbody == N_NONE) goto out;
+        }
+        if (p_is_kw(p, KW_FINALLY)) {
+            lex_next(&p->lx);
+            if (!p_expect_punct(p, P_LC, "expected '{' after finally")) goto out;
+            fbody = p_block_tail(p);
+            if (fbody == N_NONE) goto out;
+        }
+        ni = p_node(p, N_TRY);
+        if (ni != N_NONE) { p->nodes[ni].a = body; p->nodes[ni].b = cname; p->nodes[ni].c = cbody; p->nodes[ni].d = fbody; }
+        goto out;
+    }
     if (p_eat_punct(p, P_LC)) { ni = p_block_tail(p); goto out; }
     {
         u32 e = p_expr(p);
@@ -1229,6 +1322,8 @@ typedef struct {
     u32 in_func_depth;     /* 0=main */
     /* loop の break/continue パッチ連鎖（pos のリストを逆方向リンク: buf[pos]=prev head） */
     u32 brk_head[64], cont_head[64], cont_kind[64]; u32 n_loops;
+    u16 try_depth;              /* lex 上の try 領域の深さ（catch 本体含む） */
+    u8 try_at_loop[64];         /* 各 loop 開設時の try_depth（try 越境 brk/cont の検出用） */
     bool fail;
 } Cg;
 
@@ -1334,6 +1429,14 @@ static u32 cg_global_add(V8xRT *rt, u32 name, u8 is_const) {
 /* name のストア命令を出す（main では G、関数内では L 解決→見つからなければ G） */
 static bool cg_store(Cg *cg, u32 name, u8 decl_const, bool decl) {
     if (cg->in_func_depth == 0) {
+        /* main 固有ローカル（catch 束縛）があればローカルを優先。var 宣言は従来通りグローバル */
+        i32 lslot = decl ? -1 : cg_local_find(cg, name);
+        if (lslot >= 0) {
+            if (cg->locals[lslot].is_const) { v8x_errf(cg->rt, "assignment to const local"); cg->fail = true; return false; }
+            cg_op(cg, OP_LSTORE);
+            cg_u32(cg, (u32)lslot);
+            return !cg->fail;
+        }
         u32 gi = cg_global_add(cg->rt, name, decl ? decl_const : 0);
         if (gi == UINT32_MAX) { cg->fail = true; return false; }
         V8xGlobal *g = &cg->rt->globals[gi];
@@ -1359,7 +1462,9 @@ static bool cg_store(Cg *cg, u32 name, u8 decl_const, bool decl) {
     return !cg->fail;
 }
 static bool cg_load(Cg *cg, u32 name) {
-    if (cg->in_func_depth != 0) {
+    /* main 深でもローカルを先に見る（catch 束縛は main にも存在する）。
+     * main 固有ローカルが作られるのは catch 束縛のみなので旧経路との衝突は構造的に無い */
+    {
         i32 slot = cg_local_find(cg, name);
         if (slot >= 0) {
             cg_op(cg, OP_LLOAD);
@@ -1825,6 +1930,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
         u32 cond = cg_target_here(cg);
         u32 s_end = cg_cond_jmpf(cg, n->a);
         u32 li = cg->n_loops++;
+        cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = cond;
         cg_stmt(cg, n->b);
         cg_op(cg, OP_JMP); cg_u32(cg, cond);
@@ -1898,6 +2004,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
             u32 s_pre = cg_u32(cg, 0);
             u32 body_top = cg_target_here(cg);
             u32 li = cg->n_loops++;
+            cg->try_at_loop[li] = (u8)cg->try_depth;
             cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE;
             cg_stmt(cg, n->d);
             u32 step_addr = cg_target_here(cg);
@@ -1929,6 +2036,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
             s_end = cg_cond_jmpf(cg, n->b);
         }
         u32 li = cg->n_loops++;
+        cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE; /* step addr 後決め */
         cg_stmt(cg, n->d);
         u32 step_addr = cg_target_here(cg);
@@ -1952,6 +2060,11 @@ static void cg_stmt(Cg *cg, u32 ni) {
     }
     case N_BREAK:
         if (!cg->n_loops) { v8x_errf(cg->rt, "break outside loop"); cg->fail = true; break; }
+        /* try 領域を跨ぐ制御移動は finally 連鎖が必要。v0.1 は未対応で明白に拒否（台帳） */
+        if ((u32)cg->try_depth != cg->try_at_loop[cg->n_loops - 1]) {
+            v8x_errf(cg->rt, "break across try boundary is unsupported in v0.1");
+            cg->fail = true; break;
+        }
         {
             u32 site = cg_jmp_op(cg, OP_JMP);
             /* 連鎖: imm に prev head を埋め、あとで一括 patch */
@@ -1963,6 +2076,10 @@ static void cg_stmt(Cg *cg, u32 ni) {
         break;
     case N_CONTINUE:
         if (!cg->n_loops) { v8x_errf(cg->rt, "continue outside loop"); cg->fail = true; break; }
+        if ((u32)cg->try_depth != cg->try_at_loop[cg->n_loops - 1]) {
+            v8x_errf(cg->rt, "continue across try boundary is unsupported in v0.1");
+            cg->fail = true; break;
+        }
         {
             u32 site = cg_jmp_op(cg, OP_JMP);
             u32 li = cg->n_loops - 1;
@@ -1971,6 +2088,64 @@ static void cg_stmt(Cg *cg, u32 ni) {
             cg->cont_head[li] = site;
         }
         break;
+    case N_THROW:
+        cg_expr(cg, n->a);
+        cg_op(cg, OP_THROW);
+        break;
+    case N_TRY: {
+        /* レイアウト（制御は TRY_LEAVE が常に転移するので catch/finally への落下なし）:
+         *   TRY_PUSH catch_pc, finally_pc, catch_slot
+         *   <try 本体>
+         *   TRY_LEAVE Ldone          ; 正常完了（unwinder 未介入時のみここを通る）
+         *  Lcatch: <catch 本体>      ; unwinder が束縛代入→in_catch=1 でここに来る
+         *   TRY_LEAVE Ldone          ; catch 完了も finally 連鎖が要る
+         *  Lfin: <finally 本体>
+         *   FIN_END
+         *  Ldone: 以後の文 */
+        bool has_catch = n->c != N_NONE, has_fin = n->d != N_NONE;
+        cg_op(cg, OP_TRY_PUSH);
+        u32 p_catch = cg_u32(cg, 0);
+        u32 p_fin = cg_u32(cg, 0);
+        u32 cslot = V8X_SLOT_NONE;
+        if (has_catch && n->b != UINT32_MAX) {
+            /* 束縛は現 frame のローカルとして割付（既存名は共有。ブロックスコープ厳密分離は台帳） */
+            i32 sl = cg_local_add(cg, n->b, 0);
+            if (sl < 0) break;
+            cslot = (u32)sl;
+        }
+        cg_u32(cg, cslot);
+        cg->try_depth++;
+        cg_stmt(cg, n->a);
+        cg_op(cg, OP_TRY_LEAVE);
+        u32 leave1 = cg_u32(cg, 0);
+        cg->try_depth--;
+        if (cg->fail) break;
+        u32 catch_pc = cg_target_here(cg);
+        u32 leave2 = N_NONE;
+        if (has_catch) {
+            cg->try_depth++; /* catch 本体内の throw でも finally は走る（entry を残す設計） */
+            cg_stmt(cg, n->c);
+            cg_op(cg, OP_TRY_LEAVE);
+            leave2 = cg_u32(cg, 0);
+            cg->try_depth--;
+        }
+        if (cg->fail) break;
+        u32 fin_pc = cg_target_here(cg);
+        if (has_fin) {
+            /* finally の内側は try 領域ではない（throw は unwinder の FIN 規則で外へ） */
+            cg_stmt(cg, n->d);
+            cg_op(cg, OP_FIN_END);
+        }
+        if (cg->fail) break;
+        /* finally 本体に break/continue を書くと領域外に出る JS 複雑規則になるため、
+         * v0.1 では loop が try_depth==0 でない限り loop を開設できない既存ゲートで十分 */
+        u32 done = cg_target_here(cg);
+        cg_patch_u32(cg, p_catch, has_catch ? catch_pc : V8X_PC_NONE);
+        cg_patch_u32(cg, p_fin, has_fin ? fin_pc : V8X_PC_NONE);
+        cg_patch_u32(cg, leave1, done);
+        if (leave2 != N_NONE) cg_patch_u32(cg, leave2, done);
+        break;
+    }
     case N_RET:
         if (!cg->in_func_depth) { v8x_errf(cg->rt, "return outside function"); cg->fail = true; break; }
         /* return <local> の LLOAD;RET 融合 */
@@ -2067,6 +2242,218 @@ static void v8x_ast_dump(P *p) {
  * VM はそれに依らず push/pop/深度を動的にも検査する（defense in depth）。 */
 typedef struct { u32 pc; u8 fn; } VfyFrame;
 
+static u32 v8x_op_imm_len(u8 op) {
+    switch (op) {
+    case OP_CONST_I: case OP_CONST_STR:
+    case OP_GLOAD: case OP_GSTORE:
+    case OP_MAKEF:
+    case OP_LLOAD: case OP_LSTORE:
+    case OP_JMP: case OP_JMPF: case OP_JMPT:
+    case OP_MULCI: case OP_ADDCI: case OP_SUBCI: case OP_MODCI:
+    case OP_GADD_P: case OP_LADD_P:
+    case OP_GSTORE_SPV: case OP_LSTORE_PV:
+    case OP_RET_L:
+    case OP_TRY_LEAVE:
+    case OP_GLOAD_S: case OP_GSTORE_S:
+        return 4;
+    case OP_CONST_D:
+    case OP_LINC: case OP_GINC:
+    case OP_GMULC: case OP_LMULC:
+    case OP_GADD_G:
+    case OP_ADDCI_G: case OP_SUBCI_G: case OP_MULCI_G: case OP_MODCI_G:
+    case OP_ADDCI_L: case OP_SUBCI_L: case OP_MULCI_L: case OP_MODCI_L:
+    case OP_ADD_GX: case OP_SUB_GX: case OP_MUL_GX: case OP_MOD_GX:
+    case OP_ADD_LX: case OP_SUB_LX: case OP_MUL_LX: case OP_MOD_LX:
+        return 8;
+    case OP_LADD_LL:
+    case OP_TRY_PUSH:
+        return 12;
+    case OP_CJMPF_L: case OP_CJMPF_G:
+        return 13;
+    case OP_CJMPF_MODG: case OP_CJMPF_MODL:
+    case OP_LOOPINC_G: case OP_LOOPINC_L:
+    case OP_LOOPINC_GV: case OP_LOOPINC_LV:
+    case OP_CJMPF_MULGG:
+    case OP_CJMPF_MODGG:
+        return 17;
+    case OP_CALL:
+        return 1;
+    default: return 0;
+    }
+}
+
+
+/* ============================== CoJIT（静的検証駆動 AOT 特化） ==============================
+ * 「静的検証で、必要な部分のみ最適化する」層。実行時コード生成（禁止事項の JIT）ではなく、
+ * compile 直後のバイト列から意味保持が構造的に自明な形だけを検出し、証明済み
+ * スーパー命令へ畳む。異常を見つけたら一切無変更（汎用実行が既定＝安全側）。
+ * 特化後ストリームは必ず v8x_verify の whole-scan を通す（事後セルフチェック）。
+ *
+ * S1: キャリア回転（while 形・関数内 for 形＝codegen の AST 回転が届かない経路）
+ *   P:  CJMPF_{G,L} slot, k, cmp, exit        (pre-check)
+ *       body（任意の命令列）
+ *   T:  LINC|GINC slot, d
+ *       JMP P
+ *   exit:
+ * を
+ *   T:  JMP Lx / NOP×9      Lx: LOOPINC_{G,L}V slot, d, k, cmp, P+14 / JMP exit
+ * に書き換える。
+ * 等価性（逐語確認済みの要点）:
+ *  - LOOPINC_V は [LINC;CJMPF] の細部まで同一の分岐網（int/i64/double/bin_add/
+ *    to_number/isnan/fmod なし）＋ last_val 更新（LINC/GINC の文脈意味を保持）。
+ *  - 実行順序は原列 body;inc;check;body;... と回転後で逐語同一（inc は既に末尾）。
+ *  - continue→T は JMP Lx に着地し同一 update+check を通る。break→exit は不変。
+ *  - 受理条件は形適合のみ（T+14==exit、slot 一致、JMP 背逆）。body 中の op は
+ *    不問（移動しないため）。交叉ジャンプは構造化 codegen の不変条件で存在しない。
+ */
+
+/* pc を内包する最も内側（最小 span）の funcs エントリ index を返す。無ければ main 相当の 0…
+ * ではなく UINT32_MAX（呼出側は funcs[] 参照前に検査せよ） → cojit では必ず見つかる想定 */
+static u32 v8x_func_owner_of(const V8xRT *rt, u32 pc) {
+    u32 best = UINT32_MAX, best_span = UINT32_MAX;
+    for (u32 i = 0; i < rt->n_funcs; i++) {
+        u32 off = rt->funcs[i].code_off, end = rt->funcs[i].code_end;
+        if (pc >= off && pc < end && end - off <= best_span) {
+            best = i; best_span = end - off;
+        }
+    }
+    return best;
+}
+
+static u32 v8x_cojit(V8xRT *rt, u32 code_from) {
+    u32 applied = 0;
+    u8 *code = rt->code;
+    const u32 end = rt->code_len; /* 追記分は走査しない */
+    u32 pc = code_from;
+    while (pc < end) {
+        u8 op = code[pc];
+        if (op >= OP_COUNT) break; /* 入力は codegen 直後（正当）。防御として中止 */
+        if (op == OP_CJMPF_G || op == OP_CJMPF_L) {
+            bool is_g = op == OP_CJMPF_G;
+            u32 slot, exit_t; i32 k; u8 cmp;
+            memcpy(&slot, code + pc + 1, 4);
+            memcpy(&k, code + pc + 5, 4);
+            cmp = code[pc + 9];
+            memcpy(&exit_t, code + pc + 10, 4);
+            /* 末尾候補:
+             *   A: [LINC|GINC slot d][JMP pc]        …14B（文末融合形）
+             *   B: [GLOAD_S slot][ADDCI d][GSTORE_SPV slot][JMP pc]  …20B（関数内グローバル）
+             *   C: [LLOAD slot][ADDCI d][LSTORE_PV slot][JMP pc]     …20B（関数内ローカル）
+             * かつ T+{14,20}==exit_t。A/B/C は全て「slot += d（+last_val 更新）」で、
+             * LOOPINC_V の合成元と逐語等価（int fast/i64 域/bin_add/to_number/isnan）。 */
+            bool found = false;
+            u32 t_tail = 0, t_len = 14; i32 d = 0;
+            u32 q = pc + 14;
+            for (u32 steps = 0; q < end && steps < 10000 && !found; steps++) {
+                u8 o2 = code[q];
+                if (o2 >= OP_COUNT) break;
+                u32 stride = 1 + v8x_op_imm_len(o2);
+                if (q + stride > end) break;
+                if ((o2 == OP_LINC && !is_g) || (o2 == OP_GINC && is_g)) {
+                    u32 s2; i32 d2;
+                    memcpy(&s2, code + q + 1, 4);
+                    memcpy(&d2, code + q + 5, 4);
+                    if (s2 == slot && code[q + 9] == OP_JMP) {
+                        u32 bt;
+                        memcpy(&bt, code + q + 10, 4);
+                        if (bt == pc && q + 14 == exit_t) {
+                            found = true; t_tail = q; t_len = 14; d = d2;
+                        }
+                    }
+                } else if (is_g && o2 == OP_GLOAD_S) {
+                    u32 s2; i32 d2; u32 s3;
+                    memcpy(&s2, code + q + 1, 4);
+                    memcpy(&d2, code + q + 6, 4);
+                    memcpy(&s3, code + q + 11, 4);
+                    if (s2 == slot && s3 == slot &&
+                        code[q + 5] == OP_ADDCI && code[q + 10] == OP_GSTORE_SPV &&
+                        code[q + 15] == OP_JMP) {
+                        u32 bt;
+                        memcpy(&bt, code + q + 16, 4);
+                        if (bt == pc && q + 20 == exit_t) {
+                            found = true; t_tail = q; t_len = 20; d = d2;
+                        }
+                    }
+                } else if (!is_g && o2 == OP_LLOAD) {
+                    u32 s2; i32 d2; u32 s3;
+                    memcpy(&s2, code + q + 1, 4);
+                    memcpy(&d2, code + q + 6, 4);
+                    memcpy(&s3, code + q + 11, 4);
+                    if (s2 == slot && s3 == slot &&
+                        code[q + 5] == OP_ADDCI && code[q + 10] == OP_LSTORE_PV &&
+                        code[q + 15] == OP_JMP) {
+                        u32 bt;
+                        memcpy(&bt, code + q + 16, 4);
+                        if (bt == pc && q + 20 == exit_t) {
+                            found = true; t_tail = q; t_len = 20; d = d2;
+                        }
+                    }
+                }
+                q += stride;
+            }
+            if (found) {
+                /* 発生元関数（内側優先の最小 span）を求める: ローカル版の trampoline は
+                 * その関数と同じ n_locals の領域に属さないと verify が健全に通せない */
+                u32 owner = v8x_func_owner_of(rt, pc);
+                if (!is_g && owner == UINT32_MAX) { /* 防御層: 設計上到達不能 */
+                    pc += 14;
+                    continue;
+                }
+                /* 変更は全て容量確保の後（OOM では無変更＝従来路実行に留まる） */
+                bool cap_ok = true;
+                if (rt->code_len + 22 > rt->code_cap) {
+                    u32 nc = rt->code_cap ? rt->code_cap * 2 : 1024;
+                    while (nc < rt->code_len + 22) nc *= 2;
+                    u8 *ncp = (u8 *)realloc(rt->code, nc);
+                    if (!ncp) { cap_ok = false; code = rt->code; }
+                    else { rt->code = ncp; rt->code_cap = nc; code = ncp; }
+                }
+                if (cap_ok && !is_g && rt->n_funcs == rt->cap_funcs) {
+                    /* 領域エントリ追加のための funcs 拡張 */
+                    u32 nc = rt->cap_funcs ? rt->cap_funcs * 2 : 32;
+                    V8xFuncEnt *nf = (V8xFuncEnt *)realloc(rt->funcs, (u64)nc * sizeof(V8xFuncEnt));
+                    if (!nf) cap_ok = false;
+                    else { rt->funcs = nf; rt->cap_funcs = nc; }
+                }
+                if (cap_ok) {
+                    u32 lx = rt->code_len;
+                    if (!is_g) {
+                        /* trampoline 領域を発生元関数の n_locals で登録（verifier の
+                         * ローカルスロット照査を健全なまま通す） */
+                        u32 fe = rt->n_funcs++;
+                        rt->funcs[fe].code_off = lx;
+                        rt->funcs[fe].code_end = lx + 22;
+                        rt->funcs[fe].name = 0;
+                        rt->funcs[fe].n_params = 0;
+                        rt->funcs[fe].n_locals = rt->funcs[owner].n_locals;
+                    }
+                    code[rt->code_len++] = is_g ? OP_LOOPINC_GV : OP_LOOPINC_LV;
+                    memcpy(code + rt->code_len, &slot, 4); rt->code_len += 4;
+                    memcpy(code + rt->code_len, &d, 4);    rt->code_len += 4;
+                    memcpy(code + rt->code_len, &k, 4);    rt->code_len += 4;
+                    code[rt->code_len++] = cmp;
+                    u32 body_top = pc + 14; /* 回転後のループ先頭は body（pre-check 済み） */
+                    memcpy(code + rt->code_len, &body_top, 4); rt->code_len += 4;
+                    code[rt->code_len++] = OP_JMP;
+                    memcpy(code + rt->code_len, &exit_t, 4); rt->code_len += 4;
+                    code[t_tail] = OP_JMP;
+                    memcpy(code + t_tail + 1, &lx, 4);
+                    for (u32 z = t_tail + 5; z < t_tail + t_len; z++) code[z] = OP_NOP;
+                    applied++;
+                    pc += 14;
+                    continue;
+                }
+                /* 容量失敗: 無変更で次へ */
+                pc += 14;
+                continue;
+            }
+        }
+        pc += 1 + v8x_op_imm_len(op);
+    }
+    rt->cojit_applied += applied;
+    return applied;
+}
+
 static bool v8x_verify(V8xRT *rt, u32 code_from) {
     u32 len = rt->code_len;
     if (code_from > len) { v8x_errf(rt, "verify: range"); return false; }
@@ -2098,37 +2485,7 @@ static bool v8x_verify(V8xRT *rt, u32 code_from) {
         u8 op = rt->code[pc];
         if (op >= OP_COUNT) { v8x_errf(rt, "verify: bad opcode %u at %u", op, pc); goto done; }
         pc++;
-        u32 imm_len = 0;
-        switch (op) {
-        case OP_CONST_I: case OP_CONST_STR:
-        case OP_GLOAD: case OP_GSTORE:
-        case OP_MAKEF:
-            imm_len = 4; break;
-        case OP_LLOAD: case OP_LSTORE:
-            imm_len = 4; break; /* レイアウトは u32 に統一（codegen と一致するか下で確認） */
-        case OP_CONST_D: imm_len = 8; break;
-        case OP_JMP: case OP_JMPF: case OP_JMPT: imm_len = 4; break;
-        case OP_CALL: imm_len = 1; break;
-        case OP_LINC: case OP_GINC: imm_len = 8; break;
-        case OP_GMULC: case OP_LMULC: imm_len = 8; break;
-        case OP_MULCI: case OP_ADDCI: case OP_SUBCI: case OP_MODCI: imm_len = 4; break;
-        case OP_GADD_P: case OP_LADD_P: imm_len = 4; break;
-        case OP_GADD_G: imm_len = 8; break;
-        case OP_CJMPF_MODG: case OP_CJMPF_MODL: imm_len = 17; break;
-        case OP_GSTORE_SPV: case OP_LSTORE_PV: imm_len = 4; break;
-        case OP_LOOPINC_G: imm_len = 17; break;
-        case OP_ADDCI_G: case OP_SUBCI_G: case OP_MULCI_G: case OP_MODCI_G:
-        case OP_ADDCI_L: case OP_SUBCI_L: case OP_MULCI_L: case OP_MODCI_L: imm_len = 8; break;
-        case OP_CJMPF_MULGG: imm_len = 17; break;
-        case OP_CJMPF_MODGG: imm_len = 17; break;
-        case OP_LADD_LL: imm_len = 12; break;
-        case OP_RET_L: imm_len = 4; break;
-        case OP_ADD_GX: case OP_SUB_GX: case OP_MUL_GX: case OP_MOD_GX:
-        case OP_ADD_LX: case OP_SUB_LX: case OP_MUL_LX: case OP_MOD_LX: imm_len = 8; break;
-        case OP_CJMPF_L: case OP_CJMPF_G: imm_len = 13; break;
-        case OP_GLOAD_S: case OP_GSTORE_S: imm_len = 4; break;
-        default: imm_len = 0; break;
-        }
+        u32 imm_len = v8x_op_imm_len(op); /* 表は cojit と共有（drift 防止） */
         if (pc + imm_len > len) { v8x_errf(rt, "verify: operand overrun at %u", pc - 1); goto done; }
         /* 内容検査 */
         if (op == OP_JMP || op == OP_JMPF || op == OP_JMPT) {
@@ -2157,14 +2514,15 @@ static bool v8x_verify(V8xRT *rt, u32 code_from) {
                     goto done;
                 }
             }
-        } else if (op == OP_CJMPF_MODG || op == OP_CJMPF_MODL || op == OP_LOOPINC_G) {
+        } else if (op == OP_CJMPF_MODG || op == OP_CJMPF_MODL || op == OP_LOOPINC_G ||
+                   op == OP_LOOPINC_L || op == OP_LOOPINC_GV || op == OP_LOOPINC_LV) {
             u32 tgt;
             memcpy(&tgt, &rt->code[pc + 13], 4);
             if (tgt >= len) { v8x_errf(rt, "verify: jump out of range %u", tgt); goto done; }
             jt[n_jt++] = tgt;
             u32 slot;
             memcpy(&slot, &rt->code[pc], 4);
-            if (op == OP_CJMPF_MODL) {
+            if (op == OP_CJMPF_MODL || op == OP_LOOPINC_L || op == OP_LOOPINC_LV) {
                 if (slot >= rt->funcs[cur].n_locals) {
                     v8x_errf(rt, "verify: local slot %u >= %u", slot, rt->funcs[cur].n_locals);
                     goto done;
@@ -2248,6 +2606,27 @@ static bool v8x_verify(V8xRT *rt, u32 code_from) {
                 v8x_errf(rt, "verify: bad string ref %u", idx);
                 goto done;
             }
+        } else if (op == OP_TRY_PUSH) {
+            /* catch/finally pc: NONE か len 内の命令開始。slot: NONE か現関数 locals 内 */
+            for (int w = 0; w < 2; w++) {
+                u32 t;
+                memcpy(&t, &rt->code[pc + (u32)w * 4], 4);
+                if (t != V8X_PC_NONE) {
+                    if (t >= len) { v8x_errf(rt, "verify: try target out of range %u", t); goto done; }
+                    jt[n_jt++] = t;
+                }
+            }
+            u32 cslot;
+            memcpy(&cslot, &rt->code[pc + 8], 4);
+            if (cslot != V8X_SLOT_NONE && cslot >= rt->funcs[cur].n_locals) {
+                v8x_errf(rt, "verify: catch slot %u >= %u", cslot, rt->funcs[cur].n_locals);
+                goto done;
+            }
+        } else if (op == OP_TRY_LEAVE) {
+            u32 t;
+            memcpy(&t, &rt->code[pc], 4);
+            if (t >= len) { v8x_errf(rt, "verify: try_leave target out of range %u", t); goto done; }
+            jt[n_jt++] = t;
         } else if (op == OP_MAKEF) {
             u32 fidx;
             memcpy(&fidx, &rt->code[pc], 4);
@@ -2669,6 +3048,173 @@ static bool v8x_binfv_compute(V8xRT *rt, u8 baseop, V8xVal lv, V8xVal rv, u32 sp
 
 typedef struct { u32 ret_off; u32 base; u32 func; } V8xFrame;
 
+/* ---- JS 例外: cold 経路の out-of-line 化 ----
+ * 例外機構はホット数値ループでは「存在しない」ため、そのコードを dispatch
+ * 関数の中に展開したままだと I$ / 分岐予測 / インライン予算を静かに食い潰す
+ * （2026-07-31 実測: inline 展開のままでは arith +24% / branch +42% / fib30 +11%
+ * 悪化。バイトコード列は新旧で完全同一だったため、原因は機械語レイアウト悪化と
+ * 同定。cold 関数に隔離してホット経路を復元する。意味論は旧マクロと 1 行対応）。 */
+#if defined(__GNUC__)
+#  define V8X_COLDFN __attribute__((noinline, cold))
+#else
+#  define V8X_COLDFN
+#endif
+
+/* vm_exec の制御ローカルのスナップショット。cold fn が読み書きし、呼出し側の
+ * case が V8X_VMST_OUT/IN で同期する（stk/cap は grow で更新され得るのでポインタ渡し） */
+typedef struct {
+    V8xVal **pstk;
+    u32 *pcap;
+    u8 *code;
+    u32 pc_off, sp, base, nframes, cur, entry;
+    V8xFrame *frames;
+} V8xVmSt;
+
+static V8X_COLDFN bool v8x_vm_stk_grow1(V8xRT *rt, V8xVmSt *st) {
+    if (*st->pcap > st->sp) return true;
+    u32 cap = *st->pcap;
+    if (cap >= V8X_STK_MAX) { v8x_errf(rt, "stack capacity budget exhausted"); return false; }
+    u32 ncap = cap * 2 <= V8X_STK_MAX ? cap * 2 : V8X_STK_MAX;
+    V8xVal *ns = (V8xVal *)realloc(rt->stk, (u64)ncap * sizeof(V8xVal));
+    if (!ns) { v8x_errf(rt, "oom: stack grow"); return false; }
+    rt->stk = *st->pstk = ns; *st->pcap = ncap;
+    return true;
+}
+
+/* 指定深さまで frame を引き剥がす（値の伝播なし）。main(深さ0) は base=0, cur=entry で復帰 */
+static V8X_COLDFN void v8x_vm_teardown_to(V8xVmSt *st, u32 fdepth) {
+    while (st->nframes > fdepth) {
+        st->nframes--;
+        st->base = st->frames[st->nframes].base;
+        st->cur = st->frames[st->nframes].func;
+    }
+    if (st->nframes == 0) { st->base = 0; st->cur = st->entry; }
+}
+
+/* 例外の巻き戻し: FIN(top) → pop して継続。TRY: catch があれば束縛代入して捕捉、
+ * 無ければ finally があれば FIN(mode=1) に化けて実行、両方無ければ pop。
+ * true なら pc_off 確定済み（捕捉 or finally 突入）、false なら uncaught/異常（err 設定済） */
+static V8X_COLDFN bool v8x_vm_unwind(V8xRT *rt, V8xVmSt *st, V8xVal uv) {
+    for (;;) {
+        if (!rt->n_tries) {
+            if (!v8x_vm_stk_grow1(rt, st)) return false; /* OOM 系は err 設定済 */
+            (*st->pstk)[st->sp++] = uv;
+            rt->gc_sp = st->sp; /* 文字列化の GC から値を保護 */
+            u32 s_ = v8x_to_string(rt, uv);
+            u32 sl_ = 0;
+            const u8 *bp_ = s_ != UINT32_MAX ? v8x_str(rt, s_, &sl_) : NULL;
+            if (bp_) v8x_errf(rt, "uncaught exception: %.*s", sl_ > 96 ? 96 : (int)sl_, (const char *)bp_);
+            else v8x_errf(rt, "uncaught exception");
+            return false;
+        }
+        V8xTryEnt *te_ = &rt->tries[rt->n_tries - 1];
+        if (te_->kind == V8X_TE_FIN) {
+            /* 保留中の return/throw は新例外で破棄（JS 規則）。無害化して pop */
+            te_->pending = V8X_VAL_UNDEF;
+            rt->n_tries--;
+            continue;
+        }
+        v8x_vm_teardown_to(st, te_->frame);
+        st->sp = te_->sp;
+        if (!te_->in_catch && te_->catch_pc != V8X_PC_NONE) {
+            if (te_->catch_slot != V8X_SLOT_NONE) {
+                if (st->base + te_->catch_slot >= st->sp) {
+                    v8x_errf(rt, "internal: catch slot OOB"); return false; }
+                (*st->pstk)[st->base + te_->catch_slot] = uv;
+            }
+            te_->in_catch = 1;
+            te_->sp = st->sp;
+            st->pc_off = te_->catch_pc;
+            return true;
+        }
+        if (te_->finally_pc != V8X_PC_NONE) {
+            te_->kind = V8X_TE_FIN; te_->mode = 1; te_->pending = uv; te_->resume_pc = V8X_PC_NONE;
+            st->pc_off = te_->finally_pc;
+            return true;
+        }
+        te_->pending = V8X_VAL_UNDEF;
+        rt->n_tries--;
+    }
+}
+
+/* return の finally 連鎖（mode=2 ペンディングに返り値を保持）後に frame 解体。
+ * true なら pc_off 確定済み（finally 転移 or 解体+push 完了）、false なら致命的 */
+static V8X_COLDFN bool v8x_vm_ret_step(V8xRT *rt, V8xVmSt *st, V8xVal rv) {
+    for (;;) {
+        if (!rt->n_tries) break;
+        V8xTryEnt *te_ = &rt->tries[rt->n_tries - 1];
+        if (te_->frame > st->nframes) {
+            /* 直前の RET 連鎖で深さ管理が崩れない限り到達不能（防御層） */
+            v8x_errf(rt, "internal: try/frame skew"); return false; }
+        if (te_->frame < st->nframes) break;
+        if (te_->kind == V8X_TE_FIN) {
+            te_->pending = V8X_VAL_UNDEF; rt->n_tries--; continue; }
+        if (te_->finally_pc != V8X_PC_NONE) {
+            te_->kind = V8X_TE_FIN; te_->mode = 2; te_->pending = rv; te_->resume_pc = V8X_PC_NONE;
+            st->sp = te_->sp;
+            st->pc_off = te_->finally_pc;
+            return true;
+        }
+        rt->n_tries--;
+    }
+    st->sp = st->base;
+    if (!st->nframes) { v8x_errf(rt, "internal: ret at top level"); return false; }
+    st->nframes--;
+    st->base = st->frames[st->nframes].base;
+    st->cur = st->frames[st->nframes].func;
+    st->pc_off = st->frames[st->nframes].ret_off;
+    if (!v8x_vm_stk_grow1(rt, st)) return false;
+    (*st->pstk)[st->sp++] = rv;
+    return true;
+}
+
+static V8X_COLDFN bool v8x_vm_try_push(V8xRT *rt, V8xVmSt *st, u32 cpc, u32 fpc, u32 cslot) {
+    if (rt->n_tries >= 1024) { v8x_errf(rt, "try depth budget exhausted"); return false; }
+    if (rt->n_tries == rt->cap_tries) {
+        u32 nc = rt->cap_tries ? rt->cap_tries * 2 : 16;
+        if (nc > 1024) nc = 1024;
+        V8xTryEnt *nt_ = (V8xTryEnt *)realloc(rt->tries, (u64)nc * sizeof(V8xTryEnt));
+        if (!nt_) { v8x_errf(rt, "oom: tries"); return false; }
+        rt->tries = nt_; rt->cap_tries = nc;
+    }
+    V8xTryEnt *e_ = &rt->tries[rt->n_tries++];
+    memset(e_, 0, sizeof *e_);
+    e_->frame = st->nframes; e_->sp = st->sp;
+    e_->catch_pc = cpc; e_->finally_pc = fpc; e_->catch_slot = cslot;
+    return true;
+}
+
+static V8X_COLDFN bool v8x_vm_try_leave(V8xRT *rt, V8xVmSt *st, u32 resume) {
+    if (!rt->n_tries) { v8x_errf(rt, "internal: try_leave without entry"); return false; }
+    V8xTryEnt *e_ = &rt->tries[rt->n_tries - 1];
+    if (e_->kind != V8X_TE_TRY || e_->frame != st->nframes) {
+        v8x_errf(rt, "internal: try_leave entry mismatch"); return false; }
+    if (e_->finally_pc != V8X_PC_NONE) {
+        u32 fpc = e_->finally_pc;
+        e_->kind = V8X_TE_FIN; e_->mode = 0; e_->resume_pc = resume; e_->sp = st->sp;
+        st->pc_off = fpc;
+    } else {
+        rt->n_tries--;
+        st->pc_off = resume;
+    }
+    return true;
+}
+
+static V8X_COLDFN bool v8x_vm_fin_end(V8xRT *rt, V8xVmSt *st) {
+    if (!rt->n_tries) { v8x_errf(rt, "internal: fin_end without entry"); return false; }
+    V8xTryEnt *e_ = &rt->tries[rt->n_tries - 1];
+    if (e_->kind != V8X_TE_FIN || e_->frame != st->nframes) {
+        v8x_errf(rt, "internal: fin_end entry mismatch"); return false; }
+    u8 mode_ = e_->mode;
+    V8xVal pv_ = e_->pending;
+    u32 resume_ = e_->resume_pc;
+    e_->pending = V8X_VAL_UNDEF;
+    rt->n_tries--;
+    if (mode_ == 0) { st->pc_off = resume_; return true; }
+    if (mode_ == 1) return v8x_vm_unwind(rt, st, pv_);
+    return v8x_vm_ret_step(rt, st, pv_);
+}
+
 /* dispatch: GCC/Clang では computed-goto（分岐予測局所化）、他は switch。
  * V8X_TEST_SWITCH_DISPATCH で強制的に switch 側をビルド（検証・bench_v8x の差分測定用）。 */
 #if defined(__GNUC__) && !defined(V8X_TEST_SWITCH_DISPATCH)
@@ -2705,6 +3251,18 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
 #define V8X_POP() (sp > base ? stk[--sp] : (dead = true, v8x_errf(rt, "stack underflow"), V8X_VAL_UNDEF))
 #define V8X_PEEK() stk[sp - 1]
 #define V8X_BUDGET() do { if (!--budget) { v8x_errf(rt, "instruction budget exhausted"); free(frames); return false; } } while (0)
+
+    /* cold 例外経路との同期窓（ホット経路では一切触れない。case 内で OUT→cold call→IN） */
+    V8xVmSt vmst_;
+#define V8X_VMST_OUT() do { \
+    vmst_.pstk = &stk; vmst_.pcap = &cap; vmst_.code = code; \
+    vmst_.pc_off = (u32)(pc - code); vmst_.sp = sp; vmst_.base = base; \
+    vmst_.nframes = nframes; vmst_.cur = cur; vmst_.entry = entry; vmst_.frames = frames; \
+} while (0)
+#define V8X_VMST_IN() do { \
+    pc = code + vmst_.pc_off; sp = vmst_.sp; base = vmst_.base; \
+    nframes = vmst_.nframes; cur = vmst_.cur; \
+} while (0)
 
     /* メイン locals 窓 */
     {
@@ -2754,6 +3312,10 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
         [OP_MUL_GX] = &&l_MUL_GX, [OP_MOD_GX] = &&l_MOD_GX,
         [OP_ADD_LX] = &&l_ADD_LX, [OP_SUB_LX] = &&l_SUB_LX,
         [OP_MUL_LX] = &&l_MUL_LX, [OP_MOD_LX] = &&l_MOD_LX,
+        [OP_TRY_PUSH] = &&l_TRY_PUSH, [OP_TRY_LEAVE] = &&l_TRY_LEAVE,
+        [OP_FIN_END] = &&l_FIN_END, [OP_THROW] = &&l_THROW,
+        [OP_LOOPINC_L] = &&l_LOOPINC_L, [OP_NOP] = &&l_NOP,
+        [OP_LOOPINC_GV] = &&l_LOOPINC_GV, [OP_LOOPINC_LV] = &&l_LOOPINC_LV,
         [OP_HALT] = &&l_HALT,
     };
 #define V8X_NEXT() do { if (dead) { free(frames); return false; } V8X_BUDGET(); goto *v8x_jt[*pc++]; } while (0)
@@ -3003,6 +3565,13 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
     V8X_L(RET): {
         if (sp <= base) { v8x_errf(rt, "stack underflow: ret"); free(frames); return false; }
         V8xVal v = V8X_POP();
+        if (rt->n_tries) { /* try 存在時のみ cold 連鎖（finally）。非存在は旧来の完全 inline */
+            V8X_VMST_OUT();
+            bool ok_ = v8x_vm_ret_step(rt, &vmst_, v);
+            V8X_VMST_IN();
+            if (!ok_) { free(frames); return false; }
+            V8X_NEXT();
+        }
         sp = base;
         if (!nframes) { free(frames); v8x_errf(rt, "internal: ret at top level"); return false; }
         nframes--;
@@ -3384,7 +3953,14 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
         u32 slot; memcpy(&slot, pc, 4); pc += 4;
         if (base + slot >= sp) { v8x_errf(rt, "local OOB read"); free(frames); return false; }
         V8xVal v = stk[base + slot];
-        /* RET（LLOAD;RET の融合）と同一の巻き戻し順序 */
+        /* RET（LLOAD;RET の融合）と同一の巻き戻し順序（finally 連鎖込み） */
+        if (rt->n_tries) {
+            V8X_VMST_OUT();
+            bool ok_ = v8x_vm_ret_step(rt, &vmst_, v);
+            V8X_VMST_IN();
+            if (!ok_) { free(frames); return false; }
+            V8X_NEXT();
+        }
         sp = base;
         if (!nframes) { free(frames); v8x_errf(rt, "internal: ret at top level"); return false; }
         nframes--;
@@ -3478,7 +4054,160 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
         if (!r) pc = code + tgt;
         V8X_NEXT();
     }
+    /* ---- JS 例外（op 意味論は cg N_TRY コメントと paired） ---- */
+    V8X_L(TRY_PUSH): {
+        u32 cpc, fpc, cslot;
+        memcpy(&cpc, pc, 4); memcpy(&fpc, pc + 4, 4); memcpy(&cslot, pc + 8, 4);
+        pc += 12;
+        V8X_VMST_OUT();
+        bool ok_ = v8x_vm_try_push(rt, &vmst_, cpc, fpc, cslot);
+        V8X_VMST_IN();
+        if (!ok_) { free(frames); return false; }
+        V8X_NEXT();
+    }
+    V8X_L(TRY_LEAVE): {
+        u32 resume; memcpy(&resume, pc, 4); pc += 4;
+        V8X_VMST_OUT();
+        bool ok_ = v8x_vm_try_leave(rt, &vmst_, resume);
+        V8X_VMST_IN();
+        if (!ok_) { free(frames); return false; }
+        V8X_NEXT();
+    }
+    V8X_L(FIN_END): {
+        V8X_VMST_OUT();
+        bool ok_ = v8x_vm_fin_end(rt, &vmst_);
+        V8X_VMST_IN();
+        if (!ok_) { free(frames); return false; }
+        V8X_NEXT();
+    }
+    V8X_L(THROW): {
+        if (sp <= base) { v8x_errf(rt, "stack underflow: throw"); free(frames); return false; }
+        V8xVal tv_ = V8X_POP();
+        V8X_VMST_OUT();
+        bool ok_ = v8x_vm_unwind(rt, &vmst_, tv_);
+        V8X_VMST_IN();
+        if (!ok_) { free(frames); return false; }
+        V8X_NEXT();
+    }
+    V8X_L(LOOPINC_L): {
+        u32 slot; memcpy(&slot, pc, 4); pc += 4;
+        i32 d; memcpy(&d, pc, 4); pc += 4;
+        i32 lim; memcpy(&lim, pc, 4); pc += 4;
+        u8 cmp = *pc++;
+        u32 tgt; memcpy(&tgt, pc, 4); pc += 4;
+        if (base + slot >= sp) { v8x_errf(rt, "local OOB write"); free(frames); return false; }
+        V8xVal lv = stk[base + slot], nv;
+        bool r;
+        if (v8x_is_intv(lv)) {
+            i64 s2 = (i64)v8x_get_int(lv) + (i64)d;
+            if (s2 >= -2147483648ll && s2 <= 2147483647ll) {
+                i32 il = (i32)s2;
+                nv = V8X_MK_INT(il);
+                r = cmp == 0 ? il < lim : cmp == 1 ? il <= lim : cmp == 2 ? il > lim : il >= lim;
+            } else {
+                nv = v8x_num((double)s2);
+                double ds = (double)s2, dl = (double)lim;
+                r = cmp == 0 ? ds < dl : cmp == 1 ? ds <= dl : cmp == 2 ? ds > dl : ds >= dl;
+            }
+        } else {
+            rt->gc_sp = sp;
+            if (!v8x_bin_add(rt, lv, V8X_MK_INT(d), sp, &nv)) { free(frames); return false; }
+            if (v8x_is_intv(nv)) {
+                i32 il = v8x_get_int(nv);
+                r = cmp == 0 ? il < lim : cmp == 1 ? il <= lim : cmp == 2 ? il > lim : il >= lim;
+            } else {
+                rt->gc_sp = sp;
+                double dv = v8x_to_number(rt, nv), dl = (double)lim;
+                if (rt->err[0]) { free(frames); return false; }
+                r = !isnan(dv) && (cmp == 0 ? dv < dl : cmp == 1 ? dv <= dl : cmp == 2 ? dv > dl : dv >= dl);
+            }
+        }
+        stk[base + slot] = nv;
+        if (r) pc = code + tgt;
+        V8X_NEXT();
+    }
+    V8X_L(LOOPINC_GV): {
+        u32 gi; memcpy(&gi, pc, 4); pc += 4;
+        i32 d; memcpy(&d, pc, 4); pc += 4;
+        i32 lim; memcpy(&lim, pc, 4); pc += 4;
+        u8 cmp = *pc++;
+        u32 tgt; memcpy(&tgt, pc, 4); pc += 4;
+        if (gi >= rt->n_globals) { v8x_errf(rt, "internal: global slot OOB"); free(frames); return false; }
+        V8xVal lv = rt->globals[gi].v, nv;
+        bool r;
+        if (v8x_is_intv(lv)) {
+            i64 s2 = (i64)v8x_get_int(lv) + (i64)d;
+            if (s2 >= -2147483648ll && s2 <= 2147483647ll) {
+                i32 il = (i32)s2;
+                nv = V8X_MK_INT(il);
+                r = cmp == 0 ? il < lim : cmp == 1 ? il <= lim : cmp == 2 ? il > lim : il >= lim;
+            } else {
+                nv = v8x_num((double)s2);
+                double ds = (double)s2, dl = (double)lim;
+                r = cmp == 0 ? ds < dl : cmp == 1 ? ds <= dl : cmp == 2 ? ds > dl : ds >= dl;
+            }
+        } else {
+            /* 汎用: GINC + CJMPF_G と同じ手続き（文字列なら bin_add で連結→数値化比較） */
+            rt->gc_sp = sp;
+            if (!v8x_bin_add(rt, lv, V8X_MK_INT(d), sp, &nv)) { free(frames); return false; }
+            if (v8x_is_intv(nv)) {
+                i32 il = v8x_get_int(nv);
+                r = cmp == 0 ? il < lim : cmp == 1 ? il <= lim : cmp == 2 ? il > lim : il >= lim;
+            } else {
+                rt->gc_sp = sp;
+                double dv = v8x_to_number(rt, nv), dl = (double)lim;
+                if (rt->err[0]) { free(frames); return false; }
+                r = !isnan(dv) && (cmp == 0 ? dv < dl : cmp == 1 ? dv <= dl : cmp == 2 ? dv > dl : dv >= dl);
+            }
+        }
+        rt->globals[gi].v = nv; rt->last_val = nv; /* LINC/GINC 経路等価（文末更新の保持） */
+        if (r) pc = code + tgt;
+        V8X_NEXT();
+    }
+
+    V8X_L(LOOPINC_LV): {
+        u32 slot; memcpy(&slot, pc, 4); pc += 4;
+        i32 d; memcpy(&d, pc, 4); pc += 4;
+        i32 lim; memcpy(&lim, pc, 4); pc += 4;
+        u8 cmp = *pc++;
+        u32 tgt; memcpy(&tgt, pc, 4); pc += 4;
+        if (base + slot >= sp) { v8x_errf(rt, "local OOB write"); free(frames); return false; }
+        V8xVal lv = stk[base + slot], nv;
+        bool r;
+        if (v8x_is_intv(lv)) {
+            i64 s2 = (i64)v8x_get_int(lv) + (i64)d;
+            if (s2 >= -2147483648ll && s2 <= 2147483647ll) {
+                i32 il = (i32)s2;
+                nv = V8X_MK_INT(il);
+                r = cmp == 0 ? il < lim : cmp == 1 ? il <= lim : cmp == 2 ? il > lim : il >= lim;
+            } else {
+                nv = v8x_num((double)s2);
+                double ds = (double)s2, dl = (double)lim;
+                r = cmp == 0 ? ds < dl : cmp == 1 ? ds <= dl : cmp == 2 ? ds > dl : ds >= dl;
+            }
+        } else {
+            rt->gc_sp = sp;
+            if (!v8x_bin_add(rt, lv, V8X_MK_INT(d), sp, &nv)) { free(frames); return false; }
+            if (v8x_is_intv(nv)) {
+                i32 il = v8x_get_int(nv);
+                r = cmp == 0 ? il < lim : cmp == 1 ? il <= lim : cmp == 2 ? il > lim : il >= lim;
+            } else {
+                rt->gc_sp = sp;
+                double dv = v8x_to_number(rt, nv), dl = (double)lim;
+                if (rt->err[0]) { free(frames); return false; }
+                r = !isnan(dv) && (cmp == 0 ? dv < dl : cmp == 1 ? dv <= dl : cmp == 2 ? dv > dl : dv >= dl);
+            }
+        }
+        stk[base + slot] = nv; rt->last_val = nv;
+        if (r) pc = code + tgt;
+        V8X_NEXT();
+    }
+
+    V8X_L(NOP): { V8X_NEXT(); } /* CoJIT 埋め。通常到達不能、到達しても透過 */
+
     V8X_L(HALT): {
+        if (rt->n_tries) { /* 防御層: main 正常終了で try が残るのは内部不整合 */
+            v8x_errf(rt, "internal: try/frame skew at halt"); free(frames); return false; }
         free(frames);
         return true;
     }
@@ -3541,11 +4270,16 @@ void v8x_free(V8xRT *rt) {
     free(rt->funcs);
     free(rt->globals);
     free(rt->stk);
+    free(rt->tries);
     free(rt);
 }
 
+void v8x_set_cojit(V8xRT *rt, int enabled) { if (rt) rt->cojit_off = !enabled; }
+uint32_t v8x_cojit_count(V8xRT *rt) { return rt ? rt->cojit_applied : 0; }
+
 bool v8x_eval(V8xRT *rt, const char *src, V8xVal *out) {
     rt->err[0] = 0;
+    rt->n_tries = 0; /* 前回 eval が途中終了（uncaught/budget/誤り）した場合の残留を棄却 */
     if (!src) { v8x_errf(rt, "null source"); return false; }
     u64 slen = strlen(src);
     if (slen > V8X_MAX_SRC) { v8x_errf(rt, "source budget exhausted"); return false; }
@@ -3624,7 +4358,15 @@ bool v8x_eval(V8xRT *rt, const char *src, V8xVal *out) {
     f0 = &rt->funcs[main_idx];
     free(cg.locals);
     free(p.nodes); free(p.list); free(p.lx.esc);
-    if (cg.fail) { rt->n_funcs--; rt->code_len = code_from; return false; }
+    /* 失敗時は funcs 表も main_idx まで戻す（途中生成のネスト関数エントリが
+     * 区間表に残って次回 eval の region を食い違わせる潜在バグを塞ぐ） */
+    if (cg.fail) { rt->n_funcs = main_idx; rt->code_len = code_from; return false; }
+
+    /* CoJIT: 意味保持が構造的に自明な形のみ特化（異常時は無変更）。append したら
+     * main 領域を再捺印してから必ず verify の whole-scan を通す（事後セルフチェック） */
+    if (!rt->cojit_off) (void)v8x_cojit(rt, code_from);
+    f0 = &rt->funcs[main_idx];
+    f0->code_end = rt->code_len;
 
     if (!v8x_verify(rt, f0->code_off)) return false;
 
@@ -3640,6 +4382,28 @@ bool v8x_eval(V8xRT *rt, const char *src, V8xVal *out) {
 }
 
 const char *v8x_error(V8xRT *rt) { return rt && rt->err[0] ? rt->err : ""; }
+
+/* ---- ホスト側値生成（公開 C ABI。ファサード層向け。契約は v8x.h 参照） ---- */
+V8xVal v8x_mknum(double d) { return v8x_num(d); }
+V8xVal v8x_mkbool(bool b) { return b ? V8X_VAL_TRUE : V8X_VAL_FALSE; }
+V8xVal v8x_mknull(void) { return V8X_VAL_NULL; }
+V8xVal v8x_mkundefined(void) { return V8X_VAL_UNDEF; }
+bool v8x_is_string(V8xRT *rt, V8xVal v) {
+    if (!rt || !v8x_is_objv(v)) return false;
+    u32 oi = v8x_get_obj(v);
+    if (oi >= rt->n_objs) return false;
+    return rt->objs[oi].kind == V8X_OK_STR || rt->objs[oi].kind == V8X_OK_ROPE;
+}
+V8xVal v8x_mkstring(V8xRT *rt, const char *s, uint32_t len) {
+    if (!rt) return V8X_VAL_UNDEF;
+    if (!s && len) { v8x_errf(rt, "null string data"); return V8X_VAL_UNDEF; }
+    if (len > V8X_MAX_SRC) { v8x_errf(rt, "string budget exhausted"); return V8X_VAL_UNDEF; }
+    /* VM 停止中は v8x_gc が no-op（gc_live=false）。nursery 経由の mkstr は
+       GC 未発火でも budget 超過時のみ err を返す安全設計（内部 mkstr と同一経路） */
+    u32 oi = v8x_mkstr(rt, (const u8 *)s, len);
+    if (oi == UINT32_MAX) return V8X_VAL_UNDEF;
+    return V8X_MK_OBJ(oi);
+}
 
 void v8x_set_insn_budget(V8xRT *rt, uint64_t budget) {
     if (rt) rt->insn_budget_def = budget;
@@ -3659,10 +4423,13 @@ const char *v8x_as_str(V8xRT *rt, V8xVal v, uint32_t *len) {
     if (oi >= rt->n_objs) return NULL;
     if (rt->objs[oi].kind != V8X_OK_STR && rt->objs[oi].kind != V8X_OK_ROPE) return NULL;
     /* NUL 終端を API として約束するための 1 バイト余裕は mkstr で確保していない。
-     * len 参照 API なので NUL は返さない（bytes は len まで有効）。ROPE はここで平坦化。 */
+     * len 参照 API なので NUL は返さない（bytes は len まで有効）。ROPE はここで平坦化。
+     * 読取 API は自身の成否のみで報告する: 前回 eval の残留 err に黙殺されると
+     * ホスト側が恒久的に読めなくなる事前バグ（V8 ファサード持込みで同定） */
+    rt->err[0] = 0;
     u32 l;
     const u8 *b = v8x_str(rt, oi, &l);
-    if (rt->err[0]) return NULL;
+    if (!b) return NULL;
     if (len) *len = l;
     return (const char *)b;
 }

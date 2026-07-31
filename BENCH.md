@@ -2,6 +2,90 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-07-31: CSS RuleSet 索引（Blink RuleSet 戦略）— 合成カスケード 23.32×、カスケード order バグ同定・修正
+
+- **RuleSet 索引**（src/css.c）: 右端 compound の最強特徴（id>class>tag>universal）で
+  (rule, sel) を単一バケツへ格納し、要素側は自身の特徴が指すバケツ + universal のみ全マッチ
+  （Blink RuleSet と同一戦略）。バケツは distinct ぴったり確保 + hash 昇順ソート + 二分探索
+  （slack ゼロ、エントリ 8B、構築は qsort 一回）。kill switch `if_css_set_naive_matching` で
+  旧全走査に切替可能（監査用）。
+- **カスケード文書順の一意化（索引差分監査が炙り出した既存バグ）**: rule 単位 `order++` では
+  `order = rule_base + decl_idx` がルール間で衝突し、同 spec 同重要度のタイで「後勝ち」が
+  成立し得なかった（反復順序依存 = 索引化で結果が変わる原因）。decl 単位ストライド +
+  `order_end` で一意化し CSS 仕様の後勝ちに修正（回帰テスト: `.a{bg;color:red}.b{color:blue}` → blue）。
+- **Blink API 互換**: src/css_blink.h（header-only、0 バイト、C ABI）+ docs/BLINK_COMPAT.md に
+  coverage map を定義。戦略・カスケード順序・specificity ビット配置は同値、pseudo/属性/
+  兄弟/@規則等はサブセット外と明記（「互換」の範囲を誇張しない）。
+
+### 実測（bench/bench_css.c、2500 rules × 3000 elements 合成、5 交互 round min、このコンテナ）
+| 経路 | 時間 | 比 |
+|---|---|---|
+| naive 全走査 | 471.990 ms | 1.00× |
+| RuleSet 索引（既定） | **20.240 ms** | **23.32×** |
+
+### 検証（このターン、CSS）
+- on/off 差分オラクル 220 seeds（構造化ランダム sheet×DOM、全ノード計算済みスタイル bit 一致）。
+  単体計 **17,543 checks×2 dispatch 0 fail**（CSS oracle/facade 追加分含む）。
+- ASAN が索引構築の universal 無キー初期化漏れ（qsort cmp のゴミ key memcmp）を一度摘発 → 修正済
+  （安全側の規律: universal は無キー `{NULL,0}` 契約に統一）。
+- fuzz 500+500 0 crash、conformance 97.3% 不変、tui/gui smoke PASS、guard ALL PASS。
+- バイナリ: ifuto 223,872 B（天井 240KB 内、索引・audit 追加で +4,096 B）、ifuto-gui 199,192 B、
+  ldd 不変条件維持。
+
+## 2026-07-31: V8x v0.2 — JS 例外 + CoJIT（検証駆動 AOT 特化）+ cold 分離回帰ポストモーテム
+
+構成（このターンの到達点）:
+- **JS 例外 v0.1**: `throw` / `try` / `catch(e)` / `catch`（ES2019 束縛省略）/ `finally`。
+  cross-frame 巻き戻し、rethrow、return 経路の finally（返り値は finally 実行前に確定）、
+  未捕捉はホスト致命的エラー（budget/OOM と同格の fail-fast）。**v0.1 の明示的限界**
+  （誤動作より明白な拒否）: break/continue が try 境界を跨ぐのは compile エラー、
+  TypeError 等のホスト致命的は JS から throw 不可能、catch 束縛は関数 locals を共有再利用。
+- **CoJIT v0.1**（利用者提案「静的検証で必要部分のみ最適化するコンパクト JIT」の採用形）:
+  codegen 後のバイトコードに対し `CJMPF_{G,L}; body; [更新]; JMP; exit:` な while 形・
+  関数内部形を検出し、回転して `LOOPINC_{G,L}V`（inc+cmp+branch+last_val 保持の融合）へ
+  書き換える **AOT 特化**。runtime codegen はゼロ＝JIT 禁止の不変条件に抵触しない
+  （実行可能書き込みページは依然ゼロ、profile 収集もゼロ、生成物は検証済みの既存命令のみ）。
+  **ハッキング耐性（利用者要求「色々してもろて」の回答としての構造）**:
+  1. 特化器は失敗しても致命的にならない（検出しなければ汎用命令のまま残る＝安全側）;
+  2. 特化後ストリームは必ず `v8x_verify` whole-scan を再通過（事後セルフチェック。
+     実際この自己検査が trampoline の local-slot 領域違反を一度摘発して設計を修正）;
+  3. テストに on/off 2 インスタンスの差分オラクル＋ C 側独立予測との三方向一致
+     （xorshift32 構造化ランダム 400 seed。特化器が意味を変えた瞬間に赤くなる機械監査）。
+  適用 tail は A: `LINC/GINC;JMP`、B: 関数内 global 更新列、C: local 更新列。
+  発火数は `v8x_cojit_count`、kill switch は `v8x_set_cojit`。
+- **cold 分離（回帰ポストモーテム）**: 例外機構を dispatch マクロで inline 展開した初版は
+  バイトコード列が完全同一（op 名列 diff=0）にもかかわらず **arith +24% / branch +42% /
+  fib30 +11% 悪化**（新旧バイナリ交互計測で確定、nodejit 側はほぼ不変）。原因は冷コードが
+  vm_exec の I$/分岐予測/インライン予算を侵食する機械語レイアウト問題（下記 121→138→111ms
+  前例と同型）。`v8x_vm_unwind/ret_step/try_push/try_leave/fin_end` を noinline+cold に
+  隔離（RET は `n_tries==0` の旧来完全 inline 高速経路を保持）して回復。
+
+### 実測（このコンテナ、2026-07-31、cold 分離後・交互計測 median、base=c00528b）
+| 指標 | v8x | 対 base | 対 node --jitless（guard） |
+|---|---|---|---|
+| arith 5M loop | 115.1-123.7 ms | **1.000×**（回復。悪化版は 1.235×） | 0.967 / 1.039（閾 1.05 PASS） |
+| branch 5M | 59.2-59.8 ms | 1.058×（悪化版は 1.422×） | 0.721 / 0.704（PASS） |
+| fib30 | 69.8-78.8 ms | 0.958× | 0.714 台（PASS） |
+| bench_v8x arith 100k | **2.413 ms**（前セッション 3.048） | 自前基準で改善 | — |
+| bench_v8x fib(22) | **1.494 ms**（同 1.670） | 改善 | — |
+
+CoJIT の正直な効き（-O2、while 形・関数内形に限る）: while_arith(global) ±1.01×、
+while_fib 1.02×、関数内 1.05〜1.18×。**天井破りではなくカバレッジ一般化**（canonical-for 由来の
+AST 融合と同等速度に while 形を引き上げる）。vs V8 full JIT の残差（arith 2.3× 級）には触れない
+— 本丸は generalized stmt-stencil mega-fusion 側（台帳不変）。
+
+### このターンが同定・修正した既存バグ（テストで回帰固定）
+1. codegen 失敗ロールバックが `n_funcs--` だけでネスト関数エントリを funcs 表に残し、
+   後続 eval の領域表が skew（"verify: outside function"）。`n_funcs = main_idx` に修正。
+2. **`var a=0,b=0;` カンマ宣言が最後の宣言しか残さなかった**（ReferenceError 化）。
+   parser を scratch 収集→commit に修正。`var ca=1,cb=2` 等の回帰テスト追加。
+
+### 検証（このターン）
+- 単体 **2,440 checks×2 dispatch 0 fail**（例外 19、CoJIT 行列+400 seed oracle、カンマ回帰等）。
+- fuzz 500+500 0 crash、guard ALL PASS（qjs 相対は参照バイナリ不在で SKIP 明示）、
+  conformance 97.3% 不変、tui/gui smoke PASS。
+- bench_v8x 計算値不変（fib22=17711 / arith=905003 / mixed=7.9996e+07）。
+
 ## 2026-07-31: v0.2 — GUI（生 X11）+ Markdown + slim-DOM + viewport 窓グリッド
 
 構成（このターンの到達点）:

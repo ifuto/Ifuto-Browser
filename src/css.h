@@ -73,13 +73,32 @@ typedef struct {
 typedef struct {
     IfSelector *sels; u32 n_sels;
     IfDecl *decls;    u32 n_decls;
-    u32 order;
+    u32 order;         /* decl 単位で一意な単調 base（order + decl_index が勝者の全順序キー） */
 } IfRule;
+
+/* ---- RuleSet 風セレクタインデックス（Blink RuleSet 相当のバケツ戦略） ----
+ * 右端 compound の最強特徴（id > class > tag > universal）で各 (rule, sel) を
+ * 単一バケツに格納。要素側は自身の特徴が指すバケツ + universal だけを全マッチすれば、
+ * マッチ集合は全走査と一致する（バケツ外のエントリは右端 compound が必ず不成立）。
+ * キー照合は matcher と完全同一規則: id/class は memcmp 完全一致（case-sensitive）、
+ * tag は canonical lowercase（既知タグは静的名、未知タグは ASCII-lowercase 複製）。 */
+typedef struct { u32 rule, sel; } IfSelEntry;
+typedef struct { u32 hash; IfStr key; u32 start, len; } IfSelBucket; /* hash 昇順ソート */
+typedef struct {
+    IfSelEntry *pool;                 /* 全エントリ（バケツごと連続スライス、arena 所有） */
+    u32 n_pool;                       /* 0 = 未構築（OOM フォールバックで naive 経路） */
+    IfSelBucket *id_b;  u32 n_id;
+    IfSelBucket *cl_b;  u32 n_cl;
+    IfSelBucket *tg_b;  u32 n_tg;
+    u32 univ_start, univ_len;         /* pool 内の universal スライス */
+} IfRuleSet;
 
 typedef struct IfStyleSheet {
     IfRule *rules; u32 n_rules;
     u32 n_dropped_rules;
     u32 n_dropped_decls;
+    u32 order_end;                    /* このシートが消費した order の排他上端（シート間隙間の決定値） */
+    IfRuleSet rs;
 } IfStyleSheet;
 
 /* ---- 計算済みスタイル ---- */
@@ -112,5 +131,10 @@ float if_css_resolve_len(IfLen l, float self_fs, float root_fs); /* px へ（PCT
 void if_style_apply(IfArena *a, IfDom *dom);
 
 bool if_css_match_selector(const IfNode *n, const IfSelector *sel);
+
+/* 監査・差分検証用の kill switch（既定 0 = RuleSet 索引経路）。1 にすると全ノードで
+ * 旧来の全走査マッチになる。索引の候補集合 ≡ 全走査のマッチ集合であることを
+ * テストが on/off で機械監査するために存在（CoJIT の on/off oracle と同型）。 */
+void if_css_set_naive_matching(int enabled);
 
 #endif

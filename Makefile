@@ -54,9 +54,21 @@ $(BUILD)/fuzz_v8x: fuzz/fuzz_v8x.c $(V8XSRC) | $(BUILD)
 
 .PHONY: test uitest golden fuzz bench tuibench clean size conformance guard vsx v8xbench gui guismoke
 
-test: $(BUILD)/run_tests $(BUILD)/run_tests_switch
+test: $(BUILD)/run_tests $(BUILD)/run_tests_switch cxxtest
 	./$(BUILD)/run_tests
 	./$(BUILD)/run_tests_switch
+
+# C++ V8 API ファサード（src/v8x/v8.h）の実動証明。
+# 製品法則の検査を兼ねる: このテストバイナリは libstdc++ を動的リンクしないこと。
+CXX ?= g++
+$(BUILD)/v8_compat_smoke.o: tests/cpp/v8_compat_smoke.cc src/v8x/v8.h src/v8x/v8x.h | $(BUILD)
+	$(CXX) -std=c++11 -fno-exceptions -fno-rtti -O2 -Wall -Wextra -I src -o $@ -c tests/cpp/v8_compat_smoke.cc
+$(BUILD)/test_v8compat: $(BUILD)/v8_compat_smoke.o $(V8XSRC) | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ $(BUILD)/v8_compat_smoke.o $(V8XSRC) $(LDFLAGS_REL) -lm
+cxxtest: $(BUILD)/test_v8compat
+	@if ldd $(BUILD)/test_v8compat | grep -q 'libstdc++'; then \
+		echo 'FATAL: v8compat links libstdc++ (製品法則違反)' >&2; exit 1; fi
+	./$(BUILD)/test_v8compat
 
 # TUI を疑似端末(PTY)越しに駆動する e2e スモーク（tabstrip/scroll/quit 等）
 uitest: $(BUILD)/ifuto
@@ -85,6 +97,13 @@ $(BUILD)/bench_v8x: bench/bench_v8x.c $(V8XSRC) | $(BUILD)
 
 $(BUILD)/bench_v8x_switch: bench/bench_v8x.c $(V8XSRC) | $(BUILD)
 	$(CC) $(BASE) $(REL) -DV8X_TEST_SWITCH_DISPATCH -o $@ bench/bench_v8x.c $(V8XSRC) $(LDFLAGS_REL) -lm
+
+# CSS RuleSet 索引の効果（naive 全走査との同一バイナリ比較。結果は BENCH.md へ実測公開）
+$(BUILD)/bench_css: bench/bench_css.c $(ENGINE) | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ bench/bench_css.c $(ENGINE) $(LDFLAGS_REL) -lm
+
+cssbench: $(BUILD)/bench_css
+	$(BUILD)/bench_css
 
 # V8x 単体 CLI（比較ベンチ / make guard の被測定バイナリ。本体には不加入）
 $(BUILD)/v8x_cli: bench/v8x_cli.c $(V8XSRC) | $(BUILD)
