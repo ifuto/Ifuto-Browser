@@ -114,14 +114,33 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_LLOAD, OP_LSTORE, OP_GLOAD, OP_GSTORE,
     OP_JMP, OP_JMPF, OP_JMPT,
     OP_CALL, OP_RET, OP_MAKEF,
+    OP_LINC,                /* slot u32 | delta i32 : x = x + d（スタック中立・last_val 更新） */
+    OP_CJMPF_L,             /* slot u32 | imm i32 | cmp u8 | tgt u32 : 比較+条件分岐の融合 */
+    OP_CJMPF_G,             /* name u32 | imm i32 | cmp u8 | tgt u32 : 同上（グローバル） */
+    OP_GLOAD_S,             /* slot u32 : 直結グローバル load（compile 時登録済み保証は cg_store 不変条件） */
+    OP_GSTORE_S,            /* slot u32 : 直結グローバル store（const 検査は compile 時済み） */
+    OP_GINC,                /* slot u32 | delta i32 : グローバル版 LINC */
     OP_HALT,
     OP_COUNT
 };
 
 struct V8xRT {
-    /* ヒープ（obj index 参照。free は v8x_free 一括。GC は v0.1 台帳） */
+    /* ヒープ（obj index 参照。mark-sweep GC: スイープは index 不変・穴再利用。
+     * 構造的安全: コンパイル生成物（< pin_mark）はゴミになり得ない構成で、
+     * 到達不能は実行時生成物のみ。根は VM スタック＋globals＋nursery の3系のみ） */
     V8xObj *objs; u32 n_objs, cap_objs;
-    u64 heap_bytes; /* STR bytes 累計（上限管理用） */
+    u64 heap_bytes; /* 生存 STR bytes 累計（GC が減算。上限は「生存分」で裁く） */
+    u32 pin_mark;   /* objs[0..pin_mark): コンパイル由来。スイープ対象外 */
+    u32 *free_objs; u32 n_free, cap_free; /* スイープで空いたスロット（LIFO 再利用） */
+    u64 gc_next;    /* 適応 GC 閾値（bytes）。硬上限 V8X_MAX_HEAP_MB とは別に、
+                     * 前回 GC 後 live ×2（下限 512KB）で発火し定常 RSS を live 漸近に抑える */
+    u32 gc_next_objs; /* 同上（オブジェクト数。スロット配列の高水位を live 漸近に） */
+    u32 gc_sp;      /* VM が alloc サイト直前に同期するスタック深さスナップショット */
+    u32 nury[4]; u32 n_nury; /* C 側一時ルート（concat 中の to_string 一時 obj） */
+    bool gc_live;   /* vm_exec 実行中のみ true（GC はこの時だけ発火） */
+    /* GLOAD/GSTORE の O(1) 化: name(u32 intern id) -> global slot の脱 Salt ハッシュ
+     * （globals は append-only。n_globals 変化検知でのみ全再構築） */
+    u32 *ghash; u32 ghash_cap; u32 ghash_sync;
     /* コード＋関数表（eval ごとに追記。関数は以後の eval から呼べる） */
     u8 *code; u32 code_len, code_cap;
     V8xFuncEnt *funcs; u32 n_funcs, cap_funcs;
@@ -130,8 +149,8 @@ struct V8xRT {
     /* VM 作業領域 */
     V8xVal *stk; u32 cap_stk;
     u64 insn_budget_def;
-    u32 heap_mb;    /* 既定 V8X_MAX_HEAP_MB。v8x_tune で組込側責任で引上げ可 */
-    u32 max_objs;   /* 既定 V8X_MAX_OBJECTS。同上 */
+    u32 heap_mb;    /* 硬上限 = heap_mb<<20。既定 V8X_MAX_HEAP_MB。v8x_tune で組込側責任で引上げ可 */
+    u32 max_objs;   /* オブジェクト数硬上限。既定 V8X_MAX_OBJECTS。同上 */
     V8xVal last_val;
     char err[256];
     /* parse 作業の再利用バッファは eval ローカルで確保（再入安全） */
@@ -158,8 +177,84 @@ static void v8x_errf(V8xRT *rt, const char *fmt, ...) {
     va_end(ap);
 }
 
+/* ---- mark-sweep GC。ルートは VM スタック(gc_sp スナップショット)＋globals＋nursery＋last_val。
+ * スイープは index を動かさない（バイトコード中の CONST_STR/MAKEF オペランド = obj index を
+ * 無効化しないための構造的条件）。空いたスロットは free_objs で再利用する。 */
+static void v8x_gc_mark_val(V8xRT *rt, V8xVal v, u8 *mk) {
+    if (v8x_is_objv(v)) {
+        u32 i = v8x_get_obj(v);
+        if (i >= rt->pin_mark && i < rt->n_objs) mk[i - rt->pin_mark] = 1;
+    }
+}
+static u32 v8x_gc(V8xRT *rt) {
+    if (!rt->gc_live) return 0;
+    u32 span = rt->n_objs - rt->pin_mark;
+    if (!span) return 0;
+    u8 *mk = (u8 *)calloc(span, 1);
+    if (!mk) return 0; /* OOM 時は回収不能扱い（呼び出し側が budget エラーに倒す。安全側） */
+    if (rt->stk) {
+        u32 lim = rt->gc_sp < rt->cap_stk ? rt->gc_sp : rt->cap_stk;
+        for (u32 i = 0; i < lim; i++) v8x_gc_mark_val(rt, rt->stk[i], mk);
+    }
+    v8x_gc_mark_val(rt, rt->last_val, mk);
+    for (u32 i = 0; i < rt->n_globals; i++) v8x_gc_mark_val(rt, rt->globals[i].v, mk);
+    for (u32 i = 0; i < rt->n_nury; i++) {
+        u32 oi = rt->nury[i];
+        if (oi >= rt->pin_mark && oi < rt->n_objs) mk[oi - rt->pin_mark] = 1;
+    }
+    u32 got = 0;
+    for (u32 i = rt->pin_mark; i < rt->n_objs; i++) {
+        V8xObj *o = &rt->objs[i];
+        if (o->kind == 0 || mk[i - rt->pin_mark]) continue;
+        if (o->kind == V8X_OK_STR && o->bytes) { rt->heap_bytes -= o->len; free(o->bytes); }
+        o->kind = 0; o->bytes = NULL; o->len = 0;
+        if (rt->n_free == rt->cap_free) {
+            u32 nc = rt->cap_free ? rt->cap_free * 2 : 128;
+            u32 *nf = (u32 *)realloc(rt->free_objs, (u64)nc * sizeof(u32));
+            if (!nf) break; /* リスト拡張失敗: 解放済みスロットの再利用だけ諦める */
+            rt->free_objs = nf; rt->cap_free = nc;
+        }
+        rt->free_objs[rt->n_free++] = i;
+        got++;
+    }
+    free(mk);
+    u64 next = rt->heap_bytes * 2;
+    u64 floor_ = 512u << 10, ceil_ = (u64)rt->heap_mb << 20;
+    rt->gc_next = next < floor_ ? floor_ : next > ceil_ ? ceil_ : next;
+    u32 nobjs_live = rt->n_objs - rt->n_free;
+    u64 nobj = (u64)nobjs_live * 2 + 1024;
+    rt->gc_next_objs = nobj > rt->max_objs ? rt->max_objs : (u32)nobj;
+    return got;
+}
+
+/* obj_new 直後に後続処理が失敗したときの巻き戻し。
+ * idx が最終スロットなら append を戻し、それ以外（free-list 由来）は穴に返す。 */
+static void obj_free_rollback(V8xRT *rt, u32 idx) {
+    memset(&rt->objs[idx], 0, sizeof(V8xObj));
+    if (idx + 1 == rt->n_objs) rt->n_objs--;
+    else if (rt->n_free < rt->cap_free) rt->free_objs[rt->n_free++] = idx;
+    /* free リスト満杯なら kind==0 のまま放置（GC が再度拾う。リークはスロットのみで安全側） */
+}
+
 static u32 v8x_obj_new(V8xRT *rt) {
-    if (rt->n_objs >= rt->max_objs) { v8x_errf(rt, "object budget exhausted"); return UINT32_MAX; }
+    if (rt->n_objs - rt->n_free >= rt->gc_next_objs) v8x_gc(rt); /* 生存オブジェクト数の適応閾値
+        * （n_objs は free-list 再利用で単調にしか見えないので live = n_objs - n_free で裁う。
+        *  これを誤ると freelist 充填後に毎回 GC する常勤化バグになる — 実測 9ms→265ms 退行） */
+    if (rt->n_free) {
+        u32 idx = rt->free_objs[--rt->n_free];
+        memset(&rt->objs[idx], 0, sizeof(V8xObj));
+        return idx;
+    }
+    if (rt->n_objs >= rt->max_objs) {
+        v8x_gc(rt);
+        if (rt->n_free) {
+            u32 idx = rt->free_objs[--rt->n_free];
+            memset(&rt->objs[idx], 0, sizeof(V8xObj));
+            return idx;
+        }
+        v8x_errf(rt, "object budget exhausted");
+        return UINT32_MAX;
+    }
     if (rt->n_objs == rt->cap_objs) {
         u32 nc = rt->cap_objs ? rt->cap_objs * 2 : 64;
         V8xObj *no = (V8xObj *)realloc(rt->objs, (u64)nc * sizeof(V8xObj));
@@ -173,9 +268,13 @@ static u32 v8x_obj_new(V8xRT *rt) {
 
 /* STR obj を新規作成（bytes はコピー）。失敗時 UINT32_MAX（err 設定済み） */
 static u32 v8x_mkstr(V8xRT *rt, const u8 *p, u32 n) {
+    if ((u64)rt->heap_bytes + n > rt->gc_next) v8x_gc(rt); /* 適応閾値（RSS 漸近抑制） */
     if ((u64)rt->heap_bytes + n > (u64)rt->heap_mb << 20) {
-        v8x_errf(rt, "heap bytes budget exhausted");
-        return UINT32_MAX;
+        v8x_gc(rt); /* 生存分だけで再判定（上限は live bytes に対して適用） */
+        if ((u64)rt->heap_bytes + n > (u64)V8X_MAX_HEAP_MB << 20) {
+            v8x_errf(rt, "heap bytes budget exhausted");
+            return UINT32_MAX;
+        }
     }
     u32 idx = v8x_obj_new(rt);
     if (idx == UINT32_MAX) return UINT32_MAX;
@@ -527,7 +626,10 @@ static bool p_is_punct(P *p, u8 pk) { return p->lx.kind == TK_PUNCT && p->lx.pk 
 static bool p_is_kw(P *p, u8 kw) { return p->lx.kind == TK_KW && p->lx.pk == kw; }
 static bool p_eat_punct(P *p, u8 pk) {
     if (!p_is_punct(p, pk)) return false;
-    lex_next(&p->lx);
+    /* lex_next の失敗（未知文字等）を握り潰すと lx.kind が陳腐化して同じトークンを
+     * 食い続ける無限再帰になる（fuzz: "--." で p_unary が C スタック枯渇）。
+     * 必ず失敗を上流へ伝播させる。 */
+    if (lex_next(&p->lx) < 0) { p->fail = "lex error"; return true; }
     return true;
 }
 static bool p_expect_punct(P *p, u8 pk, const char *what) {
@@ -653,11 +755,24 @@ static u32 p_primary(P *p) {
 
 static u32 p_unary(P *p) {
     if (p->fail) return N_NONE;
-    if (p_eat_punct(p, P_BANG))  { u32 x = p_unary(p); u32 ni = x == N_NONE ? N_NONE : p_node(p, N_UNARY); if (ni != N_NONE) { p->nodes[ni].op = OP_NOT;  p->nodes[ni].a = x; } return ni; }
-    if (p_eat_punct(p, P_MINUS)) { u32 x = p_unary(p); u32 ni = x == N_NONE ? N_NONE : p_node(p, N_UNARY); if (ni != N_NONE) { p->nodes[ni].op = OP_NEG;  p->nodes[ni].a = x; } return ni; }
-    if (p_eat_punct(p, P_PLUS))  { u32 x = p_unary(p); u32 ni = x == N_NONE ? N_NONE : p_node(p, N_UNARY); if (ni != N_NONE) { p->nodes[ni].op = OP_POS;  p->nodes[ni].a = x; } return ni; }
-    if (p_is_kw(p, KW_TYPEOF))   { lex_next(&p->lx); u32 x = p_unary(p); u32 ni = x == N_NONE ? N_NONE : p_node(p, N_UNARY); if (ni != N_NONE) { p->nodes[ni].op = OP_TYPEOF; p->nodes[ni].a = x; } return ni; }
-    return p_primary(p);
+    /* 深さ会計必須: 単項演算子の連鎖（"-----x" 等）も C 再帰する。budget 節約で
+     * 省略するとトークン不全時の再帰競走と相まって宿主プロセスを殺す（fuzz 由来）。 */
+    if (++p->depth > V8X_PARSE_DEPTH) { p->depth--; p->fail = "parse depth exhausted"; return N_NONE; }
+    u8 uop = 0;
+    if (p_eat_punct(p, P_BANG)) uop = OP_NOT;
+    else if (p_eat_punct(p, P_MINUS)) uop = OP_NEG;
+    else if (p_eat_punct(p, P_PLUS)) uop = OP_POS;
+    else if (p_is_kw(p, KW_TYPEOF)) { if (lex_next(&p->lx) < 0) p->fail = "lex error"; uop = OP_TYPEOF; }
+    u32 ni;
+    if (!uop) ni = p_primary(p);
+    else if (p->fail) ni = N_NONE;
+    else {
+        u32 x = p_unary(p);
+        ni = x == N_NONE ? N_NONE : p_node(p, N_UNARY);
+        if (ni != N_NONE) { p->nodes[ni].op = uop; p->nodes[ni].a = x; }
+    }
+    p->depth--;
+    return ni;
 }
 
 static u32 p_bin_rhs(P *p, u8 mk_op, u32 (*next)(P *)) {
@@ -1031,9 +1146,38 @@ static i32 cg_local_add(Cg *cg, u32 name, u8 is_const) {
     return (i32)cg->n_locals++;
 }
 
+/* name(u32 intern id) → global slot の O(1) 検索（脱 Salt: name は攻撃者文字列ではなく
+ * エンジン内部の連番 intern id のため DoS 耐性問題なし。globals は append-only で、
+ * ベイク時点とのズレは n_globals 一致で検知して全再構築） */
+static bool ghash_build(V8xRT *rt) {
+    u32 need = 16;
+    while (need < rt->n_globals * 2 + 8) need <<= 1;
+    u32 *g = (u32 *)calloc(need, sizeof(u32));
+    if (!g) return false;
+    for (u32 i = 0; i < rt->n_globals; i++) {
+        u32 h = (rt->globals[i].name * 2654435761u) & (need - 1);
+        while (g[h]) h = (h + 1) & (need - 1);
+        g[h] = i + 1; /* 1-based。0 は空 */
+    }
+    free(rt->ghash);
+    rt->ghash = g; rt->ghash_cap = need; rt->ghash_sync = rt->n_globals;
+    return true;
+}
 static u32 cg_global_find(V8xRT *rt, u32 name) {
-    for (u32 i = 0; i < rt->n_globals; i++)
-        if (rt->globals[i].name == name) return i;
+    if (!rt->n_globals) return UINT32_MAX;
+    if (rt->ghash_sync != rt->n_globals) {
+        if (!ghash_build(rt)) {
+            for (u32 i = 0; i < rt->n_globals; i++) /* メモリ逼迫時のフォールバック */
+                if (rt->globals[i].name == name) return i;
+            return UINT32_MAX;
+        }
+    }
+    u32 h = (name * 2654435761u) & (rt->ghash_cap - 1);
+    while (rt->ghash[h]) {
+        u32 gi = rt->ghash[h] - 1;
+        if (rt->globals[gi].name == name) return gi;
+        h = (h + 1) & (rt->ghash_cap - 1);
+    }
     return UINT32_MAX;
 }
 static u32 cg_global_add(V8xRT *rt, u32 name, u8 is_const) {
@@ -1062,8 +1206,8 @@ static bool cg_store(Cg *cg, u32 name, u8 decl_const, bool decl) {
         V8xGlobal *g = &cg->rt->globals[gi];
         if (!decl && g->is_const) { v8x_errf(cg->rt, "assignment to const global"); cg->fail = true; return false; }
         (void)g;
-        cg_op(cg, OP_GSTORE);
-        cg_u32(cg, name);
+        cg_op(cg, OP_GSTORE_S); /* compile 時登録不変条件により name 解決不要 */
+        cg_u32(cg, gi);
         return !cg->fail;
     }
     i32 slot = decl ? cg_local_add(cg, name, decl_const) : cg_local_find(cg, name);
@@ -1071,8 +1215,8 @@ static bool cg_store(Cg *cg, u32 name, u8 decl_const, bool decl) {
         /* 未定義への代入はグローバル生成（非 strict 近似） */
         u32 gi = cg_global_add(cg->rt, name, 0);
         if (gi == UINT32_MAX) { cg->fail = true; return false; }
-        cg_op(cg, OP_GSTORE);
-        cg_u32(cg, name);
+        cg_op(cg, OP_GSTORE_S);
+        cg_u32(cg, gi);
         return true;
     }
     if (cg->fail) return false;
@@ -1090,6 +1234,13 @@ static bool cg_load(Cg *cg, u32 name) {
             return !cg->fail;
         }
     }
+    /* 名前が compile 時点で登録済みなら直結版。未登録は前方参照（実行時解決に倒す） */
+    u32 gi = cg_global_find(cg->rt, name);
+    if (gi != UINT32_MAX) {
+        cg_op(cg, OP_GLOAD_S);
+        cg_u32(cg, gi);
+        return !cg->fail;
+    }
     cg_op(cg, OP_GLOAD);
     cg_u32(cg, name);
     return !cg->fail;
@@ -1102,6 +1253,55 @@ static void cg_stmt(Cg *cg, u32 ni);
 static u32 cg_jmp_op(Cg *cg, u8 op) {
     cg_op(cg, op);
     return cg_u32(cg, 0);
+}
+
+/* 条件式の融合吐き: `local/global rel int定数` の形だけ CJMPF_L/G 1命令にし、
+ * それ以外は通常経路（expr + JMPF）。戻り値は分岐先 patch site（両経路で同一規約）。
+ * 意味保持の証明: 融合側も一般側も 'lhs rel rhs が偽なら tgt へ' のみ。スタック効果は
+ * 一般形が +1+1-1-1=0、融合形が 0 で一致。NaN 時 false も同一（VM コメント参照）。 */
+static u32 cg_cond_jmpf(Cg *cg, u32 ni) {
+    V8xNode *n = &cg->p->nodes[ni];
+    u8 cmp = 0xFF;
+    if (n->kind == N_BIN) {
+        if (n->op == OP_LT) cmp = 0;
+        else if (n->op == OP_LE) cmp = 1;
+        else if (n->op == OP_GT) cmp = 2;
+        else if (n->op == OP_GE) cmp = 3;
+    }
+    if (cmp != 0xFF && n->a != N_NONE && n->b != N_NONE) {
+        V8xNode *L = &cg->p->nodes[n->a], *R = &cg->p->nodes[n->b];
+        int var_side = (L->kind == N_IDENT && R->kind == N_NUM && R->op == 1) ? 0
+                     : (R->kind == N_IDENT && L->kind == N_NUM && L->op == 1) ? 1 : -1;
+        if (var_side >= 0) {
+            u32 name = var_side ? R->a : L->a;
+            u32 imm = var_side ? L->a : R->a;
+            /* var 右辺形はオペランド交換で cmp を反転（LT<->GT, LE<->GE） */
+            if (var_side) cmp = cmp == 0 ? 2 : cmp == 1 ? 3 : cmp == 2 ? 0 : 1;
+            if (cg->in_func_depth != 0) {
+                i32 slot = cg_local_find(cg, name);
+                if (slot >= 0) {
+                    cg_op(cg, OP_CJMPF_L);
+                    cg_u32(cg, (u32)slot);
+                    cg_u32(cg, imm);
+                    cg_op(cg, cmp);
+                    return cg_u32(cg, 0);
+                }
+            }
+            /* 前方参照（compile 時未登録）は汎用経路に倒す。登録済みなら slot 直結 */
+            u32 gi = cg_global_find(cg->rt, name);
+            if (gi == UINT32_MAX) {
+                cg_expr(cg, ni);
+                return cg_jmp_op(cg, OP_JMPF);
+            }
+            cg_op(cg, OP_CJMPF_G);
+            cg_u32(cg, gi);
+            cg_u32(cg, imm);
+            cg_op(cg, cmp);
+            return cg_u32(cg, 0);
+        }
+    }
+    cg_expr(cg, ni);
+    return cg_jmp_op(cg, OP_JMPF);
 }
 
 static void cg_expr(Cg *cg, u32 ni) {
@@ -1170,18 +1370,55 @@ static void cg_stmt(Cg *cg, u32 ni) {
         if (n->a == N_NONE) break; /* 空文 */
         for (u32 i = 0; i < n->c; i++) cg_stmt(cg, cg->p->list[n->a + i]);
         break;
-    case N_EXPRSTMT:
-        cg_expr(cg, n->a);
-        if (!cg->fail) cg_op(cg, OP_POPV);
+    case N_EXPRSTMT: {
+        /* 文脈限定の LINC 融合: `x = x + 定数int;` / `x = x - 定数int;` を 1 命令化する。
+         * 式文としての最終値破棄は VM 側が last_val を更新するので意味差なし。
+         * rhs の変数が左辺と同一スロットに解決されるときのみ（別名・グローバルは対象外）。 */
+        V8xNode *e = &cg->p->nodes[n->a];
+        bool fused = false;
+        if (e->kind == N_ASSIGN && e->b != N_NONE) {
+            V8xNode *rhs = &cg->p->nodes[e->b];
+            if (rhs->kind == N_BIN && (rhs->op == OP_ADD || rhs->op == OP_SUB) &&
+                rhs->a != N_NONE && rhs->b != N_NONE) {
+                V8xNode *L = &cg->p->nodes[rhs->a], *R = &cg->p->nodes[rhs->b];
+                if (L->kind == N_IDENT && L->a == e->a && R->kind == N_NUM && R->op == 1) {
+                    i64 dd = (i64)(i32)R->a;
+                    if (rhs->op == OP_SUB) dd = -dd;
+                    if (dd >= -2147483648ll && dd <= 2147483647ll) {
+                        i32 slot = cg->in_func_depth != 0 ? cg_local_find(cg, e->a) : -1;
+                        if (slot >= 0) {
+                            cg_op(cg, OP_LINC);
+                            cg_u32(cg, (u32)slot);
+                            cg_u32(cg, (u32)(i32)dd);
+                            fused = true;
+                        } else if (cg->in_func_depth == 0) {
+                            /* トップレベル: cg_global_add で登録が保証される直結 GINC。
+                             * const グローバルへの代入は融合しない（汎用経路で正しく例外化） */
+                            u32 gi = cg_global_find(cg->rt, e->a);
+                            if (gi != UINT32_MAX && !cg->rt->globals[gi].is_const) {
+                                cg_op(cg, OP_GINC);
+                                cg_u32(cg, gi);
+                                cg_u32(cg, (u32)(i32)dd);
+                                fused = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!fused) {
+            cg_expr(cg, n->a);
+            if (!cg->fail) cg_op(cg, OP_POPV);
+        }
         break;
+    }
     case N_VAR:
         if (n->b != N_NONE) cg_expr(cg, n->b);
         else cg_op(cg, OP_UNDEF_T);
         if (!cg->fail) cg_store(cg, n->a, n->flags, true);
         break;
     case N_IF: {
-        cg_expr(cg, n->a);
-        u32 s_else = cg_jmp_op(cg, OP_JMPF);
+        u32 s_else = cg_cond_jmpf(cg, n->a);
         cg_stmt(cg, n->b);
         if (n->c != N_NONE) {
             u32 s_end = cg_jmp_op(cg, OP_JMP);
@@ -1196,8 +1433,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
     case N_WHILE: {
         if (cg->n_loops >= 64) { v8x_errf(cg->rt, "loop nesting budget exhausted"); cg->fail = true; break; }
         u32 cond = cg_target_here(cg);
-        cg_expr(cg, n->a);
-        u32 s_end = cg_jmp_op(cg, OP_JMPF);
+        u32 s_end = cg_cond_jmpf(cg, n->a);
         u32 li = cg->n_loops++;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = cond;
         cg_stmt(cg, n->b);
@@ -1223,8 +1459,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
         u32 cond = cg_target_here(cg);
         u32 s_end = N_NONE;
         if (n->b != N_NONE) {
-            cg_expr(cg, n->b);
-            s_end = cg_jmp_op(cg, OP_JMPF);
+            s_end = cg_cond_jmpf(cg, n->b);
         }
         u32 li = cg->n_loops++;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE; /* step addr 後決め */
@@ -1398,6 +1633,9 @@ static bool v8x_verify(V8xRT *rt, u32 code_from) {
         case OP_CONST_D: imm_len = 8; break;
         case OP_JMP: case OP_JMPF: case OP_JMPT: imm_len = 4; break;
         case OP_CALL: imm_len = 1; break;
+        case OP_LINC: case OP_GINC: imm_len = 8; break;
+        case OP_CJMPF_L: case OP_CJMPF_G: imm_len = 13; break;
+        case OP_GLOAD_S: case OP_GSTORE_S: imm_len = 4; break;
         default: imm_len = 0; break;
         }
         if (pc + imm_len > len) { v8x_errf(rt, "verify: operand overrun at %u", pc - 1); goto done; }
@@ -1408,6 +1646,33 @@ static bool v8x_verify(V8xRT *rt, u32 code_from) {
             if (tgt >= len) { v8x_errf(rt, "verify: jump out of range %u", tgt); goto done; }
             if (n_jt) { } /* counting */
             jt[n_jt++] = tgt;
+        } else if (op == OP_CJMPF_L || op == OP_CJMPF_G) {
+            u32 tgt;
+            memcpy(&tgt, &rt->code[pc + 9], 4);
+            if (tgt >= len) { v8x_errf(rt, "verify: jump out of range %u", tgt); goto done; }
+            jt[n_jt++] = tgt;
+            if (op == OP_CJMPF_L) {
+                u32 slot;
+                memcpy(&slot, &rt->code[pc], 4);
+                if (slot >= rt->funcs[cur].n_locals) {
+                    v8x_errf(rt, "verify: local slot %u >= %u", slot, rt->funcs[cur].n_locals);
+                    goto done;
+                }
+            }
+        } else if (op == OP_LINC) {
+            u32 slot;
+            memcpy(&slot, &rt->code[pc], 4);
+            if (slot >= rt->funcs[cur].n_locals) {
+                v8x_errf(rt, "verify: local slot %u >= %u", slot, rt->funcs[cur].n_locals);
+                goto done;
+            }
+        } else if (op == OP_GLOAD_S || op == OP_GSTORE_S || op == OP_GINC) {
+            u32 slot;
+            memcpy(&slot, &rt->code[pc], 4);
+            if (slot >= rt->n_globals) {
+                v8x_errf(rt, "verify: global slot %u >= %u", slot, rt->n_globals);
+                goto done;
+            }
         } else if (op == OP_LLOAD || op == OP_LSTORE) {
             u32 slot;
             memcpy(&slot, &rt->code[pc], 4);
@@ -1594,6 +1859,69 @@ static bool v8x_loose_eq(V8xRT *rt, V8xVal a, V8xVal b) {
     return false;
 }
 
+/* `+` 演算の完全実装（int fast path / 文字列連結 / 数値加算）。
+ * ADD 命令と LINC 非 int フォールバックで共有するため分離。
+ * sp は GC ルート深さ（文字列経路のみ使用）。失敗時 false（rt->err 設定済み）。 */
+static bool v8x_bin_add(V8xRT *rt, V8xVal va, V8xVal vb, u32 sp, V8xVal *out) {
+    if (v8x_is_intv(va) && v8x_is_intv(vb)) {
+        i64 r = (i64)v8x_get_int(va) + (i64)v8x_get_int(vb);
+        if (r >= -2147483648ll && r <= 2147483647ll) { *out = V8X_MK_INT((i32)r); return true; }
+        *out = v8x_num((double)r);
+        return true;
+    }
+    bool sa = v8x_is_objv(va) && rt->objs[v8x_get_obj(va)].kind == V8X_OK_STR;
+    bool sb = v8x_is_objv(vb) && rt->objs[v8x_get_obj(vb)].kind == V8X_OK_STR;
+    if (sa || sb) {
+        rt->gc_sp = sp; /* GC 発火点: ルート深さを同期 */
+        u32 nur0 = rt->n_nury;
+        u32 ia = v8x_to_string(rt, va);
+        if (ia == UINT32_MAX) return false;
+        if (rt->n_nury < 4) rt->nury[rt->n_nury++] = ia; /* ib 変換の GC から ia を守る */
+        u32 ib = v8x_to_string(rt, vb);
+        if (ib == UINT32_MAX) { rt->n_nury = nur0; return false; }
+        /* ib も obj_new 前に root 化: obj_new 内の適応 GC は pa/pb の根拠を殺し得る
+         * （ASan 実検出: memcpy 時点の heap-use-after-free）。順序は here-document で固定。 */
+        if (ib >= rt->pin_mark && rt->n_nury < 4) rt->nury[rt->n_nury++] = ib;
+        u32 la, lb;
+        const u8 *pa = v8x_str(rt, ia, &la), *pb = v8x_str(rt, ib, &lb);
+        if ((u64)la + lb > (u64)rt->heap_mb << 20) { rt->n_nury = nur0; v8x_errf(rt, "heap bytes budget exhausted"); return false; }
+        /* 中間バッファなし: obj を先に確保して bytes に直接書き込む（1 alloc/concat） */
+        u32 ic = v8x_obj_new(rt);
+        if (ic == UINT32_MAX) { rt->n_nury = nur0; return false; }
+        u8 *cat = (u8 *)malloc((u64)la + lb + 1);
+        if (!cat) {
+            obj_free_rollback(rt, ic); /* append/再利用を種別に応じて巻き戻す */
+            rt->n_nury = nur0;
+            v8x_errf(rt, "oom: concat");
+            return false;
+        }
+        memcpy(cat, pa, la);
+        memcpy(cat + la, pb, lb);
+        /* heap 上限は live bytes で裁く（mkstr と同一規則）。
+         * GC は memcpy 後・co 投入前のこの順序が安全: cat は独立所有、ic は kind==0 で
+         * スイープに拾われない、to_string 一時 obj は消費済みなので回収されて良い。 */
+        if (rt->heap_bytes + (u64)la + lb > rt->gc_next) v8x_gc(rt);
+        if (rt->heap_bytes + (u64)la + lb > (u64)rt->heap_mb << 20) {
+            v8x_gc(rt);
+            if (rt->heap_bytes + (u64)la + lb > (u64)rt->heap_mb << 20) {
+                obj_free_rollback(rt, ic);
+                free(cat);
+                rt->n_nury = nur0;
+                v8x_errf(rt, "heap bytes budget exhausted");
+                return false;
+            }
+        }
+        V8xObj *co = &rt->objs[ic];
+        co->kind = V8X_OK_STR; co->len = la + lb; co->bytes = cat;
+        rt->heap_bytes += (u64)la + lb;
+        rt->n_nury = nur0;
+        *out = V8X_MK_OBJ(ic);
+        return true;
+    }
+    *out = v8x_num(v8x_canon(v8x_to_number(rt, va) + v8x_to_number(rt, vb)));
+    return true;
+}
+
 /* ============================== VM ============================== */
 
 typedef struct { u32 ret_off; u32 base; u32 func; } V8xFrame;
@@ -1663,6 +1991,8 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
         [OP_GLOAD] = &&l_GLOAD, [OP_GSTORE] = &&l_GSTORE,
         [OP_JMP] = &&l_JMP, [OP_JMPF] = &&l_JMPF, [OP_JMPT] = &&l_JMPT,
         [OP_CALL] = &&l_CALL, [OP_RET] = &&l_RET, [OP_MAKEF] = &&l_MAKEF,
+        [OP_LINC] = &&l_LINC, [OP_CJMPF_L] = &&l_CJMPF_L, [OP_CJMPF_G] = &&l_CJMPF_G,
+        [OP_GLOAD_S] = &&l_GLOAD_S, [OP_GSTORE_S] = &&l_GSTORE_S, [OP_GINC] = &&l_GINC,
         [OP_HALT] = &&l_HALT,
     };
 #define V8X_NEXT() do { if (dead) { free(frames); return false; } V8X_BUDGET(); goto *v8x_jt[*pc++]; } while (0)
@@ -1701,35 +2031,33 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
 
     V8X_L(ADD): {
         V8xVal vb = V8X_POP(), va = V8X_POP();
+        V8xVal out;
+        if (!v8x_bin_add(rt, va, vb, sp, &out)) { free(frames); return false; }
+        V8X_PUSH(out);
+        V8X_NEXT();
+    }
+    V8X_L(SUB): {
+        V8xVal vb = V8X_POP(), va = V8X_POP();
         if (v8x_is_intv(va) && v8x_is_intv(vb)) {
-            i64 r = (i64)v8x_get_int(va) + (i64)v8x_get_int(vb);
+            i64 r = (i64)v8x_get_int(va) - (i64)v8x_get_int(vb);
             if (r >= -2147483648ll && r <= 2147483647ll) { V8X_PUSH(V8X_MK_INT((i32)r)); V8X_NEXT(); }
             V8X_PUSH(v8x_num((double)r));
             V8X_NEXT();
         }
-        bool sa = v8x_is_objv(va) && rt->objs[v8x_get_obj(va)].kind == V8X_OK_STR;
-        bool sb = v8x_is_objv(vb) && rt->objs[v8x_get_obj(vb)].kind == V8X_OK_STR;
-        if (sa || sb) {
-            u32 ia = v8x_to_string(rt, va), ib = v8x_to_string(rt, vb);
-            if (ia == UINT32_MAX || ib == UINT32_MAX) { free(frames); return false; }
-            u32 la, lb;
-            const u8 *pa = v8x_str(rt, ia, &la), *pb = v8x_str(rt, ib, &lb);
-            if ((u64)la + lb > (u64)rt->heap_mb << 20) { v8x_errf(rt, "heap bytes budget exhausted"); free(frames); return false; }
-            u8 *cat = (u8 *)malloc((u64)la + lb + 1);
-            if (!cat) { v8x_errf(rt, "oom: concat"); free(frames); return false; }
-            memcpy(cat, pa, la);
-            memcpy(cat + la, pb, lb);
-            u32 ic = v8x_mkstr(rt, cat, la + lb);
-            free(cat);
-            if (ic == UINT32_MAX) { free(frames); return false; }
-            V8X_PUSH(V8X_MK_OBJ(ic));
-            V8X_NEXT();
-        }
-        V8X_PUSH(v8x_num(v8x_canon(v8x_to_number(rt, va) + v8x_to_number(rt, vb))));
+        V8X_PUSH(v8x_num(v8x_canon(v8x_to_number(rt, va) - v8x_to_number(rt, vb))));
         V8X_NEXT();
     }
-    V8X_L(SUB): { V8X_BINOP_NUM(da_ - db_); V8X_NEXT(); }
-    V8X_L(MUL): { V8X_BINOP_NUM(da_ * db_); V8X_NEXT(); }
+    V8X_L(MUL): {
+        V8xVal vb = V8X_POP(), va = V8X_POP();
+        if (v8x_is_intv(va) && v8x_is_intv(vb)) {
+            i64 r = (i64)v8x_get_int(va) * (i64)v8x_get_int(vb);
+            if (r >= -2147483648ll && r <= 2147483647ll) { V8X_PUSH(V8X_MK_INT((i32)r)); V8X_NEXT(); }
+            V8X_PUSH(v8x_num((double)r));
+            V8X_NEXT();
+        }
+        V8X_PUSH(v8x_num(v8x_canon(v8x_to_number(rt, va) * v8x_to_number(rt, vb))));
+        V8X_NEXT();
+    }
     V8X_L(DIV): { V8X_BINOP_NUM(da_ / db_); V8X_NEXT(); }
     V8X_L(MOD): {
         V8xVal vb = V8X_POP(), va = V8X_POP();
@@ -1742,8 +2070,13 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
         V8X_NEXT();
     }
     /* 比較 4 命令は独立本体（dispatch 両モードで壊れないマクロ展開。文字列辞書式は両辺 string のみ） */
-#define V8X_REL(NUMCMP, STRCMP) { \
+#define V8X_REL(NUMCMP, STRCMP, INTCMP) { \
         V8xVal rb_ = V8X_POP(), ra_ = V8X_POP(); \
+        if (v8x_is_intv(ra_) && v8x_is_intv(rb_)) { \
+            i32 ia_ = v8x_get_int(ra_), ib_ = v8x_get_int(rb_); \
+            V8X_PUSH((INTCMP) ? V8X_VAL_TRUE : V8X_VAL_FALSE); \
+            V8X_NEXT(); \
+        } \
         bool sa_ = v8x_is_objv(ra_) && rt->objs[v8x_get_obj(ra_)].kind == V8X_OK_STR; \
         bool sb_ = v8x_is_objv(rb_) && rt->objs[v8x_get_obj(rb_)].kind == V8X_OK_STR; \
         if (sa_ && sb_) { \
@@ -1758,10 +2091,10 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
             V8X_PUSH(r_ ? V8X_VAL_TRUE : V8X_VAL_FALSE); \
         } \
         V8X_NEXT(); }
-    V8X_L(LT): { V8X_REL(da_ <  db_, cmp_ <  0); }
-    V8X_L(LE): { V8X_REL(da_ <= db_, cmp_ <= 0); }
-    V8X_L(GT): { V8X_REL(da_ >  db_, cmp_ >  0); }
-    V8X_L(GE): { V8X_REL(da_ >= db_, cmp_ >= 0); }
+    V8X_L(LT): { V8X_REL(da_ <  db_, cmp_ <  0, ia_ <  ib_); }
+    V8X_L(LE): { V8X_REL(da_ <= db_, cmp_ <= 0, ia_ <= ib_); }
+    V8X_L(GT): { V8X_REL(da_ >  db_, cmp_ >  0, ia_ >  ib_); }
+    V8X_L(GE): { V8X_REL(da_ >= db_, cmp_ >= 0, ia_ >= ib_); }
 #undef V8X_REL
     V8X_L(EQ):  { V8xVal vb = V8X_POP(), va = V8X_POP(); V8X_PUSH(v8x_loose_eq(rt, va, vb) ? V8X_VAL_TRUE : V8X_VAL_FALSE);  V8X_NEXT(); }
     V8X_L(NE):  { V8xVal vb = V8X_POP(), va = V8X_POP(); V8X_PUSH(!v8x_loose_eq(rt, va, vb) ? V8X_VAL_TRUE : V8X_VAL_FALSE); V8X_NEXT(); }
@@ -1789,6 +2122,7 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
         else if (v8x_numv(v, &d)) s = "number";
         else if (v8x_is_objv(v)) s = rt->objs[v8x_get_obj(v)].kind == V8X_OK_STR ? "string" : "function";
         else s = "undefined";
+        rt->gc_sp = sp; /* mkstr の GC 発火に備えてルート深さを同期 */
         u32 idx = v8x_mkstr(rt, (const u8 *)s, (u32)strlen(s));
         if (idx == UINT32_MAX) { free(frames); return false; }
         V8X_PUSH(V8X_MK_OBJ(idx));
@@ -1903,12 +2237,109 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
     V8X_L(MAKEF): {
         u32 fidx;
         memcpy(&fidx, pc, 4); pc += 4;
+        rt->gc_sp = sp; /* obj_new の GC 発火に備えてルート深さを同期 */
         u32 oi = v8x_obj_new(rt);
         if (oi == UINT32_MAX) { free(frames); return false; }
         V8xObj *o = &rt->objs[oi];
         o->kind = V8X_OK_FUNC;
         o->code_off = fidx; /* FUNC obj の code_off は「func 表 index」を指す（名前の再利用） */
         V8X_PUSH(V8X_MK_OBJ(oi));
+        V8X_NEXT();
+    }
+    V8X_L(LINC): {
+        u32 slot;
+        memcpy(&slot, pc, 4); pc += 4;
+        i32 d;
+        memcpy(&d, pc, 4); pc += 4;
+        if (base + slot >= sp) { v8x_errf(rt, "local OOB write"); free(frames); return false; }
+        V8xVal lv = stk[base + slot];
+        V8xVal nv;
+        if (v8x_is_intv(lv)) {
+            i64 r = (i64)v8x_get_int(lv) + (i64)d;
+            if (r >= -2147483648ll && r <= 2147483647ll) nv = V8X_MK_INT((i32)r);
+            else nv = v8x_num((double)r);
+        } else {
+            /* x = x + d の汎用経路（文字列連結を含む。オペランド順序は左=x, 右=d で保持） */
+            if (!v8x_bin_add(rt, lv, V8X_MK_INT(d), sp, &nv)) { free(frames); return false; }
+        }
+        stk[base + slot] = nv;
+        rt->last_val = nv; /* 式文の POPV と同義（N_EXPRSTMT 融合との整合） */
+        V8X_NEXT();
+    }
+    V8X_L(GLOAD_S): {
+        u32 gi;
+        memcpy(&gi, pc, 4); pc += 4;
+        if (gi >= rt->n_globals) { v8x_errf(rt, "internal: global slot OOB"); free(frames); return false; }
+        V8X_PUSH(rt->globals[gi].v);
+        V8X_NEXT();
+    }
+    V8X_L(GSTORE_S): {
+        u32 gi;
+        memcpy(&gi, pc, 4); pc += 4;
+        if (gi >= rt->n_globals) { v8x_errf(rt, "internal: global slot OOB"); free(frames); return false; }
+        rt->globals[gi].v = V8X_POP();
+        V8X_NEXT();
+    }
+    V8X_L(GINC): {
+        u32 gi;
+        memcpy(&gi, pc, 4); pc += 4;
+        i32 d;
+        memcpy(&d, pc, 4); pc += 4;
+        if (gi >= rt->n_globals) { v8x_errf(rt, "internal: global slot OOB"); free(frames); return false; }
+        V8xVal lv = rt->globals[gi].v;
+        V8xVal nv;
+        if (v8x_is_intv(lv)) {
+            i64 r = (i64)v8x_get_int(lv) + (i64)d;
+            if (r >= -2147483648ll && r <= 2147483647ll) nv = V8X_MK_INT((i32)r);
+            else nv = v8x_num((double)r);
+        } else {
+            if (!v8x_bin_add(rt, lv, V8X_MK_INT(d), sp, &nv)) { free(frames); return false; }
+        }
+        rt->globals[gi].v = nv;
+        rt->last_val = nv;
+        V8X_NEXT();
+    }
+    V8X_L(CJMPF_L): {
+        u32 slot;
+        memcpy(&slot, pc, 4); pc += 4;
+        i32 imm;
+        memcpy(&imm, pc, 4); pc += 4;
+        u8 cmp = *pc++;
+        u32 tgt;
+        memcpy(&tgt, pc, 4); pc += 4;
+        if (base + slot >= sp) { v8x_errf(rt, "local OOB read"); free(frames); return false; }
+        V8xVal lv = stk[base + slot];
+        bool r;
+        if (v8x_is_intv(lv)) {
+            i32 il = v8x_get_int(lv);
+            r = cmp == 0 ? il < imm : cmp == 1 ? il <= imm : cmp == 2 ? il > imm : il >= imm;
+        } else {
+            /* 文字列×数値は数値化（汎用 LT と同一経路。"5" < 10 等を保持）。NaN なら false */
+            double dl = v8x_to_number(rt, lv), dm = (double)imm;
+            r = !isnan(dl) && (cmp == 0 ? dl < dm : cmp == 1 ? dl <= dm : cmp == 2 ? dl > dm : dl >= dm);
+        }
+        if (!r) pc = code + tgt;
+        V8X_NEXT();
+    }
+    V8X_L(CJMPF_G): {
+        u32 gi; /* 事前解決スロット（verifier が n_globals 未満を保証） */
+        memcpy(&gi, pc, 4); pc += 4;
+        i32 imm;
+        memcpy(&imm, pc, 4); pc += 4;
+        u8 cmp = *pc++;
+        u32 tgt;
+        memcpy(&tgt, pc, 4); pc += 4;
+        if (gi >= rt->n_globals) { v8x_errf(rt, "internal: global slot OOB"); free(frames); return false; }
+        V8xVal lv = rt->globals[gi].v;
+        bool r;
+        if (v8x_is_intv(lv)) {
+            i32 il = v8x_get_int(lv);
+            r = cmp == 0 ? il < imm : cmp == 1 ? il <= imm : cmp == 2 ? il > imm : il >= imm;
+        } else {
+            double dl = v8x_to_number(rt, lv), dm = (double)imm;
+            r = !isnan(dl) && (cmp == 0 ? dl < dm : cmp == 1 ? dl <= dm : cmp == 2 ? dl > dm : dl >= dm);
+        }
+        if (!r) pc = code + tgt;
         V8X_NEXT();
     }
     V8X_L(HALT): {
@@ -1934,13 +2365,15 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
 V8xRT *v8x_new(void) {
     V8xRT *rt = (V8xRT *)calloc(1, sizeof(V8xRT));
     if (!rt) return NULL;
+    rt->gc_next = 512u << 10;
+    rt->gc_next_objs = 4096;
+    rt->heap_mb = V8X_MAX_HEAP_MB;
+    rt->max_objs = V8X_MAX_OBJECTS;
     rt->stk = (V8xVal *)malloc((u64)V8X_STK_INIT * sizeof(V8xVal));
     if (!rt->stk) { free(rt); return NULL; }
     rt->cap_stk = V8X_STK_INIT;
     if (rt->cap_stk > V8X_STK_MAX) rt->cap_stk = V8X_STK_MAX;
     rt->insn_budget_def = 10000000;
-    rt->heap_mb = V8X_MAX_HEAP_MB;
-    rt->max_objs = V8X_MAX_OBJECTS;
     rt->last_val = V8X_VAL_UNDEF;
     /* main 関数エントリ（entry 0。code 範囲は eval ごとの末尾まで） */
     if (v8x_obj_new(rt) == UINT32_MAX) { free(rt->stk); free(rt); return NULL; }
@@ -1966,6 +2399,8 @@ void v8x_free(V8xRT *rt) {
     for (u32 i = 0; i < rt->n_objs; i++)
         if (rt->objs[i].kind == V8X_OK_STR) free(rt->objs[i].bytes);
     free(rt->objs);
+    free(rt->free_objs);
+    free(rt->ghash);
     free(rt->code);
     free(rt->funcs);
     free(rt->globals);
@@ -2057,7 +2492,12 @@ bool v8x_eval(V8xRT *rt, const char *src, V8xVal *out) {
 
     if (!v8x_verify(rt, f0->code_off)) return false;
 
-    if (!vm_exec(rt, main_idx)) return false;
+    rt->pin_mark = rt->n_objs; /* コンパイル由来はスイープ対象外。実行時生成物のみ集める */
+    rt->gc_live = true;        /* GC は VM ルートが生きている実行中に限る */
+    bool vm_ok = vm_exec(rt, main_idx);
+    rt->gc_live = false;
+    rt->gc_sp = 0;
+    if (!vm_ok) return false;
 
     if (out) *out = rt->last_val;
     return true;

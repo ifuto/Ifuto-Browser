@@ -6,3 +6,5 @@ core
 core.*
 bench/*.html
 __pycache__/
+bench/results/
+artifacts/

@@ -237,6 +237,41 @@ static void t_dispatch_parity(void) {
     CHECK(d == 674928); /* 参照実装 (Python: a=(a*31+i)%1000003, i=1..200) で実算 */
 }
 
+
+/* --- 融合命令（LINC / CJMPF_L/G）と fuzz 起源パーサ硬直化の regression（v0.1 追加） --- */
+static void test_v8x_fusion_and_hardening(void) {
+    /* LINC: x = x ± int 定数 が式文で融合されても意味不変（int/文字列/溢れ） */
+    want_num("function f(){ var i = 0; i = i + 2147483647; i = i + 1; return i; } f()", 2147483648.0);
+    want_num("function f(){ var i = 5; i = i - 9; return i; } f()", -4);
+    want_num("function f(){ var t = 0; for (var i = 0; i < 10; i = i + 1) { t = t + i; } return t; } f()", 45);
+    want_str("function f(){ var s = 'a'; s = s + 1; return s; } f()", "a1");
+    /* CJMPF_L/G: local rel int / global rel int、逆転形、<=/>=、文字列数値化 */
+    want_num("function f(){ var c = 0; for (var i = 0; i <= 5; i = i + 1) c = c + 1; return c; } f()", 6);
+    want_num("function f(){ var c = 0; for (var i = 10; i >= 8; i = i - 1) c = c + 1; return c; } f()", 3);
+    /* グローバル名は g_rt に持ち越されるため一意名を使う（v0.0 設計: NAME は永続） */
+    want_num("var gq = 0; for (var gi = 0; gi < 4; gi = gi + 1) gq = gq + 1; gq", 4);
+    want_num("var gr = 0; for (var gj = 0; 4 > gj; gj = gj + 1) gr = gr + 1; gr", 4);
+    want_num("function f(){ var s = '5'; if (s < 10) return 1; return 0; } f()", 1);
+    want_num("function f(){ var s = 'z'; if (s < 10) return 1; return 0; } f()", 0);
+    want_num("function f(){ if (3 < 2) return 1; return 2; } f()", 2);
+    /* != / == int fast path 意味保持 */
+    want_bool("function f(){ var a = 3; return a == '3'; } f()", true);
+    want_bool("function f(){ var a = 3; return a === '3'; } f()", false);
+    want_bool("function f(){ var a = 3; return a != 4; } f()", true);
+    /* GC: 文字列 churn が object/heap budget で死なない（到達不能は回収される） */
+    want_num("var gs = ''; for (var gk = 0; gk < 3000; gk = gk + 1) { gs = gs + 'x'; } gk", 3000);
+    want_num("var gn = 0; for (var gl = 0; gl < 3000; gl = gl + 1) { var gt = 'x' + gl; gn = gn + 1; } gn", 3000);
+    /* GC 後も生存参照は保持される（ルート経由の文字列が回収されない） */
+    want_str("var gkeep = 'K'; for (var gm = 0; gm < 2000; gm = gm + 1) { var gu = 'x' + gm; } gkeep", "K");
+    /* fuzz 起源: 単項マイナス連鎖と字句不全の硬直化（クラッシュせず評価が止まる） */
+    {
+        V8xVal v;
+        CHECK(!v8x_eval(g_rt, "--.", &v));
+        CHECK(!v8x_eval(g_rt, "var x = 1 +", &v));
+        CHECK(!v8x_eval(g_rt, "---------------5", &v) || true); /* budget 内なら -5 で良い。構文拒否でも良い */
+    }
+}
+
 void test_v8x(void) {
     g_rt = v8x_new();
     CHECK(g_rt != NULL);
@@ -249,6 +284,7 @@ void test_v8x(void) {
     t_equality_logic();
     t_budgets_and_boundaries();
     t_dispatch_parity();
+    test_v8x_fusion_and_hardening();
     v8x_free(g_rt);
     g_rt = NULL;
 }

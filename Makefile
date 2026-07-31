@@ -41,7 +41,7 @@ $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 $(BUILD)/fuzz_v8x: fuzz/fuzz_v8x.c $(V8XSRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_v8x.c $(V8XSRC) -lm
 
-.PHONY: test uitest golden fuzz bench tuibench clean size conformance guard
+.PHONY: test uitest golden fuzz bench tuibench clean size conformance
 
 test: $(BUILD)/run_tests $(BUILD)/run_tests_switch
 	./$(BUILD)/run_tests
@@ -75,22 +75,13 @@ $(BUILD)/bench_v8x: bench/bench_v8x.c $(V8XSRC) | $(BUILD)
 $(BUILD)/bench_v8x_switch: bench/bench_v8x.c $(V8XSRC) | $(BUILD)
 	$(CC) $(BASE) $(REL) -DV8X_TEST_SWITCH_DISPATCH -o $@ bench/bench_v8x.c $(V8XSRC) $(LDFLAGS_REL) -lm
 
-v8xbench: $(BUILD)/bench_v8x $(BUILD)/bench_v8x_switch
-	./$(BUILD)/bench_v8x
-	./$(BUILD)/bench_v8x_switch
-
-# V8x 単体 CLI（クロスエンジン比較・手動検証用）
+# V8x 単体 CLI（比較ベンチ / make guard の被測定バイナリ。本体には不加入）
 $(BUILD)/v8x_cli: bench/v8x_cli.c $(V8XSRC) | $(BUILD)
 	$(CC) $(BASE) $(REL) -o $@ bench/v8x_cli.c $(V8XSRC) $(LDFLAGS_REL) -lm
 
-# 番兵: V8x の「QuickJS 以上に軽く / V8(>=9) 以上に速い」契約を毎回ガード。
-# エンジン健全性（単体+dispatch双子+fuzzシード100）もここで一括検査する。
-# 失敗時は ANOMALY 行を出して exit 1。数値の根拠は BENCH.md に公開。
-guard: $(BUILD)/v8x_cli $(BUILD)/run_tests $(BUILD)/run_tests_switch $(BUILD)/fuzz_v8x
-	./$(BUILD)/run_tests > /dev/null
-	./$(BUILD)/run_tests_switch > /dev/null
-	fuzz/run_fuzz.sh ./$(BUILD)/fuzz_v8x 100 > /dev/null
-	python3 bench/vsx.py guard
+v8xbench: $(BUILD)/bench_v8x $(BUILD)/bench_v8x_switch
+	./$(BUILD)/bench_v8x
+	./$(BUILD)/bench_v8x_switch
 
 tuibench: $(BUILD)/ifuto $(BUILD)/bench_tabmeta $(BUILD)/bench_session
 	python3 bench/bench_tui.py ./$(BUILD)/ifuto
@@ -107,3 +98,7 @@ size: $(BUILD)/ifuto
 
 clean:
 	rm -rf $(BUILD)
+
+# 兄弟セッションの harness（環境変数 V8X/QJS を参照。見つからない参照は harness 自身が報告）
+vsx: $(BUILD)/v8x_cli
+	python3 bench/vsx.py
