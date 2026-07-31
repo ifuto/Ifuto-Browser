@@ -272,6 +272,65 @@ static void test_v8x_fusion_and_hardening(void) {
     }
 }
 
+/* phase 2/3: ROPE 連結・融合命令・for 回転の回帰。全て node/qjs 地上値と照合済みの数を使い、
+ * グローバル名は rp_/ci_ 接頭で一意化する（v0.0 設計: グローバルは rt 内永続）。 */
+static void test_v8x_rope_and_superinst(void) {
+    /* ROPE: 蓄積連結→等値・型・関係比較・alias・truthy */
+    want_bool("var rpa=''; for (var rpi=0; rpi<20000; rpi=rpi+1) { rpa=rpa+'x'; } rpa===rpa", true);
+    want_bool("var rpb=''; var rpc=''; for (var rpj=0; rpj<20000; rpj=rpj+1) { rpb=rpb+'x'; rpc=rpc+'x'; } rpb===rpc", true);
+    want_bool("var rpd=''; var rpe=''; for (var rpk=0; rpk<20000; rpk=rpk+1) { rpd=rpd+'x'; rpe=rpe+'x'; } rpe=rpe+'y'; rpd===rpe", false);
+    want_bool("var rpt=''; for (var rpl=0; rpl<5000; rpl=rpl+1) { rpt=rpt+'x'; } var rpu=rpt; rpt=rpt+'y'; rpu===rpt", false);
+    want_bool("var rpf=''; for (var rpm=0; rpm<20000; rpm=rpm+1) { rpf=rpf+'x'; } rpf<'y'", true);
+    want_bool("var rpg=''; for (var rpn=0; rpn<300; rpn=rpn+1) { rpg=rpg+'ab'; } typeof rpg === 'string'", true);
+    /* ROPE とリテラルの等値（len 不一致は flatten せず即 false。等長は flatten 一致） */
+    want_bool("var rph=''; for (var rpo=0; rpo<5; rpo=rpo+1) { rph=rph+'12345678901234'; } rph==='1234567890123412345678901234123456789012341234567890123412345678901234'", true);
+    /* *CI 系: 文字列化する ADD は imm 右辺の連結（順序保持） */
+    want_str("var cia='q'; cia + 1", "q1");
+    want_str("var cib='q'; cib = cib + 1; cib", "q1");
+    want_str("'a' + 1", "a1");
+    want_str("1 + 'a'", "1a");
+    /* GMULC/LMULC/*CI int fast・溢れ・左定数 MUL（交換の丸め一致） */
+    want_num("var cic=6; cic*3", 18);
+    want_num("var cid=6; 3*cid", 18);
+    want_num("var cie=5; (2+3)*4 + cie", 25);
+    want_num("var cif=2147483647; cif+1", 2147483648.0);
+    want_num("function f(){ var cli=6; return cli*3; } f()", 18);
+    want_num("function f(){ var clj=17; return clj%5; } f()", 2);
+    want_num("var cig= -2147483648 + 0; cig% -1", 0);
+    want_num("var cih= -17; cih%5", -2);
+    /* CJMPF_MOD: ==/!=、負の被除数、MOD 0 除算（NaN→else） */
+    want_num("var cii=0; for (var cik=0; cik<10; cik=cik+1) { if (cik%3==0) { cii=cii+1; } } cii", 4);
+    want_num("var cij=0; for (var cil=-10; cil<0; cil=cil+1) { if (cil%3==0) { cij=cij+1; } } cij", 3);
+    want_num("var cim=0; for (var cin=0; cin<10; cin=cin+1) { if (cin%3!=0) { cim=cim+1; } } cim", 6);
+    want_num("function f(){ var cl=0; for (var i=0; i<9; i=i+1) { if (i%4==0) { cl=cl+1; } } return cl; } f()", 3);
+    /* GADD_G / GADD_P: int・文字列連結のオペランド順序 */
+    want_num("var cip=1; var ciq=2; cip = cip + ciq; cip", 3);
+    want_str("var cir='x'; var cis=1; cir = cir + cis; cir", "x1");
+    want_str("var cit='x'; cit + 'y'", "xy");
+    /* 文レベル代入の completion 値（JS 仕様: var 文は空 completion で上書きしない） */
+    want_num("var ciu=0; ciu=42;", 42);
+    want_num("var civ=0; civ=42; var ciw=1;", 42);
+    /* *CI-st 再融合（グローバル/ローカル × 文字列/数値） */
+    want_num("var cix=0; for (var ciz=0; ciz<1000; ciz=ciz+1) { cix=(cix+ciz*3+1)%1000003; } cix", 499497);
+    want_str("var cja='a'; cja = cja + 1; cja", "a1");
+    want_num("function f(){ var ll=10; ll = ll*3; ll = (ll+5)%7; return ll; } f()", 0);
+    /* GX/LX（dst = expr op slot 3 アドレス融合）: 値・文字列順序・fmod フォールバック */
+    want_num("var gxa=0; var gxm=100000; for (var gxi=0; gxi<100000; gxi=gxi+1) { gxa = (gxa + gxi*3 + 1) % gxm; } gxa", 50000);
+    want_str("var gxb='a'; var gxc='b'; gxb = gxb + gxc; gxb", "ab");
+    want_num("var gxd=-17; var gxe=5; gxd = gxd % gxe; gxd", -2);
+    want_num("function f(){ var la=2; var lb=3; la = la * lb; lb = lb - la; return lb; } f()", -3);
+    want_str("function f(){ var lc='q'; var ld=4; lc = lc + ld; return lc; } f()", "q4");
+    /* CJMPF_MULGG/MODGG: 試行除法形（負数・文字列化・溢れの回帰込み） */
+    want_num("var gpf=0; for (var gpn=2; gpn<200; gpn=gpn+1) { var gpp=1; var gpd=2; while (gpd*gpd<=gpn) { if (gpn%gpd==0) { gpp=0; break; } gpd=gpd+1; } if (gpp) { gpf=gpf+1; } } gpf", 46);
+    /* LOOPINC 回転: break/continue/逆方向/非整数カウンタ/式初期化 */
+    want_num("var roa=0; for (var roi=0; roi<100; roi=roi+1) { if (roi==5) break; roa=roa+1; } roa", 5);
+    want_num("var rob=0; for (var roj=0; roj<10; roj=roj+1) { if (roj%2==0) { continue; } rob=rob+1; } rob", 5);
+    want_num("var roc=0; for (var rok=1999; rok>0; rok=rok-1) { roc=roc+rok; } roc", 1999000);
+    want_num("for (roq=0; roq<5; roq=roq+1) { } roq", 5); /* 非 var 初期化（pre-existing gap の回帰。roq は事前宣言なしで作られる） */
+    want_num("var rod=0; for (var rol=0.5; rol<4; rol=rol+1) { rod=rod+1; } rod", 4);
+    /* IIFE 未対応は仕様外機能なのでテストしない（parser 近似の既定） */
+}
+
 void test_v8x(void) {
     g_rt = v8x_new();
     CHECK(g_rt != NULL);
@@ -285,6 +344,7 @@ void test_v8x(void) {
     t_budgets_and_boundaries();
     t_dispatch_parity();
     test_v8x_fusion_and_hardening();
+    test_v8x_rope_and_superinst();
     v8x_free(g_rt);
     g_rt = NULL;
 }

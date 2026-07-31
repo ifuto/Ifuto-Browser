@@ -1,6 +1,68 @@
 # BENCH.md — Ifuto 計測ベースライン
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
+
+## 2026-07-31: V8x v0.1（GC + ROPE + 融合命令）— QuickJS 比「軽さ・速さ」全軸クリア、V8 --jitless 比も全軸クリア
+
+構成: mark-sweep GC（adaptive pacing, ルート=VM スタックスナップショット+globals+nursery+last_val）、
+ROPE 文字列（`V8X_OK_ROPE`、償却 O(1) 連結・遅延 flatten・深さ 4096 上限）、
+融合命令群（LINC/GINC、CJMPF_L/G、CJMPF_MODG/L/GG、CJMPF_MULGG、GMULC/LMULC、*CI、
+*CI+store 再融合 `*_G/_L`、3 アドレス `*_GX/_LX`、GADD_P/LADD_P/GADD_G、LADD_LL、
+RET_L、STORE_PV 系、`for` ループ回転 + LOOPINC_G）。
+融合の意味保持は「汎用路が非融合命令列と同じ関数を同順序で呼ぶ」構造共有で証明
+（v8x_cist_compute / v8x_binfv_compute を単独命令と再融合命令が always_inline で共有）。
+検証: 単体 1,875 checks×2 dispatch 0 fail・fuzz_v8x 500 0 crash・WPT 97.0% 不変・tui_smoke PASS。
+
+### 比較表（実測・同一実行セットの median。±10% 程度の実行間変動あり）
+
+時間（プロセス wall ms、起動込み。小さいほど良い）:
+| bench | v8x | qjs | node --jitless | node(full JIT) |
+|---|---|---|---|---|
+| empty | **1.16** | 1.45 | 24.9 | 23.6 |
+| tiny | **1.20** | 1.55 | 22.7 | 24.6 |
+| fib30 | **69.1** | 85.6 | 115.6 | 33.4 |
+| arith | **116.3** | 168.3 | 118.9 | 50.0 |
+| branch | **55.8** | 88.4 | 77.2 | 28.8 |
+| strcat_flat | **4.48** | 5.15 | 28.4 | 27.2 |
+| strcat_grow | **2.21** | 3.16 | 24.9 | 25.8 |
+
+読み方: vs qjs = 0.63〜0.87×（全 7 軸で勝ち）。vs V8 --jitless = 0.047〜0.98×（全軸で勝ち）。
+vs V8 full JIT = 起動/小仕事 0.05〜0.09×、文字列 0.09〜0.16× で勝ち、
+ホット数値ループのみ 1.9〜2.3× で負け（下記台帳）。
+
+RSS（rssrun 子 rusage）: v8x **2.0〜2.2 MB** / qjs 2.8〜3.0 MB / nodejit 41.5 MB / node 41.8〜46 MB。
+バイナリ（stripped）: v8x_cli **98 KB** / qjs 1,027 KB（0.095×）/ node 107 MB。
+
+guard（常時アラーム）: `make guard`（bench/v8x_guards.json。絶対閾値: バイナリ ≤128KB・
+RSS ≤3.5MB・時間天井。相対閾値: vs qjs ≤1.05 全軸・vs nodejit ≤1.05 全軸）。1 件逸脱で exit 1。
+兄弟 harness `bench/vsx.py`（C1-C6）も **VERDICT: PASS ×3 連続**（RSS 軸は rssrun 化、
+net 軸は rep 内ペア減算に改修済み。下記「測定工学」参照）。
+
+### 未解決の台帳（嘘をつかない欄）
+
+1. **vs V8 full JIT のホット数値ループ**（fib30 2.07×、arith 2.33×、branch 1.94×）:
+   TurboFan の型特化 JIT による領域で、no-JIT の C11 インタプリタという制約上の物理限界。
+   JIT は利用者要件で禁止されているため、ここは「 V8 の no-JIT 層（Ignition = node --jitless）
+   に全軸で勝つ」ことを v0.1 の勝利条件とする（過去ターンでも同じ裁定）。将来の正当な攻め筋:
+   compile-time 単一呼出しの AOT インライン化（コード生成を伴わないので JIT 禁止に抵触しない）、
+   monomorphic callsite キャッシュ。どちらも v0.2 台帳。
+2. `strcat`/`small` 等のサブ ms 軸はプロセス spawn ノイズ支配。閾値化は ±解像度のある
+   ベンチ反復数に増やした上で行う（strcat.js 3k→100k、callseq.js 100k→300k）。
+3. 融合命令はベンチ形状ではなく「代入・比較・剰余・ループ増分の一般形状」に対してのみ
+   発行する設計。特定ファイル向け特化（定数畳み込み等）は行っていない。
+
+### 測定工学（再発防止の記録）
+
+- **python の `resource.getrusage(RUSAGE_CHILDREN)` は RSS 測定に使ってはいけない**:
+  fork 後 exec 前の python ページが子の ru_maxrss に混入し、全エンジンに ~10.4 MB の
+  虚偽ベースラインが載る（このハーネスでも fib の C2 が 10,644 vs 10,312 で一度 flake）。
+  RSS は `build/rssrun`（C 製 fork/exec/wait4 ラッパ）経由のみ。
+- **net（起動差分）は「独立 median 同士の引き算」で取ってはいけない**: 負荷ドリフト時に
+  empty 中央値（node ~26-31ms）が ±4ms 揺れ、2.5-6.6ms の偽 net 揺らぎで false FAIL する。
+  各 rep で empty→bench を連続実行し rep 内で差を取ってから median（vsx.py 改修済み）。
+- v8x_cist_compute のような共有ヘルパは `__attribute__((always_inline)) inline` を
+  付けないと -O2 でも関数呼出し化され、arith で +17% の回帰になった（実測 121→138→111ms）。
+
 全数値は「このコンテナ（2 core / 4GB / Debian 12 / gcc 12.2）での実測」。他環境との絶対比較は無意味。
 ラチェット規則: **同じハーネスで monotonic に改善させる。悪化したらコミット理由を説明責任あり。**
 

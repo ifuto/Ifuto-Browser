@@ -41,7 +41,7 @@ $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 $(BUILD)/fuzz_v8x: fuzz/fuzz_v8x.c $(V8XSRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_v8x.c $(V8XSRC) -lm
 
-.PHONY: test uitest golden fuzz bench tuibench clean size conformance
+.PHONY: test uitest golden fuzz bench tuibench clean size conformance guard vsx v8xbench
 
 test: $(BUILD)/run_tests $(BUILD)/run_tests_switch
 	./$(BUILD)/run_tests
@@ -78,6 +78,15 @@ $(BUILD)/bench_v8x_switch: bench/bench_v8x.c $(V8XSRC) | $(BUILD)
 # V8x 単体 CLI（比較ベンチ / make guard の被測定バイナリ。本体には不加入）
 $(BUILD)/v8x_cli: bench/v8x_cli.c $(V8XSRC) | $(BUILD)
 	$(CC) $(BASE) $(REL) -o $@ bench/v8x_cli.c $(V8XSRC) $(LDFLAGS_REL) -lm
+
+# RSS 測定ラッパ（python 直測は fork/exec 間の python ページ混入で ~10MB 誤計るため C 製）
+$(BUILD)/rssrun: bench/rssrun.c | $(BUILD)
+	$(CC) -std=c11 -O2 -o $@ bench/rssrun.c
+
+# 常時監視アラーム: 閾値（bench/v8x_guards.json）から 1 件でも逸脱したら exit 1。
+# 絶対閾値は参照エンジンなしで常時有効。相対閾値は QJS=/path/to/qjs と node 検出で有効化。
+guard: $(BUILD)/v8x_cli $(BUILD)/rssrun
+	QJS=$${QJS:-/home/user/ref/quickjs/qjs} python3 bench/v8x_compare.py --rounds 3 --rss --guard bench/v8x_guards.json
 
 v8xbench: $(BUILD)/bench_v8x $(BUILD)/bench_v8x_switch
 	./$(BUILD)/bench_v8x

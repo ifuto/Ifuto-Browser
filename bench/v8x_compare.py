@@ -35,17 +35,28 @@ def wall_median(cmd, rounds):
         ts.append((time.perf_counter() - t0) * 1000.0)
     return statistics.median(ts)
 
+RSSRUN = os.path.join(ROOT, "build", "rssrun")
+
 def maxrss_kb(cmd):
-    """専用 helper プロセス内で実行しその子の ru_maxrss を取る（測定の独立性を担保）。"""
-    code = ("import subprocess,sys,resource;"
-            "r=subprocess.run(sys.argv[1:],stdout=subprocess.DEVNULL);"
-            "sys.exit(r.returncode) if r.returncode else "
-            "print(resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)")
-    out = subprocess.run([sys.executable, "-c", code] + cmd, capture_output=True, text=True)
+    """build/rssrun（C 製 fork/exec/wait4 ラッパ）で子の ru_maxrss を取る。
+    python ラッパ経由だと fork 後 exec 前の python ページが混入して
+    全エンジンに ~10MB の虚偽ベースラインが載る（実測済み）ため python 直測は禁止。"""
+    if not os.path.isfile(RSSRUN):
+        sys.stderr.write("RSS SKIP: build/rssrun がありません（cc -std=c11 -O2 -o build/rssrun bench/rssrun.c）\n")
+        return -1
+    out = subprocess.run([RSSRUN] + cmd, capture_output=True, text=True)
     if out.returncode != 0:
         sys.stderr.write("RSS FAIL: %s\n" % " ".join(cmd))
         return -1
-    return int(out.stdout.strip().splitlines()[-1])
+    for tok in out.stdout.strip().split():
+        # 形式: "wall_ms X rss_kb Y"
+        pass
+    parts = out.stdout.strip().split()
+    try:
+        return int(parts[parts.index("rss_kb") + 1])
+    except (ValueError, IndexError):
+        sys.stderr.write("RSS PARSE FAIL: %s -> %s\n" % (" ".join(cmd), out.stdout[:120]))
+        return -1
 
 def main():
     ap = argparse.ArgumentParser()
@@ -94,17 +105,17 @@ def main():
         print("\nratio vs qjs (time, >1 は v8x が遅い):")
         for b in BENCHES:
             a, c = res["time_ms"][b]["v8x"], res["time_ms"][b]["qjs"]
-        print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
+            print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
     if "nodejit" in eng:
         print("ratio vs V8 --jitless:")
         for b in BENCHES:
             a, c = res["time_ms"][b]["v8x"], res["time_ms"][b]["nodejit"]
-        print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
+            print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
     if "node" in eng:
         print("ratio vs V8 full (JIT)")
         for b in BENCHES:
             a, c = res["time_ms"][b]["v8x"], res["time_ms"][b]["node"]
-        print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
+            print("  %-12s %s" % (b, "%.3f" % (a / c) if (a is not None and c) else "FAIL"))
 
     if args.json:
         out = os.path.join(RESULTS, "latest.json")

@@ -1,0 +1,34 @@
+{
+  "absolute": {
+    "v8x_cli_max_bytes": 131072,
+    "time_ms_max": {
+      "empty": 4.0, "tiny": 4.0, "fib30": 140.0, "arith": 220.0,
+      "branch": 140.0, "strcat_flat": 12.0, "strcat_grow": 8.0
+    },
+    "rss_kb_max": { "empty": 3584, "tiny": 3584, "fib30": 3584, "strcat_grow": 4096 }
+  },
+  "relative": {
+    "time_vs_qjs": {
+      "ref": "qjs", "kind": "time",
+      "max_ratio": {
+        "empty": 1.05, "tiny": 1.05, "fib30": 1.05, "arith": 1.05,
+        "branch": 1.05, "strcat_flat": 1.05, "strcat_grow": 1.05
+      }
+    },
+    "rss_vs_qjs": {
+      "ref": "qjs", "kind": "rss",
+      "max_ratio": { "empty": 1.05, "tiny": 1.05, "fib30": 1.05, "strcat_grow": 1.05 }
+    },
+    "size_vs_qjs": {
+      "ref": "qjs", "kind": "size",
+      "max_ratio": { "binary": 0.15 }
+    },
+    "time_vs_nodejit": {
+      "ref": "nodejit", "kind": "time",
+      "max_ratio": {
+        "empty": 1.05, "tiny": 1.05, "fib30": 1.05, "arith": 1.05,
+        "branch": 1.05, "strcat_flat": 1.05, "strcat_grow": 1.05
+      }
+    }
+  }
+}

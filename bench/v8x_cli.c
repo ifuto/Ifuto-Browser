@@ -19,7 +19,9 @@ static void print_val(V8xRT *rt, V8xVal v) {
     bool b;
     uint32_t len;
     if (v8x_as_num(v, &d)) {
-        if (isfinite(d) && d == (double)(long long)d && fabs(d) < 9007199254740992.0)
+        if (isnan(d)) { printf("NaN\n"); return; }
+        if (isinf(d)) { printf("%sInfinity\n", d > 0 ? "" : "-"); return; }
+        if (d == (double)(long long)d && fabs(d) < 9007199254740992.0)
             printf("%.0f\n", d);
         else
             printf("%.17g\n", d);

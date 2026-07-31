@@ -33,10 +33,26 @@ print(json.dumps({"wall": dt, "rss": rss, "out": p.stdout.decode("utf-8", "repla
                   "rc": p.returncode, "err": p.stderr.decode("utf-8", "replace")[-400:]}))
 '''
 
+RSSRUN = os.path.join(ROOT, "build", "rssrun")
+
 def run_one(cmd):
     r = subprocess.run([sys.executable, "-c", HELPER, json.dumps(cmd)],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return json.loads(r.stdout.decode())
+    j = json.loads(r.stdout.decode())
+    # RSS（と wall）は rssrun（C 製 fork/exec/wait4）で取り直す。python helper 経由は
+    # fork 後 exec 前の python ページが ru_maxrss に混入し全エンジンに ~10MB の
+    # 虚偽ベースラインが載る（実測確認済み。C2 の fib flake の真因）。stdout は突合に
+    # 使うので helper 側を保持する
+    if os.path.isfile(RSSRUN):
+        rr = subprocess.run([RSSRUN] + cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if rr.returncode == 0:
+            parts = rr.stdout.decode().split()
+            try:
+                j["wall"] = float(parts[parts.index("wall_ms") + 1])
+                j["rss"] = int(parts[parts.index("rss_kb") + 1])
+            except (ValueError, IndexError):
+                pass
+    return j
 
 def med_run(cmd, reps):
     ws, rss, out = [], 0, None
@@ -46,6 +62,21 @@ def med_run(cmd, reps):
             return {"wall": None, "rss": None, "out": None, "err": j["err"]}
         ws.append(j["wall"]); rss = max(rss, j["rss"]); out = j["out"]
     return {"wall": statistics.median(ws), "rss": rss, "out": out, "err": ""}
+
+def paired_net(bench_cmd, empty_cmd, reps):
+    """ベースライン引き算は「独立 median 同士の差」だと empty 系と bench 系の
+    測定時刻が離れており、spawn レイテンシの系統的ドリフト（負荷変動）が
+    そのまま疑似 net 差になる（実測で nodejit の empty 中央値が 26-31ms 揺れ、
+    2.5-6.6ms の偽 net 揺らぎ = C4 の false FAIL を招いた）。
+    各 rep で empty の直後に bench を打ち、rep 内で差を取ってから median を取る。"""
+    nets = []
+    for _ in range(reps):
+        j0 = run_one(empty_cmd)
+        j1 = run_one(bench_cmd)
+        if j0["rc"] != 0 or j1["rc"] != 0:
+            return None
+        nets.append(max(j1["wall"] - j0["wall"], 0.05))
+    return statistics.median(nets)
 
 def norm(out):
     """stdout を数値なら float に正規化して突合用キーを返す"""
@@ -114,6 +145,8 @@ def main():
         reps = 21 if b == "empty" else (5 if quick else 9)
         for e in eng:
             R[b][e] = med_run(eng[e](b), reps)
+            if b != "empty":
+                R[b][e]["net"] = paired_net(eng[e](b), eng[e]("empty"), reps)
 
     # ---- 正確性差分（全エンジン出力突合）----
     anomalies = []
@@ -145,6 +178,8 @@ def main():
     wall = lambda b, e: R[b][e]["wall"]
     rss = lambda b, e: R[b][e]["rss"]
     def netwall(b, e):
+        if R[b][e].get("net") is not None:
+            return R[b][e]["net"]  # 同 rep 内差分（ドリフト排除済み）
         w, w0 = wall(b, e), wall("empty", e)
         if w is None or w0 is None:
             return None
