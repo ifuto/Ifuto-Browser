@@ -3,6 +3,7 @@
  * どちらかでだけ失敗するような差分は dispatch バグなので即座に止める。 */
 #include "tests.h"
 #include "../src/v8x/v8x.h"
+#include "../src/common.h"
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
@@ -331,6 +332,55 @@ static void test_v8x_rope_and_superinst(void) {
     /* IIFE 未対応は仕様外機能なのでテストしない（parser 近似の既定） */
 }
 
+/* 定数除数 magic 剰余の同値性: JS:0 ≤ x ≤ 2^31−1 全域・負経路・2 の冪,
+ * D=1・D 巨大の角まで C の % (=JS 規約の数学的意味) と絶対一致することの掃引検証。
+ * magic 変形は「実行時コード生成なし」の整数同値変形であり、これが破れると
+ * fusion 系命令（MODCI / *CI_G/L / CJMPF_MODG/L）の数学的基盤が崩れる。 */
+static double mm_sweep_c(i32 lo, i32 hi, i32 d) {
+    double s = 0;
+    for (i32 i = lo; i < hi; i++) s += (double)(i % d);
+    return s;
+}
+
+static void test_v8x_modmagic(void) {
+    static const i32 DS[] = { 2, 3, 4, 5, 7, 8, 10, 13, 16, 97, 256, 1000,
+                              65536, 1000003, 1048576, 2147483646, 2147483647 };
+    char buf[320];
+    for (u32 t = 0; t < sizeof DS / sizeof DS[0]; t++) {
+        i32 d = DS[t];
+        /* 非負掃引（magic 経路）: var msa{t} = 0; for (msi{t}=0; <300000; ++) msa += msi % d */
+        snprintf(buf, sizeof buf,
+                 "var msa%u=0; for (var msi%u=0; msi%u<300000; msi%u=msi%u+1) { msa%u=msa%u+msi%u%%%d; } msa%u",
+                 t, t, t, t, t, t, t, t, d, t);
+        want_num(buf, mm_sweep_c(0, 300000, d));
+        /* 負混在掃引（C フォールバック経路） */
+        snprintf(buf, sizeof buf,
+                 "var mnb%u=0; for (var mnj%u=-150000; mnj%u<150000; mnj%u=mnj%u+1) { mnb%u=mnb%u+mnj%u%%%d; } mnb%u",
+                 t, t, t, t, t, t, t, t, d, t);
+        want_num(buf, mm_sweep_c(-150000, 150000, d));
+        /* 条件一致融合 (CJMPF_MOD): count i in [0,B) s.t. i%d==k */
+        i32 B = 200000;
+        i32 k = d > 7 ? 7 : d - 1;
+        i32 cnt_c = 0;
+        for (i32 i = 0; i < B; i++) if (i % d == k) cnt_c++;
+        snprintf(buf, sizeof buf,
+                 "var mcc%u=0; for (var mcj%u=0; mcj%u<200000; mcj%u=mcj%u+1) { if (mcj%u%%%d==%d) { mcc%u=mcc%u+1; } } mcc%u",
+                 t, t, t, t, t, t, d, k, t, t, t);
+        want_num(buf, cnt_c);
+    }
+    /* 角: 2^31−1/2 境界（int 上限直下の magic 精度）。d>1 かつ x≥0 の最端 */
+    want_num("2147483647 % 2147483647", 2147483647 % 2147483647);
+    want_num("2147483647 % 2147483646", 2147483647 % 2147483646);
+    want_num("2147483646 % 1000003", 2147483646 % 1000003);
+    want_num("2147483647 % 1000003", 2147483647 % 1000003);
+    want_num("2147483647 % 2", 1);
+    want_num("2147483647 % 1073741824", 2147483647 % 1073741824);
+    /* d=1 / 負の除数 / 負の被除数（非 magic 経路の規約確認） */
+    want_num("2147483647 % 1", 0);
+    want_num("-7 % 3", -1);
+    want_num("7 % -3", 1);
+}
+
 void test_v8x(void) {
     g_rt = v8x_new();
     CHECK(g_rt != NULL);
@@ -345,6 +395,7 @@ void test_v8x(void) {
     t_dispatch_parity();
     test_v8x_fusion_and_hardening();
     test_v8x_rope_and_superinst();
+    test_v8x_modmagic();
     v8x_free(g_rt);
     g_rt = NULL;
 }

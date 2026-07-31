@@ -182,6 +182,11 @@ struct V8xRT {
     u32 max_objs;   /* オブジェクト数硬上限。既定 V8X_MAX_OBJECTS。同上 */
     V8xVal last_val;
     char err[256];
+    /* 定数除数の剰余を magic-multiply に強度削減する直写メモ（8 エントリ）。
+     * 実行時コード生成は一切行わない（禁止事項の JIT ではない）: m,p は d にのみ
+     * 依存する数学的定数で、純粋な整数同値変形を d ごとに 1 度だけ計算する。
+     * d=0 は「空」の番兵（規約上 d>1 のみ登録するので衝突しない） */
+    struct { u64 m; u32 d; u8 p; } mm[8];
     /* parse 作業の再利用バッファは eval ローカルで確保（再入安全） */
 };
 
@@ -2555,6 +2560,45 @@ static bool v8x_bin_add(V8xRT *rt, V8xVal va, V8xVal vb, u32 sp, V8xVal *out) {
     return true;
 }
 
+/* 定数除数の剰余（JS の % 規約）を magic-multiply で計算。imul64+shr+msub ≈ 5 cycle
+ * （idiv は 20〜45 cycle）。経路は x ≥ 0 かつ d > 1 に限定し、それ以外は C の %。
+ *
+ * 数学的正当性: p = 32 + floor(log2 d), m = ceil(2^p / d)（d が 2 の冪なら移位）と
+ * 取ると、0 ≤ x ≤ 2^31−1 の全域で floor(m·x / 2^p) == floor(x / d) が厳密に成立。
+ * 証明: 2^p = m·d − e（0 < e ≤ d）と書ける（m は天井）ので
+ *   m·x/2^p = x/d + e·x/(d·2^p)。
+ * e·x ≤ (d−1)(2^31−1) < d·2^31 ≤ d·2^32 ≤ 2^p（p ≥ 32 + log2 d ⟹ 2^p ≥ d·2^32）
+ * より付加項は 1/d 未満。floor(x/d) と次の整数のgapは 1/d 以上なので整数部は跨がない。
+ * 溢れなし: m ≤ ceil(2^(32+fl)/2^fl) = 2^32、x ≤ 2^31−1 ⟹ m·x < 2^63。
+ * （d 非冪で p = 32+fl ≤ 62、d 冪は q = x >> fl） */
+#if defined(__GNUC__)
+__attribute__((always_inline)) inline
+#endif
+static i32 v8x_mod_imm(V8xRT *rt, i32 x, i32 d) {
+    if (x >= 0 && d > 1) {
+        u32 ud = (u32)d;
+        u32 slot = ud & 7u;
+        if (rt->mm[slot].d != ud) {
+            u32 d2 = ud;
+            u8 fl = 31;
+            while (!(d2 & 0x80000000u)) { fl--; d2 <<= 1; } /* floor(log2 d)（clz 代替） */
+            if ((ud & (ud - 1)) == 0) { /* 2 の冪: 移位のみ */
+                rt->mm[slot].m = 0; rt->mm[slot].p = fl;
+            } else {
+                u8 p = (u8)(32 + fl);
+                rt->mm[slot].m = ((((u64)1) << p) + ud - 1) / ud;
+                rt->mm[slot].p = p;
+            }
+            rt->mm[slot].d = ud;
+        }
+        u64 m = rt->mm[slot].m; u8 p = rt->mm[slot].p;
+        u64 xu = (u64)(u32)x;
+        u64 q = m ? ((m * xu) >> p) : (xu >> p);
+        return (i32)(xu - q * (u64)ud);
+    }
+    return x % d; /* x<0 / d∈{0,±1}（INT32_MIN%-1 は呼出側で除外済）→ C 準拠 = JS 規約 */
+}
+
 /* *CI 計算の共有体。各演算は対応する単独命令（ADDCI/SUBCI/MULCI/MODCI) と
  * 同一手続き・同一丸め（int は i64 経由、溢れは (double)r、文字列 ADD は右辺連結）。
  * 単独 *CI 命令と *CI+store 再融合命令がこの 1 実装を共有することで
@@ -2566,7 +2610,9 @@ static bool v8x_cist_compute(V8xRT *rt, u8 baseop, V8xVal lv, i32 imm, u32 sp, V
     if (v8x_is_intv(lv)) {
         i32 iv = v8x_get_int(lv);
         if (baseop == OP_MOD) {
-            if (imm != 0 && !(iv == INT32_MIN && imm == -1)) { *out = V8X_MK_INT(iv % imm); return true; }
+            if (imm != 0 && !(iv == INT32_MIN && imm == -1)) {
+                *out = V8X_MK_INT(v8x_mod_imm(rt, iv, imm)); return true; /* iv≥0&&imm>1 なら magic */
+            }
         } else {
             i64 r = baseop == OP_ADD ? (i64)iv + (i64)imm
                   : baseop == OP_SUB ? (i64)iv - (i64)imm
@@ -3150,7 +3196,7 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
         double dk = (double)k;
         bool eq;
         if (v8x_is_intv(lv) && m != 0 && !(v8x_get_int(lv) == INT32_MIN && m == -1)) {
-            eq = (double)(v8x_get_int(lv) % m) == dk;
+            eq = (double)v8x_mod_imm(rt, v8x_get_int(lv), m) == dk; /* x≥0&&m>1 なら magic */
         } else {
             rt->gc_sp = sp;
             double dv = v8x_to_number(rt, lv);
@@ -3172,7 +3218,7 @@ static bool vm_exec(V8xRT *rt, u32 entry) {
         double dk = (double)k;
         bool eq;
         if (v8x_is_intv(lv) && m != 0 && !(v8x_get_int(lv) == INT32_MIN && m == -1)) {
-            eq = (double)(v8x_get_int(lv) % m) == dk;
+            eq = (double)v8x_mod_imm(rt, v8x_get_int(lv), m) == dk; /* x≥0&&m>1 なら magic */
         } else {
             rt->gc_sp = sp;
             double dv = v8x_to_number(rt, lv);
