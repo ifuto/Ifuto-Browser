@@ -13,6 +13,9 @@
 #include "tui.h"
 #include "chrome.h"
 #include <sys/stat.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "html_int.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,6 +29,27 @@ static double now_ms(void) {
 }
 
 static IfStr read_all(IfArena *a, const char *path) {
+    /* まず mmap を試す: 入力のユーザランド複製を避け、読み切り clean page は
+     * カーネルがメモリ逼迫時に退避できる（巨大文書の RSS 削減の構造的一歩。
+     * ゼロコピー設計の tokenizer/DOM 参照がそのまま mmap 上に乗る）。
+     * stdin や特殊ファイルでは fread 経路にフォールバック（同一インターフェース）。 */
+    if (strcmp(path, "-") != 0) {
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+                if ((unsigned long long)st.st_size > IF_MAX_INPUT_BYTES) {
+                    fprintf(stderr, "ifuto: input too large\n"); close(fd); exit(1);
+                }
+                void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+                close(fd);
+                if (m != MAP_FAILED) return if_str((const char *)m, (u32)st.st_size);
+            } else {
+                close(fd);
+            }
+        }
+        /* fopen が NULL なら下の fread 経路がエラー報告する */
+    }
     FILE *f = strcmp(path, "-") == 0 ? stdin : fopen(path, "rb");
     if (!f) { fprintf(stderr, "ifuto: cannot open %s\n", path); exit(1); }
     u64 cap = 1 << 16, n = 0;
@@ -176,11 +200,23 @@ int main(int argc, char **argv) {
     double t4 = now_ms();
     double arena_after_layout = (double)if_arena_reserved(&a);
 
-    IfGrid *grid = if_render_grid(&a, lay);
-    IfStr out = if_render_emit(&a, grid, ansi);
+    /* 巨大文書はチャンク窓グリッドの再利用で定数メモリ発行する（法則: 画面描画に
+     * 関係ないものは保持しない。グリッド・出力バッファ双方の全量保持をやめる）。
+     * 窓は 4096 行単位で cells を malloc 一回だけ再利用。発行バイト列は従来と完全一致
+     * （差分は tests の tui/gui smoke の sha256 が機械監査） */
+    i32 mx = 0, my = 0;
+    if_render_extent(lay, &mx, &my);
+    IfGrid win;
+    win.cells = (IfCell *)malloc((size_t)mx * 4096 * sizeof(IfCell));
+    if (!win.cells) if_fatal("render: oom window grid");
+    win.y_off = 0;
+    for (i32 r0 = 0; r0 < my; r0 += 4096) {
+        i32 r1 = r0 + 4096 < my ? r0 + 4096 : my;
+        if_render_grid_rows_into(lay, r0, r1, &win);
+        if_render_emit_rows(stdout, &win, ansi);
+    }
+    free(win.cells);
     double t5 = now_ms();
-
-    fwrite(out.p, 1, out.n, stdout);
 
     if (links && lay->n_links) {
         printf("\nリンク:\n");
@@ -204,7 +240,7 @@ int main(int argc, char **argv) {
             "  nodes=%u parse_errors=%u grid=%dx%d links=%u peak_rss_kb=%llu\n"
             "  arena_kb: parse=%.1f style=%.1f layout=%.1f render=%.1f\n",
             t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0,
-            dom->n_nodes, dom->n_errors, grid->w, grid->h, lay->n_links,
+            dom->n_nodes, dom->n_errors, mx, my, lay->n_links,
             (unsigned long long)vwhwm_kb,
             arena_after_parse / 1024.0, arena_after_style / 1024.0,
             arena_after_layout / 1024.0, (double)if_arena_reserved(&a) / 1024.0);

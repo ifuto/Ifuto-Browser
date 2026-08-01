@@ -68,7 +68,7 @@ def main():
 
     eng = find_engines()
     if "akl" not in eng or not os.path.isfile(eng["akl"][0]):
-        print("build/akl_cli がありません: make build/akl_cli"); return 2
+        print("build/akl がありません: make build/akl"); return 2
     print("engines:", {k: " ".join(v) for k, v in eng.items()})
 
     res = {"time_ms": {}, "rss_kb": {}, "size_bytes": {}}

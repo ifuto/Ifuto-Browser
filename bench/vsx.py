@@ -11,7 +11,7 @@
   python3 bench/vsx.py report [--quick] [--bench NAME]   ... 表を出すだけ（exit 0）
   python3 bench/vsx.py guard  [--quick]                  ... 不成立なら ANOMALY 行 + exit 1
 
-環境変数: AKL_CLI(既定 build/akl_cli) QJS(既定 /tmp/qjs-official/qjs, 無ければ qjs 系軸 SKIP)
+環境変数: AKL_CLI(既定 build/akl) QJS(既定 /tmp/qjs-official/qjs, 無ければ qjs 系軸 SKIP)
           NODE(既定 node)
 """
 import json, os, statistics, subprocess, sys, shutil
@@ -132,7 +132,7 @@ def main():
     benches = [only] if only else BENCHES
     eng = get_engines()
     if "akl" not in eng:
-        print("FATAL: build/akl_cli not found (run: make build/akl_cli)"); return 2
+        print("FATAL: build/akl not found (run: make build/akl)"); return 2
     have_qjs = "qjs" in eng
     if not have_qjs:
         print("NOTE: QuickJS not found -> qjs 軸は SKIP (QJS=/path/to/qjs で有効化)")

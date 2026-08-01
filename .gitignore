@@ -8,3 +8,4 @@ bench/*.html
 __pycache__/
 bench/results/
 artifacts/
+.arena/

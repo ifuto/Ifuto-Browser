@@ -2,6 +2,7 @@
 #include "render.h"
 #include "utf8.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 u8 if_rgba_to_ansi(u32 rgba) {
@@ -222,6 +223,60 @@ static void pen_apply(IfOut *o, const IfPen *pen) {
     if (pen->flags & IF_F_STRIKE) out_str(o, "\x1b[9m");
     if (pen->fg != IF_CELL_DEFAULT) { out_str(o, "\x1b[38;5;"); out_u32(o, pen->fg); out_str(o, "m"); }
     if (pen->bg != IF_CELL_DEFAULT) { out_str(o, "\x1b[48;5;"); out_u32(o, pen->bg); out_str(o, "m"); }
+}
+
+void if_render_extent(const IfLayout *lay, i32 *mx, i32 *my) {
+    i32 x = lay->width, y = lay->height;
+    if (lay->root) grid_max_walk(lay->root, &x, &y);
+    if (x < 1) x = 1;
+    if (y < 1) y = 1;
+    *mx = x; *my = y;
+}
+
+void if_render_emit_rows(FILE *out, const IfGrid *grid, int ansi) {
+    IfPen cur = { (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
+    bool pen_dirty = false;
+    /* 1 行ぶんの作業バッファを一度だけ確保（出力全体は保持しない = 定数メモリ） */
+    u64 rowcap = (u64)grid->w * 4 + 128;
+    u8 *row = (u8 *)malloc(rowcap ? rowcap : 1);
+    if (!row) if_fatal("render: oom row buffer");
+    for (i32 y = 0; y < grid->h; y++) {
+        u64 n = 0;
+        i32 last = grid->w - 1;
+        if (!ansi) {
+            while (last >= 0 && grid->cells[(i64)y * grid->w + last].cp == ' ') last--;
+        }
+        for (i32 x = 0; x <= last; x++) {
+            const IfCell *c = &grid->cells[(i64)y * grid->w + x];
+            if (c->cp == 0) continue; /* 全角 2 セル目 */
+            if (ansi) {
+                IfPen p = { c->fg, c->bg, c->flags };
+                if (p.fg != cur.fg || p.bg != cur.bg || p.flags != cur.flags) {
+                    /* インライン展開: pen_apply 相当を直接バッファに（行バッファ徹底のため） */
+                    const char *esc = "\x1b[0m";
+                    u64 en = 4; if (rowcap - n < 64) { fwrite(row, 1, n, out); n = 0; }
+                    memcpy(row + n, esc, en); n += en;
+                    if (p.flags & IF_F_BOLD) { memcpy(row + n, "\x1b[1m", 4); n += 4; }
+                    if (p.flags & IF_F_ITALIC) { memcpy(row + n, "\x1b[3m", 4); n += 4; }
+                    if (p.flags & IF_F_ULINE) { memcpy(row + n, "\x1b[4m", 4); n += 4; }
+                    if (p.flags & IF_F_STRIKE) { memcpy(row + n, "\x1b[9m", 4); n += 4; }
+                    if (p.fg != IF_CELL_DEFAULT) n += (u64)snprintf((char *)row + n, 64, "\x1b[38;5;%um", p.fg);
+                    if (p.bg != IF_CELL_DEFAULT) n += (u64)snprintf((char *)row + n, 64, "\x1b[48;5;%um", p.bg);
+                    cur = p;
+                    pen_dirty = true;
+                }
+            }
+            u8 enc[4];
+            u32 cp = c->cp ? c->cp : ' ';
+            u64 en = if_utf8_encode(cp, enc);
+            if (rowcap - n < en + 8) { fwrite(row, 1, n, out); n = 0; }
+            memcpy(row + n, enc, en); n += en;
+        }
+        if (ansi && pen_dirty) { memcpy(row + n, "\x1b[0m", 4); n += 4; cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 }; }
+        row[n++] = '\n';
+        fwrite(row, 1, n, out);
+    }
+    free(row);
 }
 
 IfStr if_render_emit(IfArena *arena, const IfGrid *grid, int ansi) {

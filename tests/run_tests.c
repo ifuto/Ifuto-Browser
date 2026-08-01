@@ -10,6 +10,7 @@ void test_css(void);
 void test_css_ruleset_oracle(void);
 void test_layout(void);
 void test_uichrome(void);
+void test_ifuto_pages(void);
 void test_akl(void);
 void test_md(void);
 
@@ -26,6 +27,7 @@ int main(void) {
     fprintf(stderr, "[layout]\n");
     RUN(test_layout);
     RUN(test_uichrome);
+    RUN(test_ifuto_pages);
     fprintf(stderr, "[akl]\n");
     RUN(test_akl);
     fprintf(stderr, "[md]\n");

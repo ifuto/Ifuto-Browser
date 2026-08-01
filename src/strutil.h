@@ -41,6 +41,18 @@ static inline bool if_str_is_ws_only(IfStr s) {
     return true;
 }
 
+/* 部分文字列検索（スライス版 strstr。NUL 終端は一切要求しない）。
+ * needle は C 文字列（内部ページ検証・属性値検査などリテラル用途が主）。
+ * memcmp 走査のみで allocator を触らない = メモリ法則に忠実。 */
+static inline bool if_str_contains(IfStr hay, const char *needle) {
+    size_t nn = strlen(needle);
+    if (nn == 0) return true;
+    if (nn > hay.n) return false;
+    for (u32 i = 0; i + nn <= hay.n; i++)
+        if (memcmp(hay.p + i, needle, nn) == 0) return true;
+    return false;
+}
+
 static inline IfStr if_str_trim(IfStr s) {
     u32 a = 0, b = s.n;
     while (a < b && (s.p[a] == ' ' || s.p[a] == '\t' || s.p[a] == '\n' || s.p[a] == '\r' || s.p[a] == '\f')) a++;

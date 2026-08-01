@@ -3,6 +3,7 @@
 #include "tests.h"
 #include "../src/ui_input.h"
 #include "../src/chrome.h"
+#include "../src/ifuto_pages.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -307,6 +308,57 @@ static void test_chrome_store(void) {
     if_chrome_init(&c3, fake_fs());
     CHECK(if_chrome_restore(&c3, 100) == 0);
     if_chrome_destroy(&c3);
+}
+
+/* ---- ifuto:// 内部ページ（普通のブラウザの settings/history 相当） ---- */
+void test_ifuto_pages(void) {
+    pool_reset();
+    setenv("IFUTO_HOME", "/fk", 1);
+    IfChrome c;
+    if_chrome_init(&c, fake_fs());
+    CHECK(c.store.enabled);
+
+    /* settings / about / memory: 内部ページが通常 DOM 経路で読める */
+    CHECK(if_chrome_open(&c, "ifuto://settings", 100));
+    IfTab *t = if_chrome_cur(&c);
+    CHECK(t && t->doc && strcmp(t->url, "ifuto://settings") == 0);
+    CHECK(strcmp(t->title, "ifuto://settings") == 0);
+    IfArena ta; if_arena_init(&ta, 1 << 16);
+    IfStr body = if_dom_text_content(&ta, t->dom->root);
+    CHECK(body.p != NULL);
+    CHECK(if_str_contains(body, "akl") || if_str_contains(body, "Aklus"));
+    CHECK(if_str_contains(body, "CoJIT"));
+
+    /* 履歴は開いた順にストアへ。history ページに直前の URL が現れる */
+    CHECK(if_chrome_open(&c, "/tmp/x/a.html", 100));
+    CHECK(if_chrome_open(&c, "ifuto://history", 100));
+    t = if_chrome_cur(&c);
+    CHECK(t && t->doc && strcmp(t->title, "ifuto://history") == 0);
+    if_arena_destroy(&ta); if_arena_init(&ta, 1 << 16);
+    body = if_dom_text_content(&ta, t->dom->root);
+    CHECK(if_str_contains(body, "a.html"));
+    CHECK(if_str_contains(body, "Alpha"));
+
+    /* memory ページはタブ会計を含む（Alpha が開かれている） */
+    CHECK(if_chrome_open(&c, "ifuto://memory", 100));
+    t = if_chrome_cur(&c);
+    CHECK(t && t->doc && strcmp(t->title, "ifuto://memory") == 0);
+    if_arena_destroy(&ta); if_arena_init(&ta, 1 << 16);
+    body = if_dom_text_content(&ta, t->dom->root);
+    CHECK(if_str_contains(body, "Alpha"));
+    CHECK(if_str_contains(body, "KB"));
+
+    /* about / 未知ページ（未知ページも落ちない・案内を出す） */
+    CHECK(if_chrome_open(&c, "ifuto://about", 100));
+    t = if_chrome_cur(&c);
+    CHECK(t && t->doc && strcmp(t->title, "ifuto://about") == 0);
+    CHECK(if_chrome_open(&c, "ifuto://nope", 100));
+    t = if_chrome_cur(&c);
+    CHECK(t && t->doc); /* 内部ページでなければ通常ファイル経路へ（ここでは開けない） */
+    CHECK(strcmp(t->url, "ifuto://nope") == 0);
+
+    if_arena_destroy(&ta);
+    if_chrome_destroy(&c);
 }
 
 void test_uichrome(void) {

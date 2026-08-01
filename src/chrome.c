@@ -5,6 +5,7 @@
 #include "chrome.h"
 #include "css.h"
 #include "md.h"
+#include "ifuto_pages.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -162,10 +163,19 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
     IfArena *doc = (IfArena *)malloc(sizeof(IfArena));
     if (!doc) if_fatal("oom: doc arena");
     if_arena_init(doc, 1 << 18);
-    IfStr input = c->fs.read_file(doc, path, c->fs.ctx);
+    IfStr input;
+    /* ifuto:// 内部ページ（普通のブラウザの settings/history 相当）はローカル情報を
+     * HTML として生成して通常 DOM 経路に乗せる（多層防御 = 共通パーサに統一） */
+    if (!if_ifuto_page(doc, path, c, &input))
+        input = c->fs.read_file(doc, path, c->fs.ctx);
     /* read_file 失敗の判定: 空ファイルは合法、失敗は ctx 別の手段が必要 →
-     * ファイルサイズ 0 との区別は stat のみ存在で担保する */
-    if (!input.p || (input.n == 0 && !c->fs.exists(path, c->fs.ctx))) {
+     * ファイルサイズ 0 との区別は stat のみ存在で担保する（内部ページは stat 評価を飛ばす） */
+    else if (!input.p) {
+        if_arena_destroy(doc);
+        free(doc);
+        return false;
+    }
+    if (input.n == 0 && strncmp(path, "ifuto://", 8) != 0 && !c->fs.exists(path, c->fs.ctx)) {
         if_arena_destroy(doc);
         free(doc);
         return false;

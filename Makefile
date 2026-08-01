@@ -106,8 +106,8 @@ cssbench: $(BUILD)/bench_css
 	$(BUILD)/bench_css
 
 # Akl 単体 CLI（比較ベンチ / make guard の被測定バイナリ。本体には不加入）
-$(BUILD)/akl_cli: bench/akl_cli.c $(AKLSRC) | $(BUILD)
-	$(CC) $(BASE) $(REL) -o $@ bench/akl_cli.c $(AKLSRC) $(LDFLAGS_REL) -lm
+$(BUILD)/akl: bench/akl_cli.c $(AKLSRC) src/sandbox.c | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ bench/akl_cli.c $(AKLSRC) src/sandbox.c $(LDFLAGS_REL) -lm
 
 # RSS 測定ラッパ（python 直測は fork/exec 間の python ページ混入で ~10MB 誤計るため C 製）
 $(BUILD)/rssrun: bench/rssrun.c | $(BUILD)
@@ -115,7 +115,7 @@ $(BUILD)/rssrun: bench/rssrun.c | $(BUILD)
 
 # 常時監視アラーム: 閾値（bench/akl_guards.json）から 1 件でも逸脱したら exit 1。
 # 絶対閾値は参照エンジンなしで常時有効。相対閾値は QJS=/path/to/qjs と node 検出で有効化。
-guard: $(BUILD)/akl_cli $(BUILD)/rssrun
+guard: $(BUILD)/akl $(BUILD)/rssrun
 	QJS=$${QJS:-/home/user/ref/quickjs/qjs} python3 bench/akl_compare.py --rounds 3 --rss --guard bench/akl_guards.json
 
 aklbench: $(BUILD)/bench_akl $(BUILD)/bench_akl_switch
@@ -139,5 +139,5 @@ clean:
 	rm -rf $(BUILD)
 
 # 兄弟セッションの harness（環境変数 AKL/QJS を参照。見つからない参照は harness 自身が報告）
-vsx: $(BUILD)/akl_cli
+vsx: $(BUILD)/akl
 	python3 bench/vsx.py

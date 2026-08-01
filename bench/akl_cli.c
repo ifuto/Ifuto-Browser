@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "../src/sandbox.h"
 #include <math.h>
 #include <sys/resource.h>
 
@@ -59,12 +60,13 @@ static char *slurp(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    int times = 1, want_rss = 0;
+    int times = 1, want_rss = 0, want_sandbox = 1;
     unsigned long long budget = 1000000000000ull; /* bench 用途: 既定は実質無制限。--budget で縮めて枯渇挙動も検査可 */
     const char *file = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--times") && i + 1 < argc) times = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rss")) want_rss = 1;
+        else if (!strcmp(argv[i], "--no-sandbox")) want_sandbox = 0;
         else if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = strtoull(argv[++i], 0, 10);
         else if (!file) file = argv[i];
         else {
@@ -72,10 +74,20 @@ int main(int argc, char **argv) {
             if (r2 > 0) times = r2;
         }
     }
-    if (!file || times < 1) { fprintf(stderr, "usage: akl_cli [--times N] [--rss] file.js\n"); return 2; }
+    if (!file || times < 1) { fprintf(stderr, "usage: akl [--times N] [--rss] [--budget N] [--no-sandbox] file.js\n"); return 2; }
     if (times > 256) times = 256;
     char *src = slurp(file);
     if (!src) { fprintf(stderr, "cannot read %s\n", file); return 2; }
+    /* ハッキング耐性（ユーザ要求）: 入力の解釈・実行は不可逆サンドボックスの内側で行う。
+     * ファイルは lock 前に読み込み済み（allowlist は open を含まない）。
+     * --no-sandbox 指定時のみ明示的に素通し（デバッグ用。規定は ON） */
+    if (want_sandbox) {
+        if (if_sandbox_apply(IF_SB_AKL) != 0) {
+            fprintf(stderr, "sandbox unavailable on this kernel (use --no-sandbox to bypass, 安全側のため既定では終了)\n");
+            free(src);
+            return 2;
+        }
+    }
     double ts[256];
     /* 兄弟 CLI 規約: AKL_TUNE=INSNS,HEAP_MB,OBJS で上限引上げ（--budget は insn 側の別経路） */
     unsigned long long t_insn = 0, t_heap = 0, t_objs = 0;
