@@ -80,11 +80,12 @@ typedef struct IfNode {
     u16 tag;             /* ELEMENT のみ有意 */
     u8 ns;               /* ELEMENT: IF_NS_* */
     u8 flags;            /* IF_NF_* */
-    IfStr tag_name;      /* canonical（既知タグは静的 lowercase 名、未知は arena 複製） */
+    /* tag_name(ELEMENT) / text(TEXT,COMMENT) / dtype(DOCTYPE) は kind で排他 → union 化
+     * （メモリ則: 112B→88B。PI は COMMENT で target+data を同時保持する必要があるため、
+     *   target は attrs[0].name に入れる＝COMMENT は attrs を使わない規約）。 */
+    union { IfStr tag_name; IfStr text; IfDoctype *dtype; } u;
     IfAttr *attrs;
     u32 n_attrs;
-    IfStr text;          /* TEXT / COMMENT ノードの中身 */
-    IfDoctype *dtype;    /* DOCTYPE のみ非 NULL */
     const struct IfStyle *style; /* カスケード後に付与（intern 所有・不変。監査: 全消費者 read-only） */
     struct IfNode *parent, *first_child, *last_child, *next_sibling;
     /* template のみ: 「content」文書フラグメント（子はここに入る。子リストは常空）。

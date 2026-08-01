@@ -27,15 +27,16 @@ typedef struct IfSeg {
 } IfSeg;
 
 typedef struct IfBox {
-    u8 kind;               /* IF_BOX_* */
+    /* 64B ぴったり配置（ポインタ→i32→小物の順。構築時 tail は layout.c の frame スタック） */
+    struct IfBox *first_child, *next_sibling;
     IfNode *node;          /* BLOCK: 対応要素（LINE: NULL＝無名） */
     const IfStyle *st;
+    IfSeg *segs;           /* LINE ペイロード */
     i32 x, y, w, h;        /* border-box の絶対セル座標 */
-    struct IfBox *first_child, *last_child, *next_sibling; /* last_child: O(1) 追加のため */
-    /* LINE ペイロード */
-    IfSeg *segs;
     u32 n_segs;
+    u8 kind;               /* IF_BOX_* */
     u8 text_align;
+    u8 _pad[2];
 } IfBox;
 
 typedef struct {

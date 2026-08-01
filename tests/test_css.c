@@ -190,8 +190,8 @@ void test_css(void) {
             while (sn) {
                 IfNode *nd = stk[--sn];
                 if (nd->kind == IF_NODE_ELEMENT && nd->tag == IF_TAG_UNKNOWN) {
-                    if (nd->tag_name.n == 4 && memcmp(nd->tag_name.p, "xfoo", 4) == 0) xf = nd;
-                    if (nd->tag_name.n == 4 && memcmp(nd->tag_name.p, "xbar", 4) == 0) xb = nd;
+                    if (nd->u.tag_name.n == 4 && memcmp(nd->u.tag_name.p, "xfoo", 4) == 0) xf = nd;
+                    if (nd->u.tag_name.n == 4 && memcmp(nd->u.tag_name.p, "xbar", 4) == 0) xb = nd;
                 }
                 for (IfNode *c = nd->first_child; c; c = c->next_sibling)
                     if (sn < 64) stk[sn++] = c;

@@ -131,15 +131,15 @@ bool if_dom_has_class(const IfNode *n, IfStr cls) {
 static u64 text_len_dfs(const IfNode *n) {
     u64 s = 0;
     for (const IfNode *c = n->first_child; c; c = c->next_sibling)
-        s += (c->kind == IF_NODE_TEXT) ? c->text.n : text_len_dfs(c);
+        s += (c->kind == IF_NODE_TEXT) ? c->u.text.n : text_len_dfs(c);
     return s;
 }
 
 static void text_write_dfs(const IfNode *n, u8 *buf, u64 *w) {
     for (const IfNode *c = n->first_child; c; c = c->next_sibling) {
         if (c->kind == IF_NODE_TEXT) {
-            memcpy(buf + *w, c->text.p, c->text.n);
-            *w += c->text.n;
+            memcpy(buf + *w, c->u.text.p, c->u.text.n);
+            *w += c->u.text.n;
         } else {
             text_write_dfs(c, buf, w);
         }
@@ -161,7 +161,7 @@ IfStr if_dom_text_content(IfArena *a, const IfNode *n) {
 static void dump_node(const IfNode *n, FILE *out, int depth) {
     for (int i = 0; i < depth; i++) fputs("  ", out);
     if (n->kind == IF_NODE_TEXT) {
-        IfStr t = n->text;
+        IfStr t = n->u.text;
         if (t.n > 48) t.n = 48;
         fprintf(out, "#text \"");
         for (u32 i = 0; i < t.n; i++) {
@@ -170,11 +170,11 @@ static void dump_node(const IfNode *n, FILE *out, int depth) {
             else if (c == '"') fputs("\\\"", out);
             else fputc(c, out);
         }
-        if (n->text.n > 48) fputs("…", out);
+        if (n->u.text.n > 48) fputs("…", out);
         fputs("\"\n", out);
         return;
     }
-    fprintf(out, "<%s", n->tag_name.p ? n->tag_name.p : "?");
+    fprintf(out, "<%s", n->u.tag_name.p ? n->u.tag_name.p : "?");
     for (u32 i = 0; i < n->n_attrs; i++) {
         fprintf(out, " %.*s=\"%.*s\"",
                 (int)n->attrs[i].name.n, n->attrs[i].name.p,
@@ -218,19 +218,19 @@ static void ser_node(const IfNode *n, FILE *o, int depth) {
     switch (n->kind) {
     case IF_NODE_TEXT:
         fputc('|', o); fputc(' ', o); ser_indent(o, depth); fputc('"', o);
-        ser_str(o, n->text); fputs("\"\n", o);
+        ser_str(o, n->u.text); fputs("\"\n", o);
         return;
     case IF_NODE_COMMENT:
         fputc('|', o); fputc(' ', o); ser_indent(o, depth);
-        if (n->tag_name.n) { /* PI: <?target data?> */
-            fputs("<?", o); ser_str(o, n->tag_name); fputc(' ', o);
-            ser_str(o, n->text); fputs("?>\n", o);
+        if (n->n_attrs) { /* PI: <?target data?>（target は attrs[0].name。insert_comment 規約） */
+            fputs("<?", o); ser_str(o, n->attrs[0].name); fputc(' ', o);
+            ser_str(o, n->u.text); fputs("?>\n", o);
         } else {
-            fputs("<!-- ", o); ser_str(o, n->text); fputs(" -->\n", o);
+            fputs("<!-- ", o); ser_str(o, n->u.text); fputs(" -->\n", o);
         }
         return;
     case IF_NODE_DOCTYPE: {
-        const IfDoctype *d = n->dtype;
+        const IfDoctype *d = n->u.dtype;
         fputc('|', o); fputc(' ', o); ser_indent(o, depth);
         if (!d || !d->has_name) { fputs("<!DOCTYPE >\n", o); return; }
         fputs("<!DOCTYPE ", o); ser_str(o, d->name);
@@ -246,7 +246,7 @@ static void ser_node(const IfNode *n, FILE *o, int depth) {
         fputc('<', o);
         if (n->ns == IF_NS_SVG) fputs("svg ", o);
         else if (n->ns == IF_NS_MATHML) fputs("math ", o);
-        ser_str(o, n->tag_name); fputs(">\n", o);
+        ser_str(o, n->u.tag_name); fputs(">\n", o);
         if (n->n_attrs) {
             /* html5lib 形式は属性を名前の辞書順で出す */
             const IfAttr **sorted = (const IfAttr **)malloc((size_t)n->n_attrs * sizeof *sorted);
@@ -264,7 +264,7 @@ static void ser_node(const IfNode *n, FILE *o, int depth) {
             }
             free((void *)sorted);
         }
-        if (n->tag_name.n == 8 && memcmp(n->tag_name.p, "template", 8) == 0) {
+        if (n->u.tag_name.n == 8 && memcmp(n->u.tag_name.p, "template", 8) == 0) {
             fputc('|', o); fputc(' ', o); ser_indent(o, depth + 1);
             fputs("content\n", o);
             /* content 分離実装後: 子は content フラグメント配下（要素子は常空） */

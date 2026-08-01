@@ -189,10 +189,10 @@ static IfNode *make_element(IfTB *b, const IfTok *tok) {
         char *lc = (char *)if_arena_alloc(b->arena, (u64)tok->tag_raw.n + 1);
         for (u32 i = 0; i < tok->tag_raw.n; i++) lc[i] = (char)if_ascii_lower((u8)tok->tag_raw.p[i]);
         lc[tok->tag_raw.n] = 0;
-        n->tag_name = if_str(lc, tok->tag_raw.n);
+        n->u.tag_name = if_str(lc, tok->tag_raw.n);
     } else {
         const char *s = if_tag_name(tok->tag);
-        n->tag_name = if_str(s, (u32)strlen(s));
+        n->u.tag_name = if_str(s, (u32)strlen(s));
     }
     n->attrs = tok->attrs;
     n->n_attrs = tok->n_attrs;
@@ -286,15 +286,15 @@ static void append_text(IfTB *b, IfStr text) {
         if (last && last->kind == IF_NODE_TEXT) merge_to = last;
     }
     if (merge_to) {
-        u64 nn = (u64)merge_to->text.n + text.n;
+        u64 nn = (u64)merge_to->u.text.n + text.n;
         char *buf = (char *)if_arena_alloc(b->arena, nn);
-        memcpy(buf, merge_to->text.p, merge_to->text.n);
-        memcpy(buf + merge_to->text.n, text.p, text.n);
-        merge_to->text = if_str(buf, (u32)nn);
+        memcpy(buf, merge_to->u.text.p, merge_to->u.text.n);
+        memcpy(buf + merge_to->u.text.n, text.p, text.n);
+        merge_to->u.text = if_str(buf, (u32)nn);
         return;
     }
     IfNode *n = new_node(b, IF_NODE_TEXT);
-    n->text = text;
+    n->u.text = text;
     if (pl.before) insert_child_before(pl.parent, n, pl.before);
     else append_child(pl.parent, n);
 }
@@ -666,7 +666,7 @@ static IfNode *clone_element(IfTB *b, const IfNode *src) {
     IfNode *c = new_node(b, IF_NODE_ELEMENT);
     c->tag = src->tag;
     c->ns = src->ns;
-    c->tag_name = src->tag_name;
+    c->u.tag_name = src->u.tag_name;
     if (src->n_attrs) {
         c->attrs = (IfAttr *)if_arena_alloc(b->arena, (u64)src->n_attrs * sizeof(IfAttr));
         memcpy(c->attrs, src->attrs, (u64)src->n_attrs * sizeof(IfAttr));
@@ -1396,11 +1396,24 @@ static void step_after_after_frameset(IfTB *b, IfTok tok) {
 /* rawtext または RCDATA の container 要素か（内容は element の子テキスト1本） */
 static bool rawish(u16 t) { return if_tag_is_rawtext(t) || if_tag_is_rcdata(t); }
 
+/* PI の target を attrs[0].name に積む（IfNode union 化で COMMENT の tag_name 欄は
+ * text と共有になったため。COMMENT は attrs を通常使わない規約。serializer は
+ * dom.c IF_NODE_COMMENT 分岐で n_attrs>0 を PI 印として読む） */
+static void pi_target_save(IfTB *b, IfNode *n, IfStr target) {
+    if (!target.n) return; /* 空 target は旧挙動どおり通常 comment として serialize */
+    IfAttr *at = (IfAttr *)if_arena_alloc(b->arena, sizeof(IfAttr));
+    if (!at) return; /* OOM 時は target なし PI（通常 comment として見える）に劣化 */
+    at->name = target;
+    at->value = if_str(NULL, 0);
+    n->attrs = at;
+    n->n_attrs = 1;
+}
+
 static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok) {
     if (under_slim(b)) return;
     IfNode *n = new_node(b, IF_NODE_COMMENT);
-    n->text = tok->text;
-    if (tok->is_pi) n->tag_name = tok->pi_target; /* PI は target を tag_name に保持（comment では未使用の欄） */
+    n->u.text = tok->text;
+    if (tok->is_pi) pi_target_save(b, n, tok->pi_target);
     append_child(parent, n);
 }
 
@@ -1408,8 +1421,8 @@ static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok) {
 static void insert_comment_placed(IfTB *b, const IfTok *tok) {
     if (under_slim(b)) return;
     IfNode *n = new_node(b, IF_NODE_COMMENT);
-    n->text = tok->text;
-    if (tok->is_pi) n->tag_name = tok->pi_target;
+    n->u.text = tok->text;
+    if (tok->is_pi) pi_target_save(b, n, tok->pi_target);
     append_placed(b, n);
 }
 
@@ -1558,10 +1571,10 @@ static void step_initial(IfTB *b, IfTok tok) {
         if (!b->seen_doctype) {
             b->seen_doctype = true;
             IfNode *d = new_node(b, IF_NODE_DOCTYPE);
-            d->dtype = (IfDoctype *)if_arena_calloc(b->arena, sizeof(IfDoctype));
-            d->dtype->name = tok.text;      d->dtype->has_name = tok.dt_has_name;
-            d->dtype->pub = tok.dt_pub;     d->dtype->has_pub = tok.dt_has_pub;
-            d->dtype->sys = tok.dt_sys;     d->dtype->has_sys = tok.dt_has_sys;
+            d->u.dtype = (IfDoctype *)if_arena_calloc(b->arena, sizeof(IfDoctype));
+            d->u.dtype->name = tok.text;      d->u.dtype->has_name = tok.dt_has_name;
+            d->u.dtype->pub = tok.dt_pub;     d->u.dtype->has_pub = tok.dt_has_pub;
+            d->u.dtype->sys = tok.dt_sys;     d->u.dtype->has_sys = tok.dt_has_sys;
             append_child(b->dom->root, d);
         } else {
             b->dom->n_errors++; /* 複数 doctype は無視 */
@@ -2537,8 +2550,8 @@ static void foreign_adjust(IfTB *b, IfNode *n) {
     if (n->ns == IF_NS_SVG) {
         for (u32 i = 0; i < sizeof IF_SVG_TAG_ADJUST / sizeof IF_SVG_TAG_ADJUST[0]; i++) {
             IfStr lc = if_str(IF_SVG_TAG_ADJUST[i].lc, (u32)strlen(IF_SVG_TAG_ADJUST[i].lc));
-            if (if_str_eq_ci(n->tag_name, lc)) {
-                n->tag_name = if_str(IF_SVG_TAG_ADJUST[i].canon,
+            if (if_str_eq_ci(n->u.tag_name, lc)) {
+                n->u.tag_name = if_str(IF_SVG_TAG_ADJUST[i].canon,
                                      (u32)strlen(IF_SVG_TAG_ADJUST[i].canon));
                 break;
             }
@@ -2604,7 +2617,7 @@ static void foreign_step(IfTB *b, const IfTok *tok) {
      * HTML 名前空間要素に到達したら無視ではなく「現行挿入モードの HTML 規則」で
      * 再処理（<div><svg></div>a で div が畳まれ "a" が外に出る挙動の根拠） */
     IfStr name = tok_end_name(tok);
-    if (b->depth && if_str_eq_ci(top(b)->tag_name, name)) { pop(b); return; }
+    if (b->depth && if_str_eq_ci(top(b)->u.tag_name, name)) { pop(b); return; }
     b->dom->n_errors++; /* step 2: 先端のタグ名不一致 */
     for (u32 i = b->depth; i > 0; i--) {
         IfNode *e = b->stack[i - 1];
@@ -2614,7 +2627,7 @@ static void foreign_step(IfTB *b, const IfTok *tok) {
             b->no_foreign = false;
             return;
         }
-        if (if_str_eq_ci(e->tag_name, name)) {
+        if (if_str_eq_ci(e->u.tag_name, name)) {
             while (b->depth > i - 1) pop(b);
             return;
         }

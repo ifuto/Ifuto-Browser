@@ -860,7 +860,7 @@ static bool match_compound(const IfNode *n, const IfCompound *cp) {
         if (cp->tag != IF_TAG_UNKNOWN) {
             if (n->tag != cp->tag) return false;
         } else {
-            if (n->tag != IF_TAG_UNKNOWN || !if_str_eq_ci(n->tag_name, cp->tag_name)) return false;
+            if (n->tag != IF_TAG_UNKNOWN || !if_str_eq_ci(n->u.tag_name, cp->tag_name)) return false;
         }
     }
     for (u32 i = 0; i < cp->n_classes; i++)
@@ -1016,10 +1016,10 @@ static void collect_from_sheet(IfArena *a, const IfNode *n, const IfStyleSheet *
     if (n->tag != IF_TAG_UNKNOWN) {
         const char *nm = if_tag_name(n->tag);
         if (nm) tkey = if_str(nm, (u32)strlen(nm));
-    } else if (n->tag_name.n) {
-        u8 *buf = (u8 *)if_arena_alloc(a, n->tag_name.n);
-        for (u32 i = 0; i < n->tag_name.n; i++) buf[i] = rs_lower((u8)n->tag_name.p[i]);
-        tkey = if_str((const char *)buf, n->tag_name.n);
+    } else if (n->u.tag_name.n) {
+        u8 *buf = (u8 *)if_arena_alloc(a, n->u.tag_name.n);
+        for (u32 i = 0; i < n->u.tag_name.n; i++) buf[i] = rs_lower((u8)n->u.tag_name.p[i]);
+        tkey = if_str((const char *)buf, n->u.tag_name.n);
     }
     if (tkey.n) collect_slice(n, sh, rs_find(rs->tg_b, rs->n_tg, rs_hash(tkey), tkey), origin, win);
 

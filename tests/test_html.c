@@ -20,9 +20,9 @@ static IfDom *parse(IfArena *a, const char *html) {
 /* slim-DOM テスト用: 本文中に needle を含む TEXT ノードが居るか（content 辺も潜る） */
 static bool sl_tree_text_has(const IfNode *n, const char *needle) {
     size_t nl = strlen(needle);
-    if (n->kind == IF_NODE_TEXT && n->text.n >= nl) {
-        for (u32 i = 0; i + nl <= n->text.n; i++)
-            if (memcmp(n->text.p + i, needle, nl) == 0) return true;
+    if (n->kind == IF_NODE_TEXT && n->u.text.n >= nl) {
+        for (u32 i = 0; i + nl <= n->u.text.n; i++)
+            if (memcmp(n->u.text.p + i, needle, nl) == 0) return true;
     }
     for (const IfNode *c = n->first_child; c; c = c->next_sibling)
         if (sl_tree_text_has(c, needle)) return true;
@@ -68,7 +68,7 @@ void test_html(void) {
         IfNode *p = first_elem(body);
         CHECK(p && p->tag == IF_TAG_P);
         IfNode *t = p->first_child;
-        CHECK(t && t->kind == IF_NODE_TEXT && if_str_eq(t->text, IF_S("Hello")));
+        CHECK(t && t->kind == IF_NODE_TEXT && if_str_eq(t->u.text, IF_S("Hello")));
     }
 
     /* p の暗黙終了 + 属性（デコード込み） + 重複属性 first-wins */
@@ -104,7 +104,7 @@ void test_html(void) {
         CHECK(style != NULL);
         IfNode *t = style->first_child;
         CHECK(t && t->kind == IF_NODE_TEXT);
-        CHECK(t && if_str_eq(t->text, IF_S("p > a { color: red }")));
+        CHECK(t && if_str_eq(t->u.text, IF_S("p > a { color: red }")));
     }
 
     /* li の暗黙終了 */

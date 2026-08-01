@@ -28,6 +28,12 @@ typedef struct {
     u64 pieces_scratch_cap;
     IfSeg *segs_scratch;
     u64 segs_scratch_cap;
+    /* box 構築時 tail（IfBox から last_child フィールドを追放した代替。子追加は
+     * 親 box 構築中に集中かつ再帰スタック規律なので、frame に持って O(1) を保つ。
+     * frame 深さ超過/不一致時は兄弟走査の正しいフォールバックに落ちる（性能のみ） */
+    IfBox *frame_box[512];
+    IfBox *frame_tail[512];
+    int frame_n;
 } IfLC;
 
 static i32 px2col(float px) { return (i32)floorf(px / IF_CHAR_W_PX + 0.5f); }
@@ -46,12 +52,28 @@ static i32 len_v(IfLen l, float self_fs, float root_fs, i32 basis_w) {
     return px2row(if_css_resolve_len(l, self_fs, root_fs));
 }
 
-static void box_add_child(IfBox *parent, IfBox *child) {
+static void box_add_child(IfLC *lc, IfBox *parent, IfBox *child) {
     child->next_sibling = NULL;
-    /* O(1): 末尾走査は兄弟 N に対して O(N²) になる（実測済み。禁止） */
-    if (parent->last_child) parent->last_child->next_sibling = child;
+    IfBox *tail = NULL;
+    bool use_frame = lc && lc->frame_n > 0 && lc->frame_box[lc->frame_n - 1] == parent;
+    if (use_frame) tail = lc->frame_tail[lc->frame_n - 1];
+    else { /* フォールバック（設計上到達しないはずの防御経路。正しさ優先） */
+        for (tail = parent->first_child; tail && tail->next_sibling; tail = tail->next_sibling) {}
+    }
+    if (tail) tail->next_sibling = child;
     else parent->first_child = child;
-    parent->last_child = child;
+    if (use_frame) lc->frame_tail[lc->frame_n - 1] = child;
+}
+
+/* IfBox 生成直後（子の構築を始める前）に frame を積み、構築完了で降ろす */
+static void frame_push(IfLC *lc, IfBox *box) {
+    if (lc->frame_n < 512) { lc->frame_box[lc->frame_n] = box; lc->frame_tail[lc->frame_n] = NULL; }
+    lc->frame_n++;
+}
+static void frame_pop(IfLC *lc, IfBox *box) {
+    lc->frame_n--;
+    (void)box; /* 対称性のみ。depth 超過分は push で積まれないので pop も対称 */
+    if (lc->frame_n < 0) lc->frame_n = 0;
 }
 
 static IfBox *new_box(IfLC *lc, u8 kind, IfNode *node, const IfStyle *st) {
@@ -90,7 +112,7 @@ static void collect_link(IfLC *lc, IfNode *a) {
 }
 
 static void flatten_into(IfFlat *f, IfNode *n, const IfStyle *st) {
-    if (n->kind == IF_NODE_TEXT) { flat_push(f, n->text, st, 0); return; }
+    if (n->kind == IF_NODE_TEXT) { flat_push(f, n->u.text, st, 0); return; }
     if (n->kind != IF_NODE_ELEMENT) return;
     const IfStyle *est = n->style ? n->style : st;
     if (n->style && n->style->display == IF_D_NONE) return;
@@ -157,7 +179,7 @@ static void wrap_end_line(IfWrap *w, float max_lh) {
         line->n_segs = w->n_segs;
         for (u32 i = 0; i < line->n_segs; i++) dst[i].x += shift;
     }
-    box_add_child(w->parent, line);
+    box_add_child(w->lc, w->parent, line);
     w->y += rows;
     w->n_segs = 0;
     w->line_w = 0;
@@ -323,7 +345,7 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
         i32 mb = len_v(cst->margin[2], cst->font_size, lc->root_fs, content_w);
         y += (prev_mb > mt ? prev_mb : mt); /* 兄弟縦マージン相殺: max */
         IfBox *child = layout_element(lc, c, content_x, y, content_w);
-        box_add_child(box, child);
+        box_add_child(lc, box, child);
         y += child->h;
         prev_mb = mb;
         c = c->next_sibling;
@@ -384,7 +406,9 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
         return box;
     }
 
+    frame_push(lc, box); /* box の子追加は frame_top==box で O(1) tail を引く */
     i32 content_h = layout_children(lc, box, node, content_x, content_y, content_w);
+    frame_pop(lc, box);
     if (st->height.unit != IF_U_AUTO) {
         i32 spec = len_v(st->height, fs, lc->root_fs, avail_w);
         if (spec > content_h) content_h = spec; /* 指定高はクリップせず拡張のみ（v0.1 近似） */
@@ -440,7 +464,7 @@ static void dump_box(const IfBox *b, FILE *out, int depth) {
         return;
     }
     fprintf(out, "BLOCK x=%d y=%d w=%d h=%d", b->x, b->y, b->w, b->h);
-    if (b->node) fprintf(out, " <%s>", b->node->tag_name.p ? b->node->tag_name.p : "?");
+    if (b->node) fprintf(out, " <%s>", b->node->u.tag_name.p ? b->node->u.tag_name.p : "?");
     fputc('\n', out);
     for (const IfBox *c = b->first_child; c; c = c->next_sibling) dump_box(c, out, depth + 1);
 }
