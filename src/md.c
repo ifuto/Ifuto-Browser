@@ -91,6 +91,8 @@ typedef struct {
     char *c_buf;          /* 複製バッファ（heap。flush ごとに使い回し） */
     u32 c_n, c_cap;
     u8 mode;              /* 0=empty 1=borrow 2=copy */
+    /* node slab: 生成は直列 bump（ノード単位の arena 呼出を slab refill に畳む） */
+    IfNode *nslab, *nslab_end;
 } Mo;
 
 static void mo_taint(Mo *m) { m->tainted = true; }
@@ -145,7 +147,7 @@ static void run_to_copy(Mo *m) {
 }
 
 /* raw slice を text run に追加（dom モード。借用量判定つき） */
-static void run_add(Mo *m, const char *p, u32 n) {
+static inline void run_add(Mo *m, const char *p, u32 n) {
     if (!n) return;
     if (m->mode == 0) {
         if (mo_persistent(m, p)) { m->b_p = p; m->b_n = n; m->mode = 1; return; }
@@ -165,7 +167,7 @@ static void run_add(Mo *m, const char *p, u32 n) {
     m->c_n += n;
 }
 
-static void run_add_ch(Mo *m, char c) {
+static inline void run_add_ch(Mo *m, char c) {
     if (m->mode != 2) run_to_copy(m);
     if (m->c_n + 2 > m->c_cap) {
         u64 nc = m->c_cap ? m->c_cap : 64;
@@ -177,18 +179,26 @@ static void run_add_ch(Mo *m, char c) {
     m->c_buf[m->c_n++] = c;
 }
 
-static IfNode *mnew(Mo *m, IfNodeKind kind) {
+static inline IfNode *mnew(Mo *m, IfNodeKind kind) {
     u64 _t0; if (mpf()) _t0 = if_rdtsc_md(); else _t0 = 0;
     IfDom *d = m->dom;
-    if (d->n_nodes >= IF_MAX_DOM_NODES) { mo_taint(m); return NULL; }
-    IfNode *n = (IfNode *)if_arena_alloc(m->a, sizeof(IfNode));
+    IfNode *n;
+    if (__builtin_expect(m->nslab != m->nslab_end, 1)) {
+        n = m->nslab++;
+    } else {
+        if (__builtin_expect(d->n_nodes >= IF_MAX_DOM_NODES, 0)) { mo_taint(m); return NULL; }
+        n = (IfNode *)if_arena_bump(m->a, 128 * sizeof(IfNode));
+        m->nslab = n + 1;
+        m->nslab_end = n + 128;
+    }
+    if (__builtin_expect(d->n_nodes >= IF_MAX_DOM_NODES, 0)) { mo_taint(m); return NULL; }
+    d->n_nodes++;
     n->kind = kind;
     n->tag = 0; n->ns = IF_NS_HTML; n->flags = 0;
     n->attrs = NULL; n->n_attrs = 0;
     n->style = NULL;
     n->parent = n->first_child = n->last_child = n->next_sibling = NULL;
     n->content = NULL;
-    d->n_nodes++;
     if (_t0) MP_MNEW += if_rdtsc_md() - _t0;
     return n;
 }
@@ -201,13 +211,13 @@ static void mattach(IfNode *parent, IfNode *ch) {
 }
 
 /* 現在の run を TEXT ノードとして確定（open/close/void の前に必ず呼ぶ） */
-static void run_flush(Mo *m) {
+static inline void run_flush(Mo *m) {
     u64 _t0; if (mpf()) _t0 = if_rdtsc_md(); else _t0 = 0;
     if (m->mode != 0) {
         IfStr t;
         if (m->mode == 1) t = if_str(m->b_p, m->b_n);
         else {
-            char *np = (char *)if_arena_alloc(m->a, m->c_n ? m->c_n : 1);
+            char *np = (char *)if_arena_bump(m->a, m->c_n ? m->c_n : 1);
             if (m->c_n) memcpy(np, m->c_buf, m->c_n);
             t = if_str(np, m->c_n);
         }
@@ -270,7 +280,8 @@ static void mo_attr(Mo *m, const char *an, u32 anl, IfStr v) {
 }
 
 static void mo_elem_store(Mo *m, bool push) {
-    run_flush(m);
+    if (m->mode) run_flush(m); /* flush は mode≠0 のときだけ */
+    if (__builtin_expect(m->tainted, 0)) return;
     IfNode *n = mnew(m, IF_NODE_ELEMENT);
     if (!n) return;
     n->tag = g_pend.tag;
@@ -300,6 +311,40 @@ static void mo_elem_store(Mo *m, bool push) {
     }
 }
 
+/* 無属性要素の open+push 融合（pend 経由の多段コールを 1 つに畳む。
+ * DOM の生出力は mo_open+mo_open_end と同値（pend.nattr==0 のときの mo_elem_store と同一遷移）。
+ * string backend も "<name>" の同じ 3 書きでバイト一致。has_style 監視対象外タグのみに使う
+ * （md emitter は style タグを生成しない） */
+static inline void mo_open_push(Mo *m, u16 tag, const char *nm, u32 nl) {
+    if (__builtin_expect(!m->is_dom, 0)) {
+        b_putn(&m->str, "<", 1); b_putn(&m->str, nm, nl); b_putc(&m->str, '>');
+        return;
+    }
+    if (m->mode) run_flush(m);
+    IfNode *n = mnew(m, IF_NODE_ELEMENT);
+    if (__builtin_expect(!n || m->tainted, 0)) return;
+    n->tag = tag;
+    n->u.tag_name = if_str(nm, nl);
+    mattach(m->cur, n);
+    if (__builtin_expect(m->sp >= 128, 0)) { mo_taint(m); return; }
+    m->stk[m->sp++] = n;
+    m->cur = n;
+}
+
+/* void 要素（hr/br）の融合 */
+static inline void mo_open_void(Mo *m, u16 tag, const char *nm, u32 nl) {
+    if (__builtin_expect(!m->is_dom, 0)) {
+        b_putn(&m->str, "<", 1); b_putn(&m->str, nm, nl); b_putc(&m->str, '>');
+        return;
+    }
+    if (m->mode) run_flush(m);
+    IfNode *n = mnew(m, IF_NODE_ELEMENT);
+    if (__builtin_expect(!n || m->tainted, 0)) return;
+    n->tag = tag;
+    n->u.tag_name = if_str(nm, nl);
+    mattach(m->cur, n);
+}
+
 static void mo_open_end(Mo *m) { /* 開始タグ閉じ＋要素をスタックへ */
     if (!m->is_dom) { b_putc(&m->str, '>'); return; }
     mo_elem_store(m, true);
@@ -317,9 +362,10 @@ static void mo_close(Mo *m, const char *name, u32 nl) {
         b_putc(&m->str, '>');
         return;
     }
-    run_flush(m);
-    if (m->sp <= 0 || m->stk[m->sp - 1]->u.tag_name.n != nl ||
-        memcmp(m->stk[m->sp - 1]->u.tag_name.p, name, nl) != 0) {
+    if (m->mode) run_flush(m); /* flush は mode≠0 のときだけ（呼出自体を畳む） */
+    IfNode *top = m->sp > 0 ? m->stk[m->sp - 1] : NULL;
+    if (!top || top->u.tag_name.n != nl ||
+        (top->u.tag_name.p != name && memcmp(top->u.tag_name.p, name, nl) != 0)) {
         mo_taint(m); /* 到達不能のはず（emitter は常に対応させる） */
         return;
     }
@@ -413,8 +459,7 @@ static i32 find_close(IfStr s, u32 from, const char *delim, u32 dn) {
 }
 
 static void emit_fmt(Mo *out, Fn *fn, u16 tag, const char *name, u32 nl, IfStr inner) {
-    mo_open(out, tag, name, nl);
-    mo_open_end(out);
+    mo_open_push(out, tag, name, nl);
     inline_span(out, fn, inner);
     mo_close(out, name, nl);
 }
@@ -514,8 +559,7 @@ static bool try_link(Mo *out, Fn *fn, IfStr s, u32 *adv) {
              * 旧挙動そのものが正（テスト固定）なので厳密に再現する） */
             IfStr idv = scratch_cat(&g_scr1, "fr-", 3, id, seen ? "-2" : "", seen ? 2 : 0);
             IfStr hrv = scratch_cat(&g_scr2, "#fn-", 4, id, "", 0);
-            mo_open(out, IF_TAG_SUP, "sup", 3);
-            mo_open_end(out);
+            mo_open_push(out, IF_TAG_SUP, "sup", 3);
             mo_open(out, IF_TAG_A, "a", 1);
             mo_attr(out, "href", 4, hrv);
             mo_attr(out, "id", 2, idv);
@@ -815,8 +859,7 @@ static u32 ln_indent(Ln l) {
 
 /* 段落: 連結は「スペース」、前行の末尾 2 空白（ハードブレーク）なら <br> で接続 */
 static void emit_para_lines(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi) {
-    mo_open(out, IF_TAG_P, "p", 1);
-    mo_open_end(out);
+    mo_open_push(out, IF_TAG_P, "p", 1);
     bool prev_hard = false;
     for (u32 i = lo; i < hi; i++) {
         IfStr x = if_str(ls[i].p, ls[i].n);
@@ -826,8 +869,7 @@ static void emit_para_lines(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi) {
         if (hard) x.n -= trail;
         if (i > lo) {
             if (prev_hard) {
-                mo_open(out, IF_TAG_BR, "br", 2);
-                mo_open_end_void(out);
+                mo_open_void(out, IF_TAG_BR, "br", 2);
             } else {
                 mo_text_ch(out, ' ');
             }
@@ -853,8 +895,7 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
         if (hh) {
             static const char HNM[6][3] = { "h1", "h2", "h3", "h4", "h5", "h6" };
             const char *nm = HNM[hh - 1]; /* 静的文字列（tag_name の寿命規約） */
-            mo_open(out, (u16)(IF_TAG_H1 + (hh - 1)), nm, 2);
-            mo_open_end(out);
+            mo_open_push(out, (u16)(IF_TAG_H1 + (hh - 1)), nm, 2);
             u32 k = (u32)hh;
             while (k < l.n && (l.p[k] == ' ' || l.p[k] == '\t')) k++;
             IfStr t = if_str(l.p + k, l.n - k);
@@ -871,8 +912,7 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
             continue;
         }
         if (ln_is_hr(l)) {
-            mo_open(out, IF_TAG_HR, "hr", 2);
-            mo_open_end_void(out);
+            mo_open_void(out, IF_TAG_HR, "hr", 2);
             mo_text_ch(out, '\n');
             i++;
             continue;
@@ -883,8 +923,7 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
             while (k < l.n && l.p[k] == fsym) k++;
             while (k < l.n && (l.p[k] == ' ' || l.p[k] == '\t')) k++;
             IfStr lang = if_str(l.p + k, l.n - k);
-            mo_open(out, IF_TAG_PRE, "pre", 3);
-            mo_open_end(out);
+            mo_open_push(out, IF_TAG_PRE, "pre", 3);
             mo_open(out, IF_TAG_CODE, "code", 4);
             if (lang.n) {
                 IfStr cv = scratch_cat(&g_scr1, "lang-", 5, lang, "", 0);
@@ -917,8 +956,7 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
                     b_putc(&qb, '\n');
                     i++;
                 }
-                mo_open(out, IF_TAG_BLOCKQUOTE, "blockquote", 10);
-                mo_open_end(out);
+                mo_open_push(out, IF_TAG_BLOCKQUOTE, "blockquote", 10);
                 mo_text_ch(out, '\n');
                 if (out->is_dom) {
                     IfStr fin = b_finish(&qb); /* arena 恒久化（参照寿命） */
@@ -940,11 +978,9 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
                     b_putn(&flat, x.p, x.n);
                     b_putc(&flat, '\n');
                 }
-                mo_open(out, IF_TAG_BLOCKQUOTE, "blockquote", 10);
-                mo_open_end(out);
+                mo_open_push(out, IF_TAG_BLOCKQUOTE, "blockquote", 10);
                 mo_text_ch(out, '\n');
-                mo_open(out, IF_TAG_P, "p", 1);
-                mo_open_end(out);
+                mo_open_push(out, IF_TAG_P, "p", 1);
                 if (out->is_dom) {
                     IfStr fin = b_finish(&flat);
                     mo_range(out, fin.p, fin.n);
@@ -965,14 +1001,12 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
         if (ln_list_item(l, &mk)) {
             bool ordered = mk.ordered;
             u32 base = mk.indent;
-            mo_open(out, ordered ? IF_TAG_OL : IF_TAG_UL, ordered ? "ol" : "ul", 2);
-            mo_open_end(out);
+            mo_open_push(out, ordered ? IF_TAG_OL : IF_TAG_UL, ordered ? "ol" : "ul", 2);
             mo_text_ch(out, '\n');
             while (i < hi) {
                 LiMark m2;
                 if (!ln_list_item(ls[i], &m2) || m2.ordered != ordered || m2.indent != base) break;
-                mo_open(out, IF_TAG_LI, "li", 2);
-                mo_open_end(out);
+                mo_open_push(out, IF_TAG_LI, "li", 2);
                 inline_span(out, fn, if_str(ls[i].p + m2.mwidth, ls[i].n - m2.mwidth));
                 i++;
                 u32 j = i;
@@ -995,24 +1029,19 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
             IfStr heads[32];
             u32 nh = split_cells(l, heads, 32);
             if (nh > 32) nh = 32; /* 旧実装の読み出し範囲は cells 配列まで（32 列天井） */
-            mo_open(out, IF_TAG_TABLE, "table", 5);
-            mo_open_end(out);
+            mo_open_push(out, IF_TAG_TABLE, "table", 5);
             mo_text_ch(out, '\n');
-            mo_open(out, IF_TAG_THEAD, "thead", 5);
-            mo_open_end(out);
-            mo_open(out, IF_TAG_TR, "tr", 2);
-            mo_open_end(out);
+            mo_open_push(out, IF_TAG_THEAD, "thead", 5);
+            mo_open_push(out, IF_TAG_TR, "tr", 2);
             for (u32 k2 = 0; k2 < nh; k2++) {
-                mo_open(out, IF_TAG_TH, "th", 2);
-                mo_open_end(out);
+                mo_open_push(out, IF_TAG_TH, "th", 2);
                 inline_span(out, fn, heads[k2]);
                 mo_close(out, "th", 2);
             }
             mo_close(out, "tr", 2);
             mo_close(out, "thead", 5);
             mo_text_ch(out, '\n');
-            mo_open(out, IF_TAG_TBODY, "tbody", 5);
-            mo_open_end(out);
+            mo_open_push(out, IF_TAG_TBODY, "tbody", 5);
             mo_text_ch(out, '\n');
             i += 2;
             while (i < hi && !ln_blank(ls[i])) {
@@ -1022,11 +1051,9 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
                 IfStr cells[32];
                 u32 nc = split_cells(ls[i], cells, 32);
                 if (nc > 32) nc = 32;
-                mo_open(out, IF_TAG_TR, "tr", 2);
-                mo_open_end(out);
+                mo_open_push(out, IF_TAG_TR, "tr", 2);
                 for (u32 k2 = 0; k2 < nc; k2++) {
-                    mo_open(out, IF_TAG_TD, "td", 2);
-                    mo_open_end(out);
+                    mo_open_push(out, IF_TAG_TD, "td", 2);
                     inline_span(out, fn, cells[k2]);
                     mo_close(out, "td", 2);
                 }
@@ -1137,11 +1164,9 @@ footnotes:;
         mo_attr(out, "class", 5, IF_S("footnotes"));
         mo_open_end(out);
         mo_text_ch(out, '\n');
-        mo_open(out, IF_TAG_HR, "hr", 2);
-        mo_open_end_void(out);
+        mo_open_void(out, IF_TAG_HR, "hr", 2);
         mo_text_ch(out, '\n');
-        mo_open(out, IF_TAG_OL, "ol", 2);
-        mo_open_end(out);
+        mo_open_push(out, IF_TAG_OL, "ol", 2);
         mo_text_ch(out, '\n');
         for (u32 i = 0; i < fn->n_refs; i++) {
             u32 di = fn_find_def(fn, fn->refs[i]);

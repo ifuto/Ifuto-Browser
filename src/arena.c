@@ -1,8 +1,23 @@
 #include "arena.h"
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+
+/* 厳格 -std=c11 では glibc が隠す定数（ABI 固定値） */
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS 0x20
+#endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 14
+#endif
 
 #define IF_ARENA_ALIGN 16u
+/* 大ブロックは malloc を通さず mmap 直取り + MADV_HUGEPAGE。
+ * 巨大文書の初回タッチは「新規 4KB ページのマイナーフォールト 9 万回≒60-180ms」（実測
+ * 2026-08-01）で、THP 化は fault を 1/512 に減らす唯一の構造策（prefault でも fault は消えない）。
+ * pad は free/munmap の区別に使う（旧来 0 初期化のままの小ブロックは malloc 経由）。 */
+#define IF_ABLK_MMAP 0xAB12CD34EF567890ull
+#define IF_ABLK_MMAP_MIN (2u << 20)
 
 void if_arena_init(IfArena *a, u64 default_cap) {
     a->head = NULL;
@@ -15,8 +30,31 @@ static IfArenaBlock *if_arena_new_block(IfArena *a, u64 need) {
     if (need > cap) cap = need;
     /* オーバーフロー検査: header + align + cap */
     if (cap > IF_MAX_ARENA_ALLOC) if_fatal("arena: single block too large (hostile input?)");
-    IfArenaBlock *b = (IfArenaBlock *)malloc(sizeof(IfArenaBlock) + cap);
-    if (!b) if_fatal("arena: out of memory");
+    IfArenaBlock *b;
+    u64 total = sizeof(IfArenaBlock) + cap;
+    if (cap >= IF_ABLK_MMAP_MIN) {
+        /* 2MB アライン矯正つき mmap: 非アラインだと窓の両端 ~511 ページが 4KB fault 化する
+         * （2026-08-01 実測: 4MB block × 89 で ~45k fault）。揃えれば全ページ THP。 */
+        u64 ask = total + (2u << 20);
+        void *m = mmap(NULL, ask, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m != MAP_FAILED) {
+            uintptr_t base = (uintptr_t)m;
+            uintptr_t aligned = (base + ((2u << 20) - 1)) & ~(uintptr_t)((2u << 20) - 1);
+            if (aligned > base) munmap((void *)base, aligned - base);
+            if (aligned + total < base + ask) munmap((void *)(aligned + total), base + ask - (aligned + total));
+            (void)madvise((void *)aligned, total, MADV_HUGEPAGE);
+            b = (IfArenaBlock *)aligned;
+            b->pad = IF_ABLK_MMAP;
+        } else {
+            b = (IfArenaBlock *)malloc(total);
+            if (!b) if_fatal("arena: out of memory");
+            b->pad = 0;
+        }
+    } else {
+        b = (IfArenaBlock *)malloc(total);
+        if (!b) if_fatal("arena: out of memory");
+        b->pad = 0;
+    }
     b->next = a->head;
     b->cap = cap;
     b->used = 0;
@@ -53,7 +91,8 @@ void if_arena_destroy(IfArena *a) {
     IfArenaBlock *b = a->head;
     while (b) {
         IfArenaBlock *next = b->next;
-        free(b);
+        if (b->pad == IF_ABLK_MMAP) munmap(b, sizeof(IfArenaBlock) + b->cap);
+        else free(b);
         b = next;
     }
     a->head = NULL;

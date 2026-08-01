@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
 
     double t0 = now_ms();
     IfArena a;
-    if_arena_init(&a, 1 << 18);
+    if_arena_init(&a, 1 << 22); /* CLI: 4MB ブロック→THP 直取り（マイナーフォールト税の構造除去。GUI/テストは従来のまま） */
     IfStr input = read_all(&a, path);
 
     double t1 = now_ms();
