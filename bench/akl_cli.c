@@ -60,13 +60,19 @@ static char *slurp(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    int times = 1, want_rss = 0, want_sandbox = 1;
-    unsigned long long budget = 1000000000000ull; /* bench 用途: 既定は実質無制限。--budget で縮めて枯渇挙動も検査可 */
+    int times = 1, want_rss = 0, want_sandbox = 1, use_cojit = 1;
+    /* CLI 製品既定 budget: 500M ops（実測で bench/js 最大は arith の <=100M。
+     * 5x の余裕を持たせつつ、暴走スクリプトは数秒で確実に死ぬ上限）。
+     * 旧来の CLI 既定 1e12 は「while(1){} が実質無限に CPU を焼く」状態で、
+     * fail-stop 規則と CPU 非酷使規則の双方に違反していた（ユーザ報告で検出）。
+     * --budget N で明示変更。--budget 0 はエンジン既定（現在 10M ops、埋込向け）。 */
+    unsigned long long budget = 500000000ull;
     const char *file = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--times") && i + 1 < argc) times = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rss")) want_rss = 1;
         else if (!strcmp(argv[i], "--no-sandbox")) want_sandbox = 0;
+        else if (!strcmp(argv[i], "--no-cojit")) use_cojit = 0;
         else if (!strcmp(argv[i], "--budget") && i + 1 < argc) budget = strtoull(argv[++i], 0, 10);
         else if (!file) file = argv[i];
         else {
@@ -74,7 +80,7 @@ int main(int argc, char **argv) {
             if (r2 > 0) times = r2;
         }
     }
-    if (!file || times < 1) { fprintf(stderr, "usage: akl [--times N] [--rss] [--budget N] [--no-sandbox] file.js\n"); return 2; }
+    if (!file || times < 1) { fprintf(stderr, "usage: akl [--times N] [--rss] [--budget N] [--no-sandbox] [--no-cojit] file.js\n"); return 2; }
     if (times > 256) times = 256;
     char *src = slurp(file);
     if (!src) { fprintf(stderr, "cannot read %s\n", file); return 2; }
@@ -97,7 +103,8 @@ int main(int argc, char **argv) {
         AklRT *rt = akl_new();
         if (!rt) { fprintf(stderr, "akl_new failed\n"); return 1; }
         akl_tune(rt, (uint64_t)t_insn, (uint32_t)t_heap, (uint32_t)t_objs);
-        if (!tn || !tn[0]) akl_set_insn_budget(rt, budget);
+        if (!tn || !tn[0]) { if (budget) akl_set_insn_budget(rt, budget); }
+        if (!use_cojit) akl_set_cojit(rt, 0);
         AklVal v;
         double t0 = now_ms();
         bool ok = akl_eval(rt, src, &v);

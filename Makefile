@@ -52,7 +52,7 @@ $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 $(BUILD)/fuzz_akl: fuzz/fuzz_akl.c $(AKLSRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_akl.c $(AKLSRC) -lm
 
-.PHONY: test uitest golden fuzz bench tuibench clean size conformance guard vsx aklbench gui guismoke
+.PHONY: test uitest golden fuzz bench tuibench clean size conformance guard vsx aklbench gui guismoke akltest
 
 test: $(BUILD)/run_tests $(BUILD)/run_tests_switch cxxtest
 	./$(BUILD)/run_tests
@@ -65,6 +65,10 @@ $(BUILD)/v8_compat_smoke.o: tests/cpp/v8_compat_smoke.cc src/akl/v8.h src/akl/ak
 	$(CXX) -std=c++11 -fno-exceptions -fno-rtti -O2 -Wall -Wextra -I src -o $@ -c tests/cpp/v8_compat_smoke.cc
 $(BUILD)/test_v8compat: $(BUILD)/v8_compat_smoke.o $(AKLSRC) | $(BUILD)
 	$(CC) $(BASE) $(REL) -o $@ $(BUILD)/v8_compat_smoke.o $(AKLSRC) $(LDFLAGS_REL) -lm
+# akl 単体ランナーの e2e（budget kill・既定 budget 収束・--no-cojit・seccomp 回帰）
+akltest: $(BUILD)/akl
+	python3 tests/akl_cli_smoke.py ./$(BUILD)/akl
+
 cxxtest: $(BUILD)/test_v8compat
 	@if ldd $(BUILD)/test_v8compat | grep -q 'libstdc++'; then \
 		echo 'FATAL: v8compat links libstdc++ (製品法則違反)' >&2; exit 1; fi

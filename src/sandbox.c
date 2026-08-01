@@ -83,6 +83,32 @@ int if_sandbox_apply(IfSandboxProfile profile) {
     SB_ALLOW(__NR_pread64);      /* 既オープン fd のみ（open は許可しない） */
     SB_ALLOW(__NR_getrusage);    /* --rss 観測（副作用なし） */
 
+    if (profile == IF_SB_AKL) {
+        /* glibc stdio は stdout/stderr が文字デバイス（tty・/dev/null）だと
+         * isatty 判定（_IO_LINE_BUF 化）で ioctl(fd, TCGETS) を投げる。
+         * ioctl 全許可は広すぎるので「request == TCGETS（読取のみ・副作用なし）」
+         * の 1 命令だけを引数検査つきで許可する。それ以外の ioctl は従来通り kill。
+         * 実測: stdout→/dev/null で nr=16(SIGSYS) を再現 → 当該箇所のみと確認済み。
+         * BPF オフセット注記: jt/jf は「次命令からの相対」。
+         *   i0 不一致 → 6 先 = arm 全体をスキップして共通 allowlist へ
+         *   i2 不一致 → 3 先 = RET KILL（request が TCGETS でない ioctl は殺す）
+         *   i4 不一致 → 1 先 = RET KILL（上位 32bit が非 0 も殺す） */
+        PROG[idx].code = BPF_JMP | BPF_JEQ | BPF_K; PROG[idx].jt = 0; PROG[idx].jf = 6;
+        PROG[idx].k = (uint32_t)__NR_ioctl; idx++;                              /* i0 */
+        PROG[idx].code = BPF_LD | BPF_W | BPF_ABS; PROG[idx].jt = 0; PROG[idx].jf = 0;
+        PROG[idx].k = (uint32_t)(offsetof(struct seccomp_data, args) + 8); idx++; /* i1: args[1] lo */
+        PROG[idx].code = BPF_JMP | BPF_JEQ | BPF_K; PROG[idx].jt = 0; PROG[idx].jf = 3;
+        PROG[idx].k = 0x5401u; idx++;                                           /* i2: TCGETS */
+        PROG[idx].code = BPF_LD | BPF_W | BPF_ABS; PROG[idx].jt = 0; PROG[idx].jf = 0;
+        PROG[idx].k = (uint32_t)(offsetof(struct seccomp_data, args) + 12); idx++; /* i3: args[1] hi */
+        PROG[idx].code = BPF_JMP | BPF_JEQ | BPF_K; PROG[idx].jt = 0; PROG[idx].jf = 1;
+        PROG[idx].k = 0; idx++;                                                 /* i4: hi == 0 */
+        PROG[idx].code = BPF_RET | BPF_K; PROG[idx].jt = 0; PROG[idx].jf = 0;
+        PROG[idx].k = SECCOMP_RET_ALLOW; idx++;                                 /* i5 */
+        PROG[idx].code = BPF_RET | BPF_K; PROG[idx].jt = 0; PROG[idx].jf = 0;
+        PROG[idx].k = SECCOMP_RET_KILL_PROCESS; idx++;                          /* i6 */
+    }
+
     if (profile == IF_SB_CHROME) {
         /* tty / X11 / SHM を最小追加: いずれも既接続 fd 上の操作のみ（open/connect 不許可） */
         SB_ALLOW(__NR_ioctl);        /* TIOCGWINSZ 等（v0.1。request 絞りは台帳） */

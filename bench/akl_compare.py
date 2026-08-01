@@ -14,7 +14,7 @@ RESULTS = os.path.join(ROOT, "bench", "results")
 BENCHES = ["empty", "tiny", "fib30", "arith", "branch", "strcat_flat", "strcat_grow"]
 
 def find_engines():
-    e = {"akl": [os.path.join(ROOT, "build", "akl_cli")]}
+    e = {"akl": [os.path.join(ROOT, "build", "akl")]}
     qjs = os.environ.get("QJS", "/home/user/ref/quickjs/qjs")
     if os.path.isfile(qjs) and os.access(qjs, os.X_OK):
         e["qjs"] = [qjs]

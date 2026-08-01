@@ -693,6 +693,13 @@ static int lex_next(Lex *lx) {
         lx->kind = TK_IDENT; lx->str_p = lx->s + st; lx->str_len = ln;
         return 0;
     }
+    /* ++ / -- は未対応。通すと二重 unary（+ (+x) / - (-x)）に落ちて「静かに
+     * 間違った答え」を返す（実測: var i=5; --i; i → 5、本来は 4）。
+     * 規則「未対応は構文エラーで明白に落ちる」に従い、隣接は lex で拒否する。
+     * JS 側も a--b は SyntaxError なので互換方向でも安全側。
+     * 空白ありの 1 - -2 は従来通り 3 に評価される（分離は失われない）。 */
+    if ((c == '+' && lex_at(lx, 1) == '+') || (c == '-' && lex_at(lx, 1) == '-'))
+        return -1;
     /* punct 複数文字（最長一致。テーブル順序に依存しない: "==" が "===" を潰さない） */
     int best = -1; u32 bestl = 0;
     for (int k = 0; k < P_N; k++) {

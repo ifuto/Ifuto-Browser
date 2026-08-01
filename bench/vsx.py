@@ -91,7 +91,7 @@ def norm(out):
         return ("str", tail if len(tail) < 4096 else (len(tail), tail[:64], tail[-64:]))
 
 def get_engines():
-    cli = os.environ.get("AKL_CLI", os.path.join(ROOT, "build", "akl_cli"))
+    cli = os.environ.get("AKL_CLI", os.path.join(ROOT, "build", "akl"))
     qjs = os.environ.get("QJS", "/tmp/qjs-official/qjs")
     node = os.environ.get("NODE", shutil.which("node") or "node")
     src_cache = {}
@@ -102,7 +102,8 @@ def get_engines():
         return src_cache[b]
     eng = {}
     if os.path.isfile(cli) and os.access(cli, os.X_OK):
-        # 製品既定値（budget 打切りあり）のまま走らせる。bench/js は全て既定内に収束する。
+        # CLI 製品既定 budget（500M ops）のまま走らせる。実測で bench/js 最大は
+        # arith の <=100M ops なので全て既定内に収束する（bench/akl_cli.c の注記と一致）。
         eng["akl"] = lambda b: [cli, os.path.join(JSDIR, b + ".js"), "1"]
     if os.path.isfile(qjs) and os.access(qjs, os.X_OK):
         eng["qjs"] = lambda b: [qjs, "-e", src_of(b) + "\nprint(typeof __R==='undefined'?0:__R);"]
@@ -218,7 +219,7 @@ def main():
         print("  %-8s %s" % (b, " | ".join(cells)))
 
     # ---- バイナリサイズ ----
-    sizes = {"akl_cli": stripped_size(os.environ.get("AKL_CLI", os.path.join(ROOT, "build", "akl_cli")), "akl"),
+    sizes = {"akl_cli": stripped_size(os.environ.get("AKL_CLI", os.path.join(ROOT, "build", "akl")), "akl"),
              "qjs": stripped_size(os.environ.get("QJS", "/tmp/qjs-official/qjs"), "qjs") if have_qjs else None,
              "node": stripped_size(os.environ.get("NODE", shutil.which("node") or "node"), "node")}
     print("\n=== stripped binary size ===")

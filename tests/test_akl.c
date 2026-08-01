@@ -108,6 +108,15 @@ static void t_vars_assign(void) {
     want_err("const c = 1; c = 2;", "const");
     want_err("var 1x;", NULL);
     want_err("const z;", "initializer");
+    /* ++/-- は未対応。黙って二重 unary に落とすと「静かに間違った答え」になる
+     * （実測: var i=5; --i; i が 5 を返していた。本来は 4）ので lex で明白に拒否 */
+    want_err("var i = 5; --i; i", NULL);
+    want_err("var i = 1; ++i; i", NULL);
+    want_err("var i = 9; i--; i", NULL);
+    want_err("var i = 9; i++; i", NULL);
+    want_num("1 - -2", 3);           /* 空白分離の二重 unary は生き続ける */
+    want_num("- -3", 3);
+    want_num("5 + +2", 7);
 }
 
 static void t_control(void) {
