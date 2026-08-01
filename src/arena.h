@@ -36,4 +36,33 @@ u64   if_arena_reserved(const IfArena *a);
  * arena は realloc できないので、コピー移動し旧領域は捨てる（ページ寿命内なら損失は軽微）。 */
 void *if_arena_grow(IfArena *a, void *ptr, u64 *cap, u64 need, u64 esz);
 
+/* arena.c の IF_ARENA_ALIGN と同値（inline 経路との整合のため公開） */
+#define IF_ARENA_ALIGN_I 16u
+/* ---- inline bump 高速経路（2026-08-01 性能本丸） ----
+ * if_arena_alloc と同一の不変条件（16B アライン・bump・fast-fail）を保つ。
+ * 先頭ブロックに収まる通常経路のみ inline 化し、新規ブロック系は従来関数へ。 */
+static inline void *if_arena_bump(IfArena *a, u64 size) {
+    IfArenaBlock *b = a->head;
+    if (__builtin_expect(b != NULL, 1)) {
+        u64 off = (b->used + (IF_ARENA_ALIGN_I - 1)) & ~(u64)(IF_ARENA_ALIGN_I - 1);
+        if (__builtin_expect(off <= b->cap && size <= b->cap - off, 1)) {
+            b->used = off + size;
+            return (u8 *)b + sizeof(IfArenaBlock) + off;
+        }
+    }
+    return if_arena_alloc(a, size);
+}
+
+/* 「直前の bump/alloc が ptr で size だった」場合に限り取り消す（seg pop の巻き戻し）。
+ * 条件が崩れていれば何もしない（arena は不可逆が原則、これは最新端のみの最適化）。 */
+static inline void if_arena_rewind_last(IfArena *a, void *ptr, u64 size) {
+    IfArenaBlock *b = a->head;
+    if (!b || !ptr) return;
+    u64 off = (b->used + (IF_ARENA_ALIGN_I - 1)) & ~(u64)(IF_ARENA_ALIGN_I - 1);
+    (void)off;
+    if ((u8 *)ptr >= (u8 *)b + sizeof(IfArenaBlock) &&
+        (u8 *)ptr + size == (u8 *)b + sizeof(IfArenaBlock) + b->used)
+        b->used = (u64)((u8 *)ptr - ((u8 *)b + sizeof(IfArenaBlock)));
+}
+
 #endif

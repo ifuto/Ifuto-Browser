@@ -7,6 +7,7 @@
 #include "layout.h"
 #include "utf8.h"
 #include <math.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -30,18 +31,37 @@ typedef struct IfPiece {
     u8 br;   /* 1 = 強制改行 */
 } IfPiece;
 
+/* ---- 開発用 rdtsc ゾーン計測（IF_LAYOUT_PROF=1 のときのみ。既定経路は分岐 1 個） ---- */
+#if defined(__x86_64__) || defined(__i386__)
+static inline u64 if_rdtsc(void) { u32 lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((u64)hi << 32) | lo; }
+#else
+static inline u64 if_rdtsc(void) { return 0; }
+#endif
+static int if_lp_on = -2; /* -2 = 未初期化 */
+static u64 LPF_TOTAL, LPF_IFC, LPF_FLAT, LPF_WRAP, LPF_ENDL, LPF_GEOM, LPF_CHILDREN;
+__attribute__((destructor)) static void lpf_dump(void) {
+    if (if_lp_on > 0)
+        fprintf(stderr, "LAYOUTPROF total=%llu ifc=%llu flat=%llu wrap=%llu endl=%llu geom=%llu children-sites=%llu (cycles)\n",
+                (unsigned long long)LPF_TOTAL, (unsigned long long)LPF_IFC, (unsigned long long)LPF_FLAT,
+                (unsigned long long)LPF_WRAP, (unsigned long long)LPF_ENDL, (unsigned long long)LPF_GEOM,
+                (unsigned long long)LPF_CHILDREN);
+}
+static inline bool lpf(void) {
+    if (if_lp_on == -2) { const char *e = getenv("IF_LAYOUT_PROF"); if_lp_on = (e && e[0] == '1') ? 1 : 0; }
+    return if_lp_on > 0;
+}
+
 typedef struct {
     IfArena *arena;
     float root_fs;
     IfLink *links;
     u32 n_links;
     u64 links_cap;
-    /* IFC/折り返しスクラッチ: pieces/segs 配列は「行・run 内で消費が完結」するので再利用する。
-     * （arena は free しない。使い回せる一時配列を毎回確定させると大文書で数十 MB 無駄になる——実測済み） */
+    /* IFC/折り返しスクラッチ: pieces 配列は「run 内で消費が完結」するので再利用する。
+     * （segs は 2026-08-01 に直接 arena 確定へ移行: LINE ごとの alloc+memcpy 確定を消去。
+     *   巻き戻し可能な pop のみを許し、スクラッチ二重書きは構造排除） */
     IfPiece *pieces_scratch;
     u64 pieces_scratch_cap;
-    IfSeg *segs_scratch;
-    u64 segs_scratch_cap;
     /* box 構築時 tail（IfBox から last_child フィールドを追放した代替。子追加は
      * 親 box 構築中に集中かつ再帰スタック規律なので、frame に持って O(1) を保つ。
      * frame 深さ超過/不一致時は兄弟走査の正しいフォールバックに落ちる（性能のみ） */
@@ -123,9 +143,10 @@ static IfBox *new_box(IfLC *lc, u8 kind, IfNode *node, const IfStyle *st) {
 
 
 static const IfGeomEnt *geom_get(IfLC *lc, IfGeomCache *gc, const IfStyle *st, i32 avail_w) {
+    u64 _t0; if (lpf()) _t0 = if_rdtsc(); else _t0 = 0;
     u64 h = ((uintptr_t)st >> 4) * 2654435761u ^ (u64)(u32)avail_w * 40503u;
     IfGeomEnt *e = &gc->tab[h & (IF_GEOM_SIZE - 1)];
-    if (e->ok && e->st == st && e->w == avail_w) return e;
+    if (e->ok && e->st == st && e->w == avail_w) { if (_t0) LPF_GEOM += if_rdtsc() - _t0; return e; }
     float fs = st->font_size;
     e->st = st;
     e->w = avail_w;
@@ -155,6 +176,7 @@ static const IfGeomEnt *geom_get(IfLC *lc, IfGeomCache *gc, const IfStyle *st, i
     if (st->height.unit != IF_U_AUTO)
         e->height_spec = len_v(st->height, fs, lc->root_fs, avail_w);
     e->ok = 1;
+    if (_t0) LPF_GEOM += if_rdtsc() - _t0;
     return e;
 }
 
@@ -166,7 +188,18 @@ typedef struct {
     IfLC *lc;
 } IfFlat;
 
-static void flat_push(IfFlat *f, IfStr text, const IfStyle *st, u8 br) {
+static void flat_push_grow(IfFlat *f, IfStr text, const IfStyle *st, u8 br);
+static inline void flat_push(IfFlat *f, IfStr text, const IfStyle *st, u8 br) {
+    if (__builtin_expect(f->n_pieces < f->lc->pieces_scratch_cap, 1)) {
+        f->pieces[f->n_pieces].text = text;
+        f->pieces[f->n_pieces].st = st;
+        f->pieces[f->n_pieces].br = br;
+        f->n_pieces++;
+        return;
+    }
+    flat_push_grow(f, text, st, br);
+}
+static void flat_push_grow(IfFlat *f, IfStr text, const IfStyle *st, u8 br) {
     f->pieces = (IfPiece *)if_arena_grow(f->lc->arena, f->pieces, &f->lc->pieces_scratch_cap,
                                          f->n_pieces + 1, sizeof(IfPiece));
     /* if_arena_grow のコピー時に f->pieces も cap も lc 側に一元反映される */
@@ -216,7 +249,7 @@ typedef struct {
     i32 content_x, content_w;
     i32 y;
     IfBox *parent;
-    IfSeg *segs;           /* == lc->segs_scratch（共有スクラッチ、n_segs は現在行の分） */
+    IfSeg *seg_base;       /* 現行の seg 先頭（arena 直接確定。LINE ごとのコピー不在） */
     u32 n_segs;
     i32 line_w;
     const IfStyle *align_st;
@@ -236,10 +269,10 @@ static inline void wrap_note_direct(IfWrap *w, const u8 *base, u32 from, u32 to,
 /* 直前 seg と style が同じでソース上連続なら拡張する合体 push（seg 爆発の構造消去。
  * レンダリングされるセル列は変わらない（同じバイト・同じ x・同じ style）） */
 static void wrap_push_seg(IfWrap *w, IfStr text, i32 x, i32 width, const IfStyle *st);
-static void wrap_push_merge(IfWrap *w, const char *p, u32 n, i32 x, i32 width, const IfStyle *st) {
+static inline void wrap_push_merge(IfWrap *w, const char *p, u32 n, i32 x, i32 width, const IfStyle *st) {
     if (n == 0) return;
     if (w->n_segs) {
-        IfSeg *last = &w->segs[w->n_segs - 1];
+        IfSeg *last = &w->seg_base[w->n_segs - 1];
         if (last->st == st && last->text.p + last->text.n == p) {
             last->text.n += n;
             last->w += width;
@@ -249,16 +282,46 @@ static void wrap_push_merge(IfWrap *w, const char *p, u32 n, i32 x, i32 width, c
     wrap_push_seg(w, if_str(p, n), x, width, st);
 }
 
-static void wrap_push_seg(IfWrap *w, IfStr text, i32 x, i32 width, const IfStyle *st) {
+/* seg 系列のブロック跨ぎ検知時の移設: (n_segs+1) 厳密の連続領域へ写し、
+ * bump 位置が seg_base+n_segs に自然接続するようにする（cap==n_segs+1 の不変条件）。
+ * 発生頻度: 256KB arena ブロック境界ごとに 1 行分まで（30MB で ~120 回規模）。 */
+static void wrap_repack_segs(IfWrap *w, IfSeg *spill) {
+    IfSeg *nb = (IfSeg *)if_arena_alloc(w->lc->arena, (u64)(w->n_segs + 1) * sizeof(IfSeg));
+    if (w->n_segs) memcpy(nb, w->seg_base, (u64)w->n_segs * sizeof(IfSeg));
+    nb[w->n_segs] = *spill;
+    w->seg_base = nb;
+}
+
+static inline void wrap_push_seg(IfWrap *w, IfStr text, i32 x, i32 width, const IfStyle *st) {
     if (text.n == 0) return;
-    w->segs = (IfSeg *)if_arena_grow(w->lc->arena, w->segs, &w->lc->segs_scratch_cap,
-                                     w->n_segs + 1, sizeof(IfSeg));
-    IfSeg *s = &w->segs[w->n_segs++];
+    IfSeg *s = (IfSeg *)if_arena_bump(w->lc->arena, sizeof(IfSeg));
+    if (w->n_segs == 0) {
+        w->seg_base = s;
+    } else if (__builtin_expect(s != w->seg_base + w->n_segs, 0)) {
+        /* arena ブロック境界で不連続: repack して spill を自分で書き込む */
+        wrap_repack_segs(w, s);
+        w->seg_base[w->n_segs].text = text;
+        w->seg_base[w->n_segs].x = x;
+        w->seg_base[w->n_segs].w = width;
+        w->seg_base[w->n_segs].st = st;
+        w->n_segs++;
+        return;
+    }
     s->text = text; s->x = x; s->w = width; s->st = st;
+    w->n_segs++;
+}
+
+/* 行尾の折り畳み空白 pop（巻き戻し可能なのは seg 系列が最新端のときだけ） */
+static inline void wrap_pop_last_seg(IfWrap *w) {
+    IfSeg *last = &w->seg_base[w->n_segs - 1];
+    if_arena_rewind_last(w->lc->arena, last, sizeof(IfSeg));
+    w->n_segs--;
 }
 
 static void wrap_end_line(IfWrap *w, float max_lh) {
-    i32 rows = px2row(max_lh);
+    u64 _e0; if (lpf()) _e0 = if_rdtsc(); else _e0 = 0;
+    /* px2row(x)==1 ⇔ 8<=x<24（floor(x/16+.5) の区間同値。頻出 lh=19.2 を 1 分岐で抜ける） */
+    i32 rows = (max_lh >= 8.0f && max_lh < 24.0f) ? 1 : px2row(max_lh);
     if (rows < 1) rows = 1;
     u8 align = w->align_st ? w->align_st->text_align : IF_TA_LEFT;
     i32 shift = 0;
@@ -271,14 +334,12 @@ static void wrap_end_line(IfWrap *w, float max_lh) {
     line->w = w->line_w;
     line->h = rows;
     line->text_align = align;
-    /* スクラッチから行ボックスに厳密サイズでコピー確定する。
-     * （指数成長のコピー浪費を行ごとに払うと大文書で数十 MB になる——実測済み） */
+    /* seg は arena 直接確定済み（無コピー）。align シフトだけ確定時に適用 */
     if (w->n_segs) {
-        IfSeg *dst = (IfSeg *)if_arena_alloc(w->lc->arena, (u64)w->n_segs * sizeof(IfSeg));
-        memcpy(dst, w->segs, (u64)w->n_segs * sizeof(IfSeg));
-        line->segs = dst;
+        line->segs = w->seg_base;
         line->n_segs = w->n_segs;
-        for (u32 i = 0; i < line->n_segs; i++) dst[i].x += shift;
+        if (shift)
+            for (u32 i = 0; i < line->n_segs; i++) line->segs[i].x += shift;
     }
     line->_pad[0] = w->direct_all ? IF_LF_DIRECT_BYTES : 0;
     w->direct_all = 1; /* 次行は既定で有効（無効化は wrap_note_direct で畳む） */
@@ -286,16 +347,27 @@ static void wrap_end_line(IfWrap *w, float max_lh) {
     /* 行スイープ直接発行用のログ（生成順 = y 単調非減少） */
     {
         IfLC *lc2 = w->lc;
-        if (lc2->lay) {
-            lc2->lay->lines = (IfBox **)if_arena_grow(lc2->arena, lc2->lay->lines,
-                &lc2->lay->cap_lines, lc2->lay->n_lines + 1, sizeof(IfBox *));
-            lc2->lay->lines[lc2->lay->n_lines++] = line;
+        IfLayout *lay = lc2->lay;
+        if (lay) {
+            if (__builtin_expect(lay->n_lines < lay->cap_lines, 1)) {
+                lay->lines[lay->n_lines++] = line;
+            } else {
+                lay->lines = (IfBox **)if_arena_grow(lc2->arena, lay->lines,
+                    &lay->cap_lines, lay->n_lines + 1, sizeof(IfBox *));
+                lay->lines[lay->n_lines++] = line;
+            }
         }
     }
     w->y += rows;
     w->n_segs = 0;
-    w->line_w = 0;
-    w->lc->segs_scratch = w->segs; /* スクラッチ保持を lc に同期 */
+    if (_e0) LPF_ENDL += if_rdtsc() - _e0;
+}
+
+/* 高頻度ワイドレンジ先出し（互いに排他的なレンジ一致で if_glyph_width と同値） */
+static inline int lw_glyph_width(u32 cp) {
+    if (cp >= 0x3041 && cp <= 0x33FF) return 2; /* ひらがな・カタカナ・CJK 記号 */
+    if (cp >= 0x4E00 && cp <= 0x9FFF) return 2; /* CJK 統合漢字 */
+    return if_glyph_width(cp);
 }
 
 /* テキスト 1 ピースを流し込む。*any は実グリフが存在したか（空白のみの run で空行を防ぐ）。 */
@@ -318,8 +390,13 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
             if (pre) {
                 i32 adv = (b0 == '\t') ? 8 : 1;
                 /* ' '(0x20) のみセル列とバイト列が一致（\t は前進 8、他は gw==0 で非発行セル） */
-                if (b0 != ' ') w->direct_all = 0;
-                wrap_push_seg(w, if_str((const char *)s + i, 1), w->content_x + cx, adv, st);
+                if (b0 != ' ') {
+                    w->direct_all = 0;
+                    wrap_push_seg(w, if_str((const char *)s + i, 1), w->content_x + cx, adv, st);
+                } else {
+                    /* 連続バイト・同 style → 先行 seg へ合体（pre 内のスペース嵐を消す） */
+                    wrap_push_merge(w, (const char *)s + i, 1, w->content_x + cx, 1, st);
+                }
                 cx += adv; i++; *any = true; continue;
             }
             u32 wsend = i + 1;
@@ -350,7 +427,7 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
         } else {
             u32 save = i;
             u32 cp = if_utf8_decode(s, n, &save);
-            int gw = if_glyph_width(cp);
+            int gw = lw_glyph_width(cp);
             wrap_note_direct(w, s, i, save, cp, gw);
             i = save; /* 1 グリフ消費（保証） */
             if (gw == 2) {
@@ -362,7 +439,7 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
                     u8 c = s[i];
                     if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') break;
                     u32 cp2 = if_utf8_decode(s, n, &s2);
-                    int gw2 = if_glyph_width(cp2);
+                    int gw2 = lw_glyph_width(cp2);
                     wrap_note_direct(w, s, i, s2, cp2, gw2);
                     if (gw2 == 2) break;
                     i = s2;
@@ -379,13 +456,13 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
             /* 行尾の折り畳み空白を除く: 全seg空白なら pop、合体 seg の場合は末尾 1B を削る。
              * （アトムは '\x20' を含まないので「末尾が 0x20」⇔ 直近 push が折り畳み空白） */
             if (w->n_segs > 0) {
-                IfSeg *last = &w->segs[w->n_segs - 1];
+                IfSeg *last = &w->seg_base[w->n_segs - 1];
                 if (last->text.n && last->text.p[last->text.n - 1] == ' ') {
-                    if (last->text.n == 1) w->n_segs--;
+                    if (last->text.n == 1) wrap_pop_last_seg(w);
                     else { last->text.n--; last->w--; }
                 }
             }
-            cx = w->n_segs > 0 ? w->segs[w->n_segs - 1].x + w->segs[w->n_segs - 1].w - w->content_x : 0;
+            cx = w->n_segs > 0 ? w->seg_base[w->n_segs - 1].x + w->seg_base[w->n_segs - 1].w - w->content_x : 0;
             wrap_end_line(w, *max_lh);
             cx = 0;
             *max_lh = lh;
@@ -397,7 +474,7 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
             while (g < atom_end) {
                 u32 gs = g;
                 u32 cp3 = if_utf8_decode(s, atom_end, &g); /* g は必ず前進 */
-                int gw3 = if_glyph_width(cp3);
+                int gw3 = lw_glyph_width(cp3);
                 wrap_note_direct(w, s, gs, g, cp3, gw3);
                 i32 gwidth = gw3 == 2 ? 2 : 1;
                 if (cx > 0 && cx + gwidth > w->content_w) {
@@ -422,6 +499,7 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
  * run の次のノード（ブロック or NULL）を返す。 */
 static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *base_st,
                           i32 content_x, i32 *y_io, i32 content_w) {
+    u64 _i0; if (lpf()) _i0 = if_rdtsc(); else _i0 = 0;
     IfFlat f = { lc->pieces_scratch, 0, lc }; /* スクラッチ再利用。run 内で消費が完結 */
     IfNode *c = cur;
     for (; c; c = c->next_sibling) {
@@ -431,8 +509,9 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
         }
         flatten_into(&f, c, base_st);
     }
+    if (_i0) { LPF_FLAT += if_rdtsc() - _i0; }
 
-    IfWrap w = { lc, content_x, content_w, *y_io, parent, lc->segs_scratch, 0, 0, base_st, 1 };
+    IfWrap w = { lc, content_x, content_w, *y_io, parent, NULL, 0, 0, base_st, 1 };
     float max_lh = base_st && base_st->line_height > 0.0f ? base_st->line_height
                  : base_st ? base_st->font_size * 1.2f : 16.0f * 1.2f;
     bool any_text = false;
@@ -444,14 +523,17 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
                    : base_st ? base_st->font_size * 1.2f : 19.2f;
             continue;
         }
-        wrap_text(&w, f.pieces[p].text, f.pieces[p].st ? f.pieces[p].st : base_st,
+        { u64 _w0; if (_i0) _w0 = if_rdtsc(); else _w0 = 0;
+          wrap_text(&w, f.pieces[p].text, f.pieces[p].st ? f.pieces[p].st : base_st,
                   (f.pieces[p].st && f.pieces[p].st->white_space == IF_WS_PRE) || pre,
                   &max_lh, &any_text);
+          if (_i0) LPF_WRAP += if_rdtsc() - _w0; }
     }
     if (w.n_segs > 0 || any_text)
         wrap_end_line(&w, max_lh);
     *y_io = w.y;
     lc->pieces_scratch = f.pieces; /* スクラッチを後続 IFC に引き継ぐ（n は毎回 0 にリセット） */
+    if (_i0) LPF_IFC += if_rdtsc() - _i0;
     return c;
 }
 

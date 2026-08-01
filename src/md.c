@@ -95,6 +95,25 @@ typedef struct {
 
 static void mo_taint(Mo *m) { m->tainted = true; }
 
+/* ---- 開発用 rdtsc ゾーン計測（IF_MD_PROF=1 のときのみ活性） ---- */
+#if defined(__x86_64__) || defined(__i386__)
+static inline u64 if_rdtsc_md(void) { u32 lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((u64)hi << 32) | lo; }
+#else
+static inline u64 if_rdtsc_md(void) { return 0; }
+#endif
+static int if_mp_on = -2;
+static u64 MP_NORM, MP_LINES, MP_BLOCKS, MP_INLINE, MP_MNEW, MP_FLUSH;
+__attribute__((destructor)) static void mpf_dump(void) {
+    if (if_mp_on > 0)
+        fprintf(stderr, "MDPROF norm=%llu lines=%llu blocks=%llu inline=%llu mnew=%llu flush=%llu (cycles)\n",
+                (unsigned long long)MP_NORM, (unsigned long long)MP_LINES, (unsigned long long)MP_BLOCKS,
+                (unsigned long long)MP_INLINE, (unsigned long long)MP_MNEW, (unsigned long long)MP_FLUSH);
+}
+static inline bool mpf(void) {
+    if (if_mp_on == -2) { const char *e = getenv("IF_MD_PROF"); if_mp_on = (e && e[0] == '1') ? 1 : 0; }
+    return if_mp_on > 0;
+}
+
 static void mo_range(Mo *m, const char *p, u32 n) {
     if (!m->dom || m->n_rng >= 16 || !p) return;
     m->rng_p[m->n_rng] = p; m->rng_n[m->n_rng] = n; m->n_rng++;
@@ -159,6 +178,7 @@ static void run_add_ch(Mo *m, char c) {
 }
 
 static IfNode *mnew(Mo *m, IfNodeKind kind) {
+    u64 _t0; if (mpf()) _t0 = if_rdtsc_md(); else _t0 = 0;
     IfDom *d = m->dom;
     if (d->n_nodes >= IF_MAX_DOM_NODES) { mo_taint(m); return NULL; }
     IfNode *n = (IfNode *)if_arena_alloc(m->a, sizeof(IfNode));
@@ -169,6 +189,7 @@ static IfNode *mnew(Mo *m, IfNodeKind kind) {
     n->parent = n->first_child = n->last_child = n->next_sibling = NULL;
     n->content = NULL;
     d->n_nodes++;
+    if (_t0) MP_MNEW += if_rdtsc_md() - _t0;
     return n;
 }
 
@@ -181,6 +202,7 @@ static void mattach(IfNode *parent, IfNode *ch) {
 
 /* 現在の run を TEXT ノードとして確定（open/close/void の前に必ず呼ぶ） */
 static void run_flush(Mo *m) {
+    u64 _t0; if (mpf()) _t0 = if_rdtsc_md(); else _t0 = 0;
     if (m->mode != 0) {
         IfStr t;
         if (m->mode == 1) t = if_str(m->b_p, m->b_n);
@@ -195,6 +217,7 @@ static void run_flush(Mo *m) {
         }
         run_reset(m);
     }
+    if (_t0) MP_FLUSH += if_rdtsc_md() - _t0;
 }
 
 /* ---- emitter 命令（string/dom 両 backend 共通の中間表現） ---- */
@@ -529,7 +552,11 @@ static bool try_link(Mo *out, Fn *fn, IfStr s, u32 *adv) {
     return true;
 }
 
+static int inl_depth = 0;
 static void inline_span(Mo *out, Fn *fn, IfStr s) {
+    u64 _t0 = 0; bool _top = false;
+    if (mpf() && inl_depth++ == 0) { _t0 = if_rdtsc_md(); _top = true; }
+    else if (!mpf()) inl_depth = inl_depth;
     u32 i = 0;
     while (i < s.n) {
         /* 通常ランを一括消費（次の特殊文字まで。string backend でも従来の
@@ -642,7 +669,10 @@ static void inline_span(Mo *out, Fn *fn, IfStr s) {
             mo_text(out, if_str(s.p + i, 1)); i++; continue;
         }
     }
+    if (_top) MP_INLINE += if_rdtsc_md() - _t0;
+    if (mpf()) inl_depth--;
 }
+
 
 /* ================= ブロック層 ================= */
 
@@ -809,7 +839,10 @@ static void emit_para_lines(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi) {
     mo_text_ch(out, '\n');
 }
 
+static int bw_depth = 0;
 static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
+    u64 _t0 = 0; bool _top = false;
+    if (mpf() && bw_depth++ == 0) { _t0 = if_rdtsc_md(); _top = true; }
     u32 i = lo;
     while (i < hi) {
         Ln l = ls[i];
@@ -1026,9 +1059,12 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
         emit_para_lines(out, fn, ls, i, j);
         i = j;
     }
+    if (_top) MP_BLOCKS += if_rdtsc_md() - _t0;
+    if (mpf()) bw_depth--;
 }
 
 static void blocks_str(Mo *out, Fn *fn, IfStr s, u32 depth) {
+    u64 _t0 = 0; if (mpf()) _t0 = if_rdtsc_md();
     /* 行配列へ割り切る（入力を切片化、コピーなし）: '\n' 探索は memchr */
     Ln *ls = NULL; u32 n = 0, cap = 0;
     u32 st = 0;
@@ -1051,6 +1087,7 @@ static void blocks_str(Mo *out, Fn *fn, IfStr s, u32 depth) {
         st = e + 1;
         p = e + 1;
     }
+    if (_t0) MP_LINES += if_rdtsc_md() - _t0;
     blocks_win(out, fn, ls, 0, n, depth);
     free(ls);
 }
@@ -1058,6 +1095,7 @@ static void blocks_str(Mo *out, Fn *fn, IfStr s, u32 depth) {
 /* ================= 入口 ================= */
 
 static void run_blocks(Mo *out, Fn *fn, IfStr in) {
+    u64 _t0 = 0; if (mpf()) _t0 = if_rdtsc_md();
     /* 正規化: CR/CRLF → LF。'\r' が無ければ入力をそのまま使う（ゼロコピー） */
     const char *cr = (const char *)memchr(in.p, '\r', in.n);
     IfStr s = in;
@@ -1089,6 +1127,7 @@ static void run_blocks(Mo *out, Fn *fn, IfStr in) {
             goto footnotes;
         }
     }
+    if (_t0) { MP_NORM += if_rdtsc_md() - _t0; }
     mo_range(out, s.p, s.n);
     blocks_str(out, fn, s, 0);
 footnotes:;
