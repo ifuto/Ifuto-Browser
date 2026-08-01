@@ -919,10 +919,22 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
     while (i < hi) {
         Ln l = ls[i];
         if (ln_blank(l)) { i++; continue; }
-        IfStr fid, ftx;
-        if (ln_fndef(l, &fid, &ftx)) { fn_add_def(fn, fid, ftx); i++; continue; }
-        int hh = ln_heading(l);
-        if (hh) {
+        /* 行分類ゲート: 先頭の非空白文字 _cs で発火不可能なチェックを構造的にスキップ。
+         * 同値性: 各条件は「そのチェックが true を返しうる必要条件」のみ
+         * （fndef/heading は col0 固定、hr/fence は ' '/\t インデント許容、
+         * quote/list は ' ' インデントのみ許容。'\t' のときは保守的に hr/fence を実行）。
+         * 副作用を持つのは fndef 成功時（fn_add_def）のみで、ゲート外で true には
+         * ならないため状態遷移も同値。チェック順序は従来と同一。 */
+        u32 _sp = 0;
+        while (_sp < l.n && l.p[_sp] == ' ') _sp++;
+        const u8 _cs = _sp < l.n ? (u8)l.p[_sp] : 0;
+        if (_sp == 0 && _cs == '[') {
+            IfStr fid, ftx;
+            if (ln_fndef(l, &fid, &ftx)) { fn_add_def(fn, fid, ftx); i++; continue; }
+        }
+        if (_sp == 0 && _cs == '#') {
+            int hh = ln_heading(l);
+            if (hh) {
             static const char HNM[6][3] = { "h1", "h2", "h3", "h4", "h5", "h6" };
             const char *nm = HNM[hh - 1]; /* 静的文字列（tag_name の寿命規約） */
             mo_open_push(out, (u16)(IF_TAG_H1 + (hh - 1)), nm, 2);
@@ -941,14 +953,17 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
             i++;
             continue;
         }
+        } /* end gate: heading */
+        if (_cs == '-' || _cs == '*' || _cs == '_' || _cs == '\t') {
         if (ln_is_hr(l)) {
             mo_open_void(out, IF_TAG_HR, "hr", 2);
             mo_text_ch(out, '\n');
             i++;
             continue;
         }
+        }
         char fsym;
-        if (ln_fence(l, &fsym)) {
+        if ((_cs == '`' || _cs == '~' || _cs == '\t') && ln_fence(l, &fsym)) {
             u32 k = 0;
             while (k < l.n && l.p[k] == fsym) k++;
             while (k < l.n && (l.p[k] == ' ' || l.p[k] == '\t')) k++;
@@ -974,7 +989,7 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
             mo_text_ch(out, '\n');
             continue;
         }
-        u32 q = ln_quote(l);
+        u32 q = _cs == '>' ? ln_quote(l) : 0;
         if (q) {
             B qb; b_init(&qb, out->a);
             if (depth < 8) {
@@ -1028,7 +1043,8 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
             continue;
         }
         LiMark mk;
-        if (ln_list_item(l, &mk)) {
+        if ((_cs == '-' || _cs == '*' || _cs == '+' || (_cs >= '0' && _cs <= '9')) &&
+            ln_list_item(l, &mk)) {
             bool ordered = mk.ordered;
             u32 base = mk.indent;
             mo_open_push(out, ordered ? IF_TAG_OL : IF_TAG_UL, ordered ? "ol" : "ul", 2);
@@ -1052,10 +1068,22 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
             mo_text_ch(out, '\n');
             continue;
         }
-        /* GFM 表 */
-        bool has_pipe = false;
-        for (u32 k = 0; k < l.n; k++) if (l.p[k] == '|') { has_pipe = true; break; }
-        if (has_pipe && i + 1 < hi && ln_is_table_delim(ls[i + 1])) {
+        /* GFM 表: 判定は連言なので順序を入れ替えて安い方（次行の delim 形）を先に。
+         * delim 行の先頭非空白は必ず '|','-',':'（split_cells が ws 後の '|' を許し、
+         * 各 cell は -/: のみ）→ それ以外では ln_is_table_delim を呼ばない。 */
+        bool is_table = false;
+        if (i + 1 < hi) {
+            Ln dl = ls[i + 1];
+            u32 dsp = 0;
+            while (dsp < dl.n && (dl.p[dsp] == ' ' || dl.p[dsp] == '\t')) dsp++;
+            if (dsp < dl.n && (dl.p[dsp] == '|' || dl.p[dsp] == '-' || dl.p[dsp] == ':') &&
+                ln_is_table_delim(dl)) {
+                bool has_pipe = false;
+                for (u32 k = 0; k < l.n; k++) if (l.p[k] == '|') { has_pipe = true; break; }
+                if (has_pipe) is_table = true;
+            }
+        }
+        if (is_table) {
             IfStr heads[32];
             u32 nh = split_cells(l, heads, 32);
             if (nh > 32) nh = 32; /* 旧実装の読み出し範囲は cells 配列まで（32 列天井） */
@@ -1103,12 +1131,21 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
             Ln x = ls[j];
             if (ln_blank(x)) break;
             if (j > i) {
+                /* 主カスケードと同じ行分類ゲート（必要条件でのみ実行。順序・結果は同値） */
+                u32 xsp = 0;
+                while (xsp < x.n && x.p[xsp] == ' ') xsp++;
+                const u8 xcs = xsp < x.n ? (u8)x.p[xsp] : 0;
                 IfStr i2d, i2t;
-                if (ln_heading(x) || ln_is_hr(x) || ln_quote(x) || ln_fndef(x, &i2d, &i2t)) break;
+                if (((xsp == 0 && xcs == '#') && ln_heading(x)) ||
+                    ((xcs == '-' || xcs == '*' || xcs == '_' || xcs == '\t') && ln_is_hr(x)) ||
+                    (xcs == '>' && ln_quote(x)) ||
+                    ((xsp == 0 && xcs == '[') && ln_fndef(x, &i2d, &i2t))) break;
                 char s3; LiMark m3;
-                if (ln_fence(x, &s3)) break;
-                if (ln_list_item(x, &m3)) break;
-                if (ln_is_table_delim(x)) break;
+                if ((xcs == '`' || xcs == '~' || xcs == '\t') && ln_fence(x, &s3)) break;
+                if ((xcs == '-' || xcs == '*' || xcs == '+' || (xcs >= '0' && xcs <= '9')) &&
+                    ln_list_item(x, &m3)) break;
+                if ((xcs == '|' || xcs == '-' || xcs == ':' || xcs == '\t') &&
+                    ln_is_table_delim(x)) break;
                 for (u32 k = 0; k < x.n; k++) if (x.p[k] == '|') { break; }
             }
             j++;
