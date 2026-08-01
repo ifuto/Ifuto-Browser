@@ -172,7 +172,7 @@ static IfNode *mnew(Mo *m, IfNodeKind kind) {
     return n;
 }
 
-static void mattach(Mo *m, IfNode *parent, IfNode *ch) {
+static void mattach(IfNode *parent, IfNode *ch) {
     ch->parent = parent;
     if (parent->last_child) parent->last_child->next_sibling = ch;
     else parent->first_child = ch;
@@ -191,7 +191,7 @@ static void run_flush(Mo *m) {
         }
         if (t.n) {
             IfNode *n = mnew(m, IF_NODE_TEXT);
-            if (n) { n->u.text = t; mattach(m, m->cur, n); }
+            if (n) { n->u.text = t; mattach(m->cur, n); }
         }
         run_reset(m);
     }
@@ -269,7 +269,7 @@ static void mo_elem_store(Mo *m, bool push) {
         n->n_attrs = g_pend.nattr;
     }
     if (g_pend.tag == IF_TAG_STYLE) m->dom->has_style = 1;
-    mattach(m, m->cur, n);
+    mattach(m->cur, n);
     if (push) {
         if (m->sp >= 128) { mo_taint(m); return; }
         m->stk[m->sp++] = n;
@@ -1171,18 +1171,18 @@ bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
     html->kind = IF_NODE_ELEMENT; html->tag = IF_TAG_HTML; html->ns = IF_NS_HTML;
     html->u.tag_name = IF_S("html");
     dom->n_nodes++;
-    mattach(&m, root, html);
+    mattach(root, html);
     m.cur = root;
     IfNode *head = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
     head->kind = IF_NODE_ELEMENT; head->tag = IF_TAG_HEAD; head->ns = IF_NS_HTML;
     head->u.tag_name = IF_S("head");
     dom->n_nodes++;
-    mattach(&m, html, head);
+    mattach(html, head);
     IfNode *body = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
     body->kind = IF_NODE_ELEMENT; body->tag = IF_TAG_BODY; body->ns = IF_NS_HTML;
     body->u.tag_name = IF_S("body");
     dom->n_nodes++;
-    mattach(&m, html, body);
+    mattach(html, body);
     m.stk[0] = html;
     m.stk[1] = body;
     m.sp = 2;

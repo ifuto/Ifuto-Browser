@@ -10,6 +10,20 @@
 #include <stdio.h>
 #include <string.h>
 
+
+/* ---- (style, avail_w) 幾何キャッシュ ---- */
+typedef struct {
+    const IfStyle *st;
+    i32 w;
+    i32 ml, mr, mt, mb, pl, pr, pt, pb;
+    i32 bl, brd, bt, bbo;
+    i32 content_w;
+    i32 height_spec; /* <0 = auto */
+    u8 ok;
+} IfGeomEnt;
+#define IF_GEOM_SIZE 1024u
+typedef struct { IfGeomEnt tab[IF_GEOM_SIZE]; } IfGeomCache;
+
 typedef struct IfPiece {
     IfStr text;
     const IfStyle *st;
@@ -34,6 +48,7 @@ typedef struct {
     IfBox *frame_box[512];
     IfBox *frame_tail[512];
     int frame_n;
+    IfGeomCache *geom;
 } IfLC;
 
 static i32 px2col(float px) { return (i32)floorf(px / IF_CHAR_W_PX + 0.5f); }
@@ -77,11 +92,56 @@ static void frame_pop(IfLC *lc, IfBox *box) {
 }
 
 static IfBox *new_box(IfLC *lc, u8 kind, IfNode *node, const IfStyle *st) {
-    IfBox *b = (IfBox *)if_arena_calloc(lc->arena, sizeof(IfBox));
-    b->kind = kind;
+    /* calloc ではなく alloc + 全メンバ明示初期化（64B memset の依存チェインを避ける） */
+    IfBox *b = (IfBox *)if_arena_alloc(lc->arena, sizeof(IfBox));
+    b->first_child = NULL;
+    b->next_sibling = NULL;
     b->node = node;
     b->st = st;
+    b->segs = NULL;
+    b->x = 0; b->y = 0; b->w = 0; b->h = 0;
+    b->n_segs = 0;
+    b->kind = kind;
+    b->text_align = 0;
+    b->_pad[0] = 0; b->_pad[1] = 0;
     return b;
+}
+
+
+static const IfGeomEnt *geom_get(IfLC *lc, IfGeomCache *gc, const IfStyle *st, i32 avail_w) {
+    u64 h = ((uintptr_t)st >> 4) * 2654435761u ^ (u64)(u32)avail_w * 40503u;
+    IfGeomEnt *e = &gc->tab[h & (IF_GEOM_SIZE - 1)];
+    if (e->ok && e->st == st && e->w == avail_w) return e;
+    float fs = st->font_size;
+    e->st = st;
+    e->w = avail_w;
+    e->bl  = st->border_w[3] > 0.0f ? 1 : 0;
+    e->brd = st->border_w[1] > 0.0f ? 1 : 0;
+    e->bt  = st->border_w[0] > 0.0f ? 1 : 0;
+    e->bbo = st->border_w[2] > 0.0f ? 1 : 0;
+    e->ml = len_h(st->margin[3], fs, lc->root_fs, avail_w);
+    e->mr = len_h(st->margin[1], fs, lc->root_fs, avail_w);
+    e->mt = len_v(st->margin[0], fs, lc->root_fs, avail_w);
+    e->mb = len_v(st->margin[2], fs, lc->root_fs, avail_w);
+    e->pl = len_h(st->padding[3], fs, lc->root_fs, avail_w);
+    e->pr = len_h(st->padding[1], fs, lc->root_fs, avail_w);
+    e->pt = len_v(st->padding[0], fs, lc->root_fs, avail_w);
+    e->pb = len_v(st->padding[2], fs, lc->root_fs, avail_w);
+    if (st->width.unit != IF_U_AUTO) {
+        e->content_w = len_h(st->width, fs, lc->root_fs, avail_w);
+        if (e->content_w < 0) e->content_w = 0;
+        i32 total = e->ml + e->bl + e->pl + e->content_w + e->pr + e->brd + e->mr;
+        if (total < avail_w && st->margin[3].unit == IF_U_AUTO && st->margin[1].unit == IF_U_AUTO)
+            e->ml = e->mr = (avail_w - total) / 2; /* margin:auto センタリング */
+    } else {
+        e->content_w = avail_w - e->ml - e->mr - e->bl - e->brd - e->pl - e->pr;
+        if (e->content_w < 0) e->content_w = 0;
+    }
+    e->height_spec = -1;
+    if (st->height.unit != IF_U_AUTO)
+        e->height_spec = len_v(st->height, fs, lc->root_fs, avail_w);
+    e->ok = 1;
+    return e;
 }
 
 /* ---------- インラインフラット化 ---------- */
@@ -148,6 +208,22 @@ typedef struct {
     const IfStyle *align_st;
 } IfWrap;
 
+/* 直前 seg と style が同じでソース上連続なら拡張する合体 push（seg 爆発の構造消去。
+ * レンダリングされるセル列は変わらない（同じバイト・同じ x・同じ style）） */
+static void wrap_push_seg(IfWrap *w, IfStr text, i32 x, i32 width, const IfStyle *st);
+static void wrap_push_merge(IfWrap *w, const char *p, u32 n, i32 x, i32 width, const IfStyle *st) {
+    if (n == 0) return;
+    if (w->n_segs) {
+        IfSeg *last = &w->segs[w->n_segs - 1];
+        if (last->st == st && last->text.p + last->text.n == p) {
+            last->text.n += n;
+            last->w += width;
+            return;
+        }
+    }
+    wrap_push_seg(w, if_str(p, n), x, width, st);
+}
+
 static void wrap_push_seg(IfWrap *w, IfStr text, i32 x, i32 width, const IfStyle *st) {
     if (text.n == 0) return;
     w->segs = (IfSeg *)if_arena_grow(w->lc->arena, w->segs, &w->lc->segs_scratch_cap,
@@ -208,19 +284,32 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
                 wrap_push_seg(w, if_str((const char *)s + i, 1), w->content_x + cx, adv, st);
                 cx += adv; i++; *any = true; continue;
             }
-            while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '\f')) i++;
+            u32 wsend = i + 1;
+            while (wsend < n && (s[wsend] == ' ' || s[wsend] == '\t' || s[wsend] == '\n' ||
+                                 s[wsend] == '\r' || s[wsend] == '\f')) wsend++;
+            u8 last_ws = s[wsend - 1];
+            i = wsend;
             if (cx > 0 && cx < w->content_w) {
-                wrap_push_seg(w, IF_S(" "), w->content_x + cx, 1, st);
+                if (last_ws == ' ') {
+                    /* 実ソースの 0x20 に乗せる（static 文字列と同じ cp のまま seg 合体可） */
+                    wrap_push_merge(w, (const char *)s + wsend - 1, 1, w->content_x + cx, 1, st);
+                } else {
+                    wrap_push_seg(w, IF_S(" "), w->content_x + cx, 1, st);
+                }
                 cx += 1;
             }
             continue;
         }
 
-        /* アトム切り出し: 全角は 1 グリフ、それ以外は空白・全角までのラン。
-         * 不変条件: このブロックは必ず i を 1 グリフ以上前進させる。 */
+        /* アトム切り出し: ASCII 可視ランは一括、全角は 1 グリフ、それ以外は従来規則。 */
         u32 atom_start = i;
         i32 atom_w = 0;
-        {
+        if (b0 >= 0x21 && b0 <= 0x7E) {
+            u32 j = i + 1;
+            while (j < n) { u8 cc = s[j]; if (cc < 0x21 || cc > 0x7E) break; j++; }
+            atom_w = (i32)(j - i);
+            i = j;
+        } else {
             u32 save = i;
             u32 cp = if_utf8_decode(s, n, &save);
             int gw = if_glyph_width(cp);
@@ -247,10 +336,16 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
 
         /* 折り返し判定（pre 以外） */
         if (!pre && cx > 0 && cx + atom_w > w->content_w) {
-            if (w->n_segs > 0 && if_str_eq(w->segs[w->n_segs - 1].text, IF_S(" "))) {
-                w->n_segs--;
-                cx = w->n_segs > 0 ? w->segs[w->n_segs - 1].x + w->segs[w->n_segs - 1].w - w->content_x : 0;
+            /* 行尾の折り畳み空白を除く: 全seg空白なら pop、合体 seg の場合は末尾 1B を削る。
+             * （アトムは '\x20' を含まないので「末尾が 0x20」⇔ 直近 push が折り畳み空白） */
+            if (w->n_segs > 0) {
+                IfSeg *last = &w->segs[w->n_segs - 1];
+                if (last->text.n && last->text.p[last->text.n - 1] == ' ') {
+                    if (last->text.n == 1) w->n_segs--;
+                    else { last->text.n--; last->w--; }
+                }
             }
+            cx = w->n_segs > 0 ? w->segs[w->n_segs - 1].x + w->segs[w->n_segs - 1].w - w->content_x : 0;
             wrap_end_line(w, *max_lh);
             cx = 0;
             *max_lh = lh;
@@ -269,13 +364,14 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
                     cx = 0;
                     *max_lh = lh;
                 }
-                wrap_push_seg(w, if_str((const char *)s + gs, g - gs), w->content_x + cx, gwidth, st);
+                wrap_push_merge(w, (const char *)s + gs, g - gs, w->content_x + cx, gwidth, st);
                 cx += gwidth;
             }
             continue;
         }
 
-        wrap_push_seg(w, if_str((const char *)s + atom_start, atom_end - atom_start), w->content_x + cx, atom_w, st);
+        wrap_push_merge(w, (const char *)s + atom_start, atom_end - atom_start,
+                        w->content_x + cx, atom_w, st);
         cx += atom_w;
     }
     w->line_w = cx;
@@ -341,8 +437,9 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
             continue;
         }
         const IfStyle *cst = c->style;
-        i32 mt = len_v(cst->margin[0], cst->font_size, lc->root_fs, content_w);
-        i32 mb = len_v(cst->margin[2], cst->font_size, lc->root_fs, content_w);
+        const IfGeomEnt *cg = geom_get(lc, lc->geom, cst, content_w);
+        i32 mt = cg->mt;
+        i32 mb = cg->mb;
         y += (prev_mb > mt ? prev_mb : mt); /* 兄弟縦マージン相殺: max */
         IfBox *child = layout_element(lc, c, content_x, y, content_w);
         box_add_child(lc, box, child);
@@ -369,32 +466,12 @@ static const IfStyle IF_STYLE_FALLBACK = {
 static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w) {
     const IfStyle *st = node->style ? node->style : &IF_STYLE_FALLBACK;
     IfBox *box = new_box(lc, IF_BOX_BLOCK, node, st);
-    float fs = st->font_size;
+    const IfGeomEnt *g = geom_get(lc, lc->geom, st, avail_w);
+    i32 bl = g->bl, brd = g->brd, bt = g->bt, bbo = g->bbo;
+    i32 pad_l = g->pl, pad_r = g->pr, pad_t = g->pt, pad_b = g->pb;
+    i32 content_w = g->content_w;
 
-    i32 bl  = st->border_w[3] > 0.0f ? 1 : 0;
-    i32 brd = st->border_w[1] > 0.0f ? 1 : 0;
-    i32 bt  = st->border_w[0] > 0.0f ? 1 : 0;
-    i32 bbo = st->border_w[2] > 0.0f ? 1 : 0;
-    i32 ml = len_h(st->margin[3], fs, lc->root_fs, avail_w);
-    i32 mr = len_h(st->margin[1], fs, lc->root_fs, avail_w);
-    i32 pad_l = len_h(st->padding[3], fs, lc->root_fs, avail_w);
-    i32 pad_r = len_h(st->padding[1], fs, lc->root_fs, avail_w);
-    i32 pad_t = len_v(st->padding[0], fs, lc->root_fs, avail_w);
-    i32 pad_b = len_v(st->padding[2], fs, lc->root_fs, avail_w);
-
-    i32 content_w;
-    if (st->width.unit != IF_U_AUTO) {
-        content_w = len_h(st->width, fs, lc->root_fs, avail_w);
-        if (content_w < 0) content_w = 0;
-        i32 total = ml + bl + pad_l + content_w + pad_r + brd + mr;
-        if (total < avail_w && st->margin[3].unit == IF_U_AUTO && st->margin[1].unit == IF_U_AUTO)
-            ml = mr = (avail_w - total) / 2; /* margin:auto センタリング */
-    } else {
-        content_w = avail_w - ml - mr - bl - brd - pad_l - pad_r;
-        if (content_w < 0) content_w = 0;
-    }
-
-    i32 x = ax + ml;
+    i32 x = ax + g->ml;
     i32 content_x = x + bl + pad_l;
     i32 y = ay; /* margin-top は呼び出し側（兄弟相殺）で処理済み */
     i32 content_y = y + bt + pad_t;
@@ -409,10 +486,8 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
     frame_push(lc, box); /* box の子追加は frame_top==box で O(1) tail を引く */
     i32 content_h = layout_children(lc, box, node, content_x, content_y, content_w);
     frame_pop(lc, box);
-    if (st->height.unit != IF_U_AUTO) {
-        i32 spec = len_v(st->height, fs, lc->root_fs, avail_w);
-        if (spec > content_h) content_h = spec; /* 指定高はクリップせず拡張のみ（v0.1 近似） */
-    }
+    if (g->height_spec >= 0 && g->height_spec > content_h)
+        content_h = g->height_spec; /* 指定高はクリップせず拡張のみ（v0.1 近似） */
 
     box->x = x;
     box->y = y;
@@ -424,6 +499,7 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
 IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
     if (width_cells < 4) width_cells = 4;
     IfLC lc = { .arena = arena, .root_fs = 16.0f };
+    lc.geom = (IfGeomCache *)if_arena_calloc(arena, sizeof(IfGeomCache));
     IfLayout *lay = (IfLayout *)if_arena_calloc(arena, sizeof(IfLayout));
     lay->arena = arena;
     lay->width = width_cells;
