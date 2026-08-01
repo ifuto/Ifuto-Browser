@@ -1,66 +1,11 @@
-/* Ifuto — TUI 入力デコーダとクロームモデルの単体テスト */
+/* Ifuto — クロームモデルの単体テスト（タブ/ストア/ifuto:// ページ）。
+ * TUI 入力デコーダのテストは TUI 廃止（2026-08-01、GUI 一本移行）で除去済み。 */
 #define _POSIX_C_SOURCE 200809L /* setenv は c11 では隠れる */
 #include "tests.h"
-#include "../src/ui_input.h"
 #include "../src/chrome.h"
 #include "../src/ifuto_pages.h"
 #include <string.h>
 #include <stdlib.h>
-
-/* --- デコーダ --- */
-
-static IfUiAction feed_str(IfUiDecoder *d, const char *s, IfUiEvent *last) {
-    IfUiAction a = UA_NONE;
-    IfUiEvent e;
-    for (const char *p = s; *p; p++)
-        if (if_ui_dec_feed(d, (u8)*p, &e)) { a = e.act; if (last) *last = e; }
-    return a;
-}
-
-static void test_uinput(void) {
-    IfUiDecoder d;
-    if_ui_dec_init(&d);
-
-    CHECK(feed_str(&d, "j", NULL) == UA_SCROLL_DOWN);
-    CHECK(feed_str(&d, "k", NULL) == UA_SCROLL_UP);
-    CHECK(feed_str(&d, "G", NULL) == UA_BOTTOM);
-    CHECK(feed_str(&d, "\t", NULL) == UA_LINK_NEXT);
-    CHECK(feed_str(&d, "\x1b[Z", NULL) == UA_LINK_PREV);
-    CHECK(feed_str(&d, "\x1b[A", NULL) == UA_SCROLL_UP);
-    CHECK(feed_str(&d, "\x1b[B", NULL) == UA_SCROLL_DOWN);
-    CHECK(feed_str(&d, "\x1b[5~", NULL) == UA_PAGE_UP);
-    CHECK(feed_str(&d, "\x1b[6~", NULL) == UA_PAGE_DOWN);
-    CHECK(feed_str(&d, "\x1b[H", NULL) == UA_TOP);
-    CHECK(feed_str(&d, "\x1bOH", NULL) == UA_TOP);
-    IfUiEvent e;
-    CHECK(feed_str(&d, "3", &e) == UA_TAB_1 + 2);
-    CHECK(feed_str(&d, "\x1b", NULL) == UA_NONE);           /* 単独 ESC は prefix 待ち */
-    CHECK(d.state == 1);
-    CHECK(feed_str(&d, "x", NULL) == UA_ESC);                /* 後続が非系列 → ESC 確定 */
-    if_ui_dec_init(&d);
-    IfUiEvent ce;
-    CHECK(feed_str(&d, "\xc3", &ce) == UA_CHAR && ce.a1 == 0xc3); /* UTF-8 head バイト */
-    if_ui_dec_init(&d);
-    CHECK(feed_str(&d, "\x7f", NULL) == UA_BACKSPACE);
-    CHECK(feed_str(&d, "\r", NULL) == UA_OPEN_LINK);
-
-    /* literal（オムニボックス）モード: アクションキーは UA_CHAR になる */
-    if_ui_dec_init(&d);
-    d.literal = 1;
-    IfUiEvent le;
-    CHECK(feed_str(&d, "j", &le) == UA_CHAR && le.a1 == 'j');
-    CHECK(feed_str(&d, "q", &le) == UA_CHAR && le.a1 == 'q');
-    CHECK(feed_str(&d, "b", &le) == UA_CHAR && le.a1 == 'b');
-    CHECK(feed_str(&d, "3", &le) == UA_CHAR && le.a1 == '3');
-    CHECK(feed_str(&d, "\x1b[A", NULL) == UA_SCROLL_UP); /* 矢印は引き続きアクション */
-    CHECK(feed_str(&d, "\r", NULL) == UA_OPEN_LINK);
-    CHECK(feed_str(&d, "\x7f", NULL) == UA_BACKSPACE);
-
-    /* 非 literal: b/B がブックマーク操作にバインドされること */
-    if_ui_dec_init(&d);
-    CHECK(feed_str(&d, "b", NULL) == UA_BOOKMARK_TOGGLE);
-    CHECK(feed_str(&d, "B", NULL) == UA_BOOKMARKS);
-}
 
 /* --- モデル（in-memory fake fs: 読み書き完全実装） --- */
 
@@ -362,7 +307,6 @@ void test_ifuto_pages(void) {
 }
 
 void test_uichrome(void) {
-    test_uinput();
     test_chrome_model();
     test_chrome_store();
 }

@@ -10,7 +10,7 @@
 #include "css.h"
 #include "layout.h"
 #include "render.h"
-#include "tui.h"
+#include "gui/gui.h"
 #include "chrome.h"
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -81,7 +81,8 @@ static void usage(FILE *f) {
           "  --dump-layout    print box tree\n"
           "  --dump-tokens    print HTML tokens\n"
           "  --dump-wptdom    print DOM in html5lib tree-construction format\n"
-          "  --ui             interactive TUI (tabs, omnibox; needs a tty)\n"
+          "  --gui            interactive GUI (single supported UI; TUI は廃止)\n"
+          "  --shot OUT.ppm   headless full-page raster to PPM (GUI 検証経路)\n"
           "  --md             force Markdown parsing (auto for .md/.markdown files)\n"
           "  --slim-dom       drop display-irrelevant subtrees (script/template) from DOM\n"
           "  --links          print collected links\n"
@@ -115,8 +116,9 @@ static int show_paths(void) {
 int main(int argc, char **argv) {
     i32 width = 100;
     int ansi = 1, do_style = 1, links = 0, stats = 0, force_md = 0;
-    enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM, M_UI } mode = M_RENDER;
-    const char *path = NULL;
+    enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM, M_GUI } mode = M_RENDER;
+    const char *path = NULL, *shot = NULL;
+    bool legacy_ui = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) width = atoi(argv[++i]);
@@ -126,7 +128,9 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dump-layout") == 0) mode = M_LAYOUT;
         else if (strcmp(argv[i], "--dump-tokens") == 0) mode = M_TOKENS;
         else if (strcmp(argv[i], "--dump-wptdom") == 0) mode = M_WPTDOM;
-        else if (strcmp(argv[i], "--ui") == 0) mode = M_UI;
+        else if (strcmp(argv[i], "--gui") == 0) mode = M_GUI;
+        else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) shot = argv[++i];
+        else if (strcmp(argv[i], "--ui") == 0) { mode = M_GUI; legacy_ui = true; }
         else if (strcmp(argv[i], "--links") == 0) links = 1;
         else if (strcmp(argv[i], "--stats") == 0) stats = 1;
         else if (strcmp(argv[i], "--md") == 0) force_md = 1;
@@ -136,8 +140,11 @@ int main(int argc, char **argv) {
         else if (argv[i][0] == '-' && argv[i][1] != 0) { usage(stderr); return 2; }
         else path = argv[i];
     }
-    if (!path && mode != M_UI) { usage(stderr); return 2; }
-    if (mode == M_UI) return if_tui_run(path);
+    if (!path && mode != M_GUI && !shot) { usage(stderr); return 2; }
+    if (legacy_ui)
+        fputs("ifuto: --ui(TUI) は完全廃止。GUI（--gui）へ移行しました\n", stderr);
+    if (shot) return if_gui_shot(path, shot);
+    if (mode == M_GUI) return if_gui_run(path);
     if (width < 4 || width > 100000) { fprintf(stderr, "ifuto: bad --width\n"); return 2; }
 
     double t0 = now_ms();

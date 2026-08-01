@@ -2,15 +2,16 @@
 
 史上最強の軽量ブラウザを目指す、全部自作のブラウザエンジンプロジェクト（C11・依存ゼロ。
 **Chromium 由来コードは 0 バイト**。リンクするのは libc と libm のみ）。
-現在地: **v0.2** — エンジン + TUI クローム + **GUI（`build/ifuto-gui`: 生 X11、Xlib 不使用、
-自前 5x7 フォント、ストリップ・ストリーミング描画）** + Markdown 表示（`.md` 自動検出）+
+現在地: **v0.3-dev** — エンジン + **GUI 一本化（2026-08-01: TUI は完全廃止。
+UI は raw X11 GUI のみ。`--shot` で同一ラスタパイプラインのヘッドレス検証）** +
+Markdown 表示（`.md` 自動検出）+
 **slim-DOM**（画面描画に関係ない script/template 配下は DOM に構築しない。実ブラウズ経路で既定）+
 **viewport 窓グリッド**（grid は文書全体ではなく可視窓のみ materialize）+
 ローカル永続化（セッション・履歴・ブックマーク。全て tmp→rename→fsync の原子書換）。
 
 ```
 HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS cascade → layout
-      → cell-grid render ─→ ANSI (TUI/CLI)
+      → cell-grid render ─→ ANSI (CLI --no-ansi / 検証)
                           └→ 5x7 raster strip → XPutImage (GUI)   ↑ 1 タブ 1 arena
 ```
 
@@ -31,24 +32,19 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 ## ビルドと実行
 
 ```sh
-make            # build/ifuto（リリース: -O2 LTO stripped）
-make gui        # build/ifuto-gui（GUI v0.2。X11 実機ではそのまま起動）
-make test       # 単体テスト 17,543 checks ×2 dispatch（ASan+UBSan+LSan 常時）
-make uitest     # TUI を疑似端末越しに駆動する e2e スモーク（15 checks）
-make guismoke   # GUI を X なしで検証（--shot ラスタ + 画素検査、17 checks）
+make            # build/ifuto（リリース: -O2 LTO stripped。GUI 統合済み単一バイナリ）
+make test       # 単体テスト 608k checks ×2 dispatch（ASan+UBSan+LSan 常時）
+make guismoke   # GUI を X なしで検証（--shot ラスタ + 画素検査）
 make golden     # 描画の厳密 diff テスト
 make fuzz       # mutation fuzz + ASan
 make bench      # サイズ/起動/時間/RSS の測定（CLI）
-make tuibench   # v-chrome 天井の実測検証（冷間開始/RSS/idle/タブメタ/セッション復元）
 make conformance # WPT tree-construction 採点（現 97.3%, 1679/1726, 2026-07-31）
 
-./build/ifuto-gui local_page.html          # GUI 起動（X11 必要。Ctrl+L/T/W/Q, 矢印, PgUp/PgDn）
-./build/ifuto-gui --shot out.ppm page.md   # ヘッドレス: 同パイプラインでフルラスタ PPM
+./build/ifuto --gui local_page.html        # GUI 起動（X11 必要。Ctrl+L/T/W/Q, 矢印, PgUp/PgDn）
+./build/ifuto --shot out.ppm page.md       # ヘッドレス: 同パイプラインでフルラスタ PPM
 ./build/ifuto notes.md                     # Markdown は拡張子で自動検出（--md で強制）
 ./build/ifuto --slim-dom --no-ansi p.html  # CLI で slim-DOM（既定は full/適合保証）
 
-./build/ifuto --ui                       # 対話 TUI（前回セッション復元 or 空タブ。tty 必要）
-./build/ifuto --ui file.html             # ファイルをロードして開始
 ./build/ifuto --show-paths               # 永続データのパス一覧（INV-9、副作用ゼロ）
 ./build/ifuto tests/pages/hello.html     # ワンショット ANSI カラー描画
 ./build/ifuto --no-ansi --width 100 file.html
@@ -57,13 +53,9 @@ make conformance # WPT tree-construction 採点（現 97.3%, 1679/1726, 2026-07-
 cat file.html | ./build/ifuto -
 ```
 
-TUI キー（`?` で常時確認可能）: `o` オムニボックス（相対パスは現タブのディレクトリ基準、
-`://` なら v0.3 待ちの通知。`@name` グループ割当・空で解除、`?query` タブライブ検索）、
-`Enter` 開く / フォーカス中リンクを開く、`Esc` キャンセル、
-`b` ブックマーク切替、`B` ブックマーク一覧（1–9 で開く）、
-`t` 新規タブ（空白）、`w` 閉じる、`]`/`[` タブ送り、`1`–`9` タブ直ジャンプ、
-`Tab`/`S-Tab` リンク巡回、`j/k`・`d/u`・`PgUp/PgDn`・`g/G`・矢印/Home/End スクロール、
-`r` リロード、`q` 終了（複数タブ時は二連打→セッション保存）。
+GUI キー: `Ctrl+L` オムニボックス、Enter 確定 / Esc 解除、`Ctrl+T` 新規タブ、
+`Ctrl+W` 閉じる、Ctrl+Tab タブ送り、`j/k`・矢印・PgUp/PgDn スクロール、`q`/`Ctrl+Q` 終了。
+（旧 TUI は 2026-08-01 に完全廃止。`--ui` は互換のため GUI 起動へ誘導する）
 
 永続データ（全て `$IFUTO_HOME` > `$XDG_DATA_HOME/ifuto` > `~/.local/share/ifuto` の単一
 ディレクトリ、`--show-paths` で確認可能）: `session.txt`（構造変化ごとに原子保存、

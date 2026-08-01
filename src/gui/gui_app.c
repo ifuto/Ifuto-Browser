@@ -14,6 +14,7 @@
 #include "../render.h"
 #include "fb.h"
 #include "x11t.h"
+#include "gui.h"
 #include "../raster.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -271,6 +272,9 @@ static void omni_insert(Gui *g, u8 ch) {
 }
 
 static int gui_run_x(const char *initial) {
+    /* 起動時 microbench: raster fill kernel をこの端末実測で決定（冪等。
+     * 決定の根拠数値は ifuto://memory に表示される） */
+    if_raster_autodetect();
     IfX *x = x11_open();
     if (!x) { fputs("ifuto-gui: X11 connect failed (headless? use --shot)\n", stderr); return 2; }
     u32 win = x11_window(x, GUI_DEF_W_PX, GUI_DEF_H_PX, "Ifuto Browser");
@@ -379,32 +383,23 @@ static int gui_run_x(const char *initial) {
     return 0;
 }
 
-int main(int argc, char **argv) {
-    const char *initial = NULL, *shot = NULL;
-    /* 起動時 microbench: raster fill kernel をこの端末実測で決定（冪等。
-     * 決定の根拠数値は ifuto://memory に表示される） */
-    if_raster_autodetect();
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) shot = argv[++i];
-        else if (argv[i][0] == '-' && argv[i][1]) {
-            fprintf(stderr, "usage: ifuto-gui [--shot OUT.ppm] [PAGE_FILE]\n");
-            return 2;
-        } else initial = argv[i];
-    }
-    if (shot) {
-        /* ヘッドレス検証: X なしで同じパイプライン（grid まで共有）を走らせる */
-        Gui g;
-        memset(&g, 0, sizeof g);
-        IfFsOps fs = { if_fs_exists_real, if_fs_read_real, NULL,
-                       if_fs_write_real, if_fs_append_real, if_fs_mkpath_real };
-        if_chrome_init(&g.c, fs);
-        g.w_cells = 125; /* 1000px 相当 */
-        g.h_cells = 45;  /* 720px 相当 */
-        g.omni_focus = true;
-        if (initial) gui_load(&g, initial, g.w_cells);
-        bool ok = shot_ppm(&g, shot);
-        free(g.wcells);
-        return ok ? 0 : 1;
-    }
-    return gui_run_x(initial);
+int if_gui_run(const char *initial_path) {
+    return gui_run_x(initial_path);
+}
+
+int if_gui_shot(const char *input_path, const char *out_ppm) {
+    /* ヘッドレス検証: X なしで同じパイプライン（grid まで共有）を走らせる */
+    if_raster_autodetect(); /* ラスタ kernel 決定（対話 GUI と同一規則） */
+    Gui g;
+    memset(&g, 0, sizeof g);
+    IfFsOps fs = { if_fs_exists_real, if_fs_read_real, NULL,
+                   if_fs_write_real, if_fs_append_real, if_fs_mkpath_real };
+    if_chrome_init(&g.c, fs);
+    g.w_cells = 125; /* 1000px 相当 */
+    g.h_cells = 45;  /* 720px 相当 */
+    g.omni_focus = true;
+    if (input_path) gui_load(&g, input_path, g.w_cells);
+    bool ok = shot_ppm(&g, out_ppm);
+    free(g.wcells);
+    return ok ? 0 : 1;
 }

@@ -20,23 +20,20 @@ all: $(BUILD)/ifuto
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/ifuto: $(SRC) | $(BUILD)
-	$(CC) $(BASE) $(REL) -o $@ $(SRC) $(LDFLAGS_REL) -lm
+# GUI は TUI 廃止（2026-08-01）で単一 UI。ifuto 本体に統合（--gui / --shot）。
+GUISRC := $(wildcard src/gui/*.c)
+$(BUILD)/ifuto: $(SRC) $(GUISRC) | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ $(SRC) $(GUISRC) $(LDFLAGS_REL) -lm
 
 # 開発用: sanitizer 付きバイナリ（テスト・手動検証は常にこちらで）
-$(BUILD)/ifuto-asan: $(SRC) | $(BUILD)
-	$(CC) $(BASE) $(SAN) -o $@ $(SRC) -lm
+$(BUILD)/ifuto-asan: $(SRC) $(GUISRC) | $(BUILD)
+	$(CC) $(BASE) $(SAN) -o $@ $(SRC) $(GUISRC) -lm
 
-# GUI フロントエンド（raw X11 クライアント + ソフトラスタ。依存は libc/libm のみを維持）
-GUISRC := $(filter-out src/main.c,$(SRC)) $(wildcard src/gui/*.c)
-$(BUILD)/ifuto-gui: $(GUISRC) | $(BUILD)
-	$(CC) $(BASE) $(REL) -o $@ $(GUISRC) $(LDFLAGS_REL) -lm
-
-gui: $(BUILD)/ifuto-gui
+gui: $(BUILD)/ifuto
 
 # ヘッドレス GUI 検証（X 不要: --shot のラスタパイプライン + 画素検査）
-guismoke: $(BUILD)/ifuto-gui
-	python3 tests/gui_smoke.py ./$(BUILD)/ifuto-gui
+guismoke: $(BUILD)/ifuto
+	python3 tests/gui_smoke.py ./$(BUILD)/ifuto
 
 TESTSRC := $(wildcard tests/*.c)
 $(BUILD)/run_tests: $(TESTSRC) $(ENGINE) $(AKLSRC) | $(BUILD)
@@ -52,7 +49,7 @@ $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 $(BUILD)/fuzz_akl: fuzz/fuzz_akl.c $(AKLSRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_akl.c $(AKLSRC) -lm
 
-.PHONY: test uitest golden fuzz bench tuibench clean size conformance guard vsx aklbench gui guismoke akltest
+.PHONY: test golden fuzz bench clean size conformance guard vsx aklbench gui guismoke akltest
 
 test: $(BUILD)/run_tests $(BUILD)/run_tests_switch cxxtest
 	./$(BUILD)/run_tests
@@ -73,10 +70,6 @@ cxxtest: $(BUILD)/test_v8compat
 	@if ldd $(BUILD)/test_v8compat | grep -q 'libstdc++'; then \
 		echo 'FATAL: v8compat links libstdc++ (製品法則違反)' >&2; exit 1; fi
 	./$(BUILD)/test_v8compat
-
-# TUI を疑似端末(PTY)越しに駆動する e2e スモーク（tabstrip/scroll/quit 等）
-uitest: $(BUILD)/ifuto
-	python3 tests/tui_smoke.py ./$(BUILD)/ifuto
 
 golden: $(BUILD)/ifuto-asan
 	tests/run_golden.sh ./$(BUILD)/ifuto-asan
@@ -127,7 +120,6 @@ aklbench: $(BUILD)/bench_akl $(BUILD)/bench_akl_switch
 	./$(BUILD)/bench_akl_switch
 
 tuibench: $(BUILD)/ifuto $(BUILD)/bench_tabmeta $(BUILD)/bench_session
-	python3 bench/bench_tui.py ./$(BUILD)/ifuto
 	./$(BUILD)/bench_tabmeta
 	./$(BUILD)/bench_session
 
