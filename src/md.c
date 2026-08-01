@@ -268,6 +268,7 @@ static void mo_elem_store(Mo *m, bool push) {
         n->attrs = at;
         n->n_attrs = g_pend.nattr;
     }
+    if (g_pend.tag == IF_TAG_STYLE) m->dom->has_style = 1;
     mattach(m, m->cur, n);
     if (push) {
         if (m->sp >= 128) { mo_taint(m); return; }

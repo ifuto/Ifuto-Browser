@@ -1102,6 +1102,29 @@ static const IfStyle *st_intern(IfStyleIntern *in, const IfStyle *tmp) {
     return e;
 }
 
+/* ---- 決定メモ化（UA-only ページの style 全走査をほぼ消す） ----
+ * computed style の決定変数は (右端照合に響く n の特徴, parent_st, root_fs, sheets)。
+ * UA シートはタグセレクタのみ（class/id/属性/擬似を含まない）なので、author シートが
+ * 無いページでは (tag or 未知タグ名, parent_st, inline style attr の有無) に縮約できる。
+ * 直接マップキャッシュ: 衝突は verify で必ず検出して再計上（損失ゼロの exact memo）。
+ * inline style attr を持つ要素は memo を通さない（値が結果に効く）。 */
+typedef struct {
+    uintptr_t parent;   /* interned parent style ポインタ（ページ内一意） */
+    uintptr_t key2;     /* 既知: tag id <<1 | 1。未知: tag_name ポインタ */
+    const IfStyle *st;  /* interned computed */
+} IfStCacheEnt;
+#define IF_STCACHE_BITS 14
+#define IF_STCACHE_SIZE (1u << IF_STCACHE_BITS)
+typedef struct {
+    IfStCacheEnt *tab;  /* arena 確保（ページ寿命） */
+} IfStCache;
+
+static bool node_has_inline_style(const IfNode *n) {
+    for (u32 i = 0; i < n->n_attrs; i++)
+        if (if_str_eq_ci(n->attrs[i].name, IF_S("style"))) return true;
+    return false;
+}
+
 static void compute_node(IfArena *a, IfNode *n, const IfStyle *parent_st, float root_fs,
                          const IfStyleSheet **sheets, u32 n_sheets, IfStyleIntern *in) {
     /* スタックの tmp に算出してから intern する（重複時は arena を一切消費しない）。
@@ -1310,13 +1333,70 @@ static void compute_node(IfArena *a, IfNode *n, const IfStyle *parent_st, float 
 }
 
 static void compute_walk(IfArena *a, IfNode *n, const IfStyle *parent_st, float root_fs,
-                         const IfStyleSheet **sheets, u32 n_sheets, IfStyleIntern *in) {
+                         const IfStyleSheet **sheets, u32 n_sheets, IfStyleIntern *in,
+                         IfStCache *cache) {
+    /* 反復 DFS（深い文書ツリーでも C スタックを消費しない） */
+    typedef struct { IfNode *n; const IfStyle *pst; float rfs; IfNode *next_sib; } Fr;
     if (n->kind != IF_NODE_ELEMENT) return;
-    compute_node(a, n, parent_st, root_fs, sheets, n_sheets, in);
-    float child_root_fs = root_fs;
-    if (n->tag == IF_TAG_HTML) child_root_fs = n->style->font_size;
-    for (IfNode *c = n->first_child; c; c = c->next_sibling)
-        if (c->kind == IF_NODE_ELEMENT) compute_walk(a, c, n->style, child_root_fs, sheets, n_sheets, in);
+    Fr stack[64];
+    int sp = 0;
+    const IfStyle *cur_parent = parent_st;
+    float cur_rfs = root_fs;
+    IfNode *cur = n;
+    for (;;) {
+        if (cur->kind == IF_NODE_ELEMENT) {
+            const IfStyle *st = NULL;
+            uintptr_t pk = (uintptr_t)cur_parent;
+            uintptr_t k2 = (cur->tag != IF_TAG_UNKNOWN)
+                ? (((uintptr_t)cur->tag << 1) | 1u)
+                : (uintptr_t)cur->u.tag_name.p;
+            bool memo = cache && !node_has_inline_style(cur);
+            if (memo) {
+                u64 h = (pk >> 4) * 2654435761u + k2 * 40503u;
+                IfStCacheEnt *e = &cache->tab[h & (IF_STCACHE_SIZE - 1)];
+                if (e->st && e->parent == pk && e->key2 == k2) st = e->st;
+                else {
+                    compute_node(a, cur, cur_parent, cur_rfs, sheets, n_sheets, in);
+                    e->parent = pk; e->key2 = k2; e->st = cur->style;
+                    st = cur->style;
+                }
+            } else {
+                compute_node(a, cur, cur_parent, cur_rfs, sheets, n_sheets, in);
+                st = cur->style;
+            }
+            if (memo) cur->style = st; else cur->style = st;
+            float child_rfs = cur_rfs;
+            if (cur->tag == IF_TAG_HTML) child_rfs = st->font_size;
+            /* 子を潜る: frame を積む */
+            IfNode *fc = cur->first_child;
+            while (fc && fc->kind != IF_NODE_ELEMENT) fc = fc->next_sibling;
+            if (fc) {
+                if (sp < 64) {
+                    stack[sp].n = cur->next_sibling;
+                    stack[sp].pst = cur_parent;
+                    stack[sp].rfs = cur_rfs;
+                    sp++;
+                    cur = fc; cur_parent = st; cur_rfs = child_rfs;
+                    continue;
+                } else {
+                    /* 深さ超過: 再帰フォールバック（性能のみ、正しさ不変） */
+                    for (IfNode *c = fc; c; c = c->next_sibling)
+                        if (c->kind == IF_NODE_ELEMENT)
+                            compute_walk(a, c, st, child_rfs, sheets, n_sheets, in, cache);
+                }
+            }
+        }
+        /* 兄弟へ、無ければ frame を降りる（frame の兄弟 NULL は更に降りる） */
+        for (;;) {
+            if (cur->next_sibling) { cur = cur->next_sibling; break; }
+            if (sp == 0) return;
+            sp--;
+            cur_parent = stack[sp].pst;
+            cur_rfs = stack[sp].rfs;
+            if (stack[sp].n) { cur = stack[sp].n; break; }
+            if (sp == 0) return;
+        }
+    }
 }
 
 static void collect_author_sheets(IfArena *a, IfNode *n, const IfStyleSheet ***arr, u32 *count, u64 *cap, u32 *order) {
@@ -1340,7 +1420,8 @@ void if_style_apply(IfArena *a, IfDom *dom) {
 
     const IfStyleSheet **sheets = NULL;
     u32 n_sheets = 0; u64 cap = 0; u32 order = 100000;
-    collect_author_sheets(a, dom->root, &sheets, &n_sheets, &cap, &order);
+    if (dom->has_style)
+        collect_author_sheets(a, dom->root, &sheets, &n_sheets, &cap, &order);
 
     const IfStyleSheet **all = (const IfStyleSheet **)if_arena_alloc(a, (n_sheets + 1) * sizeof(IfStyleSheet *));
     all[0] = ua;
@@ -1349,7 +1430,14 @@ void if_style_apply(IfArena *a, IfDom *dom) {
     IfNode *html = if_node_first_elem_child(dom->root);
     if (html) {
         IfStyleIntern in = { NULL, 0, 0, a };
-        compute_walk(a, html, NULL, 16.0f, all, n_sheets + 1, &in);
+        /* author シートが無いときだけ決定メモ化を有効化（UA シートはタグセレクタのみ） */
+        IfStCache cache = { NULL };
+        IfStCache *cp = NULL;
+        if (n_sheets == 0) {
+            cache.tab = (IfStCacheEnt *)if_arena_calloc(a, IF_STCACHE_SIZE * sizeof(IfStCacheEnt));
+            cp = &cache;
+        }
+        compute_walk(a, html, NULL, 16.0f, all, n_sheets + 1, &in, cp);
         if_css_intern_last = in.n;
     }
 }

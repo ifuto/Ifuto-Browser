@@ -196,6 +196,7 @@ static IfNode *make_element(IfTB *b, const IfTok *tok) {
     } else {
         const char *s = if_tag_name(tok->tag);
         n->u.tag_name = if_str(s, (u32)strlen(s));
+        if (tok->tag == IF_TAG_STYLE) b->dom->has_style = 1;
     }
     n->attrs = tok->attrs;
     n->n_attrs = tok->n_attrs;
