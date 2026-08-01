@@ -405,6 +405,20 @@ bool x11_put_image(IfX *x, u32 win, i32 dst_x, i32 dst_y, u32 w, u32 h, const u3
     return ok;
 }
 
+bool x11_copy_area(IfX *x, u32 win, i32 src_x, i32 src_y, i32 dst_x, i32 dst_y,
+                   u32 w, u32 h) {
+    u8 req[32];
+    memset(req, 0, sizeof req);
+    req[0] = 62; /* CopyArea */
+    p16(req + 2, 7); /* 28 bytes */
+    p32(req + 4, win); p32(req + 8, win);
+    p32(req + 12, g_x11_gc);
+    p16(req + 16, (u16)src_x); p16(req + 18, (u16)src_y);
+    p16(req + 20, (u16)dst_x); p16(req + 22, (u16)dst_y);
+    p16(req + 24, (u16)w); p16(req + 26, (u16)h);
+    return wr_all(x, req, 28);
+}
+
 static u32 keycode_to_keysym(IfX *x, u8 code, u32 state) {
     if (code < x->kmin || code > x->kmax || !x->kmap || !x->kper) return 0;
     u32 base = (u32)(code - x->kmin) * x->kper;

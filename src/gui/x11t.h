@@ -48,6 +48,11 @@ void x11_destroy(IfX *x, u32 win);
  * 1 要求の最大長は setup 値でクリップ（w*h が大きいと false） */
 bool x11_put_image(IfX *x, u32 win, i32 dst_x, i32 dst_y, u32 w, u32 h, const u32 *rgb);
 
+/* CopyArea（同一 drawable の矩形コピー。差分スクロール: 重なり領域の
+ * サーバ側シフトに使う。PutImage 共用の既定 GC で function=copy） */
+bool x11_copy_area(IfX *x, u32 win, i32 src_x, i32 src_y, i32 dst_x, i32 dst_y,
+                   u32 w, u32 h);
+
 /* 1 イベント受信（ブロッキング）。他イベントは吸収して構わない（Expose の統合は呼出側） */
 bool x11_next_event(IfX *x, IfXev *ev);
 

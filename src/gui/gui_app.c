@@ -66,6 +66,13 @@ typedef struct {
     IfGrid wingrid;
     IfTab *win_tab;
     i32 win_scroll, win_w, win_h;
+    /* 差分描画: 画面セル行ごとの内容ハッシュ（0=未描画/露出。同一値 0 は予約で
+     * 現れないよう hash 側で 0→1 に補正する）。イベントごとの全面再送を止め、
+     * 変化行だけを paint+PutImage する */
+    u32 *rowhash;
+    u32 rowhash_cap;
+    /* 差分スクロール測定（ifuto://memory 表示用: 省略できた PutImage 行数の累積） */
+    u64 diff_skip_rows;
 } Gui;
 
 /* 現タブの viewport 窓グリッドを（必要時のみ再構築して）返す。文書なしなら NULL。 */
@@ -240,28 +247,127 @@ static void gui_load(Gui *g, const char *path, i32 width_cells) {
     g->need_repaint = true;
 }
 
-static void strip_flush_x(IfX *x, u32 win, Painter *p, u32 w_px) {
-    for (u32 y = 0; y < p->rows;) {
-        /* PutImage ペイロード上限に合わせてさらに細分け（max_request 考慮） */
-        u32 chunk = p->rows - y;
+/* ---- 差分描画（ユーザー則: 再描画ではなく差分描画） ---- */
+
+static u32 fnv1a32(const void *p, u64 n, u32 h) {
+    const u8 *b = (const u8 *)p;
+    for (u64 i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; }
+    return h;
+}
+
+/* 画面セル行 row の「その行を描くのに必要な情報全部」のハッシュ。
+ * 変更行検出はこれの front/back 比較（ハッシュ衝突率 2^-32/行/イベントを許容。
+ * 衝突したら「その行だけ 1 イベント古いまま」という劣化であり破壊的でない） */
+static u32 gui_row_hash(Gui *g, i32 row) {
+    u32 h = 2166136261u;
+    if (row == 0) { /* tabstrip: タブ列+active+セル幅 */
+        for (i32 i = 0; i < g->c.n_tabs; i++) {
+            IfTab *tt = g->c.tabs[i];
+            const char *ti = tt->title ? tt->title : "";
+            h = fnv1a32(ti, strlen(ti) > 12 ? 12 : strlen(ti), h);
+            h ^= (u32)i * 2654435761u;
+        }
+        h ^= (u32)g->c.active * 2246822519u ^ (u32)g->w_cells;
+    } else if (row == 1) { /* omnibox */
+        h = fnv1a32(g->omni, g->omni_len, h) ^ (u32)g->omni_focus * 668265263u;
+    } else if (row == g->h_cells - 1) { /* status */
+        h = fnv1a32(g->status, strlen(g->status), h);
+    } else { /* 文書 viewport 行 */
+        IfTab *t = if_chrome_cur(&g->c);
+        i32 vh = g->h_cells - ROWS_TOP - ROWS_BOT;
+        i32 vr = row - ROWS_TOP;
+        const IfGrid *vg = gui_view_grid(g);
+        if (!t || !vg || vr >= vh) return 0x9E3779B9u;
+        i32 gy = t->scroll + vr;
+        if (gy < vg->y_off || gy - vg->y_off >= vg->h || gy >= t->doc_h)
+            return 0x811C9DC5u;
+        u32 w = (u32)(vg->w < g->w_cells ? vg->w : g->w_cells);
+        h = fnv1a32(&vg->cells[(i64)(gy - vg->y_off) * vg->w], (u64)w * sizeof(IfCell), h);
+    }
+    return h ? h : 1; /* 0 は「未描画」予約 */
+}
+
+static void strip_flush_span(IfX *x, u32 win, Painter *p, u32 w_px,
+                             u32 row_lo_px_off, u32 n_rows_px) {
+    /* ストリップ内 [row_lo_px_off, +n_rows_px) を上限分割しつつ送る */
+    for (u32 y = 0; y < n_rows_px;) {
+        u32 chunk = n_rows_px - y;
         u32 max_rows = x11_max_request_payload(x) ?
                        (u32)x11_max_request_payload(x) / (w_px * 4) - 8 : 32;
         if (max_rows == 0) max_rows = 1;
-        if (chunk > max_rows) chunk = max_rows;
-        x11_put_image(x, win, 0, (i32)(p->y0_px + y), w_px, chunk,
-                      p->strip.px + (u64)y * w_px);
+        if (chunk > max_rows) chunk = max_rows; /* max_rows は px 行単位 */
+        x11_put_image(x, win, 0, (i32)(p->y0_px + row_lo_px_off + y), w_px, chunk,
+                      p->strip.px + (u64)(row_lo_px_off + y) * w_px);
         y += chunk;
     }
 }
 
 static void gui_repaint_x(IfX *x, u32 win, Painter *p, Gui *g, u32 w_px, u32 h_px) {
+    if (!g->rowhash || g->rowhash_cap < (u32)g->h_cells) {
+        free(g->rowhash);
+        g->rowhash = (u32 *)calloc((u32)(g->h_cells > 0 ? g->h_cells : 1), 4);
+        if (!g->rowhash) if_fatal("oom: rowhash");
+        g->rowhash_cap = (u32)g->h_cells;
+    }
     for (u32 y0 = 0; y0 < h_px; y0 += p->strip.h_px) {
         p->y0_px = y0;
         p->rows = h_px - y0 < p->strip.h_px ? h_px - y0 : p->strip.h_px;
         i32 r0 = (i32)(y0 / GUI_CELL_H);
         i32 r1 = (i32)((y0 + p->rows + GUI_CELL_H - 1) / GUI_CELL_H) - 1;
-        for (i32 r = r0; r <= r1; r++) paint_screen_row(g, p, r);
-        strip_flush_x(x, win, p, w_px);
+        /* 差分判定（paint より先に全行の hash を確定させる） */
+        bool changed[GUI_STRIP_CELLS];
+        bool any = false;
+        for (i32 r = r0; r <= r1; r++) {
+            u32 h = gui_row_hash(g, r);
+            changed[r - r0] = (g->rowhash[r] != h);
+            any |= changed[r - r0];
+            g->rowhash[r] = h;
+        }
+        if (!any) { g->diff_skip_rows += (u32)(r1 - r0 + 1); continue; }
+        /* 変化行だけ paint し、連続ランごとに PutImage */
+        for (i32 r = r0; r <= r1; r++)
+            if (changed[r - r0]) paint_screen_row(g, p, r);
+        i32 r = r0;
+        while (r <= r1) {
+            if (!changed[r - r0]) { r++; continue; }
+            i32 ra = r;
+            while (r <= r1 && changed[r - r0]) r++;
+            i32 rb = r; /* [ra, rb) 全変化 */
+            strip_flush_span(x, win, p, w_px,
+                             (u32)(ra * GUI_CELL_H) - y0, (u32)(rb - ra) * GUI_CELL_H);
+        }
+    }
+}
+
+/* 差分スクロール: CopyArea でオーバーラップ部をサーバ側シフトし、
+ * 露出した行だけ hash を 0（未描画）に刻んで次の repaint に描かせる。 */
+static void gui_scroll_copy(IfX *x, u32 win, Gui *g, u32 w_px, i32 d, i32 vh) {
+    if (!g->rowhash) return;
+    u32 doc_top_px = ROWS_TOP * GUI_CELL_H;
+    u32 vh_px = (u32)vh * GUI_CELL_H;
+    u32 mag_cells = (u32)(d > 0 ? d : -d);
+    if (mag_cells >= (u32)vh) { /* 全面露出 */
+        memset(g->rowhash + ROWS_TOP, 0, (u32)vh * sizeof(u32));
+        return;
+    }
+    u32 mag = mag_cells * GUI_CELL_H;
+    if (d > 0)
+        x11_copy_area(x, win, 0, (i32)(doc_top_px + mag), 0, (i32)doc_top_px,
+                      w_px, vh_px - mag);
+    else
+        x11_copy_area(x, win, 0, (i32)doc_top_px, 0, (i32)(doc_top_px + mag),
+                      w_px, vh_px - mag);
+    u32 *H = g->rowhash;
+    if (d > 0) {
+        memmove(H + ROWS_TOP, H + ROWS_TOP + d,
+                ((u32)vh - (u32)d) * sizeof(u32));
+        /* 下辺に露出 [vh-d, vh) */
+        memset(H + ROWS_TOP + (u32)vh - (u32)d, 0, (u32)d * sizeof(u32));
+    } else {
+        memmove(H + ROWS_TOP - d, H + ROWS_TOP,
+                ((u32)vh + (u32)d) * sizeof(u32));
+        /* 上辺に露出 [0, -d) */
+        memset(H + ROWS_TOP, 0, (u32)(-d) * sizeof(u32));
     }
 }
 
@@ -312,6 +418,8 @@ static int gui_run_x(const char *initial) {
                 fb_init(&p.strip, w_px);
                 if_chrome_relayout(&g.c, g.w_cells);
             }
+            /* Expose/Configure はサーバ側の表示内容が信用できない → 全面差分無効化 */
+            if (g.rowhash) memset(g.rowhash, 0, g.rowhash_cap * sizeof(u32));
             gui_repaint_x(x, win, &p, &g, w_px, h_px);
             break;
         case IF_XEV_CLIENTMSG:
@@ -363,13 +471,23 @@ static int gui_run_x(const char *initial) {
             }
             i32 vh = g.h_cells - ROWS_TOP - ROWS_BOT;
             bool dirty = false;
+            IfTab *tpre = if_chrome_cur(&g.c);
+            i32 spre = tpre ? tpre->scroll : 0;
             if (ks == XK_DOWN || ks == 'j') { if_chrome_scroll(&g.c, 1, vh); dirty = true; }
             else if (ks == XK_UP || ks == 'k') { if_chrome_scroll(&g.c, -1, vh); dirty = true; }
             else if (ks == XK_NEXT) { if_chrome_scroll(&g.c, vh, vh); dirty = true; }
             else if (ks == XK_PRIOR) { if_chrome_scroll(&g.c, -vh, vh); dirty = true; }
             else if (ks == '/') { g.omni_focus = true; dirty = true; }
             else if (ks == 'q') { running = false; }
-            if (dirty) gui_repaint_x(x, win, &p, &g, w_px, h_px);
+            if (dirty) {
+                /* 差分スクロール: 純粋なスクロール変化なら CopyArea で
+                 * 画面をずらし露出行だけ描く（全面再 paint/再送を回避） */
+                IfTab *tpost = if_chrome_cur(&g.c);
+                i32 d = (tpre && tpre == tpost) ? tpost->scroll - spre : 0;
+                if (d != 0)
+                    gui_scroll_copy(x, win, &g, w_px, d, vh);
+                gui_repaint_x(x, win, &p, &g, w_px, h_px);
+            }
             break;
         }
         default: break;
@@ -379,6 +497,7 @@ static int gui_run_x(const char *initial) {
     /* IfChrome の tabs arean は leak 相当だが OS 回収に委ねる（GUI v0.2）。台帳 */
     free(p.strip.px);
     free(g.wcells);
+    free(g.rowhash);
     x11_close(x);
     return 0;
 }
