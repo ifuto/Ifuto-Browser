@@ -100,6 +100,7 @@ typedef struct {
     u32 n_errors;        /* パーサが回復したエラー数（統計用） */
     bool quirks;         /* DOCTYPE 完全表で判定（limited-quirks は false＝spec 上 no-quirks 同効） */
     IfStr title;         /* <title> のテキスト（見つからなければ empty） */
+    u8 has_selectedcontent; /* parse 中に <selectedcontent> を観測（post-pass clone の走査スイッチ） */
 } IfDom;
 
 /* 入力はドキュメント寿命中生存していること（ページ arena にコピーして呼ぶのが安全）。 */

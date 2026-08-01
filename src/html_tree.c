@@ -191,6 +191,8 @@ static IfNode *make_element(IfTB *b, const IfTok *tok) {
         for (u32 i = 0; i < tok->tag_raw.n; i++) lc[i] = (char)if_ascii_lower((u8)tok->tag_raw.p[i]);
         lc[tok->tag_raw.n] = 0;
         n->u.tag_name = if_str(lc, tok->tag_raw.n);
+        if (tok->tag_raw.n == 15 && if_str_eq_ci(n->u.tag_name, IF_S("selectedcontent")))
+            b->dom->has_selectedcontent = 1;
     } else {
         const char *s = if_tag_name(tok->tag);
         n->u.tag_name = if_str(s, (u32)strlen(s));
@@ -472,8 +474,6 @@ static void tpl_end(IfTB *b) {
  * これにより、入れ子テンプレートが閉じた直後の reset_mode が「外側で最後に
  * routing されたモード」を正しく復帰する（template.dat#67: <td> が暗黙 tr で
  * 包まれる、#68: 暗黙 tbody 生成が外側の thead routing に繋がる） */
-#if 0
-#endif
 static void tpl_route(IfTB *b, IfMode m) {
     b->mode = m;
     if (b->n_tpl) b->tpl_modes[b->n_tpl - 1] = (u8)m;
@@ -2135,7 +2135,8 @@ static void step_in_body(IfTB *b, IfTok tok) {
                 pop_until(b, IF_TAG_SELECT);
                 return;
             }
-            afe_reconstruct(b);
+            /* reconstruct AFE はしない: すると <font><select> で font が select の
+             * 内外に分裂する（webkit02#48 は font>select の包含を期待） */
             insert_element(b, &tok, true);
             b->frameset_ok = false;
             return;
@@ -2526,6 +2527,81 @@ static void step(IfTB *b, IfTok tok) {
     }
 }
 
+/* ============ customizable select: <selectedcontent> の clone ============
+ * WHATWG \"Maybe clone a selected option into a selectedcontent element\" —
+ * select 内の各 <selectedcontent> に、選択中 option（selected 属性を持つ最後の
+ * option、無ければ先頭の option）の **子孫全体の複写** を挿入する
+ * （webkit02#44-#47 台帳規則。clone は\"子を丸ごと\"であり中身の要素構造も複写） */
+static bool name_is_ci(IfStr a, const char *s, u32 n) {
+    return a.n == n && if_str_eq_ci(a, if_str(s, n));
+}
+
+static bool has_attr_ci(const IfNode *n, const char *name, u32 nn) {
+    for (u32 i = 0; i < n->n_attrs; i++)
+        if (name_is_ci(n->attrs[i].name, name, nn)) return true;
+    return false;
+}
+
+static IfNode *sc_clone(IfDom *dom, const IfNode *s) {
+    IfNode *n = (IfNode *)if_arena_calloc(dom->arena, sizeof(IfNode));
+    n->kind = s->kind;
+    n->tag = s->tag;
+    n->ns = s->ns;
+    n->flags = s->flags;
+    n->u = s->u;             /* IfStr スライス/dtype ポインタは arena 所有で不変 → 共有 */
+    n->attrs = s->attrs;     /* attrs 配列も arena 所有で不変 → 共有 */
+    n->n_attrs = s->n_attrs;
+    dom->n_nodes++;
+    IfNode *tail = NULL;
+    for (const IfNode *c = s->first_child; c; c = c->next_sibling) {
+        IfNode *cc = sc_clone(dom, c);
+        cc->parent = n;
+        if (tail) { tail->next_sibling = cc; tail = cc; }
+        else { n->first_child = cc; tail = cc; }
+    }
+    n->last_child = tail;
+    return n;
+}
+
+/* select の直接子 option から「選択中」を選ぶ（最後の selected 属性持ち、既定先頭） */
+static IfNode *sc_selected_option(const IfNode *sel) {
+    IfNode *first = NULL, *chosen = NULL;
+    for (const IfNode *c = sel->first_child; c; c = c->next_sibling) {
+        if (c->kind != IF_NODE_ELEMENT || c->tag != IF_TAG_OPTION || c->ns != IF_NS_HTML) continue;
+        if (!first) first = (IfNode *)c;
+        if (has_attr_ci(c, "selected", 8)) chosen = (IfNode *)c;
+    }
+    return chosen ? chosen : first;
+}
+
+/* select 子孫の selectedcontent をすべて selected option の clone で満たす */
+static void sc_fill(IfDom *dom, IfNode *n, const IfNode *opt) {
+    bool is_sc = n->kind == IF_NODE_ELEMENT && n->ns == IF_NS_HTML &&
+                 n->tag == IF_TAG_UNKNOWN && name_is_ci(n->u.tag_name, "selectedcontent", 15);
+    if (is_sc) {
+        IfNode *tail = NULL;
+        n->first_child = NULL; /* 既存の子は置換（spec: 全消去して clone） */
+        n->last_child = NULL;
+        for (const IfNode *c = opt->first_child; c; c = c->next_sibling) {
+            IfNode *cc = sc_clone(dom, c);
+            cc->parent = n;
+            if (tail) { tail->next_sibling = cc; tail = cc; }
+            else { n->first_child = cc; tail = cc; }
+        }
+        n->last_child = tail;
+        return; /* selectedcontent の中に更に option/select は来ない */
+    }
+    for (IfNode *c = n->first_child; c; c = c->next_sibling) sc_fill(dom, c, opt);
+}
+
+static void sc_select_walk(IfDom *dom, IfNode *n) {
+    if (n->kind == IF_NODE_ELEMENT && n->tag == IF_TAG_SELECT && n->ns == IF_NS_HTML) {
+        IfNode *opt = sc_selected_option(n);
+        if (opt) sc_fill(dom, n, opt);
+    }
+    for (IfNode *c = n->first_child; c; c = c->next_sibling) sc_select_walk(dom, c);
+}
+
 IfDom *if_parse_html(IfArena *arena, IfStr input) {
     if (input.n > IF_MAX_INPUT_BYTES) if_fatal("input exceeds per-page byte limit");
     IfDom *dom = (IfDom *)if_arena_calloc(arena, sizeof(IfDom));
@@ -2568,6 +2644,8 @@ IfDom *if_parse_html(IfArena *arena, IfStr input) {
             }
         }
     }
+    /* customizable select: selectedcontent への clone（走査は観測時のみ） */
+    if (dom->has_selectedcontent) sc_select_walk(dom, root);
     return dom;
 }
 
@@ -2771,8 +2849,8 @@ static void foreign_insert(IfTB *b, const IfTok *tok) {
         /* foreign 内の <template> はテンプレート意味論（content fragment / 挿入
          * モードスタック / has_open・pop_until の照合対象）を持たないただの
          * SVG/MathML 名前空間要素（template.dat#98/#99: "<svg template>" は
-         * content を持たず、外側の HTML template の EOF fold/pop にも混ざらない）。
-         * 参照一致の汚染を防ぐため ID を UNKNOWN に落とす（表示名は "template" のまま） */
+         * content を持たず、外側の HTML template の EOF fold/pop 照合にも混ざらない）。
+         * 参照一致の汚染を防ぐためタグ ID を UNKNOWN に落とす（表示名は "template" のまま） */
         ft.tag = IF_TAG_UNKNOWN;
     IfNode *n = make_element(b, &ft);
     n->ns = top(b)->ns;
