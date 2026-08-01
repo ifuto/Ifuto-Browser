@@ -62,4 +62,7 @@ void if_render_grid_rows_into_cur(const IfLayout *lay, i32 row0, i32 row1, IfGri
 
 u8 if_rgba_to_ansi(u32 rgba); /* RGBA8 → ANSI 256 色 or IF_CELL_DEFAULT */
 
+/* 行スイープ直接発行（if_render_emit_rows と同一バイト規約、巨大文書のグリッドレス経路） */
+void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi);
+
 #endif

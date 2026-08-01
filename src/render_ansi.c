@@ -396,3 +396,224 @@ IfStr if_render_emit(IfArena *arena, const IfGrid *grid, int ansi) {
     }
     return if_str((const char *)o.buf, (u32)o.len);
 }
+
+/* ================= 行スイープ直接発行（巨大文書のグリッドレス経路） =================
+ * 窓グリッド経路は「全セル既定充填 + 描画 + 発行」で O(w×rows) のセルメモリを必ず踏む。
+ * 本経路は paint op（行 seg / 装飾 deco）を「paint 順」のまま行カーソルで合流し、
+ * 再利用の行バッファ（L1 定常）にその行の op だけを構成して発行する。
+ * op 合流の paint 順序（証明）:
+ *   - lines[] は wrap_end_line 生成順 = DFS 順 = y 単調非減少
+ *   - deco[] は layout_element entry(bg→border) + 子 DFS の追記順 = y 開始が単調非減少
+ *   - 同一行の op 列は「deco（追記順）→ lines（生成順）」で paint 順と一致する:
+ *       * 兄弟 box の行は共有しない（純粋垂直フローで y が縮退しない）
+ *       * 祖先の deco は子孫の line より先に追記される（entry 追記規則）
+ *       * marker は li 降下前、hline は HR box 点で追記される
+ * 発行バイト列は if_render_emit(_rows) の完全一致がオラクル（tests/test_layout.c）。
+ */
+
+typedef struct {
+    u32 cp;     /* 0 = 全角継続セル */
+    u8 fg, bg, flags;
+} IfRCell;
+
+/* 行バッファにテキストを paint 順で上書き（draw_text/put_cp と同値: フルペン上書き） */
+static void row_paint_text(IfRCell *row, i32 w, i32 x, IfStr t, const IfStyle *st) {
+    u8 fg = st ? if_rgba_to_ansi(st->color) : (u8)IF_CELL_DEFAULT;
+    u8 bg = st ? if_rgba_to_ansi(st->bg) : (u8)IF_CELL_DEFAULT;
+    u8 fl = 0;
+    if (st) {
+        if (st->bold) fl |= IF_F_BOLD;
+        if (st->italic) fl |= IF_F_ITALIC;
+        if (st->underline) fl |= IF_F_ULINE;
+        if (st->strike) fl |= IF_F_STRIKE;
+    }
+    const u8 *s = (const u8 *)t.p;
+    u32 i = 0;
+    i32 cx = x;
+    while (i < t.n) {
+        u32 cp = if_utf8_decode(s, t.n, &i);
+        int gw = if_glyph_width(cp);
+        if (gw == 0) continue;
+        if (cx >= 0 && cx < w) { row[cx].cp = cp; row[cx].fg = fg; row[cx].bg = bg; row[cx].flags = fl; }
+        if (gw == 2 && cx + 1 >= 0 && cx + 1 < w) {
+            row[cx + 1].cp = 0; row[cx + 1].fg = fg; row[cx + 1].bg = bg; row[cx + 1].flags = fl;
+        }
+        cx += gw;
+    }
+}
+
+static void row_paint_cprun(IfRCell *row, i32 w, i32 x0, i32 x1, u32 cp, u8 fgA, bool keep_pen) {
+    if (x0 < 0) x0 = 0;
+    if (x1 > w) x1 = w;
+    for (i32 x = x0; x < x1; x++) {
+        row[x].cp = cp;
+        row[x].fg = fgA;
+        if (!keep_pen) { row[x].bg = (u8)IF_CELL_DEFAULT; row[x].flags = 0; }
+    }
+}
+
+static void row_paint_dec(IfRCell *row, i32 w, const IfDeco *d, i32 r) {
+    switch (d->kind) {
+    case IF_DECO_BG: {
+        u8 idx = if_rgba_to_ansi(d->argb);
+        if (idx == IF_CELL_DEFAULT && (d->argb & 0xFF) < 128) break; /* fill_bg と同値の早期return */
+        i32 x0 = d->x < 0 ? 0 : d->x, x1 = d->x + d->w > w ? w : d->x + d->w;
+        for (i32 x = x0; x < x1; x++) row[x].bg = idx;
+        break;
+    }
+    case IF_DECO_BORDER: {
+        u8 fg = if_rgba_to_ansi(d->argb);
+        u8 sides = d->tlen;
+        i32 y0 = d->y, y1 = d->y + d->h - 1;
+        if ((sides & 1) && r == y0) row_paint_cprun(row, w, d->x, d->x + d->w, 0x2500, fg, true);
+        if ((sides & 4) && r == y1) row_paint_cprun(row, w, d->x, d->x + d->w, 0x2500, fg, true);
+        if (sides & 8) row_paint_cprun(row, w, d->x, d->x + 1, 0x2502, fg, true);
+        if (sides & 2) row_paint_cprun(row, w, d->x + d->w - 1, d->x + d->w, 0x2502, fg, true);
+        if ((sides & 1) && (sides & 8) && r == y0 && d->x >= 0 && d->x < w) row[d->x].cp = 0x250C;
+        if ((sides & 1) && (sides & 2) && r == y0 && d->x + d->w - 1 >= 0 && d->x + d->w - 1 < w) row[d->x + d->w - 1].cp = 0x2510;
+        if ((sides & 4) && (sides & 8) && r == y1 && d->x >= 0 && d->x < w) row[d->x].cp = 0x2514;
+        if ((sides & 4) && (sides & 2) && r == y1 && d->x + d->w - 1 >= 0 && d->x + d->w - 1 < w) row[d->x + d->w - 1].cp = 0x2518;
+        break;
+    }
+    case IF_DECO_HLINE:
+        row_paint_cprun(row, w, d->x, d->x + d->w, 0x2500, (u8)IF_CELL_DEFAULT, false);
+        break;
+    case IF_DECO_MARKER:
+        row_paint_text(row, w, d->x, if_str(d->text, d->tlen), d->st);
+        break;
+    default: break;
+    }
+}
+
+/* 行スイープ発行。発行規約は if_render_emit_rows と一致（trim・行末リセット） */
+void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
+    /* 発行幅は窓グリッド経路と同じく lay->width（if_render_grid_rows_into_cur の
+     * out->w 規約。extent は行数だけに使い、viewport 超過セルはクリップされる） */
+    i32 mx, my = 0;
+    if_render_extent(lay, &mx, &my);
+    mx = lay->width;
+    if (mx < 1) mx = 1;
+    if (my < 1) my = 1;
+    IfRCell *row = (IfRCell *)malloc((size_t)mx * sizeof(IfRCell));
+    if (!row) if_fatal("render: oom row cells");
+    u64 outcap = (u64)mx * 4 + 128;
+    u8 *buf = (u8 *)malloc(outcap);
+    if (!buf) if_fatal("render: oom row buffer");
+    IfPen cur = { (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
+
+    /* deco の active 集合（追記順を保持したまま期限切れを惰性除去） */
+    const IfDeco **active = (const IfDeco **)malloc(sizeof(IfDeco *) * 64);
+    u32 n_active = 0, cap_active = 64;
+    u32 di = 0, li = 0;
+
+    for (i32 r = 0; r < my; r++) {
+        /* deco の開始（y==r）は追記順に active へ */
+        while (di < lay->n_deco && lay->deco[di].y <= r) {
+            const IfDeco *d = &lay->deco[di++];
+            i32 dh = d->h > 0 ? d->h : 1;
+            if (r < d->y + dh) {
+                if (n_active == cap_active) {
+                    cap_active *= 2;
+                    active = (const IfDeco **)realloc(active, sizeof(IfDeco *) * cap_active);
+                    if (!active) if_fatal("render: oom deco active");
+                }
+                active[n_active++] = d;
+            }
+        }
+        /* 期限切れ除去（順序保持の compact） */
+        for (u32 k = 0; k < n_active; ) {
+            const IfDeco *d = active[k];
+            i32 dh = d->h > 0 ? d->h : 1;
+            if (!(d->y <= r && r < d->y + dh)) {
+                /* 順序保持で 1 件除去（active は追記順のまま小さく保つ） */
+                memmove(active + k, active + k + 1, (n_active - 1 - k) * sizeof(IfDeco *));
+                n_active--;
+                continue;
+            }
+            k++;
+        }
+        bool has_line = (li < lay->n_lines && lay->lines[li]->y == r);
+        if (!has_line && n_active == 0) {
+            /* ブランク行（発行規約どおり） */
+            u64 n = 0;
+            if (ansi) {
+                memset(buf, ' ', (size_t)mx);
+                n = (u64)mx;
+                memcpy(buf + n, "\x1b[0m", 4); n += 4;
+                cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
+            }
+            buf[n++] = '\n';
+            fwrite(buf, 1, n, out);
+            continue;
+        }
+        /* 行構成: [0,maxx] だけ既定充填（ansi は全幅必要） */
+        i32 maxx = mx;
+        if (!ansi) {
+            maxx = 0;
+            if (has_line) {
+                const IfBox *b = lay->lines[li];
+                for (u32 u = 0; u < b->n_segs; u++)
+                    if (b->segs[u].x + b->segs[u].w > maxx) maxx = b->segs[u].x + b->segs[u].w;
+                for (u32 u = li + 1; u < lay->n_lines && lay->lines[u]->y == r; u++) {
+                    const IfBox *b2 = lay->lines[u];
+                    for (u32 v = 0; v < b2->n_segs; v++)
+                        if (b2->segs[v].x + b2->segs[v].w > maxx) maxx = b2->segs[v].x + b2->segs[v].w;
+                }
+            }
+            for (u32 k = 0; k < n_active; k++) {
+                const IfDeco *d = active[k];
+                if (d->kind == IF_DECO_BG) continue; /* bg は no-ansi 出力に影響しない */
+                if (d->x + d->w > maxx) maxx = d->x + d->w;
+            }
+            if (maxx > mx) maxx = mx;
+        }
+        for (i32 x = 0; x < maxx; x++) {
+            row[x].cp = ' ';
+            row[x].fg = (u8)IF_CELL_DEFAULT;
+            row[x].bg = (u8)IF_CELL_DEFAULT;
+            row[x].flags = 0;
+        }
+        /* paint: deco（追記順）→ lines */
+        for (u32 k = 0; k < n_active; k++)
+            row_paint_dec(row, maxx, active[k], r);
+        while (li < lay->n_lines && lay->lines[li]->y == r) {
+            const IfBox *b = lay->lines[li];
+            for (u32 u = 0; u < b->n_segs; u++)
+                row_paint_text(row, maxx, b->segs[u].x, b->segs[u].text, b->segs[u].st);
+            li++;
+        }
+        /* 発行（emit_rows 同値） */
+        u64 n = 0;
+        i32 last = maxx - 1;
+        if (!ansi) {
+            while (last >= 0 && row[last].cp == ' ') last--;
+        }
+        for (i32 x = 0; x <= last; x++) {
+            if (row[x].cp == 0) continue;
+            if (ansi) {
+                IfPen p = { row[x].fg, row[x].bg, row[x].flags };
+                if (p.fg != cur.fg || p.bg != cur.bg || p.flags != cur.flags) {
+                    if (outcap - n < 64) { fwrite(buf, 1, n, out); n = 0; }
+                    memcpy(buf + n, "\x1b[0m", 4); n += 4;
+                    if (p.flags & IF_F_BOLD) { memcpy(buf + n, "\x1b[1m", 4); n += 4; }
+                    if (p.flags & IF_F_ITALIC) { memcpy(buf + n, "\x1b[3m", 4); n += 4; }
+                    if (p.flags & IF_F_ULINE) { memcpy(buf + n, "\x1b[4m", 4); n += 4; }
+                    if (p.flags & IF_F_STRIKE) { memcpy(buf + n, "\x1b[9m", 4); n += 4; }
+                    if (p.fg != IF_CELL_DEFAULT) n += (u64)snprintf((char *)buf + n, 64, "\x1b[38;5;%um", p.fg);
+                    if (p.bg != IF_CELL_DEFAULT) n += (u64)snprintf((char *)buf + n, 64, "\x1b[48;5;%um", p.bg);
+                    cur = p;
+                }
+            }
+            u8 enc[4];
+            u64 en = if_utf8_encode(row[x].cp, enc);
+            if (outcap - n < en + 8) { fwrite(buf, 1, n, out); n = 0; }
+            memcpy(buf + n, enc, en); n += en;
+        }
+        if (ansi) { memcpy(buf + n, "\x1b[0m", 4); n += 4; cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 }; }
+        buf[n++] = '\n';
+        fwrite(buf, 1, n, out);
+    }
+    free(active);
+    free(buf);
+    free(row);
+}

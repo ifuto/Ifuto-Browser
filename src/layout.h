@@ -44,6 +44,10 @@ typedef struct {
     IfStr href;
 } IfLink;
 
+#include "render_sweep.h"
+
+typedef struct IfRowOps IfRowOps; /* render_ansi.c: 行スイープ発行の遅延構築 op 列 */
+
 typedef struct IfLayout {
     IfArena *arena;
     IfBox *root;
@@ -51,6 +55,15 @@ typedef struct IfLayout {
     i32 height;            /* 総コンテンツ高（セル） */
     IfLink *links;
     u32 n_links;
+    /* 行スイープ直接発行（CLI 全量 dump のグリッドレス経路）用のログ。
+     * IfBox 構造は不変（GUI/テストは従来どおりボックスを歩く）。 */
+    IfBox **lines;         /* wrap_end_line の生成順 = DFS 順 = y 単調非減少 */
+    u32 n_lines;
+    u64 cap_lines;
+    IfDeco *deco;          /* 装飾 op（DFS=paint 順。border/bg は y は開始、h は後埋め） */
+    u32 n_deco;
+    u64 cap_deco;
+    IfRowOps *rowops;      /* 初回 sweep で構築・再利用（再帰的な逐次発行 2 回目以降は O(1) 準備） */
 } IfLayout;
 
 /* dom+style からレイアウトを構築。width はセル。失敗しない（壊れた構造は空行に落ちる）。 */

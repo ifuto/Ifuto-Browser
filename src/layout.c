@@ -49,6 +49,7 @@ typedef struct {
     IfBox *frame_tail[512];
     int frame_n;
     IfGeomCache *geom;
+    IfLayout *lay;       /* lines ログ記録先 */
 } IfLC;
 
 static i32 px2col(float px) { return (i32)floorf(px / IF_CHAR_W_PX + 0.5f); }
@@ -89,6 +90,19 @@ static void frame_pop(IfLC *lc, IfBox *box) {
     lc->frame_n--;
     (void)box; /* 対称性のみ。depth 超過分は push で積まれないので pop も対称 */
     if (lc->frame_n < 0) lc->frame_n = 0;
+}
+
+static u32 deco_add(IfLC *lc, u8 kind, i32 x, i32 y, i32 w, i32 h, u32 argb,
+                    const IfStyle *st, const char *text, u8 tlen) {
+    IfLayout *lay = lc->lay;
+    lay->deco = (IfDeco *)if_arena_grow(lc->arena, lay->deco, &lay->cap_deco,
+                                        lay->n_deco + 1, sizeof(IfDeco));
+    IfDeco *d = &lay->deco[lay->n_deco];
+    d->kind = kind; d->tlen = tlen;
+    if (tlen && text) memcpy(d->text, text, tlen);
+    d->x = x; d->y = y; d->w = w; d->h = h;
+    d->argb = argb; d->st = st;
+    return lay->n_deco++;
 }
 
 static IfBox *new_box(IfLC *lc, u8 kind, IfNode *node, const IfStyle *st) {
@@ -256,6 +270,15 @@ static void wrap_end_line(IfWrap *w, float max_lh) {
         for (u32 i = 0; i < line->n_segs; i++) dst[i].x += shift;
     }
     box_add_child(w->lc, w->parent, line);
+    /* 行スイープ直接発行用のログ（生成順 = y 単調非減少） */
+    {
+        IfLC *lc2 = w->lc;
+        if (lc2->lay) {
+            lc2->lay->lines = (IfBox **)if_arena_grow(lc2->arena, lc2->lay->lines,
+                &lc2->lay->cap_lines, lc2->lay->n_lines + 1, sizeof(IfBox *));
+            lc2->lay->lines[lc2->lay->n_lines++] = line;
+        }
+    }
     w->y += rows;
     w->n_segs = 0;
     w->line_w = 0;
@@ -421,6 +444,7 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
                            i32 content_x, i32 content_y, i32 content_w) {
     i32 y = content_y;
     i32 prev_mb = 0;
+    u32 li_ord = 0; /* ol 番号: この親の LIST_ITEM li を出現順に数える（draw_marker 同値） */
     const IfStyle *base_st = node->style;
     IfNode *c = node->first_child;
     while (c) {
@@ -441,6 +465,33 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
         i32 mt = cg->mt;
         i32 mb = cg->mb;
         y += (prev_mb > mt ? prev_mb : mt); /* 兄弟縦マージン相殺: max */
+        if (lc->lay && c->tag == IF_TAG_LI && cst->display == IF_D_LIST_ITEM) {
+            /* draw_marker と同値の計算を layout 時点で行い MARKER op を追記する。
+             * （配置は li box 左端の手前/上端。x,y はこの時点で確定済み） */
+            li_ord++;
+            u16 list = IF_TAG_UL;
+            for (IfNode *p = c->parent; p; p = p->parent) {
+                if (p->kind == IF_NODE_ELEMENT && (p->tag == IF_TAG_UL || p->tag == IF_TAG_OL)) { list = p->tag; break; }
+                if (p->kind == IF_NODE_ELEMENT && p->tag == IF_TAG_LI) break;
+            }
+            /* li_ord = 「この親で自分より前の LIST_ITEM li 数+1」（draw_marker の
+             * 兄弟走査と同値だが O(1)。c->parent == node なので同じ集合を数えている） */
+            u32 idx = li_ord;
+            i32 bx = content_x + cg->ml;
+            if (list == IF_TAG_UL) {
+                i32 mx = bx - 2;
+                if (mx < 0) mx = bx;
+                deco_add(lc, IF_DECO_MARKER, mx, y, 2, 1, 0, cst, "\xE2\x80\xA2 ", 4);
+            } else {
+                char nb[12];
+                int m = snprintf(nb, sizeof nb, "%u.", idx);
+                if (m > 0) {
+                    i32 mx = bx - (m + 1);
+                    if (mx < 0) mx = 0;
+                    deco_add(lc, IF_DECO_MARKER, mx, y, (i32)m, 1, 0, cst, nb, (u8)m);
+                }
+            }
+        }
         IfBox *child = layout_element(lc, c, content_x, y, content_w);
         box_add_child(lc, box, child);
         y += child->h;
@@ -476,11 +527,28 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
     i32 y = ay; /* margin-top は呼び出し側（兄弟相殺）で処理済み */
     i32 content_y = y + bt + pad_t;
 
+    /* 行スイープ用装飾 op（DFS=paint 順: 親の装飾は子より先に追記される） */
+    u32 deco_bg = UINT32_MAX, deco_bd = UINT32_MAX;
+    if (lc->lay && (st->bg & 0xFF) >= 128)
+        deco_bg = deco_add(lc, IF_DECO_BG, x, y, bl + pad_l + content_w + pad_r + brd,
+                           0 /* h 後埋め */, st->bg, NULL, NULL, 0);
+
     if (node->tag == IF_TAG_HR) {
         box->x = x; box->y = y;
         box->w = bl + pad_l + content_w + pad_r + brd;
         box->h = bt + 1 + bbo;
+        if (lc->lay) {
+            /* paint_shell の HR: bt を除いた行へ罫線（NULL style のフルペン既定） */
+            deco_add(lc, IF_DECO_HLINE, x, y + (bt ? 1 : 0), box->w, 1, 0, NULL, NULL, 0);
+            if (deco_bg != UINT32_MAX) lc->lay->deco[deco_bg].h = box->h;
+        }
         return box;
+    }
+
+    if (lc->lay && (bl | brd | bt | bbo)) {
+        u8 sides = (u8)((bt ? 1 : 0) | (brd ? 2 : 0) | (bbo ? 4 : 0) | (bl ? 8 : 0));
+        deco_bd = deco_add(lc, IF_DECO_BORDER, x, y, bl + pad_l + content_w + pad_r + brd,
+                           0, st->border_color, NULL, NULL, sides);
     }
 
     frame_push(lc, box); /* box の子追加は frame_top==box で O(1) tail を引く */
@@ -493,14 +561,19 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
     box->y = y;
     box->w = bl + pad_l + content_w + pad_r + brd;
     box->h = bt + pad_t + content_h + pad_b + bbo;
+    if (lc->lay) {
+        if (deco_bg != UINT32_MAX) lc->lay->deco[deco_bg].h = box->h;
+        if (deco_bd != UINT32_MAX) lc->lay->deco[deco_bd].h = box->h;
+    }
     return box;
 }
 
 IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
     if (width_cells < 4) width_cells = 4;
+    IfLayout *lay = (IfLayout *)if_arena_calloc(arena, sizeof(IfLayout));
     IfLC lc = { .arena = arena, .root_fs = 16.0f };
     lc.geom = (IfGeomCache *)if_arena_calloc(arena, sizeof(IfGeomCache));
-    IfLayout *lay = (IfLayout *)if_arena_calloc(arena, sizeof(IfLayout));
+    lc.lay = lay;
     lay->arena = arena;
     lay->width = width_cells;
     lay->root = new_box(&lc, IF_BOX_BLOCK, NULL, NULL);

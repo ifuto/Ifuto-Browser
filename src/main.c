@@ -219,30 +219,15 @@ int main(int argc, char **argv) {
     double t4 = now_ms();
     double arena_after_layout = (double)if_arena_reserved(&a);
 
-    /* 巨大文書はチャンク窓グリッドの再利用で定数メモリ発行する（法則: 画面描画に
-     * 関係ないものは保持しない。グリッド・出力バッファ双方の全量保持をやめる）。
-     * 窓は 4096 行単位で cells を malloc 一回だけ再利用。発行バイト列は従来と完全一致
-     * （差分は tests の tui/gui smoke の sha256 が機械監査） */
+    /* v0.3: 行スイープ直接発行（グリッド全面充填を消す。op が触るセルだけを再利用
+     * 行バッファに構成する。発行バイト列は従来と完全一致 = tests/test_layout.c の
+     * 差分オラクルが機械固定） */
+    double tg0 = now_ms();
+    if_render_emit_rows_sweep(stdout, lay, ansi);
+    double acc_emit = now_ms() - tg0, acc_grid = 0.0;
+    double t5 = now_ms();
     i32 mx = 0, my = 0;
     if_render_extent(lay, &mx, &my);
-    IfGrid win;
-    win.cells = (IfCell *)malloc((size_t)mx * 4096 * sizeof(IfCell));
-    if (!win.cells) if_fatal("render: oom window grid");
-    win.y_off = 0;
-    /* 厳密増加窓なので走査カーソルを巡航（root 直下の子リスト first-child 再走査を
-     * 消す。render O(窓×子) → O(box+描画cell)。後退しない規約のみで使用） */
-    IfPaintCursor cur = { 0 };
-    double acc_grid = 0, acc_emit = 0;
-    for (i32 r0 = 0; r0 < my; r0 += 4096) {
-        i32 r1 = r0 + 4096 < my ? r0 + 4096 : my;
-        double tg0 = now_ms();
-        if_render_grid_rows_into_cur(lay, r0, r1, &win, &cur);
-        double tg1 = now_ms();
-        if_render_emit_rows(stdout, &win, ansi);
-        acc_grid += tg1 - tg0; acc_emit += now_ms() - tg1;
-    }
-    free(win.cells);
-    double t5 = now_ms();
 
     if (links && lay->n_links) {
         printf("\nリンク:\n");
