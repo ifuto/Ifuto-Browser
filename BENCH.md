@@ -78,22 +78,26 @@ domdump 傾きで 256→3379MiB を伸ばすと ≈ 34.4M KB ≒ **約 35 GB RSS
 
 | bench | akl | V8 --jitless (Ignition) | V8 full (TurboFan) | vs jitless | vs full |
 |---|---:|---:|---:|---:|---:|
-| empty  | 1.397ms | 23.985ms | 22.448ms | **0.058** | **0.062** |
-| tiny   | 1.350ms | 25.174ms | 24.322ms | **0.054** | **0.056** |
-| fib30  | 77.742ms | 109.124ms | 36.626ms | **0.712** | 2.123 |
-| arith  | 116.986ms | 115.943ms | 50.763ms | 1.009 | 2.305 |
-| branch | 60.106ms | 78.982ms | 32.761ms | **0.761** | 1.835 |
-| strcat_flat | 4.686ms | 28.558ms | 29.716ms | **0.164** | **0.158** |
-| strcat_grow | 2.352ms | 25.381ms | 26.610ms | **0.093** | **0.088** |
+| empty  | 1.701ms | 28.920ms | 22.218ms | **0.059** | **0.077** |
+| tiny   | 1.348ms | 22.804ms | 22.572ms | **0.059** | **0.060** |
+| fib30  | 75.858ms | 113.684ms | 36.615ms | **0.667** | 2.072 |
+| arith  | 84.530ms | 116.850ms | 50.165ms | **0.723** | 1.685 |
+| branch | 44.708ms | 77.338ms | 28.836ms | **0.578** | 1.550 |
+| strcat_flat | 4.174ms | 28.657ms | 33.744ms | **0.146** | **0.124** |
+| strcat_grow | 3.389ms | 27.009ms | 26.016ms | **0.125** | **0.130** |
 
 読み方（正直な欄）:
-- **vs V8 インタプリタ（--jitless）: 7 項目中 6 項目で akl が速い**（<1 で akl 速）。
-- **vs V8 JIT: ホット数値ループ（fib30/arith/branch）では 1.8–2.3× 負ける**。
+- **vs V8 インタプリタ（--jitless）: 7 項目中 7 項目で akl が速い**（<1 で akl 速）。
+  arith は CoJIT S2（末尾 D 回転）で 1.009 → **0.723 に逆転**。
+- **vs V8 JIT: ホット数値ループ（fib30/arith/branch）では 1.55–2.07× 負け**（旧 1.8–2.3× から縮小）。
   JIT はホットループに effect する構造上この結果は予定調和であり、隠さない。
-  akl の優位は起動（1.4ms vs 23ms）と文字列系 microbench。
-- **CoJIT（S1 ループ回転）の ON/OFF 差は上記 bench では 0.97–1.00× = ノイズ内（実測）**。
-  現行 CoJIT の効能は測定可能な速度差ではなく、op 列の正規化（今後の特化の土台）にある。
-  「速い」とは言わない。発火回数は akl_cojit_count() で機械観測可能。
+- **CoJIT S2（2026-08-01）**: 末尾 形 D（for-update `g = g + d` の DUP/store/POP 連鎖）を
+  LOOPINC_G/L（non-V 版: last_val 不変）へ回転写像。トップレベル/関数内 for が対象。
+  等価性は差分オラクル（tests/test_akl.c: continue/break/入れ子/last_val 保証の 9 系 +
+  乱択 400 系統を cojit on/off で完全一致要求）＋ switch/computed-goto 両 dispatch で検証済み。
+  実測効果: arith 115→84ms、branch 87→45ms、fib30 不変（再帰は対象外）。
+- **rssrun 計測系の wall（本稿冒頭の要求: 全て ≤100ms に）**: empty 1.4 / tiny 1.3 /
+  fib30 70.5 / arith 83.1 / branch 44.4 / strcat_flat 4.2 / strcat_grow 2.4 ms（median of 5、実測）。
 
 
 ## 2026-07-31: CSS RuleSet 索引（Blink RuleSet 戦略）— 合成カスケード 23.32×、カスケード order バグ同定・修正

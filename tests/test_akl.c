@@ -459,6 +459,15 @@ static void t_cojit(void) {
         { "var so='x'; var i=0; while(i<3){ so=so+i; i=i+1; } so", 0, 1 }, /* 数値評価不可→下で別検査 */
         { "var g=0; function gf(){ var s=0; while(g<8){ s=s+g; g=g+2; } return s; } gf()", 12, 1 },
         { "var a2=0,b2=0; while(a2<4){ while(b2<3){ b2=b2+1; } a2=a2+1; } a2*10+b2", 43, 1 }, /* 入れ子 */
+        /* ---- 末尾 D（for-update 形 g=g+d: GLOAD_S;ADDCI;DUP;GSTORE_S;POP → LOOPINC non-V） ---- */
+        { "var s=0; for(var i=0;i<5;i=i+1){ s=s+i; } s", 10, 1 },
+        { "var s=0; for(var i=10;i>0;i=i-3){ s=s+1; } s", 4, 1 },
+        { "var s=0; for(var i=0;i<7;i=i+1){ if(i==3){ continue; } s=s+i; } s", 18, 1 }, /* continue→update */
+        { "var s=0; for(var i=0;i<10;i=i+1){ if(i==4){ break; } s=s+i; } s", 6, 1 },     /* break→exit */
+        { "var s=0; for(var i=0;i<3;i=i+1){ for(var j=0;j<3;j=j+1){ s=s+1; } } s", 9, 2 }, /* 入れ子両層 */
+        { "7; for(var i=0;i<3;i=i+1){}", 7, 1 },  /* D は last_val を汚さない（V 誤用なら 3 になる） */
+        { "function ff(){ var s=0; for(var i=0;i<4;i=i+1){ s=s+i*2; } return s; } ff()", 12, 1 }, /* 関数内 D */
+        { "var so2=0; for(var i=0;i<3;i=i+1){ so2=so2+1; } so2", 3, 1 },
     };
     AklRT *on = akl_new(), *off = akl_new();
     CHECK(on && off);

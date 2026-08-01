@@ -2346,10 +2346,15 @@ static u32 akl_cojit(AklRT *rt, u32 code_from) {
              *   A: [LINC|GINC slot d][JMP pc]        …14B（文末融合形）
              *   B: [GLOAD_S slot][ADDCI d][GSTORE_SPV slot][JMP pc]  …20B（関数内グローバル）
              *   C: [LLOAD slot][ADDCI d][LSTORE_PV slot][JMP pc]     …20B（関数内ローカル）
-             * かつ T+{14,20}==exit_t。A/B/C は全て「slot += d（+last_val 更新）」で、
-             * LOOPINC_V の合成元と逐語等価（int fast/i64 域/bin_add/to_number/isnan）。 */
+             *   D: [GLOAD_S|LLOAD slot][ADDCI d][DUP][GSTORE_S|LSTORE slot][POP][JMP pc] …22B
+             *      （main トップレベルの非融合形: g = g + d の評価値を DUP/POP で捨てる。
+             *       last_val 不変）
+             * かつ T+{14,20,22}==exit_t。A/B/C は 「slot += d（+last_val 更新）」で LOOPINC_V
+             * と、D は「slot += d（last_val 不変）」で LOOPINC（non-V）と、それぞれ逐語等価
+             * （int fast/i64 域/bin_add/to_number/isnan/cmp 表まで同一）。 */
             bool found = false;
             u32 t_tail = 0, t_len = 14; i32 d = 0;
+            bool lv_update = true; /* 末尾形が last_val を更新するか（A/B/C=更新, D=不変） */
             u32 q = pc + 14;
             for (u32 steps = 0; q < end && steps < 10000 && !found; steps++) {
                 u8 o2 = code[q];
@@ -2367,7 +2372,7 @@ static u32 akl_cojit(AklRT *rt, u32 code_from) {
                             found = true; t_tail = q; t_len = 14; d = d2;
                         }
                     }
-                } else if (is_g && o2 == OP_GLOAD_S) {
+                } else if (is_g && o2 == OP_GLOAD_S && q + 22 <= end) {
                     u32 s2; i32 d2; u32 s3;
                     memcpy(&s2, code + q + 1, 4);
                     memcpy(&d2, code + q + 6, 4);
@@ -2379,9 +2384,29 @@ static u32 akl_cojit(AklRT *rt, u32 code_from) {
                         memcpy(&bt, code + q + 16, 4);
                         if (bt == pc && q + 20 == exit_t) {
                             found = true; t_tail = q; t_len = 20; d = d2;
+                            lv_update = true;
+                        }
+                    } else {
+                        /* 末尾 D（文形: g = g + d の評価値を DUP/POP で捨てる形）:
+                         *   [GLOAD_S slot][ADDCI d][DUP][GSTORE_S slot][POP][JMP pc] …22B
+                         * net = g += d, stack 中立, last_val 不変。
+                         * 各部分の逐語手続き: GLOAD_S+ADDCI ≡ LOOPINC_G の nv 計算
+                         * （int fast=i64 域一致 / overflow=(double)s2 / 文字列は同じ
+                         *  akl_bin_add(lv, MK_INT(d))。比較は CJMPF_G と同一 cmp 表）、
+                         * DUP+GSTORE_S+POP ≡ store のみで stack/last_val 不変条件一致。
+                         * → LOOPINC_G（non-V 版。last_val を動かさない）へ写像する */
+                        u32 s4; u32 bt;
+                        memcpy(&s4, code + q + 12, 4);
+                        memcpy(&bt, code + q + 18, 4);
+                        if (s2 == slot && s4 == slot &&
+                            code[q + 5] == OP_ADDCI && code[q + 10] == OP_DUP &&
+                            code[q + 11] == OP_GSTORE_S && code[q + 16] == OP_POP &&
+                            code[q + 17] == OP_JMP && bt == pc && q + 22 == exit_t) {
+                            found = true; t_tail = q; t_len = 22; d = d2;
+                            lv_update = false;
                         }
                     }
-                } else if (!is_g && o2 == OP_LLOAD) {
+                } else if (!is_g && o2 == OP_LLOAD && q + 22 <= end) {
                     u32 s2; i32 d2; u32 s3;
                     memcpy(&s2, code + q + 1, 4);
                     memcpy(&d2, code + q + 6, 4);
@@ -2393,6 +2418,21 @@ static u32 akl_cojit(AklRT *rt, u32 code_from) {
                         memcpy(&bt, code + q + 16, 4);
                         if (bt == pc && q + 20 == exit_t) {
                             found = true; t_tail = q; t_len = 20; d = d2;
+                            lv_update = true;
+                        }
+                    } else {
+                        /* 末尾 D のローカル版:
+                         *   [LLOAD slot][ADDCI d][DUP][LSTORE slot][POP][JMP pc] …22B
+                         * → LOOPINC_L（non-V）へ写像（等価性はグローバル版と同じ証明） */
+                        u32 s4; u32 bt;
+                        memcpy(&s4, code + q + 12, 4);
+                        memcpy(&bt, code + q + 18, 4);
+                        if (s2 == slot && s4 == slot &&
+                            code[q + 5] == OP_ADDCI && code[q + 10] == OP_DUP &&
+                            code[q + 11] == OP_LSTORE && code[q + 16] == OP_POP &&
+                            code[q + 17] == OP_JMP && bt == pc && q + 22 == exit_t) {
+                            found = true; t_tail = q; t_len = 22; d = d2;
+                            lv_update = false;
                         }
                     }
                 }
@@ -2434,7 +2474,8 @@ static u32 akl_cojit(AklRT *rt, u32 code_from) {
                         rt->funcs[fe].n_params = 0;
                         rt->funcs[fe].n_locals = rt->funcs[owner].n_locals;
                     }
-                    code[rt->code_len++] = is_g ? OP_LOOPINC_GV : OP_LOOPINC_LV;
+                    code[rt->code_len++] = is_g ? (lv_update ? OP_LOOPINC_GV : OP_LOOPINC_G)
+                                                : (lv_update ? OP_LOOPINC_LV : OP_LOOPINC_L);
                     memcpy(code + rt->code_len, &slot, 4); rt->code_len += 4;
                     memcpy(code + rt->code_len, &d, 4);    rt->code_len += 4;
                     memcpy(code + rt->code_len, &k, 4);    rt->code_len += 4;
