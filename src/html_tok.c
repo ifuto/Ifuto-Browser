@@ -221,6 +221,19 @@ static IfStr if_resolved(IfHtmlTok *t, u32 start, u32 end) {
  *   to_fffd=false: バイトを除去（in-body の data text は "ignore"）
  *   to_fffd=true : U+FFFD ("\xEF\xBF\xBD") に置換（rawtext/script/plaintext/属性値）
  * NUL が無ければ入力をそのまま返す（arena 確保なし）。 */
+/* frameset-ok 判定用: 「空白（TAB/LF/FF/CR/SP）でも U+0000 でもない」実文字を含むか。
+ * rawtext/plaintext（tokenizer が U+0000 を U+FFFD 化する経路）では NUL も実文字なので
+ * そちらは if_str_is_ws_only ベースで判定し、本 helper は NUL が tree に「U+0000 のまま」
+ * 届く経路（DATA text / CDATA）専用にする。 */
+static u8 if_tok_real_text(IfStr s) {
+    for (u32 i = 0; i < s.n; i++) {
+        u8 c = (u8)s.p[i];
+        if (c == 0 || c == 0x09 || c == 0x0A || c == 0x0C || c == 0x0D || c == 0x20) continue;
+        return 1;
+    }
+    return 0;
+}
+
 static IfStr if_fix_nul(IfHtmlTok *t, IfStr s, bool to_fffd) {
     bool has_nul = false;
     for (u32 i = 0; i < s.n; i++)
@@ -331,6 +344,8 @@ static IfTok if_raw_token(IfHtmlTok *t) {
         tok.text = t->raw_rcdata ? if_resolved(t, t->pos, end)
                                  : if_str((const char *)t->src + t->pos, end - t->pos);
         tok.text = if_fix_nul(t, tok.text, true);
+        /* rawtext/rcdata: tokenizer が U+0000 を U+FFFD 化するので NUL も実文字 */
+        tok.text_had_real = !if_str_is_ws_only(tok.text);
         t->pos = end;
         return tok;
     }
@@ -543,27 +558,47 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
         while (i < t->len && t->src[i] == '-') i++;
         if (i >= t->len) { t->errors++; tok.kind = TOK_COMMENT; tok.text = if_str("", 0); return tok; }
         if (t->src[i] == '>' && i - t->pos <= 1) { t->pos = i + 1; t->errors++; tok.kind = TOK_COMMENT; tok.text = if_str("", 0); return tok; }
-        /* "-->" を探す（j+2 は len-1 までに制限して境界外アクセスを防ぐ） */
+        /* "-->" または abrupt な "--!>"（abrupt-closing-of-empty-comment）を探す
+         * （j+2/j+3 は len-1 までに制限して境界外アクセスを防ぐ） */
         u32 start = t->pos;
         u32 j = start;
         while (j + 2 < t->len) {
-            if (t->src[j] == '-' && t->src[j + 1] == '-' && t->src[j + 2] == '>') {
-                tok.kind = TOK_COMMENT;
-                tok.text = if_fix_nul(t, if_str((const char *)t->src + start, j - start), true);
-                t->pos = j + 3;
-                return tok;
+            if (t->src[j] == '-' && t->src[j + 1] == '-') {
+                if (t->src[j + 2] == '>') {
+                    tok.kind = TOK_COMMENT;
+                    tok.text = if_fix_nul(t, if_str((const char *)t->src + start, j - start), true);
+                    t->pos = j + 3;
+                    return tok;
+                }
+                if (t->src[j + 2] == '!' && j + 3 < t->len && t->src[j + 3] == '>') {
+                    t->errors++; /* comment end bang state の '>' → abrupt close */
+                    tok.kind = TOK_COMMENT;
+                    tok.text = if_fix_nul(t, if_str((const char *)t->src + start, j - start), true);
+                    t->pos = j + 4;
+                    return tok;
+                }
             }
             j++;
         }
-        t->errors++; /* 閉じられないコメント: 残り全部をコメントに */
+        t->errors++; /* 閉じられないコメント EOF: comment end / end dash state の
+                      * 「保留ダッシュ」（末尾連続 '-' の先頭側から最大 2 個）は
+                      * data に付かない（spec: その状態の EOF は保留分を吐かず emit） */
+        u32 cend = t->len;
+        if (cend > start && t->src[cend - 1] == '-') {
+            cend--;
+            if (cend > start && t->src[cend - 1] == '-') cend--;
+        }
         tok.kind = TOK_COMMENT;
-        tok.text = if_fix_nul(t, if_str((const char *)t->src + start, t->len - start), true);
+        tok.text = if_fix_nul(t, if_str((const char *)t->src + start, cend - start), true);
         t->pos = t->len;
         return tok;
     }
 
-    /* "<![CDATA[": foreign content 内ではテキスト、外では bogus comment */
-    if (t->cdata_foreign && t->pos + 7 <= t->len &&
+    /* "<![CDATA[": adjusted current node が非 HTML 名前空間なら CDATA section（テキスト）、
+     * そうでなければ bogus comment（spec markup declaration open state 厳密:
+     * integration point（svg title/foreignObject/desc, math mtext 等）は node 自体が
+     * 非 HTML ns なので CDATA になる点に注意 — tree が立てる adcn_foreign 旗を見る） */
+    if (t->adcn_foreign && t->pos + 7 <= t->len &&
         memcmp(t->src + t->pos, "[CDATA[", 7) == 0) {
         u32 start = t->pos + 7;
         u32 j = start;
@@ -571,11 +606,15 @@ static IfTok if_markup_decl(IfHtmlTok *t) {
                !(t->src[j] == ']' && t->src[j + 1] == ']' && t->src[j + 2] == '>')) j++;
         IfTok cdt = { .kind = TOK_TEXT };
         if (j + 2 < t->len) {
-            cdt.text = if_fix_nul(t, if_str((const char *)t->src + start, j - start), true);
+            IfStr raw = if_str((const char *)t->src + start, j - start);
+            cdt.text_had_real = if_tok_real_text(raw); /* NUL は U+0000 のまま届く経路 */
+            cdt.text = if_fix_nul(t, raw, true);
             t->pos = j + 3;
         } else {
             t->errors++; /* 閉じられない CDATA: 残り全部をテキストに */
-            cdt.text = if_fix_nul(t, if_str((const char *)t->src + start, t->len - start), true);
+            IfStr raw = if_str((const char *)t->src + start, t->len - start);
+            cdt.text_had_real = if_tok_real_text(raw);
+            cdt.text = if_fix_nul(t, raw, true);
             t->pos = t->len;
         }
         if (cdt.text.n == 0) return if_tok_next(t);
@@ -609,6 +648,8 @@ IfTok if_tok_next(IfHtmlTok *t) {
         tok.kind = TOK_TEXT;
         tok.text = if_str((const char *)t->src + t->pos, t->len - t->pos);
         tok.text = if_fix_nul(t, tok.text, true);
+        /* plaintext: tokenizer が U+0000 を U+FFFD 化するので NUL も実文字 */
+        tok.text_had_real = !if_str_is_ws_only(tok.text);
         t->pos = t->len;
         return tok;
     }
@@ -627,7 +668,12 @@ IfTok if_tok_next(IfHtmlTok *t) {
         /* data text の U+0000: HTML content では "ignore"（in-body の parse error
          * 規則）だが、foreign content では U+FFFD 挿入が規則。tree が立てる
          * cdata_foreign 旗（foreign 内 text/CDATA で 1）で切り替える。 */
-        tok.text = if_fix_nul(t, if_resolved(t, start, t->pos), t->cdata_foreign != 0);
+        /* text_had_real は「変換前」の解決済み列から計算する: foreign で FFFD 化
+         * される生 NUL は frameset-ok を倒さないのが spec（&#0; 由来の FFFD や
+         * ソース中の実 FFFD は実文字＝倒れる；変換後判定ではこの区別が不可能） */
+        IfStr rs = if_resolved(t, start, t->pos);
+        tok.text_had_real = if_tok_real_text(rs);
+        tok.text = if_fix_nul(t, rs, t->cdata_foreign != 0);
         return tok;
     }
 
@@ -636,6 +682,7 @@ IfTok if_tok_next(IfHtmlTok *t) {
         /* 孤立 '<' で終端 → テキストとして返す */
         tok.kind = TOK_TEXT;
         tok.text = if_str("<", 1);
+        tok.text_had_real = 1;
         t->pos = t->len;
         t->errors++;
         return tok;
@@ -647,7 +694,17 @@ IfTok if_tok_next(IfHtmlTok *t) {
         return if_tag_token(t, false);
     }
     if (c1 == '/') {
-        if (t->pos + 2 < t->len && if_alpha(t->src[t->pos + 2])) {
+        if (t->pos + 2 >= t->len) {
+            /* "</" で EOF: end tag open state の EOF 規則 — parse error で
+             * テキスト "</" を吐く（bogus comment にはしない: tests1#37） */
+            tok.kind = TOK_TEXT;
+            tok.text = if_str("</", 2);
+            tok.text_had_real = 1;
+            t->pos = t->len;
+            t->errors++;
+            return tok;
+        }
+        if (if_alpha(t->src[t->pos + 2])) {
             t->pos += 2; /* "</" を消費し、タグ名先頭へ（if_tag_token は pos から名前を読む） */
             return if_tag_token(t, true);
         }
@@ -740,6 +797,7 @@ IfTok if_tok_next(IfHtmlTok *t) {
     /* '<' + その他 → '<' はリテラルテキスト */
     tok.kind = TOK_TEXT;
     tok.text = if_str("<", 1);
+    tok.text_had_real = 1;
     t->pos += 1;
     t->errors++;
     return tok;

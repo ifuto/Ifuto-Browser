@@ -108,7 +108,7 @@ static void afe_insert_marker(IfTB *b);
 static void afe_clear_to_marker(IfTB *b);
 static bool has_in_default_scope_tag(IfTB *b, u16 tag);
 static void adoption(IfTB *b, u16 tag);
-static void any_other_end_tag(IfTB *b, u16 tag);
+static void any_other_end_tag(IfTB *b, u16 tag, IfStr end_name);
 static bool has_open(IfTB *b, u16 tag);
 
 /* before の直前に挿入（foster parenting の「table の兄」経路で必要） */
@@ -257,11 +257,14 @@ static void close_p_if_open(IfTB *b) {
 static void implied_close(IfTB *b, u16 a, u16 b2, u16 barrier1, u16 barrier2) {
     for (u32 i = b->depth; i > 0; i--) {
         u16 t = b->stack[i - 1]->tag;
-        if (t == a || t == b2) {
+        /* b2/barrier2 = 0 は「未指定」。IF_TAG_UNKNOWN(0) と衝突させてはいけない
+         * （旧来は <li><menuitem><li> で menuitem(UNKNOWN) が b2=0 に誤爆して
+         *   li が畳めず menuitem が早期終了していた: menuitem-element#6/#19） */
+        if (t == a || (b2 && t == b2)) {
             while (b->depth > i - 1) pop(b);
             return;
         }
-        if (t == barrier1 || t == barrier2) return;
+        if ((barrier1 && t == barrier1) || (barrier2 && t == barrier2)) return;
     }
 }
 
@@ -389,16 +392,23 @@ static const u16 C_TR[] = { IF_TAG_TR, IF_TAG_TEMPLATE, IF_TAG_HTML };
 
 static void pop_until(IfTB *b, u16 tag) {
     while (b->depth) {
-        u16 t = top(b)->tag;
+        IfNode *n = top(b);
+        u16 t = n->tag;
         pop(b);
-        if (t == tag) break;
+        /* マッチ対象は「HTML 名前空間の tag」要素のみ: 外国内容（例: svg 内に
+         * 直接生成された <svg td>）を誤検しない（namespace-sensitivity#0 で
+         * </td> が svg td で止まり svg が閉じ残っていた実害） */
+        if (t == tag && n->ns == IF_NS_HTML) break;
     }
 }
 
-/* 「暗示終了タグを生成する」: dd/dt/li/optgroup/option/p/rp/rt が top の間 pop（except は除外） */
+/* 「暗示終了タグを生成する」: dd/dt/li/optgroup/option/p/rp/rt が top の間 pop（except は除外）。
+ * implied end tags は HTML 名前空間要素にのみ生成される（same ns 規則） */
 static void gen_implied(IfTB *b, u16 except) {
     while (b->depth) {
-        u16 t = top(b)->tag;
+        IfNode *n = top(b);
+        if (n->ns != IF_NS_HTML) return;
+        u16 t = n->tag;
         if (t == except) return;
         switch (t) {
         case IF_TAG_DD: case IF_TAG_DT: case IF_TAG_LI: case IF_TAG_OPTGROUP:
@@ -415,6 +425,7 @@ static void gen_implied(IfTB *b, u16 except) {
  * （template 終了時の「generate implied end tags thoroughly」） */
 static void gen_implied_thorough(IfTB *b) {
     while (b->depth) {
+        if (top(b)->ns != IF_NS_HTML) return;
         switch (top(b)->tag) {
         case IF_TAG_CAPTION: case IF_TAG_COLGROUP: case IF_TAG_DD: case IF_TAG_DT:
         case IF_TAG_LI: case IF_TAG_OPTGROUP: case IF_TAG_OPTION: case IF_TAG_P:
@@ -805,11 +816,21 @@ static void afe_reconstruct(IfTB *b) {
     }
 }
 
-/* any other end tag（AAA の step (a) と in-body fallback の共通形） */
-static void any_other_end_tag(IfTB *b, u16 tag) {
+/* any other end tag（AAA の step (a) と in-body fallback の共通形）。
+ * 未登録タグ（IF_TAG_UNKNOWN）は spec どおりタグ「名」で照合する（tag ID は
+ * 全部 UNKNOWN=0 で同一なので、ID 照合だと最上の任意未知要素に誤爆する:
+ * menuitem-element#9 で </menuitem> が <asdf> だけ閉じていた実害） */
+static void any_other_end_tag(IfTB *b, u16 tag, IfStr end_name) {
     for (i32 i = (i32)b->depth - 1; i >= 0; i--) {
         IfNode *node = b->stack[i];
-        if (node->tag == tag && node->ns == IF_NS_HTML) {
+        bool match;
+        if (tag != IF_TAG_UNKNOWN) {
+            match = (node->tag == tag && node->ns == IF_NS_HTML);
+        } else {
+            match = (node->kind == IF_NODE_ELEMENT && node->tag == IF_TAG_UNKNOWN &&
+                     node->ns == IF_NS_HTML && if_str_eq_ci(node->u.tag_name, end_name));
+        }
+        if (match) {
             gen_implied(b, tag);
             if (top(b)->tag != tag) b->dom->n_errors++;
             while (b->depth > (u32)i) pop(b);
@@ -888,7 +909,7 @@ static void adoption(IfTB *b, u16 tag) {
     for (u32 outer = 0; outer < 8; outer++) {
         /* step 4: AFE から subject の最後の要素（marker 手前まで） */
         i32 fi = afe_find_tag(b, tag);
-        if (fi < 0) { any_other_end_tag(b, tag); return; }
+        if (fi < 0) { any_other_end_tag(b, tag, if_str("", 0)); return; }
         IfNode *fe = b->afe[fi].n;
         i32 fs = stack_find_node(b, fe);
         if (fs < 0) { b->dom->n_errors++; afe_remove_at(b, (u32)fi); return; }
@@ -1143,7 +1164,19 @@ static void step_in_caption(IfTB *b, IfTok tok) {
 }
 
 static void step_in_colgroup(IfTB *b, IfTok tok) {
-    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { append_text(b, tok.text); return; }
+    if (tok.kind == TOK_TEXT) {
+        /* in-column-group の文字規則（WHATWG 13.2.6.4.12）: 先頭の空白 run は
+         * その場（colgroup 内）に挿入し、非空白が 1 文字でも来た時点で colgroup を
+         * 畳んで残りを in-table で再処理（非空白 run は before-table に foster される:
+         * domjs-unsafe#36 で " foo" が " "(colgroup) + "foo"(foster) に分かれる） */
+        IfStr s = tok.text;
+        u32 i = 0;
+        while (i < s.n && (s.p[i] == ' ' || s.p[i] == '\t' || s.p[i] == '\n' ||
+                           s.p[i] == '\r' || s.p[i] == '\f')) i++;
+        if (i > 0) append_text(b, if_str(s.p, i));
+        if (i < s.n) { tok.text = if_str(s.p + i, s.n - i); goto anything; }
+        return;
+    }
     if (tok.kind == TOK_COMMENT) { insert_comment_placed(b, &tok); return; }
     if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
     if (tok.kind == TOK_START) {
@@ -1252,6 +1285,14 @@ static void step_in_row(IfTB *b, IfTok tok) {
             afe_insert_marker(b);
             insert_element(b, &tok, true);
             b->mode = M_IN_CELL;
+            return;
+        case IF_TAG_TR:
+            /* in-row の tr 開始: 現在の行を正當に畳んで in-table-body で再処理。
+             * in-table 規則（暗黙 tbody 生成）へ流すと 2 段目の <tr> で tbody が
+             * 複製される（tables01#14 / tests1#86 の double-tbody 退行） */
+            b->dom->n_errors++;
+            if (!has_in_table_scope(b, IF_TAG_TR)) return;
+            end_tr_reprocess(b, tok);
             return;
         case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
         case IF_TAG_TBODY: case IF_TAG_THEAD: case IF_TAG_TFOOT:
@@ -1906,12 +1947,12 @@ static void step_in_body(IfTB *b, IfTok tok) {
         if (in_foreign_text(b)) {
             /* foreign 直下の文字（13.2.6.5）: AFE 再構築なし。非空白混じりは not-ok */
             append_text(b, tok.text);
-            if (!if_str_is_ws_only(tok.text)) b->frameset_ok = false;
+            if (tok.text_had_real) b->frameset_ok = false; /* 生 NUL→FFFD は倒さない */
             return;
         }
         afe_reconstruct(b); /* 書式の誤ネストをテキスト挿入前に修復（<b>x<p>y → y は b の中） */
         append_text(b, tok.text);
-        if (!if_str_is_ws_only(tok.text)) b->frameset_ok = false; /* 非空白は not-ok */
+        if (tok.text_had_real) b->frameset_ok = false; /* 非空白の実文字は not-ok */
         return;
     case TOK_COMMENT:
         insert_comment_placed(b, &tok);
@@ -1957,8 +1998,13 @@ static void step_in_body(IfTB *b, IfTok tok) {
             return;
         }
         if (t == IF_TAG_HTML) {
+            /* 仕様 in-body html: parse error。stack に template 要素がある文脈
+             * （template content 内や、その table 系モードに routing された状態）
+             * では 2 個目の <html> を**属性マージ無しで無視**する
+             * （WHATWG 13.2.6.4.7: "If the stack of open elements has a template
+             *   element, then ignore the token": template.dat#64-#66） */
             b->dom->n_errors++;
-            if (b->html) merge_attrs(b, b->html, &tok);
+            if (b->html && !has_open(b, IF_TAG_TEMPLATE)) merge_attrs(b, b->html, &tok);
             return;
         }
         if (t == IF_TAG_BODY || t == IF_TAG_HEAD) {
@@ -2315,7 +2361,7 @@ static void step_in_body(IfTB *b, IfTok tok) {
     /* option/optgroup の終了タグは専用規則を持たない — "any other end tag" の
      * 下降探索で処理される（両者は special カテゴリ外なので降りて来られる） */
     /* その他の終了タグ: spec の「any other end tag」規則（implied 生成 + special 障壁） */
-    any_other_end_tag(b, t);
+    any_other_end_tag(b, t, tok.tag_raw);
 }
 
 static void step(IfTB *b, IfTok tok) {
@@ -2349,6 +2395,16 @@ static void step(IfTB *b, IfTok tok) {
         if (tok.kind != TOK_TEXT) pend_flush(b);
         break;
     default: break;
+    }
+    /* foreign content 規則は挿入モード dispatch より先に判定する（WHATWG 13.2.6.5:
+     * 調整済みカレントノードが非 HTML ns なら start/end は foreign 規則）。
+     * 旧来は in-body/step_in_table 内の gate にのみあり、in-cell 等の table 系
+     * モードに dispatch された td/th が foreign 規則へ届かず svg から強制
+     * breakout していた（namespace-sensitivity#0: <td><svg><td>） */
+    if ((tok.kind == TOK_START || tok.kind == TOK_END) &&
+        in_foreign(b, &tok) && !b->no_foreign) {
+        foreign_step(b, &tok);
+        return;
     }
     switch (b->mode) {
     case M_INITIAL:     step_initial(b, tok); break;
@@ -2411,6 +2467,13 @@ IfDom *if_parse_html(IfArena *arena, IfStr input) {
 
     while (!b.stopped) {
         b.tok.cdata_foreign = in_foreign_text(&b) ? 1 : 0;
+        /* adjusted current node が非 HTML 名前空間か（<![CDATA[ 許可判定専用。
+         * integration point でも node 自体が非 HTML ns なら 1 になる点が
+         * cdata_foreign と別建ての理由: html5test-com#13/#14/#17） */
+        if (b.depth && b.stack[b.depth - 1]->ns != IF_NS_HTML)
+            b.tok.adcn_foreign = 1;
+        else
+            b.tok.adcn_foreign = 0;
         IfTok tok = if_tok_next(&b.tok);
         step(&b, tok);
         if (tok.kind == TOK_EOF) break;
@@ -2563,6 +2626,14 @@ static bool in_foreign_text(const IfTB *b) {
     IfNode *node = b->stack[b->depth - 1];
     if (node->ns == IF_NS_HTML) return false;
     if (is_math_ip(node) || is_html_ip(node)) return false;
+    if (node->ns == IF_NS_MATHML && node->tag == IF_TAG_ANNOTATION_XML) {
+        /* encoding=text/html / application/xhtml+xml の annotation-xml は HTML の
+         * branchpoint: char トークンは挿入モード規則で処理（U+0000 は drop、
+         * U+FFFD 化や CDATA 優遇はしない: plain-text-unsafe#36） */
+        IfStr enc = if_dom_attr(node, "encoding");
+        if (if_str_eq_ci(enc, IF_S("text/html")) ||
+            if_str_eq_ci(enc, IF_S("application/xhtml+xml"))) return false;
+    }
     return true;
 }
 
@@ -2639,25 +2710,31 @@ static void foreign_step(IfTB *b, const IfTok *tok) {
     if (tok->kind == TOK_START) {
         if (is_breakout_start(tok)) {
             b->dom->n_errors++;
-            /* HTML namespace（または integration point）まで pop して HTML として再処理 */
+            /* HTML namespace（または integration point）まで pop し、「現行の挿入
+             * モードの規則」で再処理する（spec: "then reprocess the token"）。
+             * step_in_body 直叩きだと in-table の foster 規則が適用されず、
+             * <table><colgroup><math>…<p> の p が table 内部に落ちる
+             * （tests9#16 / tests10#15） */
             while (b->depth) {
                 IfNode *t2 = top(b);
                 if (t2->ns == IF_NS_HTML || is_html_ip(t2) || is_math_ip(t2)) break;
                 pop(b);
             }
-            step_in_body(b, *tok);
+            step(b, *tok);
             return;
         }
         foreign_insert(b, tok);
         return;
     }
-    /* TOK_END の br/p は特例: HTML 名前空間まで pop して in-body 規則へ
+    /* TOK_END の br/p は特例: HTML 名前空間まで pop して現行挿入モードの規則へ
      * （<p><math></p>a で math/p を畳み "a" が p の外に出る spec 挙動） */
     if (tok->tag == IF_TAG_BR || tok->tag == IF_TAG_P) {
         b->dom->n_errors++;
         if (b->depth <= 1) return; /* fragment case: 無視 */
+        b->no_foreign = true;
         while (b->depth && top(b)->ns != IF_NS_HTML) pop(b);
-        step_in_body(b, *tok);
+        step(b, *tok);
+        b->no_foreign = false;
         return;
     }
     /* TOK_END（spec 13.2.6.5 の厳密形）: top が一致すれば pop。

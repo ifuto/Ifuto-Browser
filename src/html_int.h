@@ -25,6 +25,11 @@ typedef struct {
     /* COMMENT のみ: Processing Instruction（<?target data?>）だった場合 */
     u8 is_pi;
     IfStr pi_target;
+    /* TEXT のみ: 解決後の内容に「空白（TAB/LF/FF/CR/SP）でも U+0000 でもない」
+     * 実文字が 1 つでもあった。frameset-ok の not-ok 判定専用（tree 側）:
+     * 外国 content で U+0000 が U+FFFD 化されても実文字扱いしないため、
+     * tokenizer が変換前の生データから計算して渡す。TEXT 以外では 0。 */
+    u8 text_had_real;
 } IfTok;
 
 typedef struct {
@@ -35,7 +40,11 @@ typedef struct {
     u16 raw_tag;       /* 0 以外: rawtext/RCDATA モード（その要素の終了タグまで TEXT として読む） */
     u8 raw_rcdata;     /* raw 内容で文字参照を解決する（title/textarea） */
     u8 strip_lf;       /* raw 内容の先頭 LF を 1 つ捨てる（textarea の仕様） */
-    u8 cdata_foreign;  /* tree builder が設定: 現在位置が foreign content（CDATA 許可） */
+    u8 cdata_foreign;  /* tree builder が設定: 現在位置が foreign content（DATA text の
+                        * U+0000 → U+FFFD 規則の切替。integration point 等は HTML 側） */
+    u8 adcn_foreign;   /* tree builder が設定: adjusted current node が非 HTML 名前空間
+                        * （markup declaration open state の <![CDATA[ 許可判定。
+                        * integration point でも node が非 HTML ns なら 1: spec 厳密） */
     u8 plaintext;      /* <plaintext> 以降: 残り全入力を 1 個の TEXT にする */
     u8 in_attr_ctx;    /* 属性値デコード中ほど立つ（名前参照の ambiguous-amp 規則用） */
     u32 errors;
