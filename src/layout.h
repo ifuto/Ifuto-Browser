@@ -19,6 +19,11 @@
 
 enum { IF_BOX_BLOCK, IF_BOX_LINE };
 
+/* IfBox._pad[0]（LINE のみ有意）: seg バイト列 ≡ 発行セル列の保証フラグ。
+ * wrap 時に全グリフを検査済み: 全文字が gw>0 かつ enc(dec)恒等 なら、no-ansi 発行は
+ * セル再デコードなしに seg の生バイトの連結で再構成できる（0x20 ギャップは emit 側で埋める）。 */
+#define IF_LF_DIRECT_BYTES 0x01
+
 typedef struct IfSeg {
     IfStr text;            /* 表示テキスト（DOM スライス or arena 複製） */
     i32 x;                 /* 絶対 x（セル） */

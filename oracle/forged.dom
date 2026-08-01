@@ -1,0 +1,119 @@
+#document
+<html>
+  <head>
+  <body>
+    <h1>
+      #text "T1"
+    #text "\n"
+    <p>
+      #text "Para with "
+      <strong>
+        #text "b"
+      #text " and "
+      <em>
+        #text "i"
+      #text " and "
+      <code>
+        #text "c"
+      #text " and "
+      <a href="http://x">
+        #text "L"
+      #text " and <span class='z'>html</span> inline end."
+    #text "\n"
+    <p>
+      #text "#5? not heading ======"
+    #text "\n"
+    <h2>
+      #text "T2"
+    #text "\n"
+    <table>
+      #text "\n"
+      <thead>
+        <tr>
+          <th>
+            #text "a"
+          <th>
+            #text "b"
+      #text "\n"
+      <tbody>
+        #text "\n"
+        <tr>
+          <td>
+            #text "1"
+          <td>
+            #text "2"
+        #text "\n"
+      #text "\n"
+    #text "\n"
+    <ul>
+      #text "\n"
+      <li>
+        #text "[ ] todo"
+      #text "\n"
+      <li>
+        #text "[x] done"
+        <ul>
+          #text "\n"
+          <li>
+            #text "nested "
+            <strong>
+              #text "deep"
+          #text "\n"
+        #text "\n"
+      #text "\n"
+    #text "\n"
+    <ol>
+      #text "\n"
+      <li>
+        #text "one"
+      #text "\n"
+      <li>
+        #text "two"
+      #text "\n"
+    #text "\n"
+    <blockquote>
+      #text "\n"
+      <p>
+        #text "quote line1 quote line2 with "
+        <code>
+          #text "tick"
+      #text "\n"
+    #text "\n"
+    <pre>
+      <code class="lang-c extra">
+        #text "int x = 1 < 2 && 3 > 0; // <tag> &amp;\n"
+    #text "\n"
+    <p>
+      #text "footnote ref"
+      <sup>
+        <a href="#fn-n1" id="fr-n1">
+          #text "1"
+      #text " here."
+    #text "\n"
+    <hr>
+    #text "\n"
+    <hr>
+    #text "\n"
+    <p>
+      #text "text with <hr> inline and <div>block raw</div> e…"
+    #text "\n"
+    <p>
+      #text "<TABLE> <TR><TD>raw tab</TD></TR> </TABLE>"
+    #text "\n"
+    <p>
+      #text "after."
+    #text "\n"
+    <section class="footnotes">
+      #text "\n"
+      <hr>
+      #text "\n"
+      <ol>
+        #text "\n"
+        <li id="fn-n1">
+          #text "foot note body "
+          <a href="#fr-n1">
+            #text "↩"
+        #text "\n"
+      #text "\n"
+    #text "\n"
+; nodes=118 errors=1 title=""

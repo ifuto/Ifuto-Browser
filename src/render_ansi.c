@@ -486,19 +486,134 @@ static void row_paint_dec(IfRCell *row, i32 w, const IfDeco *d, i32 r) {
 }
 
 /* 行スイープ発行。発行規約は if_render_emit_rows と一致（trim・行末リセット） */
+/* ---- バッチ書き出し（行ごと fwrite の消去。850k 行規模だと fwrite コール自体が律速） ---- */
+typedef struct { u8 *p; u64 n, cap; FILE *out; } IfBB;
+static void bb_init(IfBB *b, FILE *out) {
+    b->cap = 1u << 20;
+    b->p = (u8 *)malloc(b->cap);
+    if (!b->p) if_fatal("render: oom batch buffer");
+    b->n = 0; b->out = out;
+}
+static void bb_ensure(IfBB *b, u64 k) {
+    if (b->cap - b->n >= k) return;
+    if (b->n) { fwrite(b->p, 1, b->n, b->out); b->n = 0; }
+    if (b->cap < k) {
+        while (b->cap < k) b->cap *= 2;
+        u8 *np = (u8 *)realloc(b->p, b->cap);
+        if (!np) if_fatal("render: oom batch grow");
+        b->p = np;
+    }
+}
+static inline void bb_put(IfBB *b, const void *p, u64 k) {
+    bb_ensure(b, k);
+    memcpy(b->p + b->n, p, (size_t)k);
+    b->n += k;
+}
+static inline void bb_ch(IfBB *b, u8 c) {
+    bb_ensure(b, 1);
+    b->p[b->n++] = c;
+}
+static void bb_flush(IfBB *b) { if (b->n) { fwrite(b->p, 1, b->n, b->out); b->n = 0; } }
+
+/* no-ansi byte-direct 行の 1 ラン（seg バイト or 装飾の ─ 連打） */
+typedef struct { i32 x, w; const u8 *p; u32 n; u8 kind; } IfRRun;
+enum { IF_RR_BYTES = 0, IF_RR_HLINE = 1 };
+
+/* 行 r を byte-direct で発行試行。成功なら *li_io を 1 進めて true。
+ * 失敗（seg 不整合・重複・未対応 deco）は何も出さず false（呼出側がセル経路へ）。
+ * 正当性: LINE の IF_LF_DIRECT_BYTES は wrap 時に「全グリフ gw>0 かつ enc∘dec 恒等」を
+ * 検査済み → seg バイトの連結 ≡ セル列の再エンコード列。trim は末尾 0x20 の除去で同値。 */
+static bool row_emit_fast(IfBB *bb, const IfLayout *lay, u32 *li_io,
+                          const IfDeco **active, u32 n_active, i32 mx, i32 r) {
+    u32 li = *li_io;
+    const IfBox *b = lay->lines[li];
+    if (!(b->_pad[0] & IF_LF_DIRECT_BYTES)) return false;
+    if (li + 1 < lay->n_lines && lay->lines[li + 1]->y == r) return false; /* 同行複数行は堕落 */
+
+    /* ラン集合: segs（x 単調）+ marker/hline。BORDER は未対応、BG は no-ansi で無影響 */
+    IfRRun runs[64];
+    u32 nr = 0;
+    for (u32 u = 0; u < b->n_segs; u++) {
+        if (nr == 64) return false;
+        runs[nr].x = b->segs[u].x;
+        runs[nr].w = b->segs[u].w;
+        runs[nr].p = (const u8 *)b->segs[u].text.p;
+        runs[nr].n = b->segs[u].text.n;
+        runs[nr].kind = IF_RR_BYTES;
+        nr++;
+    }
+    for (u32 k = 0; k < n_active; k++) {
+        const IfDeco *d = active[k];
+        if (d->kind == IF_DECO_BG) continue;
+        if (nr == 64) return false;
+        if (d->kind == IF_DECO_MARKER) {
+            runs[nr].x = d->x; runs[nr].w = d->w;
+            runs[nr].p = (const u8 *)d->text; runs[nr].n = d->tlen;
+            runs[nr].kind = IF_RR_BYTES; nr++;
+        } else if (d->kind == IF_DECO_HLINE) {
+            runs[nr].x = d->x; runs[nr].w = d->w;
+            runs[nr].p = NULL; runs[nr].n = 0;
+            runs[nr].kind = IF_RR_HLINE; nr++;
+        } else {
+            return false; /* BORDER 等はセル経路へ */
+        }
+    }
+    /* x 昇順へ挿入ソート（segs は既に単調、deco は小数） */
+    for (u32 a = 1; a < nr; a++) {
+        IfRRun t = runs[a];
+        u32 c = a;
+        while (c > 0 && runs[c - 1].x > t.x) { runs[c] = runs[c - 1]; c--; }
+        runs[c] = t;
+    }
+
+    u64 mark = bb->n;
+    i32 pos = 0;
+    for (u32 a = 0; a < nr; a++) {
+        if (runs[a].x < pos) { bb->n = mark; return false; } /* 重複はセル経路へ */
+        if (runs[a].x > pos) {
+            bb_ensure(bb, (u64)(runs[a].x > mx ? mx : runs[a].x) - (u64)pos + 8);
+            i32 gap = runs[a].x > mx ? mx - pos : runs[a].x - pos;
+            if (gap < 0) { bb->n = mark; return false; }
+            memset(bb->p + bb->n, ' ', (size_t)gap);
+            bb->n += (u64)gap;
+            pos = runs[a].x;
+        }
+        if (pos >= mx) break; /* viewport 右端でクリップ（セル版と同じ cx<w 判定の同値） */
+        if (runs[a].kind == IF_RR_HLINE) {
+            i32 w = runs[a].w;
+            if (pos + w > mx) w = mx - pos;
+            bb_ensure(bb, (u64)w * 3 + 8);
+            for (i32 k = 0; k < w; k++) { memcpy(bb->p + bb->n, "\xE2\x94\x80", 3); bb->n += 3; }
+            pos += runs[a].w;
+        } else {
+            /* クリップ: 右端を跨ぐ seg はセル単位で切り詰めなければならないため堕落 */
+            if (pos + runs[a].w > mx) { bb->n = mark; return false; }
+            bb_put(bb, runs[a].p, runs[a].n);
+            pos += runs[a].w;
+        }
+    }
+    /* 末尾空白 trim（byte 0x20 ＝ セル ' ' の同値変換） */
+    while (bb->n > mark && bb->p[bb->n - 1] == ' ') bb->n--;
+    bb_ch(bb, '\n');
+    *li_io = li + 1;
+    return true;
+}
+
+/* 行スイープ発行。発行規約は if_render_emit_rows と一致（trim・行末リセット） */
 void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
-    /* 発行幅は窓グリッド経路と同じく lay->width（if_render_grid_rows_into_cur の
-     * out->w 規約。extent は行数だけに使い、viewport 超過セルはクリップされる） */
-    i32 mx, my = 0;
-    if_render_extent(lay, &mx, &my);
-    mx = lay->width;
+    /* 幅は lay->width（旧 sweep 規約）。行数は lay->height と同値:
+     * 全 box/line は root の [y, y+h) に包含され lay->height = root.y+root.h であるため
+     * grid_max_walk の my は常に lay->height に一致する（包含の空手形。出力 sha256 が機械監査） */
+    i32 mx = lay->width;
     if (mx < 1) mx = 1;
+    i32 my = lay->height;
     if (my < 1) my = 1;
     IfRCell *row = (IfRCell *)malloc((size_t)mx * sizeof(IfRCell));
     if (!row) if_fatal("render: oom row cells");
     u64 outcap = (u64)mx * 4 + 128;
     u8 *buf = (u8 *)malloc(outcap);
     if (!buf) if_fatal("render: oom row buffer");
+    IfBB bb; bb_init(&bb, out);
     IfPen cur = { (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
 
     /* deco の active 集合（追記順を保持したまま期限切れを惰性除去） */
@@ -525,7 +640,6 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
             const IfDeco *d = active[k];
             i32 dh = d->h > 0 ? d->h : 1;
             if (!(d->y <= r && r < d->y + dh)) {
-                /* 順序保持で 1 件除去（active は追記順のまま小さく保つ） */
                 memmove(active + k, active + k + 1, (n_active - 1 - k) * sizeof(IfDeco *));
                 n_active--;
                 continue;
@@ -535,16 +649,32 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
         bool has_line = (li < lay->n_lines && lay->lines[li]->y == r);
         if (!has_line && n_active == 0) {
             /* ブランク行（発行規約どおり） */
-            u64 n = 0;
             if (ansi) {
-                memset(buf, ' ', (size_t)mx);
-                n = (u64)mx;
-                memcpy(buf + n, "\x1b[0m", 4); n += 4;
+                bb_ensure(&bb, (u64)mx + 8);
+                memset(bb.p + bb.n, ' ', (size_t)mx); bb.n += (u64)mx;
+                memcpy(bb.p + bb.n, "\x1b[0m", 4); bb.n += 4;
                 cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
             }
-            buf[n++] = '\n';
-            fwrite(buf, 1, n, out);
+            bb_ch(&bb, '\n');
             continue;
+        }
+        /* no-ansi かつ byte-direct 条件を満たす行はセルモデルを経由しない */
+        if (!ansi) {
+            bool cp_free = true, fastable = true;
+            for (u32 k = 0; k < n_active; k++) {
+                u8 dk = active[k]->kind;
+                if (dk != IF_DECO_BG) cp_free = false;
+                if (dk != IF_DECO_BG && dk != IF_DECO_MARKER && dk != IF_DECO_HLINE)
+                    fastable = false;
+            }
+            if (!has_line && cp_free) {
+                /* BG のみの行は no-ansi では見えない（fill_bg は cp を触らない） */
+                bb_ch(&bb, '\n');
+                continue;
+            }
+            if (has_line && fastable &&
+                row_emit_fast(&bb, lay, &li, active, n_active, mx, r))
+                continue;
         }
         /* 行構成: [0,maxx] だけ既定充填（ansi は全幅必要） */
         i32 maxx = mx;
@@ -593,7 +723,7 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
             if (ansi) {
                 IfPen p = { row[x].fg, row[x].bg, row[x].flags };
                 if (p.fg != cur.fg || p.bg != cur.bg || p.flags != cur.flags) {
-                    if (outcap - n < 64) { fwrite(buf, 1, n, out); n = 0; }
+                    if (outcap - n < 64) { bb_put(&bb, buf, n); n = 0; }
                     memcpy(buf + n, "\x1b[0m", 4); n += 4;
                     if (p.flags & IF_F_BOLD) { memcpy(buf + n, "\x1b[1m", 4); n += 4; }
                     if (p.flags & IF_F_ITALIC) { memcpy(buf + n, "\x1b[3m", 4); n += 4; }
@@ -606,13 +736,15 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
             }
             u8 enc[4];
             u64 en = if_utf8_encode(row[x].cp, enc);
-            if (outcap - n < en + 8) { fwrite(buf, 1, n, out); n = 0; }
+            if (outcap - n < en + 8) { bb_put(&bb, buf, n); n = 0; }
             memcpy(buf + n, enc, en); n += en;
         }
         if (ansi) { memcpy(buf + n, "\x1b[0m", 4); n += 4; cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 }; }
         buf[n++] = '\n';
-        fwrite(buf, 1, n, out);
+        bb_put(&bb, buf, n);
     }
+    bb_flush(&bb);
+    free(bb.p);
     free(active);
     free(buf);
     free(row);

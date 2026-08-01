@@ -220,7 +220,18 @@ typedef struct {
     u32 n_segs;
     i32 line_w;
     const IfStyle *align_st;
+    u8 direct_all;         /* 現行の全グリフが IF_LF_DIRECT_BYTES 条件を満たす */
 } IfWrap;
+
+/* デコード済み 1 グリフの byte-direct 妥当性を畳み込む。
+ * 条件: gw>0（gw==0 はセルを生成しないためバイト列とセル列が乖離する）かつ
+ * U+FFFD 置換発生時は元バイトが正に EF BF BD（enc∘dec 恒等の唯一の許容例）。 */
+static inline void wrap_note_direct(IfWrap *w, const u8 *base, u32 from, u32 to, u32 cp, int gw) {
+    if (gw == 0) { w->direct_all = 0; return; }
+    if (cp == IF_CP_REPLACEMENT &&
+        !(to - from == 3 && base[from] == 0xEF && base[from + 1] == 0xBF && base[from + 2] == 0xBD))
+        w->direct_all = 0;
+}
 
 /* 直前 seg と style が同じでソース上連続なら拡張する合体 push（seg 爆発の構造消去。
  * レンダリングされるセル列は変わらない（同じバイト・同じ x・同じ style）） */
@@ -269,6 +280,8 @@ static void wrap_end_line(IfWrap *w, float max_lh) {
         line->n_segs = w->n_segs;
         for (u32 i = 0; i < line->n_segs; i++) dst[i].x += shift;
     }
+    line->_pad[0] = w->direct_all ? IF_LF_DIRECT_BYTES : 0;
+    w->direct_all = 1; /* 次行は既定で有効（無効化は wrap_note_direct で畳む） */
     box_add_child(w->lc, w->parent, line);
     /* 行スイープ直接発行用のログ（生成順 = y 単調非減少） */
     {
@@ -304,6 +317,8 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
             if (pre && b0 == '\n') { wrap_end_line(w, *max_lh); cx = 0; i++; *max_lh = lh; continue; }
             if (pre) {
                 i32 adv = (b0 == '\t') ? 8 : 1;
+                /* ' '(0x20) のみセル列とバイト列が一致（\t は前進 8、他は gw==0 で非発行セル） */
+                if (b0 != ' ') w->direct_all = 0;
                 wrap_push_seg(w, if_str((const char *)s + i, 1), w->content_x + cx, adv, st);
                 cx += adv; i++; *any = true; continue;
             }
@@ -336,6 +351,7 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
             u32 save = i;
             u32 cp = if_utf8_decode(s, n, &save);
             int gw = if_glyph_width(cp);
+            wrap_note_direct(w, s, i, save, cp, gw);
             i = save; /* 1 グリフ消費（保証） */
             if (gw == 2) {
                 atom_w = 2;
@@ -347,6 +363,7 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
                     if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') break;
                     u32 cp2 = if_utf8_decode(s, n, &s2);
                     int gw2 = if_glyph_width(cp2);
+                    wrap_note_direct(w, s, i, s2, cp2, gw2);
                     if (gw2 == 2) break;
                     i = s2;
                     if (gw2 != 0) atom_w += 1;
@@ -381,6 +398,7 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
                 u32 gs = g;
                 u32 cp3 = if_utf8_decode(s, atom_end, &g); /* g は必ず前進 */
                 int gw3 = if_glyph_width(cp3);
+                wrap_note_direct(w, s, gs, g, cp3, gw3);
                 i32 gwidth = gw3 == 2 ? 2 : 1;
                 if (cx > 0 && cx + gwidth > w->content_w) {
                     wrap_end_line(w, *max_lh);
@@ -414,7 +432,7 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
         flatten_into(&f, c, base_st);
     }
 
-    IfWrap w = { lc, content_x, content_w, *y_io, parent, lc->segs_scratch, 0, 0, base_st };
+    IfWrap w = { lc, content_x, content_w, *y_io, parent, lc->segs_scratch, 0, 0, base_st, 1 };
     float max_lh = base_st && base_st->line_height > 0.0f ? base_st->line_height
                  : base_st ? base_st->font_size * 1.2f : 16.0f * 1.2f;
     bool any_text = false;

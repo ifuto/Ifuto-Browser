@@ -1,0 +1,43 @@
+
+
+ T1
+
+ Para with b and i and c and L and <span class='z'>html</span> inline end.
+
+ #5? not heading ======
+
+ T2
+ a
+ b
+ 1
+ 2
+
+    • [ ] todo
+    • [x] done
+
+         • nested deep
+
+   1. one
+   2. two
+
+
+      quote line1 quote line2 with tick
+
+ int x = 1 < 2 && 3 > 0; // <tag> &amp;
+
+
+ footnote ref1 here.
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+ text with <hr> inline and <div>block raw</div> end.
+
+ <TABLE> <TR><TD>raw tab</TD></TR> </TABLE>
+
+ after.
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+   1. foot note body ↩
