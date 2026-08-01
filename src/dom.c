@@ -264,7 +264,11 @@ static void ser_node(const IfNode *n, FILE *o, int depth) {
             }
             free((void *)sorted);
         }
-        if (n->u.tag_name.n == 8 && memcmp(n->u.tag_name.p, "template", 8) == 0) {
+        /* "content" 擬似ノードの出力は template 意味論を持つノード（HTML ns の
+         * template）のみ。foreign 内の <svg template>/<math template> は plain
+         * 要素なので content を出さない（template.dat#98/#99） */
+        if (n->ns == IF_NS_HTML && n->u.tag_name.n == 8 &&
+            memcmp(n->u.tag_name.p, "template", 8) == 0) {
             fputc('|', o); fputc(' ', o); ser_indent(o, depth + 1);
             fputs("content\n", o);
             /* content 分離実装後: 子は content フラグメント配下（要素子は常空） */

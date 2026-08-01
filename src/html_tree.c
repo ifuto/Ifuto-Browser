@@ -15,7 +15,7 @@
 #include <string.h>
 
 typedef enum {
-    M_INITIAL, M_BEFORE_HTML, M_BEFORE_HEAD, M_IN_HEAD, M_AFTER_HEAD, M_IN_BODY, M_AFTER_BODY,
+    M_INITIAL, M_BEFORE_HTML, M_BEFORE_HEAD, M_IN_HEAD, M_IN_HEAD_NOSCRIPT, M_AFTER_HEAD, M_IN_BODY, M_AFTER_BODY,
     M_AFTER_AFTER_BODY,
     M_IN_TABLE, M_IN_CAPTION, M_IN_COLUMN_GROUP, M_IN_TABLE_BODY, M_IN_ROW, M_IN_CELL,
     M_IN_FRAMESET, M_AFTER_FRAMESET, M_AFTER_AFTER_FRAMESET,
@@ -466,7 +466,20 @@ static void tpl_end(IfTB *b) {
     reset_mode(b);
 }
 
-/* WHATWG 13.2.6.4.8 \"in template\"。基底は in-body（台帳で常に合格だった領域）、
+/* in-template の table 系トークン routing: 「現在のテンプレート挿入モード」を
+ * routing 先モードで上書きする（push はしない — テンプレート要素 1 枚につき
+ * marker は tpl_start の 1 個に保ち、n_tpl == 開放テンプレート枚数の不変条件を守る）。
+ * これにより、入れ子テンプレートが閉じた直後の reset_mode が「外側で最後に
+ * routing されたモード」を正しく復帰する（template.dat#67: <td> が暗黙 tr で
+ * 包まれる、#68: 暗黙 tbody 生成が外側の thead routing に繋がる） */
+#if 0
+#endif
+static void tpl_route(IfTB *b, IfMode m) {
+    b->mode = m;
+    if (b->n_tpl) b->tpl_modes[b->n_tpl - 1] = (u8)m;
+}
+
+/* WHATWG 13.2.6.4.8 "in template"。基底は in-body（台帳で常に合格だった領域）、
  * 固有処理は次の 4 系のみ:
  *  1. table 系開始トークン（caption/colgroup/tbody/tfoot/thead, col, tr, td/th）
  *     → 対応する table 挿入モードへ切替・template モードスタックに marker を積んで再処理
@@ -488,23 +501,19 @@ static void step_in_template(IfTB *b, IfTok tok) {
     switch (tok.tag) {
     case IF_TAG_CAPTION: case IF_TAG_COLGROUP: case IF_TAG_TBODY:
     case IF_TAG_TFOOT: case IF_TAG_THEAD:
-        b->mode = M_IN_TABLE;
-        if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+        tpl_route(b, M_IN_TABLE);
         step(b, tok);
         return;
     case IF_TAG_COL:
-        b->mode = M_IN_COLUMN_GROUP;
-        if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+        tpl_route(b, M_IN_COLUMN_GROUP);
         step(b, tok);
         return;
     case IF_TAG_TR:
-        b->mode = M_IN_TABLE_BODY;
-        if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+        tpl_route(b, M_IN_TABLE_BODY);
         step(b, tok);
         return;
     case IF_TAG_TD: case IF_TAG_TH:
-        b->mode = M_IN_ROW;
-        if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+        tpl_route(b, M_IN_ROW);
         step(b, tok);
         return;
     case IF_TAG_FRAME: case IF_TAG_FRAMESET:
@@ -1164,6 +1173,26 @@ static void step_in_caption(IfTB *b, IfTok tok) {
 }
 
 static void step_in_colgroup(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_EOF) {
+        /* EOF はどのモードでも「template が開いていれば 1 枚畳んで再処理」が基底規則。
+         * 無いと <template><col> で body まで辿り着かない（template.dat#89） */
+        if (has_open(b, IF_TAG_TEMPLATE)) {
+            b->dom->n_errors++;
+            pop_until(b, IF_TAG_TEMPLATE);
+            if (b->n_tpl) b->n_tpl--;
+            reset_mode(b);
+            step(b, tok);
+            return;
+        }
+        if (top(b)->tag == IF_TAG_COLGROUP) {
+            pop(b);
+            b->mode = M_IN_TABLE;
+            step(b, tok);
+            return;
+        }
+        b->stopped = true;
+        return;
+    }
     if (tok.kind == TOK_TEXT) {
         /* in-column-group の文字規則（WHATWG 13.2.6.4.12）: 先頭の空白 run は
          * その場（colgroup 内）に挿入し、非空白が 1 文字でも来た時点で colgroup を
@@ -1824,7 +1853,11 @@ static void step_in_head(IfTB *b, IfTok tok) {
             tpl_start(b, &tok);
             return;
         case IF_TAG_NOSCRIPT:
+            /* head 内 noscript（scripting 無効 UA = 本ブラウザ）: WHATWG 13.2.6.4.5
+             * "in head noscript" 挿入モードへ遷移する（旧来は M_IN_HEAD 据置きの近似で、
+             * 中の開始タグが noscript を畳んで body へ逃げていた: noscript01#1） */
             insert_element(b, &tok, true);
+            b->mode = M_IN_HEAD_NOSCRIPT;
             return;
         case IF_TAG_NOFRAMES: /* head 内 noframes は body 規則（raw 処理込み） */
             insert_element(b, &tok, true);
@@ -1859,6 +1892,50 @@ static void step_in_head(IfTB *b, IfTok tok) {
         pop_if(b, IF_TAG_HEAD);
         step(b, tok);
     }
+}
+
+/* WHATWG 13.2.6.4.5 "in head noscript"（scripting 無効 UA 専用モード）:
+ * 中身は noscript の通常の子として構築する。例外規則のみ個別扱い:
+ *  - <html> 開始 → in-body 規則（2 個目 <html> の属性マージ。モードは変えない）
+ *  - コメント / 空白 text → その場に挿入
+ *  - <noscript> 開始 → parse error で無視（現行仕様は「畳んで in-head 再処理」=
+ *    属性付きの新 noscript で置換だが、vendored 台帳 noscript01#13 の期待は
+ *    「無視して外側を維持」。台帳第一主義で採用）
+ *  - </noscript> → noscript を畳んで M_IN_HEAD 復帰
+ *  - EOF → 畳んで M_IN_HEAD で再処理
+ *  - その他 → parse error: 畳んで M_IN_HEAD で再処理（div/basefont 等は head から body へ） */
+static void step_in_head_noscript(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_COMMENT) { insert_comment_placed(b, &tok); return; }
+    if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { append_text(b, tok.text); return; }
+    if (tok.kind == TOK_DOCTYPE) { b->dom->n_errors++; return; }
+    if (tok.kind == TOK_START) {
+        switch (tok.tag) {
+        case IF_TAG_HTML: step_in_body(b, tok); return; /* 属性マージ、モードは据置き（#1） */
+        case IF_TAG_HEAD: case IF_TAG_NOSCRIPT:
+            b->dom->n_errors++; return; /* 無視（#12/#13） */
+        case IF_TAG_BASEFONT: case IF_TAG_BGSOUND: case IF_TAG_LINK: case IF_TAG_META:
+        case IF_TAG_NOFRAMES: case IF_TAG_SCRIPT: case IF_TAG_STYLE:
+            /* spec: "Process the token using the rules for the 'in head' insertion
+             * mode" — void は noscript の子、noframes/style/script は raw 扱いで入る
+             * （#5-#10）。遷移しないので noscript モードを維持する */
+            step_in_head(b, tok);
+            if (b->mode == M_IN_HEAD) b->mode = M_IN_HEAD_NOSCRIPT;
+            return;
+        default: break;
+        }
+    } else if (tok.kind == TOK_END) {
+        if (tok.tag == IF_TAG_NOSCRIPT) {
+            pop_if(b, IF_TAG_NOSCRIPT);
+            b->mode = M_IN_HEAD;
+            return;
+        }
+        if (tok.tag != IF_TAG_BR) { b->dom->n_errors++; return; } /* 他 END: 無視（#14） */
+    }
+    /* anything else: parse error、畳んで M_IN_HEAD で再処理（#11/#15/#16/#17） */
+    b->dom->n_errors++;
+    pop_if(b, IF_TAG_NOSCRIPT);
+    b->mode = M_IN_HEAD;
+    step(b, tok);
 }
 
 static void step_after_head(IfTB *b, IfTok tok) {
@@ -2411,6 +2488,7 @@ static void step(IfTB *b, IfTok tok) {
     case M_BEFORE_HTML: step_before_html(b, tok); break;
     case M_BEFORE_HEAD: step_before_head(b, tok); break;
     case M_IN_HEAD:     step_in_head(b, tok); break;
+    case M_IN_HEAD_NOSCRIPT: step_in_head_noscript(b, tok); break;
     case M_AFTER_HEAD:  step_after_head(b, tok); break;
     case M_IN_BODY:     step_in_body(b, tok); break;
     case M_IN_TABLE:    step_in_table(b, tok); break;
@@ -2688,7 +2766,15 @@ static void foreign_adjust(IfTB *b, IfNode *n) {
 
 /* foreign 要素の挿入: ns 伝播 + case 調整。self_closing を尊重する。 */
 static void foreign_insert(IfTB *b, const IfTok *tok) {
-    IfNode *n = make_element(b, tok);
+    IfTok ft = *tok;
+    if (ft.tag == IF_TAG_TEMPLATE)
+        /* foreign 内の <template> はテンプレート意味論（content fragment / 挿入
+         * モードスタック / has_open・pop_until の照合対象）を持たないただの
+         * SVG/MathML 名前空間要素（template.dat#98/#99: "<svg template>" は
+         * content を持たず、外側の HTML template の EOF fold/pop にも混ざらない）。
+         * 参照一致の汚染を防ぐため ID を UNKNOWN に落とす（表示名は "template" のまま） */
+        ft.tag = IF_TAG_UNKNOWN;
+    IfNode *n = make_element(b, &ft);
     n->ns = top(b)->ns;
     foreign_adjust(b, n);
     append_placed(b, n); /* template top なら content へ、foster なら「table の兄」へ */
