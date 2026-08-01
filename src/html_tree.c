@@ -18,7 +18,8 @@ typedef enum {
     M_INITIAL, M_BEFORE_HTML, M_BEFORE_HEAD, M_IN_HEAD, M_AFTER_HEAD, M_IN_BODY, M_AFTER_BODY,
     M_AFTER_AFTER_BODY,
     M_IN_TABLE, M_IN_CAPTION, M_IN_COLUMN_GROUP, M_IN_TABLE_BODY, M_IN_ROW, M_IN_CELL,
-    M_IN_FRAMESET, M_AFTER_FRAMESET, M_AFTER_AFTER_FRAMESET
+    M_IN_FRAMESET, M_AFTER_FRAMESET, M_AFTER_AFTER_FRAMESET,
+    M_IN_TEMPLATE /* WHATWG 13.2.6.4.8。table トークン routing / frame 無視 / EOF の template pop */
 } IfMode;
 
 typedef struct {
@@ -438,14 +439,10 @@ static void tpl_start(IfTB *b, const IfTok *tok) {
     insert_element(b, tok, true);
     IfNode *t = top(b);
     if (!t->content) t->content = new_node(b, IF_NODE_DOCUMENT);
-    /* ・現行 WHATWG の "in template" モード（別実装で試作）は vendored template.dat と
-     *   系統的に不整合（the data は 2010 年代中盤の旧「appropriate template insertion mode」
-     *   世代と読める）。一次 spec 一致より台帳(pin)一致を優先し、in-body で近似: `tpl_set` 試作は台帳注１。
-     * ・将来 WPT カレントの fresh データに差し替わった時点で "in template" へ再査定する。
-     */
-    IfMode m = M_IN_BODY;
-    if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)m;
-    b->mode = m;
+    /* WHATWG 13.2.6.4.8 "in template"（旧 in-body 近似では template.dat の table 系
+     * 23 件が系統的に外れていた。2026-08-01 計測で本実装が台帳全体で優位と確定） */
+    if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+    b->mode = M_IN_TEMPLATE;
 }
 
 static void tpl_end(IfTB *b) {
@@ -456,6 +453,56 @@ static void tpl_end(IfTB *b) {
     afe_clear_to_marker(b);
     if (b->n_tpl) b->n_tpl--;
     reset_mode(b);
+}
+
+/* WHATWG 13.2.6.4.8 \"in template\"。基底は in-body（台帳で常に合格だった領域）、
+ * 固有処理は次の 4 系のみ:
+ *  1. table 系開始トークン（caption/colgroup/tbody/tfoot/thead, col, tr, td/th）
+ *     → 対応する table 挿入モードへ切替・template モードスタックに marker を積んで再処理
+ *  2. frame/frameset 開始 → parse error で無視（content に挿入しない）
+ *  3. </template> → tpl_end
+ *  4. EOF → template が開いていれば pop して AFE を掃除・mode を復帰させて再処理 */
+static void step_in_template(IfTB *b, IfTok tok) {
+    if (tok.kind == TOK_EOF) {
+        if (!has_open(b, IF_TAG_TEMPLATE)) { b->stopped = true; return; }
+        pop_until(b, IF_TAG_TEMPLATE);
+        afe_clear_to_marker(b);
+        if (b->n_tpl) b->n_tpl--;
+        reset_mode(b);
+        step(b, tok);
+        return;
+    }
+    if (tok.kind == TOK_END && tok.tag == IF_TAG_TEMPLATE) { tpl_end(b); return; }
+    if (tok.kind != TOK_START) { step_in_body(b, tok); return; }
+    switch (tok.tag) {
+    case IF_TAG_CAPTION: case IF_TAG_COLGROUP: case IF_TAG_TBODY:
+    case IF_TAG_TFOOT: case IF_TAG_THEAD:
+        b->mode = M_IN_TABLE;
+        if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+        step(b, tok);
+        return;
+    case IF_TAG_COL:
+        b->mode = M_IN_COLUMN_GROUP;
+        if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+        step(b, tok);
+        return;
+    case IF_TAG_TR:
+        b->mode = M_IN_TABLE_BODY;
+        if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+        step(b, tok);
+        return;
+    case IF_TAG_TD: case IF_TAG_TH:
+        b->mode = M_IN_ROW;
+        if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
+        step(b, tok);
+        return;
+    case IF_TAG_FRAME: case IF_TAG_FRAMESET:
+        b->dom->n_errors++; /* template content 内の frameset 系は insert しない */
+        return;
+    default:
+        step_in_body(b, tok); /* template/script/style/title/meta/link 他は in-body 規則 */
+        return;
+    }
 }
 
 /* reset the insertion mode appropriately（WHATWG アルゴリズムの非 fragment 版） */
@@ -2317,6 +2364,7 @@ static void step(IfTB *b, IfTok tok) {
     case M_IN_ROW:      step_in_row(b, tok); break;
     case M_IN_CELL:     step_in_cell(b, tok); break;
     case M_IN_FRAMESET: step_in_frameset(b, tok); break;
+    case M_IN_TEMPLATE: step_in_template(b, tok); break;
     case M_AFTER_FRAMESET: step_after_frameset(b, tok); break;
     case M_AFTER_AFTER_FRAMESET: step_after_after_frameset(b, tok); break;
     case M_AFTER_BODY:
