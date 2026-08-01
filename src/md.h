@@ -14,11 +14,18 @@
 #include "arena.h"
 #include "common.h"
 #include "strutil.h"
+#include "dom.h"
 
 /* 拡張子判定（.md / .markdown、case-insensitive） */
 bool if_path_is_md(const char *path);
 
 /* in を HTML に変換して out_html に書き出す（arena アロケート、UTF-8 透過） */
 void if_md_to_html(IfArena *a, IfStr in, IfStr *out_html);
+
+/* 高速経路: Markdown → DOM 直構築（出力意味は md→HTML→本パーサと厳密一致。
+ * taint（grammar 外の文字/AAA 到達/NUL/上限）観測時は false。呼び出し側は
+ * false なら従来の 2 段経路（if_md_to_html + if_parse_html）で処理すること。
+ * true なら *out_dom に構築済み DOM が入る（同じ arena 所有）。 */
+bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom);
 
 #endif

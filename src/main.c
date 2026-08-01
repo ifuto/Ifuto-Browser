@@ -155,9 +155,21 @@ int main(int argc, char **argv) {
     double t1 = now_ms();
     /* v0.2: Markdown（+GFM 表/脚注。表示テキストは MD 以上の情報密度を持つ方針）
      * は HTML に前段変換してから単一の WHATWG パーサへ（多層防御） */
-    IfStr md_html;
-    if (force_md || if_path_is_md(path)) { if_md_to_html(&a, input, &md_html); input = md_html; }
-    IfDom *dom = if_parse_html(&a, input);
+    IfDom *dom = NULL;
+    if (force_md || if_path_is_md(path)) {
+        /* v0.3: md は DOM 直構築を先に試す（HTML 往復を消す高速経路）。
+         * dump-tokens / wptdom は「HTML 段」の観測点なので従来どおり 2 段で。
+         * taint 観測時は従来経路へフォールバック（正しさは本パーサに集約） */
+        if (mode == M_TOKENS || mode == M_WPTDOM || getenv("IFUTO_MD_SLOW") ||
+            !if_md_parse_fast(&a, input, &dom)) {
+            IfStr md_html;
+            if_md_to_html(&a, input, &md_html);
+            input = md_html;
+            dom = if_parse_html(&a, input);
+        }
+    } else {
+        dom = if_parse_html(&a, input);
+    }
     double t2 = now_ms();
 
     if (mode == M_WPTDOM) {

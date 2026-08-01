@@ -479,6 +479,37 @@ static void tpl_route(IfTB *b, IfMode m) {
     if (b->n_tpl) b->tpl_modes[b->n_tpl - 1] = (u8)m;
 }
 
+/* 直近の template 要素の content 直下に「table 構成品でも head 系でもない実
+ * コンテンツ要素」（div 等）が既にあるか。vendored template.dat の旧世代台帳は、
+ * その状態で後続の tr/td 等テーブル開始トークンが来ると **挿入せず捨てる**
+ * （#56: <template><div><tr> は tr 消失・div 温存、#77: content に div が居れば
+ *   後続 <tr> 消失）。一方で content 直下が tr/td/thead/入れ子 template のみの
+ * 間は routing 挿入を継続する（#36/#44/#45/#67/#68/#109 等の合格面と整合する
+ * 唯一の判定子） */
+static bool tpl_content_has_real(IfTB *b) {
+    IfNode *tpl = NULL;
+    for (u32 i = b->depth; i > 0; i--) {
+        IfNode *n = b->stack[i - 1];
+        if (n->tag == IF_TAG_TEMPLATE && n->ns == IF_NS_HTML) { tpl = n; break; }
+    }
+    IfNode *c = tpl && tpl->content ? tpl->content->first_child : NULL;
+    for (; c; c = c->next_sibling) {
+        if (c->kind != IF_NODE_ELEMENT) continue;
+        if (c->tag == IF_TAG_UNKNOWN) return true;
+        switch (c->tag) {
+        case IF_TAG_TR: case IF_TAG_TD: case IF_TAG_TH: case IF_TAG_TBODY:
+        case IF_TAG_THEAD: case IF_TAG_TFOOT: case IF_TAG_CAPTION:
+        case IF_TAG_COLGROUP: case IF_TAG_COL: case IF_TAG_TABLE:
+        case IF_TAG_TEMPLATE: case IF_TAG_SCRIPT: case IF_TAG_STYLE:
+        case IF_TAG_META: case IF_TAG_LINK: case IF_TAG_NOFRAMES:
+            break;
+        default:
+            return true;
+        }
+    }
+    return false;
+}
+
 /* WHATWG 13.2.6.4.8 "in template"。基底は in-body（台帳で常に合格だった領域）、
  * 固有処理は次の 4 系のみ:
  *  1. table 系開始トークン（caption/colgroup/tbody/tfoot/thead, col, tr, td/th）
@@ -501,18 +532,22 @@ static void step_in_template(IfTB *b, IfTok tok) {
     switch (tok.tag) {
     case IF_TAG_CAPTION: case IF_TAG_COLGROUP: case IF_TAG_TBODY:
     case IF_TAG_TFOOT: case IF_TAG_THEAD:
+        if (tpl_content_has_real(b)) { b->dom->n_errors++; return; } /* 旧世代台帳: 上記 */
         tpl_route(b, M_IN_TABLE);
         step(b, tok);
         return;
     case IF_TAG_COL:
+        if (tpl_content_has_real(b)) { b->dom->n_errors++; return; }
         tpl_route(b, M_IN_COLUMN_GROUP);
         step(b, tok);
         return;
     case IF_TAG_TR:
+        if (tpl_content_has_real(b)) { b->dom->n_errors++; return; }
         tpl_route(b, M_IN_TABLE_BODY);
         step(b, tok);
         return;
     case IF_TAG_TD: case IF_TAG_TH:
+        if (tpl_content_has_real(b)) { b->dom->n_errors++; return; }
         tpl_route(b, M_IN_ROW);
         step(b, tok);
         return;
@@ -2621,6 +2656,8 @@ IfDom *if_parse_html(IfArena *arena, IfStr input) {
 
     while (!b.stopped) {
         b.tok.cdata_foreign = in_foreign_text(&b) ? 1 : 0;
+        if (b.depth && b.stack[b.depth - 1]->ns != IF_NS_HTML) b.tok.adcn_foreign = 1;
+        else b.tok.adcn_foreign = 0;
         /* adjusted current node が非 HTML 名前空間か（<![CDATA[ 許可判定専用。
          * integration point でも node 自体が非 HTML ns なら 1 になる点が
          * cdata_foreign と別建ての理由: html5test-com#13/#14/#17） */
