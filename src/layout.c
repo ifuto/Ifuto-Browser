@@ -70,7 +70,22 @@ typedef struct {
     int frame_n;
     IfGeomCache *geom;
     IfLayout *lay;       /* lines ログ記録先 */
+    u8 md_ws_stripped;   /* dom->md_ws_stripped のコピー（下記 mo_ws_sink 対応補正用） */
 } IfLC;
+
+/* md.c の mo_ws_sink と同じタグ集合（ md fast-DOM はこれら直下の ws-only TEXT を
+ * 剥がす）。旧 DOM では当該 ws TEXT が ifc 経由で prev_mb を 0 にしていたので、
+ * 剥がし後も同じ容器の兄弟では相殺を無効化して逐語同値を保つ（layout_children 参照）。 */
+static inline bool ws_sink_parent(u16 tag) {
+    switch (tag) {
+    case IF_TAG_BODY: case IF_TAG_BLOCKQUOTE: case IF_TAG_TABLE: case IF_TAG_THEAD:
+    case IF_TAG_TBODY: case IF_TAG_TR: case IF_TAG_UL: case IF_TAG_OL:
+    case IF_TAG_SECTION:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static i32 px2col(float px) { return (i32)floorf(px / IF_CHAR_W_PX + 0.5f); }
 static i32 px2row(float px) { return (i32)floorf(px / IF_ROW_H_PX + 0.5f); }
@@ -727,7 +742,10 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
         IfBox *child = layout_element(lc, c, content_x, y, content_w);
         box_add_child(lc, box, child);
         y += child->h;
-        prev_mb = mb;
+                prev_mb = mb;
+        if (lc->md_ws_stripped && ws_sink_parent(node->tag))
+            prev_mb = 0; /* 旧 DOM では sink 容器直下の ws TEXT が ifc 経由で必ず
+                          * prev_mb を 0 にしていた → 剥がし後の同値補正（md.c 参照） */
         c = c->next_sibling;
     }
     return y - content_y;
@@ -806,6 +824,7 @@ IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
     IfLC lc = { .arena = arena, .root_fs = 16.0f };
     lc.geom = (IfGeomCache *)if_arena_calloc(arena, sizeof(IfGeomCache));
     lc.lay = lay;
+    lc.md_ws_stripped = dom->md_ws_stripped;
     lay->arena = arena;
     lay->width = width_cells;
     lay->root = new_box(&lc, IF_BOX_BLOCK, NULL, NULL);

@@ -373,9 +373,35 @@ static void mo_close(Mo *m, const char *name, u32 nl) {
     m->cur = m->sp > 0 ? m->stk[m->sp - 1] : m->dom->root;
 }
 
+/* 「純ブロック容器」: 子が全てブロック要素で、直接の ws-only テキストは描画に
+ * 一切寄与しないコンテナ（INV: 画面描画に関係ないものは DOM しない）。
+ * 同値性: これらの直下の ws-only TEXT は layout で any=false/seg 無しの空 IFC に
+ * しかならず (line 非発行)、style/semantics にも到達しない → ノード自体を作らない。
+ * 除外: li/td/th/p/hN/pre/code は inline 本文の混在 or 保持必須（li 直下の "\n" は
+ * 行末空白として幅を変えうるため残す）。IDM では全 TEXT の ~45%（全ノードの ~27%）が
+ * この死ノードだった。 */
+static inline bool mo_ws_sink(const Mo *m) {
+    switch (m->cur->tag) {
+    case IF_TAG_BODY: case IF_TAG_BLOCKQUOTE: case IF_TAG_TABLE: case IF_TAG_THEAD:
+    case IF_TAG_TBODY: case IF_TAG_TR: case IF_TAG_UL: case IF_TAG_OL:
+    case IF_TAG_SECTION:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* raw 本文（string backend は 3 文字 escape。dom は raw スライス） */
 static void mo_text(Mo *m, IfStr s) {
-    if (m->is_dom) { run_add(m, s.p ? s.p : "", s.n); return; }
+    if (m->is_dom) {
+        if (s.n && mo_ws_sink(m)) { /* ws-only なら死ノード候補 → 読み捨て */
+            u32 i = 0;
+            while (i < s.n && (s.p[i] == ' ' || s.p[i] == '\n' || s.p[i] == '\t' ||
+                               s.p[i] == '\r' || s.p[i] == '\f')) i++;
+            if (i == s.n) return;
+        }
+        run_add(m, s.p ? s.p : "", s.n); return;
+    }
     for (u32 i = 0; i < s.n; i++) {
         char c = s.p[i];
         if (c == '&') b_puts(&m->str, "&amp;");
@@ -394,7 +420,11 @@ static void mo_raw_ch(Mo *m, char c) {
 
 /* ブロック間テキスト（改行等。string はそのまま、dom は TEXT ノード） */
 static void mo_text_ch(Mo *m, char c) {
-    if (m->is_dom) { run_add_ch(m, c); return; }
+    if (m->is_dom) {
+        if (mo_ws_sink(m) && (c == '\n' || c == ' ' || c == '\t' || c == '\r' || c == '\f'))
+            return; /* 純ブロック容器直下の ws-only 断片は DOM 化しない（描画不寄与。INV） */
+        run_add_ch(m, c); return;
+    }
     b_putc(&m->str, c);
 }
 
@@ -1262,6 +1292,10 @@ bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
     fn_free(&fn);
     free(m.c_buf);
     if (m.tainted) return false;
+    /* 純ブロック容器直下の ws-only TEXT を意図的に剥がした DOM（INV: 描画不寄与物は
+     * DOM しない）。layout はこのビットを見て、当該容器内の兄弟マージン相殺を
+     * 「ws TEXT が間にあった旧 DOM と逐語同じ」結果（相殺無効＝mt のみ）に補正する。 */
+    dom->md_ws_stripped = 1;
     *out_dom = dom;
     return true;
 }

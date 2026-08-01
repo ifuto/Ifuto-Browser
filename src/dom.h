@@ -102,6 +102,8 @@ typedef struct {
     IfStr title;         /* <title> のテキスト（見つからなければ empty） */
     u8 has_selectedcontent; /* parse 中に <selectedcontent> を観測（post-pass clone の走査スイッチ） */
     u8 has_style;         /* <style> 要素を観測（author sheet 収集の走査スイッチ） */
+    u8 md_ws_stripped;    /* md fast path: 純ブロック容器直下の ws-only TEXT を生成しなかった
+                           * （layout は当該容器で兄弟相殺を旧 DOM 同値に補正する） */
 } IfDom;
 
 /* 入力はドキュメント寿命中生存していること（ページ arena にコピーして呼ぶのが安全）。 */
