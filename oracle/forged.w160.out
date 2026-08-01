@@ -4,40 +4,89 @@
 
  Para with b and i and c and L and <span class='z'>html</span> inline end.
 
- #5? not heading ======
+ T2 del *bi* link2 [img: alt9]
 
- T2
- a
- b
- 1
- 2
+ Q1
 
-    • [ ] todo
-    • [x] done
 
-         • nested deep
+      quote L1 quote L2 with ql
+
+      indented?
+
+         • q item1
+         • q item2
+
+              • q nested
+
+ | 項目 | 値 | | ---- | --: | | a | -3x | | 長いセル内容 | -1x | | |escaped | x |
+ not-a-table
+
+ fn main() { println!("hi"); }
+
+
+ plain fence
+
+
+
+ tilde fence
+
+
 
    1. one
    2. two
+   3. three
 
+    • a
+    • b
 
-      quote line1 quote line2 with tick
+         • b1
+         • b2
+    • c
 
- int x = 1 < 2 && 3 > 0; // <tag> &amp;
+    • loose a
 
+    • loose b
 
- footnote ref1 here.
+    • plus1
+    • plus2
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
- text with <hr> inline and <div>block raw</div> end.
+ Foot
 
- <TABLE> <TR><TD>raw tab</TD></TR> </TABLE>
+ Use note1 and another2.
 
- after.
+ Misc
+
+ Escaped *not bold* and `not code`.
+
+ 日本語の段落テキスト。全角カナ、漢字、ひらがな混在 ABC123。
+
+ Mixed 日本語 and English in one line with <b>inline html</b> here.
+
+ <div>html block</div>
+
+ <a name="anchor"></a>
+
+ Nested <a href="x">outer <a href="y">inner</a></a> taint case.
+
+ Deepest H6
+
+ 文字だけの行 インデント2の行 tab leader
+
+ 半角カナ ABC link with bold label
+
+ em with code inside
+
+ bold with em inside
+
+ End with trailing ws
 
  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-   1. foot note body ↩
+   1. First note ↩
+   2. Second with bold ↩

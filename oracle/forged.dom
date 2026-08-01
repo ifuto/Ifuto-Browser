@@ -16,51 +16,80 @@
       <code>
         #text "c"
       #text " and "
-      <a href="http://x">
+      <a href="x">
         #text "L"
       #text " and <span class='z'>html</span> inline end."
     #text "\n"
-    <p>
-      #text "#5? not heading ======"
-    #text "\n"
     <h2>
-      #text "T2"
+      #text "T2 "
+      <del>
+        #text "del"
+      #text " "
+      <strong>
+        #text "*bi"
+      #text "* "
+      <a href="https://e.jp/あ">
+        #text "link2"
+      #text " "
+      <img src="img.png" alt="alt9">
+    #text "\n"
+    <h3>
+      #text "Q1"
+    #text "\n"
+    <blockquote>
+      #text "\n"
+      <p>
+        #text "quote L1 quote "
+        <strong>
+          #text "L2"
+        #text " with "
+        <a href="u">
+          #text "ql"
+      #text "\n"
+      <p>
+        #text "    indented?"
+      #text "\n"
+      <ul>
+        #text "\n"
+        <li>
+          #text "q item1"
+        #text "\n"
+        <li>
+          #text "q item2"
+          <ul>
+            #text "\n"
+            <li>
+              #text "q nested"
+            #text "\n"
+          #text "\n"
+        #text "\n"
+      #text "\n"
+    #text "\n"
+    <p>
+      #text "| 項目 | 値 | | ---- | --: | | a    | -3x | |…"
     #text "\n"
     <table>
       #text "\n"
       <thead>
         <tr>
           <th>
-            #text "a"
-          <th>
-            #text "b"
+            #text "not-a-table"
       #text "\n"
       <tbody>
         #text "\n"
-        <tr>
-          <td>
-            #text "1"
-          <td>
-            #text "2"
-        #text "\n"
       #text "\n"
     #text "\n"
-    <ul>
-      #text "\n"
-      <li>
-        #text "[ ] todo"
-      #text "\n"
-      <li>
-        #text "[x] done"
-        <ul>
-          #text "\n"
-          <li>
-            #text "nested "
-            <strong>
-              #text "deep"
-          #text "\n"
-        #text "\n"
-      #text "\n"
+    <pre>
+      <code class="lang-rust">
+        #text "fn main() { println!(\"hi\"); }\n"
+    #text "\n"
+    <pre>
+      <code>
+        #text "plain fence\n"
+    #text "\n"
+    <pre>
+      <code>
+        #text "\ntilde fence\n\n"
     #text "\n"
     <ol>
       #text "\n"
@@ -70,38 +99,122 @@
       <li>
         #text "two"
       #text "\n"
-    #text "\n"
-    <blockquote>
-      #text "\n"
-      <p>
-        #text "quote line1 quote line2 with "
-        <code>
-          #text "tick"
+      <li>
+        #text "three"
       #text "\n"
     #text "\n"
-    <pre>
-      <code class="lang-c extra">
-        #text "int x = 1 < 2 && 3 > 0; // <tag> &amp;\n"
+    <ul>
+      #text "\n"
+      <li>
+        #text "a"
+      #text "\n"
+      <li>
+        #text "b"
+        <ul>
+          #text "\n"
+          <li>
+            #text "b1"
+          #text "\n"
+          <li>
+            #text "b2"
+          #text "\n"
+        #text "\n"
+      #text "\n"
+      <li>
+        #text "c"
+      #text "\n"
+    #text "\n"
+    <ul>
+      #text "\n"
+      <li>
+        #text "loose a"
+      #text "\n"
+    #text "\n"
+    <ul>
+      #text "\n"
+      <li>
+        #text "loose b"
+      #text "\n"
+    #text "\n"
+    <ul>
+      #text "\n"
+      <li>
+        #text "plus1"
+      #text "\n"
+      <li>
+        #text "plus2"
+      #text "\n"
+    #text "\n"
+    <hr>
+    #text "\n"
+    <hr>
+    #text "\n"
+    <hr>
+    #text "\n"
+    <h4>
+      #text "Foot"
     #text "\n"
     <p>
-      #text "footnote ref"
+      #text "Use note"
       <sup>
-        <a href="#fn-n1" id="fr-n1">
+        <a href="#fn-a" id="fr-a">
           #text "1"
-      #text " here."
+      #text " and another"
+      <sup>
+        <a href="#fn-b" id="fr-b">
+          #text "2"
+      #text "."
     #text "\n"
-    <hr>
-    #text "\n"
-    <hr>
-    #text "\n"
-    <p>
-      #text "text with <hr> inline and <div>block raw</div> e…"
-    #text "\n"
-    <p>
-      #text "<TABLE> <TR><TD>raw tab</TD></TR> </TABLE>"
+    <h5>
+      #text "Misc"
     #text "\n"
     <p>
-      #text "after."
+      #text "Escaped *not bold* and `not code`."
+    #text "\n"
+    <p>
+      #text "日本語の段落テキスト。全角カナ、…"
+    #text "\n"
+    <p>
+      #text "Mixed 日本語 and English in one line with <b>…"
+    #text "\n"
+    <p>
+      #text "<div>html block</div>"
+    #text "\n"
+    <p>
+      #text "<a name=\"anchor\"></a>"
+    #text "\n"
+    <p>
+      #text "Nested <a href=\"x\">outer <a href=\"y\">inner</a></…"
+    #text "\n"
+    <h6>
+      #text "Deepest H6"
+    #text "\n"
+    <p>
+      #text "文字だけの行   インデント2の行 	tab…"
+    #text "\n"
+    <p>
+      #text "半角カナ ABC "
+      <a href="dest">
+        #text "link with "
+        <strong>
+          #text "bold label"
+    #text "\n"
+    <p>
+      <em>
+        #text "em with "
+        <code>
+          #text "code"
+        #text " inside"
+    #text "\n"
+    <p>
+      <strong>
+        #text "bold with "
+        <em>
+          #text "em"
+        #text " inside"
+    #text "\n"
+    <p>
+      #text "End with trailing ws"
     #text "\n"
     <section class="footnotes">
       #text "\n"
@@ -109,11 +222,19 @@
       #text "\n"
       <ol>
         #text "\n"
-        <li id="fn-n1">
-          #text "foot note body "
-          <a href="#fr-n1">
+        <li id="fn-a">
+          #text "First note "
+          <a href="#fr-a">
+            #text "↩"
+        #text "\n"
+        <li id="fn-b">
+          #text "Second with "
+          <strong>
+            #text "bold"
+          #text " "
+          <a href="#fr-b">
             #text "↩"
         #text "\n"
       #text "\n"
     #text "\n"
-; nodes=118 errors=1 title=""
+; nodes=239 errors=1 title=""
