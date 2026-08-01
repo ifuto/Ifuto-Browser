@@ -13,6 +13,7 @@ void test_uichrome(void);
 void test_ifuto_pages(void);
 void test_akl(void);
 void test_md(void);
+void test_raster(void);
 
 int main(void) {
     fprintf(stderr, "[arena]\n");
@@ -32,6 +33,8 @@ int main(void) {
     RUN(test_akl);
     fprintf(stderr, "[md]\n");
     RUN(test_md);
+    fprintf(stderr, "[raster]\n");
+    RUN(test_raster);
     fprintf(stderr, "----\nchecks: %d, failures: %d\n", g_if_test_checks, g_if_test_failures);
     return g_if_test_failures ? 1 : 0;
 }

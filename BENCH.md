@@ -2,6 +2,34 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-08-01: raster backend 起動時自動判定（CPU/GPU 判定の正直な実装）— 5.2× 高速 kernel を起動ごとに選定
+
+ifuto://settings の約束「CPU/GPU 自動判定」を実装。GPU は製品法則（ldd = linux-vdso/libc/ld (+libm)
+のみ）上 DRM ioctl 非接続なので、判定の実体は「CPU raster fill kernel を起動時 microbench で
+この端末実測選定 + GPU ノード有無の検出表示」。決定と全候補の実測値は ifuto://memory に起動ごと表示。
+
+候補 4 kernel（fill 32bpp、全て scalar 基準と bit-exact 一致を tests/test_raster.c が
+オフセット 0-8 × 長 0-65 × 色 8 種で相互証明、610k checks）:
+
+| kernel | 実装 | 白bg(均一) | 非均一色 | score |
+|---|---|---|---|---|
+| u32x1(scalar) | 1px/store | 12,737 MB/s | 12,619 MB/s | 12,702 |
+| u64x2(8B) | 8B store ×2 unroll | 49,302 | 47,107 | 48,643 |
+| **u64x8(64B)** | 64B/iter | **65,535** | **65,607** | **65,556** ← 選択 |
+| smart(memset) | 均一色→glibc memset | 50,903 | 45,638 | 49,324 |
+
+（このコンテナ 2c/4G、-O2 -flto 製品フラグ相当、512KiB バッファ warm、median of 3 runs
+ではなく min-of-2trials × reps。起動ごとに再測定するため機種差はこの表ではなく実行時決定が正）
+
+- score = 0.7×白bg + 0.3×非均一（ページ bg 全面塗りが支配的な加重）。
+- microbench 総コスト: **約 7ms/起動**（calibration つき 0.4ms/trial×2、8 測定）。GUI main() 先頭で起動時に
+  実行。TUI バイナリは冷間起動を守るため ifuto://memory 初回表示時に遅延実行（冪等 cache 済）。
+- 効果の実体: fb_rect（GUI の全 bg/glyph 塗り）が選択 kernel 経由。scalar 比 **+30%〜5.2×**
+  （色と幅に依存。1000px 幅 1 行は 4KB で 65GB/s なら 60ns/行）。
+- smart(memset) は理論上均一色で最有力だが、この機械では u64x8 が上（glibc memset の小規模
+  オーバーヘッドと store port 飽和她)。逆転する機種ではそちらが選ばれる——それが実行時選定の存在意義。
+- 検定: gui_smoke（deterministic raster / non-white coverage）PASS、ldd 両バイナリ純粋維持。
+
 ## 2026-08-01: 巨大 IDM（Markdown 文書）メモリ正確計測 — 係数と 3.3GB 外挿、および正直な現在地
 
 ユーザ要求: 「通常ブラウザで 3.3GB のメモリを食う MD ファイルをこのブラウザで読んだ際、

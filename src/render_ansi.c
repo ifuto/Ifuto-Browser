@@ -5,6 +5,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+static unsigned long long CNT_PAINT, CNT_SHELL, CNT_SEGS, CNT_FILLBG, CNT_MARKER;
+static unsigned long long CNT_FILLBG_CELLS, CNT_MARKER_SIB, CNT_DEC;
+__attribute__((destructor)) static void paintcnt_dump(void) {
+    if (getenv("PAINTCNT"))
+        fprintf(stderr, "PAINTCNT paint=%llu shell=%llu segs=%llu fillbg=%llu fillbg_cells=%llu marker=%llu marker_sib=%llu dec_break=%llu\n",
+                CNT_PAINT, CNT_SHELL, CNT_SEGS, CNT_FILLBG, CNT_FILLBG_CELLS, CNT_MARKER, CNT_MARKER_SIB, CNT_DEC);
+}
+
 u8 if_rgba_to_ansi(u32 rgba) {
     u32 a = rgba & 0xFF;
     if (a < 128) return (u8)IF_CELL_DEFAULT;
@@ -59,8 +67,16 @@ static void put_cp(IfGrid *g, i32 x, i32 y, u32 cp, const IfStyle *st, u32 bg_ov
 static void fill_bg(IfGrid *g, i32 x0, i32 y0, i32 w, i32 h, u32 bg) {
     u8 idx = if_rgba_to_ansi(bg);
     if (idx == IF_CELL_DEFAULT && (bg & 0xFF) < 128) return;
-    for (i32 y = y0; y < y0 + h; y++)
-        for (i32 x = x0; x < x0 + w; x++) {
+    /* ループの前に窓へ切り詰める（2026-08-01 同定: 全文書を跨ぐ背景箱が
+     * 窓ごとに「全行 × grid_at NULL 拒否」で 88 億セル走査していた実測起因）。
+     * 切り詰め後は全セル窓内が保証される。grid_at の拒否は安全側として残す
+     * （ペイント順序==バイト列は tui/gui smoke の sha256 が機械監査） */
+    i32 yy0 = y0 < g->y_off ? g->y_off : y0;
+    i32 yy1 = y0 + h > g->y_off + g->h ? g->y_off + g->h : y0 + h;
+    i32 xx0 = x0 < 0 ? 0 : x0;
+    i32 xx1 = x0 + w > g->w ? g->w : x0 + w;
+    for (i32 y = yy0; y < yy1; y++)
+        for (i32 x = xx0; x < xx1; x++) {
             IfCell *c = grid_at(g, x, y);
             if (c) c->bg = idx;
         }
@@ -107,9 +123,11 @@ static void draw_marker(IfGrid *g, const IfBox *b) {
         return;
     }
     u32 idx = 1;
-    for (IfNode *s = li->parent ? li->parent->first_child : NULL; s && s != li; s = s->next_sibling)
+    for (IfNode *s = li->parent ? li->parent->first_child : NULL; s && s != li; s = s->next_sibling) {
+        CNT_MARKER_SIB++;
         if (s->kind == IF_NODE_ELEMENT && s->tag == IF_TAG_LI && s->style && s->style->display == IF_D_LIST_ITEM)
             idx++;
+    }
     char buf[16];
     int m = snprintf(buf, sizeof buf, "%u.", idx);
     if (m < 0) return;
@@ -118,22 +136,21 @@ static void draw_marker(IfGrid *g, const IfBox *b) {
     draw_text(g, mx, b->y, if_str(buf, (u32)m), b->st);
 }
 
-static void paint_box(IfGrid *g, const IfBox *b) {
-    if (b->kind == IF_BOX_LINE) {
-        for (u32 i = 0; i < b->n_segs; i++) {
-            const IfSeg *s = &b->segs[i];
-            draw_text(g, s->x, b->y, s->text, s->st);
-        }
-        return;
-    }
+static unsigned long long CNT_PAINT, CNT_SHELL, CNT_SEGS, CNT_FILLBG, CNT_MARKER, CNT_DEC;
+static void paint_box(IfGrid *g, const IfBox *b); /* 前方宣言: paint_children から相互参照 */
+
+/* b 自身の装飾（背景/HR/罫線/li マーカー）を描く。子供に進むなら true。
+ * HR だけは自身の描画で完結するため false を返す。 */
+static bool paint_shell(IfGrid *g, const IfBox *b) {
     const IfStyle *st = b->st;
-    if (st && (st->bg & 0xFF) >= 128) fill_bg(g, b->x, b->y, b->w, b->h, st->bg);
+    CNT_SHELL++;
+    if (st && (st->bg & 0xFF) >= 128) { CNT_FILLBG++; fill_bg(g, b->x, b->y, b->w, b->h, st->bg); }
 
     if (b->node && b->node->tag == IF_TAG_HR) {
         /* bt を除いた行へ罫線 */
         i32 off = (st && st->border_w[0] > 0.0f) ? 1 : 0;
         draw_hline(g, b->x, b->x + b->w, b->y + off, NULL);
-        return;
+        return false;
     }
 
     /* 罫線（solid のみ。Unicode 罫線素片で描く） */
@@ -156,10 +173,52 @@ static void paint_box(IfGrid *g, const IfBox *b) {
             if (st->border_w[2] > 0 && st->border_w[3] > 0) { c = grid_at(g, b->x, b->y + b->h - 1); if (c) c->cp = 0x2514; }
             if (st->border_w[2] > 0 && st->border_w[1] > 0) { c = grid_at(g, b->x + b->w - 1, b->y + b->h - 1); if (c) c->cp = 0x2518; }
         }
-        if (b->node && b->st->display == IF_D_LIST_ITEM) draw_marker(g, b);
+        if (b->node && b->st->display == IF_D_LIST_ITEM) { CNT_MARKER++; draw_marker(g, b); }
     }
+    return true;
+}
 
-    for (const IfBox *c = b->first_child; c; c = c->next_sibling) paint_box(g, c);
+/* 子供イテレーション（start_from: NULL なら b->first_child から）。
+ * record: NULL でなければ「窓に最初に交差した子」を *record に書く（窓カーソル用） */
+static void paint_children(IfGrid *g, const IfBox *b, const IfBox *start_from, const IfBox **record) {
+    i32 gy0 = g->y_off, gy1 = g->y_off + g->h;
+    for (const IfBox *c = start_from ? start_from : b->first_child; c; c = c->next_sibling) {
+        /* この layout は兄弟の y が単調非減少（垂直フローのみ。負マージン/浮動なし）。
+         * 窓の下端を超えた時点で以降の兄弟は全て窓外なので走査自体を打ち切る
+         * （打ち切らないと「窓より後の全兄弟」の空走査が全窓に重複して O(n^2) になる）。
+         * バイト列同一性は tui/gui smoke の sha256 が機械監査する。 */
+        if (c->y >= gy1) { CNT_DEC++; break; }
+        /* 窓との交差判定（record 用）: この子かその子孫が窓内に描きうる最初の子 */
+        if (record) {
+            bool inter = (c->kind == IF_BOX_LINE)
+                ? (c->y >= gy0 && c->y < gy1)
+                : (c->h == 0 || (i64)c->y + c->h > gy0);
+            if (inter) { *record = c; record = NULL; }
+        }
+        paint_box(g, c);
+    }
+}
+
+static void paint_box(IfGrid *g, const IfBox *b) {
+    /* 窓グリッドの部分木剪定（巨大文書 O(窓数×box総数) → O(box+描画cell)）。
+     * grid の y 窓 [y0,y1) と交差しない line ボックス/高さ確定ボックスは子孫ごと捨てる。
+     * 安全根拠: この layout では子の描画 y 範囲は親の [y, y+h) に包含される
+     * （親はフロー内で子を含んで伸びる）。h==0 の容器だけは保守側で潜る（稀）。
+     * 発行バイト列は tests の tui/gui smoke sha256 が if_render_emit との完全一致で機械監査。 */
+    i32 gy0 = g->y_off, gy1 = g->y_off + g->h;
+    if (b->kind == IF_BOX_LINE) {
+        if (b->y < gy0 || b->y >= gy1) return;
+        CNT_PAINT++; CNT_SEGS += b->n_segs;
+        for (u32 i = 0; i < b->n_segs; i++) {
+            const IfSeg *s = &b->segs[i];
+            draw_text(g, s->x, b->y, s->text, s->st);
+        }
+        return;
+    }
+    if (b->h > 0 && (b->y >= gy1 || b->y + b->h <= gy0)) return;
+    CNT_PAINT++;
+    if (paint_shell(g, b))
+        paint_children(g, b, NULL, NULL);
 }
 
 IfGrid *if_render_grid(IfArena *arena, const IfLayout *lay) {
@@ -182,7 +241,7 @@ IfGrid *if_render_grid(IfArena *arena, const IfLayout *lay) {
     return g;
 }
 
-void if_render_grid_rows_into(const IfLayout *lay, i32 row0, i32 row1, IfGrid *out) {
+void if_render_grid_rows_into_cur(const IfLayout *lay, i32 row0, i32 row1, IfGrid *out, IfPaintCursor *cur) {
     out->w = lay->width;
     out->h = row1 > row0 ? row1 - row0 : 0;
     out->y_off = row0;
@@ -194,7 +253,32 @@ void if_render_grid_rows_into(const IfLayout *lay, i32 row0, i32 row1, IfGrid *o
         out->cells[i].bg = (u8)IF_CELL_DEFAULT;
         out->cells[i].flags = 0;
     }
-    if (lay->root) paint_box(out, lay->root); /* grid_at が窓外をクリップ */
+    if (!lay->root) return;
+    const IfBox *r = lay->root;
+    /* 窓の上下端と box の y 範囲の一致は「隣接」であって交差ではない（半開区間）。
+     * 端一致自体は正しい。root は全高を跨ぐので原則交差するが、壳の塗り（背景/罫線）
+     * は「box が交差する窓」でのみ必要であり、交差しない窓では一切描かないのが
+     * full-grid 経路との完全一致の条件（tests/test_layout の差分オラクルが機械固定） */
+    if (!cur) { paint_box(out, r); return; }
+    /* カーソル規約: 後退検知（窓が resume 時代より前に戻った）は自動で無効化。 */
+    const IfBox *start = NULL;
+    if (cur->resume) {
+        const IfBox *rc = (const IfBox *)cur->resume;
+        if (rc->y <= row0) start = rc; /* 単調前進のみ抱拥 */
+    }
+    cur->resume = NULL;
+    if (r->kind == IF_BOX_LINE) { paint_box(out, r); return; } /* 防御: root が line は通常ない */
+    /* root は常に交差する（全高）ため shell は必ず塗る。下部で gy 範囲外なら
+     * paint_shell 側の fill_bg/draw が窓クリップして no-op になるので正しい */
+    if (paint_shell(out, r)) {
+        const IfBox *first = NULL;
+        paint_children(out, r, start, &first);
+        cur->resume = first;
+    }
+}
+
+void if_render_grid_rows_into(const IfLayout *lay, i32 row0, i32 row1, IfGrid *out) {
+    if_render_grid_rows_into_cur(lay, row0, row1, out, NULL);
 }
 
 /* ---------- 発行 ---------- */
@@ -235,7 +319,6 @@ void if_render_extent(const IfLayout *lay, i32 *mx, i32 *my) {
 
 void if_render_emit_rows(FILE *out, const IfGrid *grid, int ansi) {
     IfPen cur = { (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
-    bool pen_dirty = false;
     /* 1 行ぶんの作業バッファを一度だけ確保（出力全体は保持しない = 定数メモリ） */
     u64 rowcap = (u64)grid->w * 4 + 128;
     u8 *row = (u8 *)malloc(rowcap ? rowcap : 1);
@@ -263,7 +346,6 @@ void if_render_emit_rows(FILE *out, const IfGrid *grid, int ansi) {
                     if (p.fg != IF_CELL_DEFAULT) n += (u64)snprintf((char *)row + n, 64, "\x1b[38;5;%um", p.fg);
                     if (p.bg != IF_CELL_DEFAULT) n += (u64)snprintf((char *)row + n, 64, "\x1b[48;5;%um", p.bg);
                     cur = p;
-                    pen_dirty = true;
                 }
             }
             u8 enc[4];
@@ -272,7 +354,8 @@ void if_render_emit_rows(FILE *out, const IfGrid *grid, int ansi) {
             if (rowcap - n < en + 8) { fwrite(row, 1, n, out); n = 0; }
             memcpy(row + n, enc, en); n += en;
         }
-        if (ansi && pen_dirty) { memcpy(row + n, "\x1b[0m", 4); n += 4; cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 }; }
+        /* 行末リセット無条件（if_render_emit と同一契約。窓発行 ≡ 全体発行を構造保証） */
+        if (ansi) { memcpy(row + n, "\x1b[0m", 4); n += 4; cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 }; }
         row[n++] = '\n';
         fwrite(row, 1, n, out);
     }
@@ -282,7 +365,6 @@ void if_render_emit_rows(FILE *out, const IfGrid *grid, int ansi) {
 IfStr if_render_emit(IfArena *arena, const IfGrid *grid, int ansi) {
     IfOut o = { NULL, 0, 0, arena };
     IfPen cur = { (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
-    bool pen_dirty = false;
 
     for (i32 y = 0; y < grid->h; y++) {
         i32 last = grid->w - 1;
@@ -298,7 +380,6 @@ IfStr if_render_emit(IfArena *arena, const IfGrid *grid, int ansi) {
                 if (p.fg != cur.fg || p.bg != cur.bg || p.flags != cur.flags) {
                     pen_apply(&o, &p);
                     cur = p;
-                    pen_dirty = true;
                 }
             }
             u8 enc[4];
@@ -306,7 +387,11 @@ IfStr if_render_emit(IfArena *arena, const IfGrid *grid, int ansi) {
             u64 n = if_utf8_encode(cp, enc);
             out_bytes(&o, enc, n);
         }
-        if (ansi && pen_dirty) { out_str(&o, "\x1b[0m"); cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 }; }
+        /* 行末リセットは無条件（2026-08-01 契約統一）: 旧規約 pen_dirty=true で不変では
+         * 「窓の先頭行」がストリーム履歴に依存して full 経路と乖離し得た（差分オラクルが
+         * ws=7 の HR 行で同定）。無条件化で行は完全に自己完結し、窓発行 ≡ 全体発行が
+         * 構造的に保証される。バイト代償は +4B/行（実測で出力比 <0.5%）。 */
+        if (ansi) { out_str(&o, "\x1b[0m"); cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 }; }
         out_str(&o, "\n");
     }
     return if_str((const char *)o.buf, (u32)o.len);

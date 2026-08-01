@@ -1055,10 +1055,61 @@ static float kw_font_size(IfStr v, float parent) {
     return -1.0f;
 }
 
+/* ---- computed style interning（2026-08-01 メモリ本丸） ----
+ * IfStyle(124B) を要素ごとに確保すると巨大文書で style arena が ~97MB/16MiB 入力に
+ * 膨らむ（実測）。算出後の IfStyle は全フィールド値のみの不変構造かつ calloc 由来で
+ * パディングまで決定的 → memcmp 等値で intern できる（損失ゼロの dedup）。
+ * 規則: node->style は読み取り専用（カスケード後に誰も書かないことは全ファイル監査済）。
+ * 同一内容のスタイルは 1 実体を全要素が指す。巨大文書で数百 unique まで絞られる。 */
+typedef struct {
+    IfStyle **tab;   /* 開放アドレスハッシュ（値は 1 実体へのポインタ） */
+    u32 cap, n;
+    IfArena *a;
+} IfStyleIntern;
+
+u32 if_css_intern_last = 0; /* 観測用: 直近の style apply での unique 数 */
+
+static u64 st_hash(const IfStyle *s) {
+    const u8 *p = (const u8 *)s;
+    u64 h = 1469598103934665603ull;
+    for (size_t i = 0; i < sizeof(IfStyle); i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/* 同一内容の実体を返す。無ければスタック tmp を arena に定着させて登録する。 */
+static const IfStyle *st_intern(IfStyleIntern *in, const IfStyle *tmp) {
+    if (in->n * 4 >= in->cap * 3) { /* 負荷率 0.75 で再ハッシュ（×2） */
+        u32 nc = in->cap ? in->cap * 2 : 1024;
+        IfStyle **nt = (IfStyle **)if_arena_calloc(in->a, (u64)nc * sizeof(IfStyle *));
+        for (u32 i = 0; i < in->cap; i++) {
+            IfStyle *e = in->tab[i];
+            if (!e) continue;
+            u32 j = (u32)st_hash(e) & (nc - 1);
+            while (nt[j]) j = (j + 1) & (nc - 1);
+            nt[j] = e;
+        }
+        in->tab = nt; in->cap = nc;
+    }
+    u32 j = (u32)st_hash(tmp) & (in->cap - 1);
+    while (in->tab[j]) {
+        if (memcmp(in->tab[j], tmp, sizeof(IfStyle)) == 0) return in->tab[j];
+        j = (j + 1) & (in->cap - 1);
+    }
+    IfStyle *e = (IfStyle *)if_arena_alloc(in->a, sizeof(IfStyle));
+    memcpy(e, tmp, sizeof(IfStyle));
+    in->tab[j] = e;
+    in->n++;
+    return e;
+}
+
 static void compute_node(IfArena *a, IfNode *n, const IfStyle *parent_st, float root_fs,
-                         const IfStyleSheet **sheets, u32 n_sheets) {
-    IfStyle *st = (IfStyle *)if_arena_calloc(a, sizeof(IfStyle));
-    n->style = st;
+                         const IfStyleSheet **sheets, u32 n_sheets, IfStyleIntern *in) {
+    /* スタックの tmp に算出してから intern する（重複時は arena を一切消費しない）。
+     * memcmp 等価のために tmp は必ず全バイト確定的に初期化する（memset 0 + 全フィールド代入） */
+    IfStyle tmp;
+    memset(&tmp, 0, sizeof tmp);
+    IfStyle *st = &tmp;
+    n->style = NULL; /* 誤参照防止（最後に intern 結果を代入する） */
 
     /* 1) 初期値 + 継承 */
     st->display = IF_D_INLINE;         /* 未知要素の既定 */
@@ -1254,16 +1305,18 @@ static void compute_node(IfArena *a, IfNode *n, const IfStyle *parent_st, float 
         default: break;
         }
     }
+    /* 算出確定。不変かつ memcmp 等価が効くので intern して実体指す（dedup、損失ゼロ） */
+    n->style = st_intern(in, &tmp);
 }
 
 static void compute_walk(IfArena *a, IfNode *n, const IfStyle *parent_st, float root_fs,
-                         const IfStyleSheet **sheets, u32 n_sheets) {
+                         const IfStyleSheet **sheets, u32 n_sheets, IfStyleIntern *in) {
     if (n->kind != IF_NODE_ELEMENT) return;
-    compute_node(a, n, parent_st, root_fs, sheets, n_sheets);
+    compute_node(a, n, parent_st, root_fs, sheets, n_sheets, in);
     float child_root_fs = root_fs;
     if (n->tag == IF_TAG_HTML) child_root_fs = n->style->font_size;
     for (IfNode *c = n->first_child; c; c = c->next_sibling)
-        if (c->kind == IF_NODE_ELEMENT) compute_walk(a, c, n->style, child_root_fs, sheets, n_sheets);
+        if (c->kind == IF_NODE_ELEMENT) compute_walk(a, c, n->style, child_root_fs, sheets, n_sheets, in);
 }
 
 static void collect_author_sheets(IfArena *a, IfNode *n, const IfStyleSheet ***arr, u32 *count, u64 *cap, u32 *order) {
@@ -1294,5 +1347,9 @@ void if_style_apply(IfArena *a, IfDom *dom) {
     for (u32 i = 0; i < n_sheets; i++) all[i + 1] = sheets[i];
 
     IfNode *html = if_node_first_elem_child(dom->root);
-    if (html) compute_walk(a, html, NULL, 16.0f, all, n_sheets + 1);
+    if (html) {
+        IfStyleIntern in = { NULL, 0, 0, a };
+        compute_walk(a, html, NULL, 16.0f, all, n_sheets + 1, &in);
+        if_css_intern_last = in.n;
+    }
 }

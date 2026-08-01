@@ -14,6 +14,7 @@
 #include "../render.h"
 #include "fb.h"
 #include "x11t.h"
+#include "../raster.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -380,6 +381,9 @@ static int gui_run_x(const char *initial) {
 
 int main(int argc, char **argv) {
     const char *initial = NULL, *shot = NULL;
+    /* 起動時 microbench: raster fill kernel をこの端末実測で決定（冪等。
+     * 決定の根拠数値は ifuto://memory に表示される） */
+    if_raster_autodetect();
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) shot = argv[++i];
         else if (argv[i][0] == '-' && argv[i][1]) {

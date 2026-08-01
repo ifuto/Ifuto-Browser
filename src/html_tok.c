@@ -340,13 +340,29 @@ static IfTok if_raw_token(IfHtmlTok *t) {
 
 /* ---- 本体 ---- */
 
+/* 確定時に属性配列を 1 回だけ arena に正確確保するための最終コピー。
+ * 旧構造は if_arena_grow でトークンごとに中間配列を確保し、成長元ブロックが
+ * ページ arena に残留し続けた（実測で parse stage の ~150MB 存在分の主因。
+ * 巨大文書では ~100-190MB が死蔵していた） */
+#define IF_ATTR_STACK_CAP 32u
+static IfAttr *attrs_finish(IfHtmlTok *t, const IfAttr *attrs, u32 n, bool spilled) {
+    if (spilled) return (IfAttr *)attrs; /* 稀な巨大属性タグの grow 路はそのまま所有 */
+    if (!n) return NULL;
+    IfAttr *fin = (IfAttr *)if_arena_alloc(t->arena, (u64)n * sizeof(IfAttr));
+    memcpy(fin, attrs, (u64)n * sizeof(IfAttr));
+    return fin;
+}
+
 static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
     IfTok tok = { .kind = TOK_EOF };
     tok.kind = is_end ? TOK_END : TOK_START;
 
-    IfAttr *attrs = NULL;
+    IfAttr sbuf[IF_ATTR_STACK_CAP];
+    IfAttr *attrs = sbuf;
     u32 n_attrs = 0;
-    u64 cap = 0;
+    u32 cap = IF_ATTR_STACK_CAP;
+    u64 acap = 0;          /* spill 路の arena 容量（if_arena_grow 規約） */
+    bool spilled = false;
 
     /* タグ名 */
     u32 name_start = t->pos;
@@ -363,13 +379,13 @@ static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
         while (t->pos < t->len && if_hws(t->src[t->pos])) t->pos++;
         if (t->pos >= t->len) { t->errors++; return (IfTok){ .kind = TOK_EOF }; }
         u8 c = t->src[t->pos];
-        if (c == '>') { t->pos++; tok.attrs = attrs; tok.n_attrs = n_attrs; return tok; }
+        if (c == '>') { t->pos++; tok.attrs = attrs_finish(t, attrs, n_attrs, spilled); tok.n_attrs = n_attrs; return tok; }
         if (c == '/') {
             t->pos++;
             if (t->pos < t->len && t->src[t->pos] == '>') {
                 t->pos++;
                 tok.self_closing = true;
-                tok.attrs = attrs;
+                tok.attrs = attrs_finish(t, attrs, n_attrs, spilled);
                 tok.n_attrs = n_attrs;
                 return tok;
             }
@@ -430,7 +446,21 @@ static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
         if (dup) continue;
 
         if (n_attrs >= IF_MAX_ATTRS) { t->errors++; continue; }
-        attrs = (IfAttr *)if_arena_grow(t->arena, attrs, &cap, n_attrs + 1, sizeof(IfAttr));
+        if (n_attrs >= cap) {
+            if (!spilled) {
+                /* スタック枠 (32) を超える稀なタグのみ arena grow 路へ移行
+                 * （中間ブロックは残留するが、攻撃者も属性バイトを支払うため増幅は線形に閉じる） */
+                spilled = true;
+                acap = 64;
+                IfAttr *na = (IfAttr *)if_arena_alloc(t->arena, acap * sizeof(IfAttr));
+                memcpy(na, attrs, (u64)n_attrs * sizeof(IfAttr));
+                attrs = na;
+                cap = 64;
+            } else {
+                attrs = (IfAttr *)if_arena_grow(t->arena, attrs, &acap, n_attrs + 1, sizeof(IfAttr));
+                cap = (u32)(acap < 0xFFFFFFFFu ? acap : 0xFFFFFFFFu);
+            }
+        }
         attrs[n_attrs].name = aname;
         attrs[n_attrs].value = aval;
         n_attrs++;

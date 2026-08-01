@@ -85,7 +85,7 @@ typedef struct IfNode {
     u32 n_attrs;
     IfStr text;          /* TEXT / COMMENT ノードの中身 */
     IfDoctype *dtype;    /* DOCTYPE のみ非 NULL */
-    struct IfStyle *style; /* カスケード後に付与（ページ arena 所有）。NULL = 未計算 */
+    const struct IfStyle *style; /* カスケード後に付与（intern 所有・不変。監査: 全消費者 read-only） */
     struct IfNode *parent, *first_child, *last_child, *next_sibling;
     /* template のみ: 「content」文書フラグメント（子はここに入る。子リストは常空）。
      * WPT serializer の "content" 行はこのノード経由で辿られる。 */

@@ -1,5 +1,6 @@
 #include "fb.h"
 #include "font5x7.h"
+#include "../raster.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -20,10 +21,10 @@ void fb_rect(IfFbStrip *s, i32 x, i32 y, i32 w, i32 h, u32 rgb) {
     if (x + w > (i32)s->w_px) w = (i32)s->w_px - x;
     if (y + h > (i32)s->h_px) h = (i32)s->h_px - y;
     if (w <= 0 || h <= 0) return;
-    for (i32 yy = y; yy < y + h; yy++) {
-        u32 *row = s->px + (u64)yy * s->w_px + (u32)x;
-        for (i32 xx = 0; xx < w; xx++) row[xx] = rgb;
-    }
+    /* fill kernel は起動時 microbench 選定（raster.c）。bit-exact 同一性は
+     * tests/test_raster.c が全候補について scalar 基準と相互証明済み */
+    for (i32 yy = y; yy < y + h; yy++)
+        if_fill32(s->px + (u64)yy * s->w_px + (u32)x, (u64)w, rgb);
 }
 
 void fb_glyph(IfFbStrip *s, i32 x_px, i32 y_px, u8 ch, u32 fg, u32 bg,

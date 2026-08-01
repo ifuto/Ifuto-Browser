@@ -137,4 +137,8 @@ bool if_css_match_selector(const IfNode *n, const IfSelector *sel);
  * テストが on/off で機械監査するために存在（CoJIT の on/off oracle と同型）。 */
 void if_css_set_naive_matching(int enabled);
 
+/* 観測用: 直近 if_style_apply の intern unique 数（computed style interning。
+ * テスト/計測が「dedup が効いているか」を機械検査するためのフック） */
+extern u32 if_css_intern_last;
+
 #endif

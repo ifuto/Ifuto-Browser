@@ -210,10 +210,17 @@ int main(int argc, char **argv) {
     win.cells = (IfCell *)malloc((size_t)mx * 4096 * sizeof(IfCell));
     if (!win.cells) if_fatal("render: oom window grid");
     win.y_off = 0;
+    /* 厳密増加窓なので走査カーソルを巡航（root 直下の子リスト first-child 再走査を
+     * 消す。render O(窓×子) → O(box+描画cell)。後退しない規約のみで使用） */
+    IfPaintCursor cur = { 0 };
+    double acc_grid = 0, acc_emit = 0;
     for (i32 r0 = 0; r0 < my; r0 += 4096) {
         i32 r1 = r0 + 4096 < my ? r0 + 4096 : my;
-        if_render_grid_rows_into(lay, r0, r1, &win);
+        double tg0 = now_ms();
+        if_render_grid_rows_into_cur(lay, r0, r1, &win, &cur);
+        double tg1 = now_ms();
         if_render_emit_rows(stdout, &win, ansi);
+        acc_grid += tg1 - tg0; acc_emit += now_ms() - tg1;
     }
     free(win.cells);
     double t5 = now_ms();
@@ -238,10 +245,12 @@ int main(int argc, char **argv) {
         fprintf(stderr,
             "ifuto stats: read=%.2fms parse=%.2fms style=%.2fms layout=%.2fms render=%.2fms total=%.2fms\n"
             "  nodes=%u parse_errors=%u grid=%dx%d links=%u peak_rss_kb=%llu\n"
+            "  render_split: grid=%.2fms emit=%.2fms\n"
             "  arena_kb: parse=%.1f style=%.1f layout=%.1f render=%.1f\n",
             t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0,
             dom->n_nodes, dom->n_errors, mx, my, lay->n_links,
             (unsigned long long)vwhwm_kb,
+            acc_grid, acc_emit,
             arena_after_parse / 1024.0, arena_after_style / 1024.0,
             arena_after_layout / 1024.0, (double)if_arena_reserved(&a) / 1024.0);
     }

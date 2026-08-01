@@ -13,8 +13,14 @@
 #include "strutil.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h> /* realloc/free（B のステージング解放規約） */
 
-/* ---- 出力ビルダ ---- */
+/* ---- 出力ビルダ ----
+ * 2026-08-01 メモリ本丸: ステージングは malloc/realloc（realloc は旧ブロックを解放し、
+ * 更に大域 realloc は mremap でページ移動するため倍加コストも安い）。完成時に
+ * arena へ正確 1 回だけコピーする（if_md_to_html は b_finish を呼ぶ）。
+ * 旧構造（arena 直接 grow）は倍加の旧ブロック全世代がページ死まで残留し、
+ * 16MiB 入力で md ステージだけ ~175MB を焼いていた（実測）。 */
 typedef struct { IfArena *a; char *p; u64 n, cap; } B;
 
 static void b_init(B *b, IfArena *a) { b->a = a; b->p = NULL; b->n = 0; b->cap = 0; }
@@ -22,12 +28,24 @@ static void b_putn(B *b, const char *s, u64 n) {
     if (b->n + n + 1 > b->cap) {
         u64 nc = b->cap ? b->cap : 256;
         while (nc < b->n + n + 1) nc *= 2;
-        char *np = (char *)if_arena_alloc(b->a, nc);
-        if (b->n) memcpy(np, b->p, b->n);
+        char *np = (char *)realloc(b->p, nc ? nc : 1);
+        if (!np) if_fatal("md: staging oom");
         b->p = np; b->cap = nc;
     }
     memcpy(b->p + b->n, s, (size_t)n);
     b->n += n; b->p[b->n] = 0;
+}
+/* 中間ステージの捨て方（qb/flat/norm。内容を消費した後に呼ぶ） */
+static void b_drop(B *b) { free(b->p); b->p = NULL; b->n = b->cap = 0; }
+/* 完成: arena へ正確確保で定着させて staging は解放（返り値の寿命は arena） */
+static IfStr b_finish(B *b) {
+    IfArena *a = b->a;
+    char *np = (char *)if_arena_alloc(a, b->n + 1);
+    if (b->n) memcpy(np, b->p, b->n);
+    np[b->n] = 0;
+    IfStr r = if_str(np, (u32)b->n);
+    b_drop(b);
+    return r;
 }
 static void b_puts(B *b, const char *s) { b_putn(b, s, (u64)strlen(s)); }
 static void b_putc(B *b, char c) { b_putn(b, &c, 1); }
@@ -77,6 +95,8 @@ typedef struct {
     IfStr *refs; u32 n_refs, cap_refs; /* 参照順の id（重複なし） */
 } Fn;
 
+static IfStr fn_own(IfStr s); /* malloc 所有コピー（脚注生存期間の対。下で定義） */
+
 static u32 fn_find_def(Fn *f, IfStr id) {
     for (u32 i = 0; i < f->n_defs; i++) if (if_str_eq(f->defs[i].id, id)) return i;
     return UINT32_MAX;
@@ -89,9 +109,21 @@ static u32 fn_ref_number(Fn *f, IfStr id) {
         f->refs = (IfStr *)if_arena_grow(f->a, f->refs, &cap, f->n_refs + 1, sizeof(IfStr));
         f->cap_refs = (u32)cap;
     }
-    f->refs[f->n_refs++] = id;
+    f->refs[f->n_refs++] = fn_own(id);
     return f->n_refs;
 }
+/* 2026-08-01: 脚注の id/text は norm ステージへのスライスであり、norm は blocks 消費後に
+ * 解放される（heap-use-after-free を ASAN で同定）。脚注の生存期間は fn が所有する
+ * malloc コピーとし、if_md_to_html の脚注 emit 後に fn_free で畳む（メモリ法則:
+ * 「参照され続けるものだけが生きる」） */
+static IfStr fn_own(IfStr s) {
+    char *p = (char *)malloc(s.n + 1);
+    if (!p) if_fatal("md: fn oom");
+    if (s.n) memcpy(p, s.p, s.n);
+    p[s.n] = 0;
+    return if_str(p, s.n);
+}
+
 static void fn_add_def(Fn *f, IfStr id, IfStr text) {
     if (fn_find_def(f, id) != UINT32_MAX) return; /* 先勝ち（CommonMark） */
     if (f->n_defs >= f->cap_defs) {
@@ -99,9 +131,19 @@ static void fn_add_def(Fn *f, IfStr id, IfStr text) {
         f->defs = (FnDef *)if_arena_grow(f->a, f->defs, &cap, f->n_defs + 1, sizeof(FnDef));
         f->cap_defs = (u32)cap;
     }
-    f->defs[f->n_defs].id = id;
-    f->defs[f->n_defs].text = text;
+    f->defs[f->n_defs].id = fn_own(id);
+    f->defs[f->n_defs].text = fn_own(text);
     f->n_defs++;
+}
+
+static void fn_free(Fn *f) {
+    for (u32 i = 0; i < f->n_refs; i++) free((void *)f->refs[i].p);
+    for (u32 i = 0; i < f->n_defs; i++) {
+        free((void *)f->defs[i].id.p);
+        free((void *)f->defs[i].text.p);
+    }
+    /* refs/defs 配列自体は arena（ページ寿命）に委ねる — 少量かつキャップ済み */
+    f->n_refs = f->n_defs = 0;
 }
 
 /* ---- inline 展開 ---- */
@@ -498,6 +540,7 @@ static void blocks_win(B *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
                 }
                 b_puts(out, "<blockquote>\n");
                 blocks_str(out, fn, if_str(qb.p ? qb.p : "", (u32)qb.n), depth + 1);
+                b_drop(&qb);
                 b_puts(out, "</blockquote>\n");
             } else {
                 /* 深度飽和: 記号を剥がした段落に落とす（敵対防御・台帳） */
@@ -511,6 +554,7 @@ static void blocks_win(B *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
                 }
                 b_puts(out, "<blockquote>\n<p>");
                 inline_span(out, fn, if_str(flat.p ? flat.p : "", (u32)flat.n));
+                b_drop(&flat);
                 b_puts(out, "</p>\n</blockquote>\n");
                 i = j;
             }
@@ -593,16 +637,18 @@ static void blocks_win(B *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
 }
 
 static void blocks_str(B *out, Fn *fn, IfStr s, u32 depth) {
-    /* 行配列へ割り切る（入力を切片化、コピーなし） */
+    /* 行配列へ割り切る（入力を切片化、コピーなし）。
+     * 配列はブロック解析中のみ生きるので malloc 系で畳む（arena 残留はしない） */
     Ln *ls = NULL; u32 n = 0, cap = 0;
     u32 st = 0;
     for (u32 p = 0; p <= s.n; p++) {
         if (p == s.n || s.p[p] == '\n') {
             if (p == s.n && st == s.n && s.n) break; /* 終端 LF の幻空行は行と数えない */
             if (n >= cap) {
-                u64 c2 = cap;
-                ls = (Ln *)if_arena_grow(out->a, ls, &c2, n + 1, sizeof(Ln));
-                cap = (u32)c2;
+                u32 c2 = cap ? cap * 2 : 64;
+                Ln *nl = (Ln *)realloc(ls, (u64)c2 * sizeof(Ln));
+                if (!nl) if_fatal("md: lines oom");
+                ls = nl; cap = c2;
             }
             ls[n].p = s.p + st;
             ls[n].n = p - st;
@@ -611,6 +657,7 @@ static void blocks_str(B *out, Fn *fn, IfStr s, u32 depth) {
         }
     }
     blocks_win(out, fn, ls, 0, n, depth);
+    free(ls);
 }
 
 void if_md_to_html(IfArena *a, IfStr in, IfStr *out_html) {
@@ -628,6 +675,7 @@ void if_md_to_html(IfArena *a, IfStr in, IfStr *out_html) {
     fn.a = a;
     B out; b_init(&out, a);
     blocks_str(&out, &fn, if_str(norm.p ? norm.p : "", (u32)norm.n), 0);
+    b_drop(&norm); /* 正規化ステージは消費され次第解放（realloc heap） */
     /* 脚注セクション（参照されたものだけ、参照順） */
     if (fn.n_refs) {
         b_puts(&out, "<section class=\"footnotes\">\n<hr>\n<ol>\n");
@@ -645,6 +693,8 @@ void if_md_to_html(IfArena *a, IfStr in, IfStr *out_html) {
         }
         b_puts(&out, "</ol>\n</section>\n");
     }
-    out_html->p = out.p ? out.p : "";
-    out_html->n = (u32)out.n;
+    fn_free(&fn); /* 脚注の所有コピーは emit 後に畳む（norm 解放規約の対） */
+    IfStr fin = b_finish(&out);
+    out_html->p = fin.p;
+    out_html->n = fin.n;
 }

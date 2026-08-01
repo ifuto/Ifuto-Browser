@@ -4,6 +4,7 @@
 #include "ifuto_pages.h"
 #include "chrome.h"
 #include "store.h"
+#include "raster.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -72,8 +73,9 @@ static void page_settings(HB *b, struct IfChrome *c) {
     hb_s(b, "viewport 窓        : grid は文書全体を保持しない（行窓・再利用）\n");
     hb_s(b, "巨大文書           : 512MB 入力 budget（超過は OOM ではなく綺麗な fail。docs: BENCH.md 巨大 IDM 計測）\n");
     hb_s(b, "</pre><h2>描画</h2><pre>");
-    hb_s(b, "CPU/GPU 自動判定   : 起動時マイクロベンチで最速の raster backend を選択\n");
-    hb_s(b, "                     （この端末での決定は ifuto://memory の表示欄に出ます）\n");
+    hb_s(b, "CPU/GPU 自動判定   : GUI 起動時（TUI ではこの表示の初回表示時）マイクロベンチで\n");
+    hb_s(b, "                     最速の raster fill kernel を選択。GPU は純 libc 方針により非接続\n");
+    hb_s(b, "                     （この端末での決定と全候補の実測値は ifuto://memory の表示欄）\n");
     hb_s(b, "</pre><h2>切替手段</h2><pre>");
     hb_s(b, "akl CoJIT OFF      : アプリ埋込 API akl_set_cojit(rt, 0)（監査・差分検証用途）\n");
     hb_s(b, "CSS 索引 OFF       : if_css_set_naive_matching(1)（同）\n");
@@ -173,6 +175,36 @@ static void page_memory(HB *b, struct IfChrome *c) {
     hb_s(b, "<p>方針（ユーザ法則）: 「メモリは使わなければ使わないほど良い」"
         "— arena はタブ寿命で保持し、view は再レイアウトで破棄・再構築。"
         "巨大 IDM の正確な係数（実測）は BENCH.md の「巨大 IDM 計測」節。</p>");
+
+    /* raster backend 決定欄（ifuto://settings の約束「この端末での決定は
+     * ifuto://memory の表示欄に出ます」をここで果たす） */
+    const IfRasterPick *rp = if_raster_autodetect();
+    char num[64];
+    hb_s(b, "<hr><h2>raster backend（起動時 microbench 決定）</h2><pre>");
+    hb_s(b, "選択: ");
+    hb_s(b, rp->selected >= 0 && rp->selected < rp->n_cand
+            ? rp->name[rp->selected] : "(bench 不能のため既定)");
+    hb_s(b, "  [bench 総時間 ");
+    hb_u64(b, rp->bench_us);
+    hb_s(b, " us, バッファ 512 KiB, 加重 0.7*白bg+0.3*非均一]\n");
+    hb_s(b, "kernel            白bg(均一)      非均一色        score\n");
+    for (int k = 0; k < rp->n_cand; k++) {
+        hb_s(b, "  ");
+        hb_s(b, rp->name[k] ? rp->name[k] : "?");
+        hb_s(b, k == rp->selected ? " *" : "  ");
+        int w = (int)strlen(rp->name[k] ? rp->name[k] : "?");
+        for (int s2 = w; s2 < 15; s2++) hb_s(b, " ");
+        hb_s(b, " ");
+        hb_put(b, num, (u32)snprintf(num, sizeof num, "%10.0f MB/s", rp->mb_uniform[k]));
+        hb_s(b, "  ");
+        hb_put(b, num, (u32)snprintf(num, sizeof num, "%10.0f MB/s", rp->mb_mixed[k]));
+        hb_s(b, "  ");
+        hb_put(b, num, (u32)snprintf(num, sizeof num, "%10.0f", rp->score[k]));
+        hb_s(b, "\n");
+    }
+    hb_s(b, "GPU : ");
+    hb_s(b, rp->gpu_note);
+    hb_s(b, "\n（数値は起動ごとにこの端末で実測。他機種・他環境との比較根拠には使わない）</pre>");
 }
 
 /* ---- about ---- */
