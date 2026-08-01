@@ -256,6 +256,13 @@ typedef struct {
     u8 direct_all;         /* 現行の全グリフが IF_LF_DIRECT_BYTES 条件を満たす */
 } IfWrap;
 
+/* direct のみ版（gw は呼出側が処理済み） */
+static inline void wrap_note_direct2(IfWrap *w, const u8 *base, u32 from, u32 to, u32 cp) {
+    if (cp == IF_CP_REPLACEMENT &&
+        !(to - from == 3 && base[from] == 0xEF && base[from + 1] == 0xBF && base[from + 2] == 0xBD))
+        w->direct_all = 0;
+}
+
 /* デコード済み 1 グリフの byte-direct 妥当性を畳み込む。
  * 条件: gw>0（gw==0 はセルを生成しないためバイト列とセル列が乖離する）かつ
  * U+FFFD 置換発生時は元バイトが正に EF BF BD（enc∘dec 恒等の唯一の許容例）。 */
@@ -495,6 +502,130 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
     w->line_w = cx;
 }
 
+/* 3バイト UTF-8 の inline デコード（有効な CJK のみ命中。不正形は従来デコーダへ。
+ * E0/ED の overlong/サロゲート規則は if_utf8_decode と同値の除外） */
+static inline bool lw_decode3(const u8 *s, u32 n, u32 *io, u32 *cp_out) {
+    u32 i = *io;
+    u8 b0 = s[i];
+    if (__builtin_expect(b0 >= 0xE0 && b0 <= 0xEF && i + 2 < n, 1)) {
+        u8 b1 = s[i + 1], b2 = s[i + 2];
+        if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 &&
+            !((b0 == 0xE0 && b1 < 0xA0) || (b0 == 0xED && b1 > 0x9F))) {
+            *cp_out = ((u32)(b0 & 0x0F) << 12) | ((u32)(b1 & 0x3F) << 6) | (u32)(b2 & 0x3F);
+            *io = i + 3;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* IFC 全収まり高速経路: run 内の全ピースが content_w に収まり、br/pre/特例文字を
+ * 含まないとき、アトム化ループなしで単一走査のまま確定する（IDM 型短文書で ~85% 命中）。
+ * 同値性: 押し出す seg 列・幅会計・空白折畳・direct/any/lh 畳込みは wrap 連鎖と逐語同一
+ * （違いは「折返し判定が発火しないことが先に証明される」点のみ）。失敗時は push した
+ * seg を LIFO rewind して完全ロールバックし、従来経路へ無痕で戻る。 */
+static bool ifc_try_fit(IfWrap *w, const IfFlat *f, const IfStyle *base_st,
+                        i32 content_w, float *max_lh_io, bool *any_io) {
+    u32 n_segs0 = w->n_segs;
+    i32 lw0 = w->line_w;
+    u8 d0 = w->direct_all;
+    bool any0 = *any_io;
+    float lh0 = *max_lh_io;
+    i32 cx = w->line_w;
+    bool pre0 = base_st && base_st->white_space == IF_WS_PRE;
+
+    for (u32 p = 0; p < f->n_pieces; p++) {
+        const IfStyle *st = f->pieces[p].st ? f->pieces[p].st : base_st;
+        bool pre_p = (f->pieces[p].st && f->pieces[p].st->white_space == IF_WS_PRE) || pre0;
+        if (f->pieces[p].br || pre_p) goto fail;
+        /* wrap_text 冒頭の lh 畳込みと同じもの（ピース到着で必ず畳む） */
+        float fs = st ? st->font_size : 16.0f;
+        float lh = st && st->line_height > 0.0f ? st->line_height : fs * 1.2f;
+        if (lh > *max_lh_io) *max_lh_io = lh;
+
+        IfStr t = f->pieces[p].text;
+        const u8 *s = (const u8 *)t.p;
+        u32 n = t.n;
+        u32 i = 0;
+        while (i < n) {
+            u8 b0 = s[i];
+            if (b0 == ' ' || b0 == '\t' || b0 == '\n' || b0 == '\r' || b0 == '\f') {
+                /* ASCII 可視以外の空白 run（折畳は wrap 版と逐語同一） */
+                u32 j = i + 1;
+                while (j < n && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' ||
+                                 s[j] == '\r' || s[j] == '\f')) j++;
+                if (cx > 0 && cx < w->content_w) {
+                    if (s[j - 1] == ' ') wrap_push_merge(w, (const char *)s + j - 1, 1,
+                                                       w->content_x + cx, 1, st);
+                    else wrap_push_seg(w, IF_S(" "), w->content_x + cx, 1, st);
+                    cx += 1;
+                }
+                i = j;
+                continue;
+            }
+            if (__builtin_expect(b0 >= 0x21 && b0 <= 0x7E, 1)) {
+                /* ASCII 可視ラン（wrap のアトム規則と同じく 0x21-0x7E の連続） */
+                u32 j = i + 1;
+                while (j < n) { u8 cc = s[j]; if (cc < 0x21 || cc > 0x7E) break; j++; }
+                wrap_push_merge(w, (const char *)s + i, j - i, w->content_x + cx,
+                                (i32)(j - i), st);
+                cx += (i32)(j - i);
+                *any_io = true;
+                i = j;
+            } else {
+                u32 pos = i, cp;
+                bool ok3 = lw_decode3(s, n, &pos, &cp);
+                if (ok3) {
+                    /* 3バイトグリフランの融合: 同一ピース内・ソース連続・同 st で wrap が
+                     * rx しない幅合計のみなので、最終 seg 系列は「個別 push → merge」
+                     * の結果と逐語同値。先にラン全体を掃き、1 回だけ push する。
+                     * （gw==0 が混ざる場合は従来どおり fail→完全ロールバックで同値） */
+                    int gw = lw_glyph_width(cp);
+                    if (__builtin_expect(gw == 0, 0)) goto fail;
+                    wrap_note_direct2(w, s, i, pos, cp);
+                    u32 rend = pos;
+                    i32 rw = gw;
+                    while (rend < n) {
+                        u32 p2 = rend, cp2;
+                        if (!lw_decode3(s, n, &p2, &cp2)) break;
+                        int gw2 = lw_glyph_width(cp2);
+                        if (__builtin_expect(gw2 == 0, 0)) goto fail;
+                        wrap_note_direct2(w, s, rend, p2, cp2);
+                        rw += gw2;
+                        rend = p2;
+                    }
+                    wrap_push_merge(w, (const char *)s + i, rend - i, w->content_x + cx, rw, st);
+                    cx += rw;
+                    *any_io = true;
+                    i = rend;
+                } else {
+                    u32 save = i;
+                    cp = if_utf8_decode(s, n, &save);
+                    pos = save;
+                    int gw = lw_glyph_width(cp);
+                    if (__builtin_expect(gw == 0, 0)) goto fail; /* 制御/結合は特例経路へ */
+                    wrap_note_direct2(w, s, i, pos, cp);
+                    wrap_push_merge(w, (const char *)s + i, pos - i, w->content_x + cx, gw, st);
+                    cx += gw;
+                    *any_io = true;
+                    i = pos;
+                }
+            }
+            if (__builtin_expect(cx > content_w, 0)) goto fail;
+        }
+    }
+    w->line_w = cx;
+    return true;
+
+fail:
+    while (w->n_segs > n_segs0) wrap_pop_last_seg(w);
+    w->line_w = lw0;
+    w->direct_all = d0;
+    *any_io = any0;
+    *max_lh_io = lh0;
+    return false;
+}
+
 /* インライン run の先頭ノードから連続するインラインレベルを IFC に流し込み、
  * run の次のノード（ブロック or NULL）を返す。 */
 static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *base_st,
@@ -516,7 +647,8 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
                  : base_st ? base_st->font_size * 1.2f : 16.0f * 1.2f;
     bool any_text = false;
     bool pre = base_st && base_st->white_space == IF_WS_PRE;
-    for (u32 p = 0; p < f.n_pieces; p++) {
+    bool fitted = ifc_try_fit(&w, &f, base_st, content_w, &max_lh, &any_text);
+    for (u32 p = 0; !fitted && p < f.n_pieces; p++) {
         if (f.pieces[p].br) {
             wrap_end_line(&w, max_lh);
             max_lh = base_st && base_st->line_height > 0.0f ? base_st->line_height
