@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h> /* realloc/free（string backend のステージング解放規約） */
+#include <pthread.h> /* 2-way 並列 fast parse（glibc>=2.34 で libc 内。ldd 不変） */
 
 #if defined(__SSE2__) || (defined(__x86_64__) && !defined(IFUTO_NO_SIMD))
 #define IF_MD_SIMD 1
@@ -91,6 +92,7 @@ typedef struct {
     char *c_buf;          /* 複製バッファ（heap。flush ごとに使い回し） */
     u32 c_n, c_cap;
     u8 mode;              /* 0=empty 1=borrow 2=copy */
+    u32 n_nodes;          /* ノード数のローカル計数（並列時はスレッド別。join で合算） */
     /* node slab: 生成は直列 bump（ノード単位の arena 呼出を slab refill に畳む） */
     IfNode *nslab, *nslab_end;
 } Mo;
@@ -181,18 +183,20 @@ static inline void run_add_ch(Mo *m, char c) {
 
 static inline IfNode *mnew(Mo *m, IfNodeKind kind) {
     u64 _t0; if (mpf()) _t0 = if_rdtsc_md(); else _t0 = 0;
-    IfDom *d = m->dom;
     IfNode *n;
+    /* ノード数は Mo ローカルに計数（2-way 並列で dom 共有カウンタの競合を構造排除）。
+     * 並列時の T5 同値性: 合計 na+nb >= cap ⟺ 逐語走査が cap に到達、のため
+     * 「ローカル >= cap → taint」は保守側であり合計判定で厳密に一致させる（join 参照）。 */
     if (__builtin_expect(m->nslab != m->nslab_end, 1)) {
         n = m->nslab++;
     } else {
-        if (__builtin_expect(d->n_nodes >= IF_MAX_DOM_NODES, 0)) { mo_taint(m); return NULL; }
+        if (__builtin_expect(m->n_nodes >= IF_MAX_DOM_NODES, 0)) { mo_taint(m); return NULL; }
         n = (IfNode *)if_arena_bump(m->a, 128 * sizeof(IfNode));
         m->nslab = n + 1;
         m->nslab_end = n + 128;
     }
-    if (__builtin_expect(d->n_nodes >= IF_MAX_DOM_NODES, 0)) { mo_taint(m); return NULL; }
-    d->n_nodes++;
+    if (__builtin_expect(m->n_nodes >= IF_MAX_DOM_NODES, 0)) { mo_taint(m); return NULL; }
+    m->n_nodes++;
     n->kind = kind;
     n->tag = 0; n->ns = IF_NS_HTML; n->flags = 0;
     n->attrs = NULL; n->n_attrs = 0;
@@ -240,7 +244,9 @@ typedef struct {
     u32 nattr;
 } MoPend;
 
-static MoPend g_pend; /* emission は単一スレッド・直列（再帰内で open 完結してから深く潜る） */
+/* emission はスレッド内直列（再帰内で open 完結してから深く潜る）。
+ * 2-way 並列のため __thread 局所化（各スレッドの emission は独立に完結する） */
+static __thread MoPend g_pend;
 
 static void mo_open(Mo *m, u16 tag, const char *name, u32 nl) {
     /* string backend: バイト列は厳密に従来どおり "<name" + 属性 + ">" */
@@ -570,7 +576,9 @@ static IfStr scratch_cat(char **slot, const char *prefix, u32 pn, IfStr id,
     p[pn + id.n + sn] = 0;
     return if_str(p, pn + id.n + sn);
 }
-static char *g_scr1, *g_scr2;
+/* スレッド局所（2-way 並列）。ワーカ終了時の 2 バッファのみ回収されない
+ * 既知の小リーク（既存のプロセス寿命解放規約と整合。CLI は 1 発実行） */
+static __thread char *g_scr1, *g_scr2;
 
 static bool try_link(Mo *out, Fn *fn, IfStr s, u32 *adv) {
     u32 i = 1;
@@ -626,7 +634,7 @@ static bool try_link(Mo *out, Fn *fn, IfStr s, u32 *adv) {
     return true;
 }
 
-static int inl_depth = 0;
+static __thread int inl_depth = 0; /* inline_span 再帰深（スレッド局所） */
 static void inline_span(Mo *out, Fn *fn, IfStr s) {
     u64 _t0 = 0; bool _top = false;
     if (mpf() && inl_depth++ == 0) { _t0 = if_rdtsc_md(); _top = true; }
@@ -911,7 +919,7 @@ static void emit_para_lines(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi) {
     mo_text_ch(out, '\n');
 }
 
-static int bw_depth = 0;
+static __thread int bw_depth = 0; /* prof 括弧の深さ（スレッド局所） */
 static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
     u64 _t0 = 0; bool _top = false;
     if (mpf() && bw_depth++ == 0) { _t0 = if_rdtsc_md(); _top = true; }
@@ -1281,7 +1289,7 @@ void if_md_to_html(IfArena *a, IfStr in, IfStr *out_html) {
 /* 高速経路: Markdown → DOM 直構築。
  * taint（T1..T5）を観測したら false を返して中間物を捨てる（呼び出し側が
  * 従来の 2 段経路で処理する。正しさは常に本パーサ側に集約）。 */
-bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
+static bool if_md_parse_fast_serial(IfArena *a, IfStr in, IfDom **out_dom) {
     /* T4: input NUL はトークナイザと意味が分かれるので fallback */
     if (in.n && memchr(in.p, 0, in.n)) return false;
     Mo m;
@@ -1318,6 +1326,7 @@ bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
     m.stk[1] = body;
     m.sp = 2;
     m.cur = body;
+    m.n_nodes = dom->n_nodes;
 
     Fn fn;
     memset(&fn, 0, sizeof fn);
@@ -1329,6 +1338,7 @@ bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
     fn_free(&fn);
     free(m.c_buf);
     if (m.tainted) return false;
+    dom->n_nodes = m.n_nodes;
     /* 純ブロック容器直下の ws-only TEXT を意図的に剥がした DOM（INV: 描画不寄与物は
      * DOM しない）。layout はこのビットを見て、当該容器内の兄弟マージン相殺を
      * 「ws TEXT が間にあった旧 DOM と逐語同じ」結果（相殺無効＝mt のみ）に補正する。 */
@@ -1336,3 +1346,228 @@ bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
     *out_dom = dom;
     return true;
 }
+
+/* ---- 2-way 並列 fast parse ----
+ * 分割スキャン: fence 状態機械を真に追跡し、「直前が空行 ∧ fence 外 ∧ 先頭非空行」
+ * の最初の行頭（入力中央以降）を分割点として返す。見つからなければ NULL。
+ * 同値証明の骨格:
+ *  - md のブロック構造（段落/リスト/表/引用/脚注定義）は全て真の空行で硬く壁に
+ *    区切られる（空行を跨いで継続する構造は実装上存在しない。引用は '>' 非空行のみ
+ *    継続、リスト children は非空 ∧ 深インデントのみ継続、表は空行で終了）。
+ *  - 唯一空行を跨ぐのは fence（```/~~~）のみ。depth-0 の fence 状態は「先頭非空白が
+ *    `/~ で 3 連以上」の行のトグルで追跡できる（ln_fence と同じ述語を再適用）。
+ *    引用/リスト内の fence は '>'/マーカー/深インデントを持ち、この述語では
+ *    開かないか、偶発的に開いても「余分に開く方向」にしか働かない（保守側。
+ *    真の空行を nested fence が跨ぐことはない → 空行直上の分割点では常に
+ *    シミュレーションと実パーサの fence 状態が一致する）。
+ *  - 脚注は "[^" が入力に無いことを別査定し、参照番号の文書順共有状態を排除。
+ *    （fence 内テキスト中の "[^" も保守的に検出して単走査へ逃げる）
+ * 検証は oracle sha256（2mb/16mb）＋全テストが機械固定する。 */
+static const char *md_par_scan(const char *p, u32 n) {
+    /* 脚注ゲート＋CR ゲート＋fence 状態機械を 1 本の SIMD 前パスで済ませる。
+     * （memchr-per-line/per-'[' の呼出コストを構造消去。見つからなければ NULL） */
+    bool in_fence = false;
+    char fsym = 0;
+    bool prev_blank = true; /* 先頭はブロック境界として開始 */
+    u32 off = 0;            /* 現在行の先頭 */
+    u32 i = 0;
+#ifdef IF_MD_SIMD
+    const __m128i v_nl = _mm_set1_epi8('\n'), v_cr = _mm_set1_epi8('\r'),
+                  v_ca = _mm_set1_epi8('^');
+    for (; i + 16 <= n; i += 16) {
+        __m128i b = _mm_loadu_si128((const __m128i *)(p + i));
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(b, v_cr))) return NULL; /* CR → 単走査（正規化が必要） */
+        unsigned carets = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(b, v_ca));
+        while (carets) { /* "[^" 検出は希少文字 '^' 駆動（隣接確認のみ） */
+            u32 k = (u32)__builtin_ctz(carets);
+            carets &= carets - 1;
+            if (i + k > 0 && p[i + k - 1] == '[') return NULL;
+        }
+        unsigned nls = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(b, v_nl));
+        while (nls) {
+            u32 k = (u32)__builtin_ctz(nls);
+            nls &= nls - 1;
+            u32 e = i + k; /* 行 [off, e) を確定 */
+            Ln l = { p + off, e - off };
+            u32 w = 0;
+            while (w < l.n && (l.p[w] == ' ' || l.p[w] == '\t')) w++;
+            bool blank = (w == l.n); /* ln_blank は ' '/'\t' のみ空白視 → 同値 */
+            if (in_fence) {
+                if (!blank) {
+                    char s2;
+                    if (ln_fence(l, &s2) && s2 == fsym) in_fence = false;
+                }
+            } else {
+                if (!blank) {
+                    char s2;
+                    if (ln_fence(l, &s2)) { in_fence = true; fsym = s2; }
+                    else if (prev_blank && off >= n / 2)
+                        return p + off; /* 最初の安全なブロック境界（中央以降） */
+                }
+            }
+            prev_blank = blank;
+            off = e + 1;
+        }
+    }
+#endif
+    for (; i < n; i++) { /* 尾（SIMD 未対応環境は全行こちら） */
+        char c = p[i];
+        if (c == '\r') return NULL;
+        if (c == '^' && i > 0 && p[i - 1] == '[') return NULL;
+        if (c != '\n') continue;
+        u32 e = i;
+        Ln l = { p + off, e - off };
+        u32 w = 0;
+        while (w < l.n && (l.p[w] == ' ' || l.p[w] == '\t')) w++;
+        bool blank = (w == l.n);
+        if (in_fence) {
+            if (!blank) {
+                char s2;
+                if (ln_fence(l, &s2) && s2 == fsym) in_fence = false;
+            }
+        } else {
+            if (!blank) {
+                char s2;
+                if (ln_fence(l, &s2)) { in_fence = true; fsym = s2; }
+                else if (prev_blank && off >= n / 2)
+                    return p + off;
+            }
+        }
+        prev_blank = blank;
+        off = e + 1;
+    }
+    return NULL;
+}
+
+typedef struct {
+    IfArena *a;
+    IfDom *dom;
+    IfNode *html, *stub;
+    const char *full_p;
+    u32 full_n;
+    IfStr slice;
+    bool tainted;
+    u32 n_nodes;
+} MdSliceJob;
+
+static void *md_slice_run(void *arg) {
+    MdSliceJob *j = (MdSliceJob *)arg;
+    Mo mb;
+    memset(&mb, 0, sizeof mb);
+    mb.a = j->a;
+    mb.is_dom = true;
+    mb.dom = j->dom;
+    mb.stk[0] = j->html;
+    mb.stk[1] = j->stub;
+    mb.sp = 2;
+    mb.cur = j->stub;
+    mo_range(&mb, j->full_p, j->full_n);
+    Fn fnb;
+    memset(&fnb, 0, sizeof fnb);
+    fnb.a = j->a;
+    fnb.is_dom = true;
+    blocks_str(&mb, &fnb, j->slice, 0);
+    run_flush(&mb);
+    fn_free(&fnb);
+    free(mb.c_buf);
+    j->tainted = mb.tainted;
+    j->n_nodes = mb.n_nodes;
+    free(g_scr1); free(g_scr2); /* TLS スクラッチはワーカ寿命で解放（LSan 清浄） */
+    g_scr1 = g_scr2 = NULL;
+    return NULL;
+}
+
+/* DOM 直構築の入口: 安全分割点が見つかれば 2-way 並列、なければ従来の単走査。
+ * 並列でも生成される DOM/フラグは単走査と逐語同値（分割点の証明は md_par_scan、
+ * 接合規約は下記。検証: oracle sha256＋全テスト＋ASan が機械固定）。 */
+bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
+    if (in.n >= (1u << 20)) {
+        const char *ep = getenv("IF_MD_PAR");
+        bool par_on = !(ep && ep[0] == '0'); /* 殺しスイッチ（調査用。既定は並列） */
+        if (par_on && !(in.n && memchr(in.p, 0, in.n)) && !memchr(in.p, '\r', in.n)) {
+            const char *splitp = md_par_scan(in.p, in.n);
+            if (splitp && splitp > in.p) {
+                /* scaffold（serial と同一形状をここでも構築） */
+                Mo m;
+                memset(&m, 0, sizeof m);
+                m.a = a;
+                m.is_dom = true;
+                IfDom *dom = (IfDom *)if_arena_calloc(a, sizeof(IfDom));
+                dom->arena = a;
+                dom->n_nodes = 1;
+                IfNode *root = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
+                root->kind = IF_NODE_DOCUMENT;
+                dom->root = root;
+                dom->quirks = true;
+                dom->n_errors = 1;
+                m.dom = dom;
+                IfNode *html = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
+                html->kind = IF_NODE_ELEMENT; html->tag = IF_TAG_HTML; html->ns = IF_NS_HTML;
+                html->u.tag_name = IF_S("html");
+                dom->n_nodes++;
+                mattach(root, html);
+                IfNode *head = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
+                head->kind = IF_NODE_ELEMENT; head->tag = IF_TAG_HEAD; head->ns = IF_NS_HTML;
+                head->u.tag_name = IF_S("head");
+                dom->n_nodes++;
+                mattach(html, head);
+                IfNode *body = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
+                body->kind = IF_NODE_ELEMENT; body->tag = IF_TAG_BODY; body->ns = IF_NS_HTML;
+                body->u.tag_name = IF_S("body");
+                dom->n_nodes++;
+                mattach(html, body);
+                m.stk[0] = html;
+                m.stk[1] = body;
+                m.sp = 2;
+                m.cur = body;
+                m.n_nodes = dom->n_nodes;
+
+                Fn fn;
+                memset(&fn, 0, sizeof fn);
+                fn.a = a;
+                fn.is_dom = true;
+
+                /* B 側は専用 arena + stub body（mattach が実 body に触れないように） */
+                IfArena ab;
+                if_arena_init(&ab, 1u << 22);
+                IfNode *stub = (IfNode *)if_arena_calloc(&ab, sizeof(IfNode));
+                stub->kind = IF_NODE_ELEMENT; stub->tag = IF_TAG_BODY; stub->ns = IF_NS_HTML;
+                stub->u.tag_name = IF_S("body");
+                MdSliceJob j;
+                j.a = &ab; j.dom = dom; j.html = html; j.stub = stub;
+                j.full_p = in.p; j.full_n = in.n;
+                j.slice = if_str(splitp, (u32)(in.p + in.n - splitp));
+                j.tainted = false; j.n_nodes = 0;
+
+                pthread_t th;
+                int rc = pthread_create(&th, NULL, md_slice_run, &j);
+                mo_range(&m, in.p, in.n);
+                blocks_str(&m, &fn, if_str(in.p, (u32)(splitp - in.p)), 0);
+                run_flush(&m);
+                if (rc == 0) pthread_join(th, NULL);
+                else md_slice_run(&j); /* 生成失敗時は同じ分割を直列実行（結果は同値） */
+                fn_free(&fn);
+                free(m.c_buf);
+                u32 total = m.n_nodes + j.n_nodes;
+                bool tainted = m.tainted || j.tainted || total >= IF_MAX_DOM_NODES;
+                if_arena_absorb(a, &ab); /* B 側の全確保を主 arena の寿命に畳む */
+                if_arena_destroy(&ab);
+                if (tainted) return false; /* 2 段経路が同じ結論へ至る（T5 含む） */
+                /* body 子列の接合: A 末尾 → B stub 先頭。B 直下の parent を実 body へ */
+                if (stub->first_child) {
+                    if (!body->first_child) body->first_child = stub->first_child;
+                    else body->last_child->next_sibling = stub->first_child;
+                    body->last_child = stub->last_child;
+                    for (IfNode *c = stub->first_child; c; c = c->next_sibling)
+                        c->parent = body;
+                }
+                dom->n_nodes = total;
+                dom->md_ws_stripped = 1;
+                *out_dom = dom;
+                return true;
+            }
+        }
+    }
+    return if_md_parse_fast_serial(a, in, out_dom);
+}
+

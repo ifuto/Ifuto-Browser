@@ -25,6 +25,17 @@ void if_arena_init(IfArena *a, u64 default_cap) {
     a->total_reserved = 0;
 }
 
+void if_arena_absorb(IfArena *dst, IfArena *src) {
+    if (!src->head) return;
+    IfArenaBlock *t = src->head;
+    while (t->next) t = t->next;
+    t->next = dst->head;
+    dst->head = src->head;
+    dst->total_reserved += src->total_reserved;
+    src->head = NULL;
+    src->total_reserved = 0;
+}
+
 static IfArenaBlock *if_arena_new_block(IfArena *a, u64 need) {
     u64 cap = a->default_cap;
     if (need > cap) cap = need;

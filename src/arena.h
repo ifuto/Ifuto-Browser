@@ -31,6 +31,10 @@ void *if_arena_alloc(IfArena *a, u64 size);            /* 未初期化, 16B alig
 void *if_arena_calloc(IfArena *a, u64 size);           /* ゼロ初期化 */
 void  if_arena_destroy(IfArena *a);
 u64   if_arena_reserved(const IfArena *a);
+/* src の全ブロックを dst の解放チェーンへ寄贈（src は空に。dst の bump 現端は不変）。
+ * 並列 parse のスレッド別 arena を join 時に主 arena へ畳み込み、
+ * 「if_arena_destroy で一括解放」の寿命規約を維持する。 */
+void  if_arena_absorb(IfArena *dst, IfArena *src);
 
 /* 可変長配列用の小さなヘルパ: *ptr (*cap 要素, elem サイズ esz) を need まで倍増。
  * arena は realloc できないので、コピー移動し旧領域は捨てる（ページ寿命内なら損失は軽微）。 */
