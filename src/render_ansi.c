@@ -622,6 +622,29 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
     u32 di = 0, li = 0;
 
     for (i32 r = 0; r < my; r++) {
+        if (!ansi) {
+            /* ギャップ一括充填: 次の LINE 到達までの区間 [r, nl_y) に
+             * (a) active の非 BG deco、(b) 新たに開始する非 BG deco が無ければ、
+             * 各行の発行は '\n' のみ（BG は no-ansi で不可視、cp_free/BG-only 規約と同値）。
+             * di/active はここでは消費せず次行の正規経路に委ねるため状態は同期する。 */
+            i32 nl_y = (li < lay->n_lines) ? lay->lines[li]->y : my;
+            if (nl_y > r) {
+                bool clean = true;
+                for (u32 k = 0; k < n_active; k++)
+                    if (active[k]->kind != IF_DECO_BG) { clean = false; break; }
+                if (clean)
+                    for (u32 d2 = di; d2 < lay->n_deco && lay->deco[d2].y < nl_y; d2++)
+                        if (lay->deco[d2].kind != IF_DECO_BG) { clean = false; break; }
+                if (clean) {
+                    u64 gap = (u64)(nl_y - r);
+                    bb_ensure(&bb, gap);
+                    memset(bb.p + bb.n, '\n', (size_t)gap);
+                    bb.n += gap;
+                    r = nl_y - 1;
+                    continue;
+                }
+            }
+        }
         /* deco の開始（y==r）は追記順に active へ */
         while (di < lay->n_deco && lay->deco[di].y <= r) {
             const IfDeco *d = &lay->deco[di++];
@@ -672,9 +695,29 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
                 bb_ch(&bb, '\n');
                 continue;
             }
-            if (has_line && fastable &&
-                row_emit_fast(&bb, lay, &li, active, n_active, mx, r))
-                continue;
+            if (has_line && fastable) {
+                /* 単一 seg 直行: row_emit_fast の nr==1/クリップ無し特例と逐語同値
+                 * （gap 空白→bb_put→trim→'\n'。IDM では内容行の大多数がこの形。
+                 *   cp_free（active が BG のみ）なら no-ansi 可視物は seg のみで同値） */
+                const IfBox *b0 = lay->lines[li];
+                if (cp_free &&
+                    (b0->_pad[0] & IF_LF_DIRECT_BYTES) && b0->n_segs == 1 &&
+                    b0->segs[0].x >= 0 && b0->segs[0].x + b0->segs[0].w <= mx &&
+                    !(li + 1 < lay->n_lines && lay->lines[li + 1]->y == r)) {
+                    u64 mark = bb.n;
+                    i32 gx = b0->segs[0].x;
+                    bb_ensure(&bb, (u64)gx + b0->segs[0].text.n + 8);
+                    if (gx) { memset(bb.p + bb.n, ' ', (size_t)gx); bb.n += (u64)gx; }
+                    memcpy(bb.p + bb.n, b0->segs[0].text.p, b0->segs[0].text.n);
+                    bb.n += b0->segs[0].text.n;
+                    while (bb.n > mark && bb.p[bb.n - 1] == ' ') bb.n--;
+                    bb.p[bb.n++] = '\n';
+                    li++;
+                    continue;
+                }
+                if (row_emit_fast(&bb, lay, &li, active, n_active, mx, r))
+                    continue;
+            }
         }
         /* 行構成: [0,maxx] だけ既定充填（ansi は全幅必要） */
         i32 maxx = mx;
