@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <pthread.h> /* 2-way 並列 layout（md fast-DOM のみ。glibc>=2.34 で ldd 不変） */
 
 
 /* ---- (style, avail_w) 幾何キャッシュ ---- */
@@ -71,6 +72,7 @@ typedef struct {
     IfGeomCache *geom;
     IfLayout *lay;       /* lines ログ記録先 */
     u8 md_ws_stripped;   /* dom->md_ws_stripped のコピー（下記 mo_ws_sink 対応補正用） */
+    IfNode *stop;        /* 並列シャードの spine 打ち止め（NULL=従来どおり兄弟末尾まで） */
 } IfLC;
 
 /* md.c の mo_ws_sink と同じタグ集合（ md fast-DOM はこれら直下の ws-only TEXT を
@@ -694,7 +696,7 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
     u32 li_ord = 0; /* ol 番号: この親の LIST_ITEM li を出現順に数える（draw_marker 同値） */
     const IfStyle *base_st = node->style;
     IfNode *c = node->first_child;
-    while (c) {
+    while (c && c != lc->stop) {
         if (c->kind == IF_NODE_ELEMENT && c->style && c->style->display == IF_D_NONE) {
             c = c->next_sibling;
             continue;
@@ -818,6 +820,77 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
     return box;
 }
 
+/* ---- 2-way 並列 layout（md fast-DOM 限定） ----
+ * body 直下の子を 2 分割し、各スレッドが独立に y=content_y から敷き、join で B 側の
+ * 全 y を H_A シフトして連結する。
+ * 同値証明の骨格:
+ *  - body 直下の兄弟マージン相殺は md_ws_stripped DOM では ws_sink 補正により常に
+ *    prev_mb=0（layout_children 参照）→ 分割点で必要な境界補正は 0、H_A 加算で厳密一致。
+ *  - 各子に必要な包含コンテキストは body 由来の不変量（content_x/w・body style）のみ。
+ *  - IfBox に親ポインタは存在しない（接合は first_child/next_sibling の継ぎ目のみで完結）。
+ *  - lines/deco ログは生成順=y 単調非減少 → H_A で区間を分離すれば連結で統合できる。
+ *  - links は A 側の終番から B 側を再採番（collect 順=文書順で同値）。
+ * IfNode は style 適用後で読み取り専用、LC・geom・lay・links は全て shard ローカル。 */
+typedef struct IfLayShard {
+    IfArena *arena;
+    IfNode vbody;          /* 実 body の浅い複製（first_child だけ差し替え） */
+    IfNode *stop;
+    const IfStyle *body_st;
+    i32 content_x, content_y, content_w;
+    i32 bx, by, box_w;     /* body 幾とう（layout_element の計算をドライバが再現） */
+    u8 bsides;
+    i32 width_cells;
+    u8 md_ws_stripped;
+    /* out */
+    IfLayout *lay;
+    i32 content_h;
+    IfBox *vroot;
+    u32 deco_bg, deco_bd;
+} IfLayShard;
+
+static void layout_shard_run_body(IfLayShard *s) {
+    IfArena *arena = s->arena;
+    IfLayout *lay = (IfLayout *)if_arena_calloc(arena, sizeof(IfLayout));
+    lay->arena = arena;
+    lay->width = s->width_cells;
+    IfLC lc = { .arena = arena, .root_fs = 16.0f };
+    lc.geom = (IfGeomCache *)if_arena_calloc(arena, sizeof(IfGeomCache));
+    lc.lay = lay;
+    lc.md_ws_stripped = s->md_ws_stripped;
+    lc.stop = s->stop;
+    IfBox *vroot = new_box(&lc, IF_BOX_BLOCK, NULL, s->body_st);
+    lay->root = vroot;
+    /* body 自身の装飾は paint 順で最初（shard A のみ担当。h は join 後に総量で後埋め） */
+    s->deco_bg = UINT32_MAX;
+    s->deco_bd = UINT32_MAX;
+    if (s->bsides & 0x80) {
+        if (lc.lay) s->deco_bg = deco_add(&lc, IF_DECO_BG, s->bx, s->by, s->box_w, 0,
+                                          s->body_st->bg, NULL, NULL, 0);
+    }
+    if (s->bsides & 0x0F) {
+        if (lc.lay) s->deco_bd = deco_add(&lc, IF_DECO_BORDER, s->bx, s->by, s->box_w, 0,
+                                          s->body_st->border_color, NULL, NULL,
+                                          (u8)(s->bsides & 0x0F));
+    }
+    frame_push(&lc, vroot); /* box_add_child の O(1) tail 経路（layout_element と同じ約款） */
+    i32 h = layout_children(&lc, vroot, &s->vbody, s->content_x, s->content_y, s->content_w);
+    frame_pop(&lc, vroot);
+    s->lay = lay;
+    s->content_h = h;
+    s->vroot = vroot;
+    lay->links = lc.links;
+    lay->n_links = lc.n_links;
+}
+
+static void *layout_shard_thread(void *arg) { layout_shard_run_body(arg); return NULL; }
+
+static void shift_tree(IfBox *b, i32 dy) {
+    for (IfBox *c = b->first_child; c; c = c->next_sibling) {
+        c->y += dy;
+        shift_tree(c, dy);
+    }
+}
+
 IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
     if (width_cells < 4) width_cells = 4;
     IfLayout *lay = (IfLayout *)if_arena_calloc(arena, sizeof(IfLayout));
@@ -838,6 +911,112 @@ IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
 
     float body_fs = body->style ? body->style->font_size : 16.0f;
     i32 body_mt = body->style ? len_v(body->style->margin[0], body_fs, 16.0f, width_cells) : 0;
+
+    /* 並列可否: md fast-DOM（md_ws_stripped）かつ body の直下子が十分に多いこと。
+     * 子数は 2 分割のために一度だけ数える（O(直下子)）。HTML/小文書は従来経路。 */
+    u32 nch = 0;
+    const char *ep = dom->md_ws_stripped ? getenv("IF_LAYOUT_PAR") : NULL;
+    if (dom->md_ws_stripped && !(ep && ep[0] == '0')) {
+        for (IfNode *c = body->first_child; c; c = c->next_sibling) nch++;
+    }
+    if (nch >= 64) {
+        /* body 自身の幾何を layout_element と同じ手順で先に確定する */
+        const IfStyle *bst = body->style ? body->style : &IF_STYLE_FALLBACK;
+        const IfGeomEnt *bg = geom_get(&lc, lc.geom, bst, width_cells);
+        i32 bl = bg->bl, brd = bg->brd, bt = bg->bt, bbo = bg->bbo;
+        i32 pad_l = bg->pl, pad_r = bg->pr, pad_t = bg->pt, pad_b = bg->pb;
+        i32 content_w = bg->content_w;
+        i32 bx = 0 + bg->ml;
+        i32 by = body_mt;
+        i32 content_x = bx + bl + pad_l;
+        i32 content_y = by + bt + pad_t;
+        i32 box_w = bl + pad_l + content_w + pad_r + brd;
+
+        IfNode *mid = body->first_child;
+        for (u32 k = 0; k < nch / 2; k++) mid = mid->next_sibling;
+
+        IfArena ab;
+        if_arena_init(&ab, 1u << 22);
+        IfLayShard sa, sb;
+        memset(&sa, 0, sizeof sa);
+        memset(&sb, 0, sizeof sb);
+        u8 bsides = (u8)(((bst->bg & 0xFF) >= 128 ? 0x80 : 0) |
+                         ((bt ? 1 : 0) | (brd ? 2 : 0) | (bbo ? 4 : 0) | (bl ? 8 : 0)));
+        sa.arena = arena; sa.vbody = *body; sa.stop = mid;
+        sa.body_st = bst; sa.content_x = content_x; sa.content_y = content_y;
+        sa.content_w = content_w; sa.bx = bx; sa.by = by; sa.box_w = box_w;
+        sa.bsides = bsides;  /* 実 body の装飾は A が担当 */
+        sa.width_cells = width_cells; sa.md_ws_stripped = 1;
+        sb.arena = &ab; sb.vbody = *body; sb.vbody.first_child = mid; sb.stop = NULL;
+        sb.body_st = bst; sb.content_x = content_x; sb.content_y = content_y;
+        sb.content_w = content_w; sb.bx = bx; sb.by = by; sb.box_w = box_w;
+        sb.bsides = 0;       /* B は body 装飾を出さない（A のみ） */
+        sb.width_cells = width_cells; sb.md_ws_stripped = 1;
+
+        pthread_t th;
+        int rc = pthread_create(&th, NULL, layout_shard_thread, &sb);
+        layout_shard_run_body(&sa);
+        if (rc == 0) pthread_join(th, NULL);
+        else layout_shard_run_body(&sb); /* 生成失敗時は同じ分割を直列実行（結果は同値） */
+
+        i32 hA = sa.content_h, hB = sb.content_h;
+        i32 content_h = hA + hB;
+        if (bg->height_spec >= 0 && bg->height_spec > content_h)
+            content_h = bg->height_spec; /* 指定高はクリップせず拡張のみ（layout_element 同値） */
+
+        /* B の全 y を H_A シフト（lines は DFS で確実に捕捉、deco は配列で） */
+        shift_tree(sb.vroot, hA);
+        for (u32 i = 0; i < sb.lay->n_deco; i++) sb.lay->deco[i].y += hA;
+
+        IfLayout *lay2 = sa.lay;
+        /* 実 body box（layout_element と同一公式） */
+        IfBox *root = new_box(&lc, IF_BOX_BLOCK, body, bst);
+        root->x = bx;
+        root->y = by;
+        root->w = box_w;
+        root->h = bt + pad_t + content_h + pad_b + bbo;
+        /* 子列の接合: A 末尾 → B 先頭（vroot は破棄） */
+        root->first_child = sa.vroot->first_child;
+        IfBox *last = root->first_child;
+        if (last) { while (last->next_sibling) last = last->next_sibling; }
+        if (last) last->next_sibling = sb.vroot->first_child;
+        else root->first_child = sb.vroot->first_child;
+        lay2->root = root;
+        lay2->height = root->y + root->h;
+        /* body 装飾 h の後埋め（layout_element と同値の最終 h） */
+        if (sa.deco_bg != UINT32_MAX) lay2->deco[sa.deco_bg].h = root->h;
+        if (sa.deco_bd != UINT32_MAX) lay2->deco[sa.deco_bd].h = root->h;
+        /* lines/deco 連結（単調区間が交差しないため memcpy 連結で統合） */
+        u32 nl = sa.lay->n_lines + sb.lay->n_lines;
+        IfBox **larr = (IfBox **)if_arena_alloc(arena, (u64)(nl ? nl : 1) * sizeof(IfBox *));
+        memcpy(larr, sa.lay->lines, (u64)sa.lay->n_lines * sizeof(IfBox *));
+        memcpy(larr + sa.lay->n_lines, sb.lay->lines, (u64)sb.lay->n_lines * sizeof(IfBox *));
+        lay2->lines = larr;
+        lay2->n_lines = nl;
+        lay2->cap_lines = nl;
+        u32 nd = sa.lay->n_deco + sb.lay->n_deco;
+        IfDeco *darr = (IfDeco *)if_arena_alloc(arena, (u64)(nd ? nd : 1) * sizeof(IfDeco));
+        memcpy(darr, sa.lay->deco, (u64)sa.lay->n_deco * sizeof(IfDeco));
+        memcpy(darr + sa.lay->n_deco, sb.lay->deco, (u64)sb.lay->n_deco * sizeof(IfDeco));
+        lay2->deco = darr;
+        lay2->n_deco = nd;
+        lay2->cap_deco = nd;
+        /* links: B を A の終番から再採番して連結（文書順同値） */
+        u32 nlk = sa.lay->n_links + sb.lay->n_links;
+        IfLink *lk = (IfLink *)if_arena_alloc(arena, (u64)(nlk ? nlk : 1) * sizeof(IfLink));
+        memcpy(lk, sa.lay->links, (u64)sa.lay->n_links * sizeof(IfLink));
+        for (u32 i = 0; i < sb.lay->n_links; i++) {
+            lk[sa.lay->n_links + i] = sb.lay->links[i];
+            lk[sa.lay->n_links + i].n = sa.lay->n_links + i + 1;
+        }
+        lay2->links = lk;
+        lay2->n_links = nlk;
+        lay2->arena = arena;
+        if_arena_absorb(arena, &ab);
+        if_arena_destroy(&ab);
+        return lay2;
+    }
+
     IfBox *root = layout_element(&lc, body, 0, body_mt, width_cells);
     lay->root = root;
     lay->height = root->y + root->h;

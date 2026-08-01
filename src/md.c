@@ -442,8 +442,50 @@ static void inline_span(Mo *out, Fn *fn, IfStr s);
 
 /* 次の「特殊文字」位置を返す（無ければ s.n 以降の消費で呼び出し側が終了を知る）。
  * 特殊集合: \ ` * _ ~ ! [ < & >  */
+#ifdef IF_MD_SIMD
+#include <immintrin.h>
+/* AVX2 版: 32B/iter。target attribute + ランタイム dispatch（ビルドフラグ不変・
+ * __builtin_cpu_supports は 1 回だけ評価）。10 種の特殊文字を 10 本の cmpeq で一括。 */
+__attribute__((target("avx2"))) static u32 scan_special_avx2(IfStr s, u32 from) {
+    const char *p = s.p;
+    u32 n = s.n;
+    const __m256i v_bs = _mm256_set1_epi8('\\'), v_bt = _mm256_set1_epi8('`'),
+                  v_st = _mm256_set1_epi8('*'), v_un = _mm256_set1_epi8('_'),
+                  v_ti = _mm256_set1_epi8('~'), v_ex = _mm256_set1_epi8('!'),
+                  v_ob = _mm256_set1_epi8('['), v_lt = _mm256_set1_epi8('<'),
+                  v_am = _mm256_set1_epi8('&'), v_gt = _mm256_set1_epi8('>');
+    u32 i = from;
+    for (; i + 32 <= n; i += 32) {
+        __m256i b = _mm256_loadu_si256((const __m256i *)(p + i));
+        __m256i e = _mm256_cmpeq_epi8(b, v_bs);
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_bt));
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_st));
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_un));
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_ti));
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_ex));
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_ob));
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_lt));
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_am));
+        e = _mm256_or_si256(e, _mm256_cmpeq_epi8(b, v_gt));
+        unsigned mask = (unsigned)_mm256_movemask_epi8(e);
+        if (mask) return i + (u32)__builtin_ctz(mask);
+    }
+    for (; i < n; i++) {
+        char c = p[i];
+        if (c == '\\' || c == '`' || c == '*' || c == '_' || c == '~' ||
+            c == '!' || c == '[' || c == '<' || c == '&' || c == '>')
+            return i;
+    }
+    return n;
+}
+#endif
+
 static u32 scan_special(IfStr s, u32 from) {
 #ifdef IF_MD_SIMD
+    static int have_avx2 = -1;
+    if (__builtin_expect(have_avx2 < 0, 0))
+        have_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    if (have_avx2) return scan_special_avx2(s, from);
     const char *p = s.p;
     u32 n = s.n;
     static const char bs = '\\', bt = '`', st = '*', un = '_', ti = '~', ex = '!', ob = '[', lt = '<', am = '&', gt = '>';
