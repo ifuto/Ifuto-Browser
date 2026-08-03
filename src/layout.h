@@ -74,7 +74,9 @@ typedef struct IfLayout {
 /* dom+style からレイアウトを構築。width はセル。失敗しない（壊れた構造は空行に落ちる）。 */
 IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells);
 /* 線形モード（CLI 行スイープ専用。BLOCK 箱を再利用し親接続を消す。全出力は同値） */
-IfLayout *if_layout_build_linear(IfArena *arena, IfDom *dom, i32 width_cells);
+/* CLI 行スイープ専用。lazy_style=1 のとき style 未適用 DOM でも正しく解決する
+ * （解決規則は if_style_apply と同値。css.h の IfStyleLazy 注釈参照） */
+IfLayout *if_layout_build_linear(IfArena *arena, IfDom *dom, i32 width_cells, u8 lazy_style);
 
 void if_layout_dump(const IfLayout *lay, void *out_FILE);
 

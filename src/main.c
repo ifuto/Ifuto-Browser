@@ -206,13 +206,20 @@ int main(int argc, char **argv) {
     }
 
     double arena_after_parse = (double)if_arena_reserved(&a);
-    if (do_style) if_style_apply(&a, dom);
+    /* lazy style: md fast-DOM × CLI 行スイープでは style 全面走査を消し、
+     * layout の DFS 訪問時に必要箇所だけ解決する（解決値は if_style_apply と同値。
+     * 詳細は css.h の IfStyleLazy 注釈。--no-style / dump / GUI は従来経路） */
+    bool style_lazy = false;
+    if (do_style) {
+        style_lazy = (mode == M_RENDER) && if_md_style_lazy_ok(dom);
+        if (!style_lazy) if_style_apply(&a, dom);
+    }
     double t3 = now_ms();
     double arena_after_style = (double)if_arena_reserved(&a);
 
     /* CLI 行スイープは box 木を参照しない → 線形モード（BLOCK 箱再利用）。dump-layout は従来経路 */
     IfLayout *lay = (mode == M_LAYOUT) ? if_layout_build(&a, dom, width)
-                                       : if_layout_build_linear(&a, dom, width);
+                                       : if_layout_build_linear(&a, dom, width, (u8)style_lazy);
     if (mode == M_LAYOUT) {
         if_layout_dump(lay, stdout);
         if_arena_destroy(&a);

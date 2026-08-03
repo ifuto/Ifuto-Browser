@@ -92,7 +92,21 @@ typedef struct {
     u8 no_boxlink;
     u8 md_ws_stripped;   /* dom->md_ws_stripped のコピー（下記 mo_ws_sink 対応補正用） */
     IfNode *stop;        /* 並列シャードの spine 打ち止め（NULL=従来どおり兄弟末尾まで） */
+    /* lazy style（線形 CLI 路専用。NULL=従来の eager 経路）。詳細は css.h の注釈。
+     * lazy 時は ELEMENT の st を n->style から読まず if_style_lazy_get で解決する
+     * （値は if_style_apply 全面走査と同値。解決は DFS 親→子の順序で行われる） */
+    IfStyleLazy *lazy;
+    float lazy_rfs;      /* html 由来の rem 基準（build_impl が確定して全 ctx で共有） */
 } IfLC;
+
+/* st アクセスの一点化。戻り値規約:
+ *   lazy  : ELEMENT → 解決値（非 NULL）。非 ELEMENT → pst（従来の継承と同じ意味）
+ *   eager : n->style（呼出側が ?: 既定で処理。従来どおり NULL があり得る） */
+static inline const IfStyle *lc_st_of(IfLC *lc, IfNode *n, const IfStyle *pst) {
+    if (__builtin_expect(lc->lazy != NULL, 0))
+        return (n->kind == IF_NODE_ELEMENT) ? if_style_lazy_get(lc->lazy, n, pst, lc->lazy_rfs) : pst;
+    return n->style;
+}
 
 /* md.c の mo_ws_sink と同じタグ集合（ md fast-DOM はこれら直下の ws-only TEXT を
  * 剥がす）。旧 DOM では当該 ws TEXT が ifc 経由で prev_mb を 0 にしていたので、
@@ -284,8 +298,14 @@ static void collect_link(IfLC *lc, IfNode *a) {
 static void flatten_into(IfFlat *f, IfNode *n, const IfStyle *st) {
     if (n->kind == IF_NODE_TEXT) { flat_push(f, n->u.text, st, 0); return; }
     if (n->kind != IF_NODE_ELEMENT) return;
-    const IfStyle *est = n->style ? n->style : st;
-    if (n->style && n->style->display == IF_D_NONE) return;
+    const IfStyle *est;
+    if (__builtin_expect(f->lc->lazy != NULL, 0)) {
+        est = lc_st_of(f->lc, n, st);           /* lazy: 解決値（非 NULL） */
+        if (est->display == IF_D_NONE) return;
+    } else {
+        est = n->style ? n->style : st;
+        if (n->style && n->style->display == IF_D_NONE) return;
+    }
     switch (n->tag) {
     case IF_TAG_BR: flat_push(f, if_str(NULL, 0), est, 1); return;
     case IF_TAG_IMG: {
@@ -736,8 +756,14 @@ static bool fitdom_walk(IfFitDom *fd, IfNode *n, const IfStyle *st,
     if (n->kind == IF_NODE_TEXT)
         return fitdom_text(fd, n->u.text, st, n->flags, max_lh_io, any_io);
     if (n->kind != IF_NODE_ELEMENT) return true;
-    const IfStyle *est = n->style ? n->style : st;
-    if (n->style && n->style->display == IF_D_NONE) return true; /* flow から除去 */
+    const IfStyle *est;
+    if (__builtin_expect(fd->lc->lazy != NULL, 0)) {
+        est = lc_st_of(fd->lc, n, st);
+        if (est->display == IF_D_NONE) return true; /* flow から除去 */
+    } else {
+        est = n->style ? n->style : st;
+        if (n->style && n->style->display == IF_D_NONE) return true; /* flow から除去 */
+    }
     switch (n->tag) {
     case IF_TAG_BR:
         return false; /* br は wrap_end_line が要る従来経路へ */
@@ -781,9 +807,12 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
         bool any_text = false;
         IfNode *c = cur;
         for (; c; c = c->next_sibling) {
-            if (c->kind == IF_NODE_ELEMENT && c->style) {
-                if (c->style->display == IF_D_NONE) continue;   /* flow から除去 */
-                if (c->style->display != IF_D_INLINE) break;     /* ブロック子: run 終了 */
+            if (c->kind == IF_NODE_ELEMENT) {
+                /* lazy: st をここで解決（値は eager 走査と同値）。eager: 従来の読み方。
+                 * style 未適用（--no-style）は従来通りゲート自体が不発。 */
+                const IfStyle *cst = lc_st_of(lc, c, base_st);
+                if (cst && cst->display == IF_D_NONE) continue;   /* flow から除去 */
+                if (cst && cst->display != IF_D_INLINE) break;     /* ブロック子: run 終了 */
             }
             if (!fitdom_walk(&fd, c, base_st, &max_lh, &any_text)) goto fit_fail;
         }
@@ -809,9 +838,10 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
         IfFlat f = { lc->pieces_scratch, 0, lc }; /* スクラッチ再利用。run 内で消費が完結 */
         u64 _f0; if (_i0) _f0 = if_rdtsc(); else _f0 = 0;
         for (c = cur; c; c = c->next_sibling) {
-            if (c->kind == IF_NODE_ELEMENT && c->style) {
-                if (c->style->display == IF_D_NONE) continue;   /* flow から除去 */
-                if (c->style->display != IF_D_INLINE) break;     /* ブロック子: run 終了 */
+            if (c->kind == IF_NODE_ELEMENT) {
+                const IfStyle *cst = lc_st_of(lc, c, base_st);
+                if (cst && cst->display == IF_D_NONE) continue;   /* flow から除去 */
+                if (cst && cst->display != IF_D_INLINE) break;     /* ブロック子: run 終了 */
             }
             flatten_into(&f, c, base_st);
         }
@@ -840,30 +870,32 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
     return c;
 }
 
-static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w);
+static IfBox *layout_element(IfLC *lc, IfNode *node, const IfStyle *pst,
+                             i32 ax, i32 ay, i32 avail_w);
 
 /* node の子を走査して配置し、content 高を返す（カーソル前進で O(N)） */
-static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
+static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node, const IfStyle *base_st,
                            i32 content_x, i32 content_y, i32 content_w) {
     i32 y = content_y;
     i32 prev_mb = 0;
     u32 li_ord = 0; /* ol 番号: この親の LIST_ITEM li を出現順に数える（draw_marker 同値） */
-    const IfStyle *base_st = node->style;
     IfNode *c = node->first_child;
     while (c && c != lc->stop) {
-        if (c->kind == IF_NODE_ELEMENT && c->style && c->style->display == IF_D_NONE) {
+        /* lazy: ELEMENT の st をここで解決（値は eager 全面走査と同値）。
+         * eager: 従来どおり c->style（NULL = style 未適用 = 判定不発） */
+        const IfStyle *cst = (c->kind == IF_NODE_ELEMENT) ? lc_st_of(lc, c, base_st) : NULL;
+        if (cst && cst->display == IF_D_NONE) {
             c = c->next_sibling;
             continue;
         }
         bool blockish = false;
-        if (c->kind == IF_NODE_ELEMENT && c->style)
-            blockish = c->style->display == IF_D_BLOCK || c->style->display == IF_D_LIST_ITEM;
+        if (cst)
+            blockish = cst->display == IF_D_BLOCK || cst->display == IF_D_LIST_ITEM;
         if (!blockish) {
             c = layout_ifc(lc, box, c, base_st, content_x, &y, content_w);
             prev_mb = 0;
             continue;
         }
-        const IfStyle *cst = c->style;
         const IfGeomEnt *cg = geom_get(lc, lc->geom, cst, content_w);
         i32 mt = cg->mt;
         i32 mb = cg->mb;
@@ -895,7 +927,7 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
                 }
             }
         }
-        IfBox *child = layout_element(lc, c, content_x, y, content_w);
+        IfBox *child = layout_element(lc, c, cst, content_x, y, content_w);
         box_add_child(lc, box, child);
         i32 child_h = child->h;
         box_recycle(lc, child); /* 線形モード以外では no-op */
@@ -922,9 +954,13 @@ static const IfStyle IF_STYLE_FALLBACK = {
     .white_space = IF_WS_NORMAL,
 };
 
-static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w) {
+static IfBox *layout_element(IfLC *lc, IfNode *node, const IfStyle *pst,
+                             i32 ax, i32 ay, i32 avail_w) {
     u64 _s0, _acc; if (lpf()) { _s0 = if_rdtsc(); _acc = 0; } else { _s0 = 0; _acc = 0; }
-    const IfStyle *st = node->style ? node->style : &IF_STYLE_FALLBACK;
+    /* lazy: ELEMENT の st を解決（呼出側が親 st を pst で渡す。値は eager と同値）。
+     * eager: 従来（未適用時は FALLBACK） */
+    const IfStyle *st = lc->lazy ? lc_st_of(lc, node, pst)
+                                 : (node->style ? node->style : &IF_STYLE_FALLBACK);
     IfBox *box = new_box(lc, IF_BOX_BLOCK, node, st);
     const IfGeomEnt *g = geom_get(lc, lc->geom, st, avail_w);
     i32 bl = g->bl, brd = g->brd, bt = g->bt, bbo = g->bbo;
@@ -963,7 +999,7 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
 
     frame_push(lc, box); /* box の子追加は frame_top==box で O(1) tail を引く */
     if (_s0) _acc += if_rdtsc() - _s0;
-    i32 content_h = layout_children(lc, box, node, content_x, content_y, content_w);
+    i32 content_h = layout_children(lc, box, node, st, content_x, content_y, content_w);
     if (_s0) _s0 = if_rdtsc();
     frame_pop(lc, box);
     if (g->height_spec >= 0 && g->height_spec > content_h)
@@ -1003,6 +1039,8 @@ typedef struct IfLayShard {
     i32 width_cells;
     u8 md_ws_stripped;
     u8 no_boxlink;
+    u8 lazy_style;       /* lazy style 有効（ctx は arena 局所に begin する） */
+    float lazy_rfs;      /* html 由来 rfs（shard 間で同値） */
     /* out */
     IfLayout *lay;
     i32 content_h;
@@ -1016,6 +1054,12 @@ static void layout_shard_run_body(IfLayShard *s) {
     lay->arena = arena;
     lay->width = s->width_cells;
     IfLC lc = { .arena = arena, .root_fs = 16.0f };
+    IfStyleLazy lz;      /* 使用時のみ begin（shard 専用 ctx。arena はこの shard 専有） */
+    if (s->lazy_style) {
+        if_style_lazy_init(&lz, arena);
+        lc.lazy = &lz;
+        lc.lazy_rfs = s->lazy_rfs;
+    }
     lc.geom = (IfGeomCache *)if_arena_calloc(arena, sizeof(IfGeomCache));
     lc.lay = lay;
     lc.md_ws_stripped = s->md_ws_stripped;
@@ -1036,7 +1080,8 @@ static void layout_shard_run_body(IfLayShard *s) {
                                           (u8)(s->bsides & 0x0F));
     }
     frame_push(&lc, vroot); /* box_add_child の O(1) tail 経路（layout_element と同じ約款） */
-    i32 h = layout_children(&lc, vroot, &s->vbody, s->content_x, s->content_y, s->content_w);
+    i32 h = layout_children(&lc, vroot, &s->vbody, s->body_st,
+                            s->content_x, s->content_y, s->content_w);
     frame_pop(&lc, vroot);
     s->lay = lay;
     s->content_h = h;
@@ -1054,10 +1099,13 @@ static void shift_tree(IfBox *b, i32 dy) {
     }
 }
 
-static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 linear) {
+static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 linear,
+                            u8 lazy_style) {
     if (width_cells < 4) width_cells = 4;
     IfLayout *lay = (IfLayout *)if_arena_calloc(arena, sizeof(IfLayout));
+    IfStyleLazy lz0;         /* lazy の親走査 ctx（並列時は各 shard が別 ctx を持つ） */
     IfLC lc = { .arena = arena, .root_fs = 16.0f };
+    if (lazy_style) { if_style_lazy_init(&lz0, arena); lc.lazy = &lz0; lc.lazy_rfs = 16.0f; }
     lc.geom = (IfGeomCache *)if_arena_calloc(arena, sizeof(IfGeomCache));
     lc.lay = lay;
     lc.no_boxlink = linear;
@@ -1066,15 +1114,29 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
     lay->width = width_cells;
     lay->root = new_box(&lc, IF_BOX_BLOCK, NULL, NULL);
 
+    IfNode *html = NULL;
     IfNode *body = NULL;
     for (IfNode *c = dom->root->first_child; c && !body; c = c->next_sibling)
         if (c->kind == IF_NODE_ELEMENT && c->tag == IF_TAG_HTML)
             for (IfNode *g = c->first_child; g; g = g->next_sibling)
-                if (g->kind == IF_NODE_ELEMENT && g->tag == IF_TAG_BODY) { body = g; break; }
+                if (g->kind == IF_NODE_ELEMENT && g->tag == IF_TAG_BODY) { html = c; body = g; break; }
     if (!body) return lay;
 
-    float body_fs = body->style ? body->style->font_size : 16.0f;
-    i32 body_mt = body->style ? len_v(body->style->margin[0], body_fs, 16.0f, width_cells) : 0;
+    /* lazy: html→body の 2 要素だけ先に解決し、以降は DFS 訪問時に各所で解決する。
+     * eager: 従来どおり style 適用済みの node->style を読む。ietf な両経路で bst の
+     * 値は一致する（compute_walk の迷子: html の parent=NULL/rfs=16、body の
+     * parent=html_st/rfs=html font_size） */
+    const IfStyle *html_st = NULL;
+    const IfStyle *bst;
+    if (lazy_style) {
+        html_st = if_style_lazy_get(&lz0, html, NULL, 16.0f);
+        lc.lazy_rfs = html_st->font_size;   /* compute_walk: HTML 直下で rfs 確定 */
+        bst = if_style_lazy_get(&lz0, body, html_st, lc.lazy_rfs);
+    } else {
+        bst = body->style ? body->style : &IF_STYLE_FALLBACK;
+    }
+    float body_fs = bst->font_size;
+    i32 body_mt = len_v(bst->margin[0], body_fs, 16.0f, width_cells);
 
     /* 並列可否: md fast-DOM（md_ws_stripped）かつ body の直下子が十分に多いこと。
      * 子数は 2 分割のために一度だけ数える（O(直下子)）。HTML/小文書は従来経路。 */
@@ -1084,8 +1146,7 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         for (IfNode *c = body->first_child; c; c = c->next_sibling) nch++;
     }
     if (nch >= 64) {
-        /* body 自身の幾何を layout_element と同じ手順で先に確定する */
-        const IfStyle *bst = body->style ? body->style : &IF_STYLE_FALLBACK;
+        /* body 自身の幾何を layout_element と同じ手順で先に確定する（bst は上で解決済） */
         const IfGeomEnt *bg = geom_get(&lc, lc.geom, bst, width_cells);
         i32 bl = bg->bl, brd = bg->brd, bt = bg->bt, bbo = bg->bbo;
         i32 pad_l = bg->pl, pad_r = bg->pr, pad_t = bg->pt, pad_b = bg->pb;
@@ -1112,12 +1173,14 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         sa.bsides = bsides;  /* 実 body の装飾は A が担当 */
         sa.width_cells = width_cells; sa.md_ws_stripped = 1;
         sa.no_boxlink = linear;
+        sa.lazy_style = lazy_style; sa.lazy_rfs = lc.lazy_rfs;
         sb.arena = &ab; sb.vbody = *body; sb.vbody.first_child = mid; sb.stop = NULL;
         sb.body_st = bst; sb.content_x = content_x; sb.content_y = content_y;
         sb.content_w = content_w; sb.bx = bx; sb.by = by; sb.box_w = box_w;
         sb.bsides = 0;       /* B は body 装飾を出さない（A のみ） */
         sb.width_cells = width_cells; sb.md_ws_stripped = 1;
         sb.no_boxlink = linear;
+        sb.lazy_style = lazy_style; sb.lazy_rfs = lc.lazy_rfs;
 
         pthread_t th;
         int rc = pthread_create(&th, NULL, layout_shard_thread, &sb);
@@ -1188,7 +1251,7 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         return lay2;
     }
 
-    IfBox *root = layout_element(&lc, body, 0, body_mt, width_cells);
+    IfBox *root = layout_element(&lc, body, html_st, 0, body_mt, width_cells);
     lay->root = root;
     lay->height = root->y + root->h;
     lay->links = lc.links;
@@ -1197,15 +1260,16 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
 }
 
 IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
-    return build_impl(arena, dom, width_cells, 0);
+    return build_impl(arena, dom, width_cells, 0, 0);
 }
 
 /* 線形モード入口（CLI 行スイープ専用）: 幾何・lines/deco/links の全出力が従来経路と
  * 同値であることを oracle/idm・golden・tests がロックする。kill switch: IF_LAYOUT_LIN=0 */
-IfLayout *if_layout_build_linear(IfArena *arena, IfDom *dom, i32 width_cells) {
+IfLayout *if_layout_build_linear(IfArena *arena, IfDom *dom, i32 width_cells, u8 lazy_style) {
     const char *e = getenv("IF_LAYOUT_LIN");
     u8 linear = !(e && e[0] == '0');
-    return build_impl(arena, dom, width_cells, linear);
+    /* lazy は線形モードのときだけ有効（木構築は node->style 読みの従来路を維持） */
+    return build_impl(arena, dom, width_cells, linear, linear ? lazy_style : 0);
 }
 
 /* ---------- デバッグダンプ ---------- */

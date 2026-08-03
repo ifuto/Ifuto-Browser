@@ -1059,13 +1059,9 @@ static float kw_font_size(IfStr v, float parent) {
  * IfStyle(124B) を要素ごとに確保すると巨大文書で style arena が ~97MB/16MiB 入力に
  * 膨らむ（実測）。算出後の IfStyle は全フィールド値のみの不変構造かつ calloc 由来で
  * パディングまで決定的 → memcmp 等値で intern できる（損失ゼロの dedup）。
- * 規則: node->style は読み取り専用（カスケード後に誰も書かないことは全ファイル監査済）。
- * 同一内容のスタイルは 1 実体を全要素が指す。巨大文書で数百 unique まで絞られる。 */
-typedef struct {
-    IfStyle **tab;   /* 開放アドレスハッシュ（値は 1 実体へのポインタ） */
-    u32 cap, n;
-    IfArena *a;
-} IfStyleIntern;
+ * 規則: node->style は読み取り専用（カスカード後に誰も書かないことは全ファイル監査済）。
+ * 同一内容のスタイルは 1 実体を全要素が指す。巨大文書で数百 unique まで絞られる。
+ * 型本体は css.h（IfStyleLazy 経路でも同じ規則で intern するため公開）。 */
 
 u32 if_css_intern_last = 0; /* 観測用: 直近の style apply での unique 数 */
 
@@ -1108,13 +1104,7 @@ static const IfStyle *st_intern(IfStyleIntern *in, const IfStyle *tmp) {
  * 無いページでは (tag or 未知タグ名, parent_st, inline style attr の有無) に縮約できる。
  * 直接マップキャッシュ: 衝突は verify で必ず検出して再計上（損失ゼロの exact memo）。
  * inline style attr を持つ要素は memo を通さない（値が結果に効く）。 */
-typedef struct {
-    uintptr_t parent;   /* interned parent style ポインタ（ページ内一意） */
-    uintptr_t key2;     /* 既知: tag id <<1 | 1。未知: tag_name ポインタ */
-    const IfStyle *st;  /* interned computed */
-} IfStCacheEnt;
-#define IF_STCACHE_BITS 14
-#define IF_STCACHE_SIZE (1u << IF_STCACHE_BITS)
+/* IfStCacheEnt / IF_STCACHE_* / IfStyleIntern は css.h へ移設（IfStyleLazy と共有） */
 typedef struct {
     IfStCacheEnt *tab;  /* arena 確保（ページ寿命） */
 } IfStCache;
@@ -1332,6 +1322,29 @@ static void compute_node(IfArena *a, IfNode *n, const IfStyle *parent_st, float 
     n->style = st_intern(in, &tmp);
 }
 
+/* 1 要素の決定解決（memo hit or compute_node）。compute_walk と IfStyleLazy の
+ * 双方がこの同一手続きを使う（規則の一点化＝同値性の構造保証）。
+ * キー・ハッシュ・memo ゲートは compute_walk の旧インラインブロックと厳密一致。 */
+static const IfStyle *st_resolve_memo(IfArena *a, IfStCacheEnt *tab, IfNode *n,
+                                      const IfStyle *parent_st, float rfs,
+                                      const IfStyleSheet **sheets, u32 n_sheets,
+                                      IfStyleIntern *in) {
+    uintptr_t pk = (uintptr_t)parent_st;
+    uintptr_t k2 = (n->tag != IF_TAG_UNKNOWN)
+        ? (((uintptr_t)n->tag << 1) | 1u)
+        : (uintptr_t)n->u.tag_name.p;
+    if (tab && !node_has_inline_style(n)) {
+        u64 h = (pk >> 4) * 2654435761u + k2 * 40503u;
+        IfStCacheEnt *e = &tab[h & (IF_STCACHE_SIZE - 1)];
+        if (e->st && e->parent == pk && e->key2 == k2) { n->style = e->st; return e->st; }
+        compute_node(a, n, parent_st, rfs, sheets, n_sheets, in);
+        e->parent = pk; e->key2 = k2; e->st = n->style;
+        return n->style;
+    }
+    compute_node(a, n, parent_st, rfs, sheets, n_sheets, in);
+    return n->style;
+}
+
 static void compute_walk(IfArena *a, IfNode *n, const IfStyle *parent_st, float root_fs,
                          const IfStyleSheet **sheets, u32 n_sheets, IfStyleIntern *in,
                          IfStCache *cache) {
@@ -1345,26 +1358,8 @@ static void compute_walk(IfArena *a, IfNode *n, const IfStyle *parent_st, float 
     IfNode *cur = n;
     for (;;) {
         if (cur->kind == IF_NODE_ELEMENT) {
-            const IfStyle *st = NULL;
-            uintptr_t pk = (uintptr_t)cur_parent;
-            uintptr_t k2 = (cur->tag != IF_TAG_UNKNOWN)
-                ? (((uintptr_t)cur->tag << 1) | 1u)
-                : (uintptr_t)cur->u.tag_name.p;
-            bool memo = cache && !node_has_inline_style(cur);
-            if (memo) {
-                u64 h = (pk >> 4) * 2654435761u + k2 * 40503u;
-                IfStCacheEnt *e = &cache->tab[h & (IF_STCACHE_SIZE - 1)];
-                if (e->st && e->parent == pk && e->key2 == k2) st = e->st;
-                else {
-                    compute_node(a, cur, cur_parent, cur_rfs, sheets, n_sheets, in);
-                    e->parent = pk; e->key2 = k2; e->st = cur->style;
-                    st = cur->style;
-                }
-            } else {
-                compute_node(a, cur, cur_parent, cur_rfs, sheets, n_sheets, in);
-                st = cur->style;
-            }
-            if (memo) cur->style = st; else cur->style = st;
+            const IfStyle *st = st_resolve_memo(a, cache ? cache->tab : NULL, cur,
+                                                cur_parent, cur_rfs, sheets, n_sheets, in);
             float child_rfs = cur_rfs;
             if (cur->tag == IF_TAG_HTML) child_rfs = st->font_size;
             /* 子を潜る: frame を積む */
@@ -1440,4 +1435,29 @@ void if_style_apply(IfArena *a, IfDom *dom) {
         compute_walk(a, html, NULL, 16.0f, all, n_sheets + 1, &in, cp);
         if_css_intern_last = in.n;
     }
+}
+
+/* ---- lazy computed style（css.h の設計注釈参照） ----
+ * if_style_apply との同値性:
+ *   - シート列は [UA] のみ（author 無しは if_md_style_lazy_ok が保証）
+ *   - 解決は st_resolve_memo 一点（compute_walk と同一手続き・同一キー・同一ハッシュ）
+ *   - 解決順は layout の DFS（pre-order で compute_walk と一致）なので intern の
+ *     挿入系列も一致し、ポインタ帰属まで同じ（ただし並列 shard は arena 別・値のみ保証） */
+void if_style_lazy_init(IfStyleLazy *lz, IfArena *a) {
+    lz->arena = a;
+    lz->sheet = if_css_parse(a, if_str(IF_UA_SHEET, (u32)sizeof(IF_UA_SHEET) - 1), 0);
+    lz->in.tab = NULL; lz->in.cap = 0; lz->in.n = 0; lz->in.a = a;
+    lz->ctab = (IfStCacheEnt *)if_arena_calloc(a, IF_STCACHE_SIZE * sizeof(IfStCacheEnt));
+    lz->rfs = 16.0f;
+}
+
+const IfStyle *if_style_lazy_get(IfStyleLazy *lz, IfNode *n, const IfStyle *parent_st, float rfs) {
+    const IfStyleSheet *ss[1] = { lz->sheet };
+    return st_resolve_memo(lz->arena, lz->ctab, n, parent_st, rfs, ss, 1, &lz->in);
+}
+
+bool if_md_style_lazy_ok(const IfDom *dom) {
+    if (!dom || !dom->md_ws_stripped || dom->has_style) return false;
+    const char *e = getenv("IF_STYLE_LAZY"); /* kill switch */
+    return !(e && e[0] == '0');
 }

@@ -141,4 +141,27 @@ void if_css_set_naive_matching(int enabled);
  * テスト/計測が「dedup が効いているか」を機械検査するためのフック） */
 extern u32 if_css_intern_last;
 
+/* ---- lazy computed style（md fast-DOM → 線形 layout の CLI 出力路専用） ----
+ * 前提: author シート無し（md では <style> は TEXT 化される）かつ md_ws_stripped DOM。
+ * computed style は (tag, parent_st, root_fs) の純粋関数なので、layout の DFS 訪問
+ * タイミングで必要箇所だけ解決しても、if_style_apply の全面走査と全ノード同値になる
+ * （compute_node と intern の規則をそのまま共有。詳細は css.c の st_resolve_memo 参照）。
+ * ctx は arena 局所（並列 shard が別 arena を別 ctx で触る設計のため競合しない）。 */
+typedef struct { uintptr_t parent; uintptr_t key2; const IfStyle *st; } IfStCacheEnt;
+#define IF_STCACHE_BITS 14
+#define IF_STCACHE_SIZE (1u << IF_STCACHE_BITS)
+typedef struct { IfStyle **tab; u32 cap, n; IfArena *a; } IfStyleIntern;
+typedef struct IfStyleLazy {
+    IfArena *arena;
+    const IfStyleSheet *sheet;  /* UA シート（この arena 内の全コピー） */
+    IfStyleIntern in;
+    IfStCacheEnt *ctab;         /* IF_STCACHE_SIZE の直接マップ（arena calloc） */
+    float rfs;                  /* rem 基準。html 解決後に呼出側が 1 度だけ確定 */
+} IfStyleLazy;
+void  if_style_lazy_init(IfStyleLazy *lz, IfArena *a);
+/* ELEMENT 専用（TEXT 等は呼ばない。従来パスでも非 ELEMENT は style NULL のまま） */
+const IfStyle *if_style_lazy_get(IfStyleLazy *lz, IfNode *n, const IfStyle *parent_st, float rfs);
+/* lazy 前提条件（md fast-DOM、author sheet 無し） + kill switch IF_STYLE_LAZY=0 */
+bool  if_md_style_lazy_ok(const IfDom *dom);
+
 #endif
