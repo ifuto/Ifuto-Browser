@@ -190,7 +190,8 @@ static inline IfNode *mnew(Mo *m, IfNodeKind kind) {
     if (__builtin_expect(m->nslab != m->nslab_end, 1)) {
         n = m->nslab++;
     } else {
-        if (__builtin_expect(m->n_nodes >= IF_MAX_DOM_NODES, 0)) { mo_taint(m); return NULL; }
+        /* cap 到達時でも bump 自体は無害（直後の一括判定で taint・返却 NULL。
+         * 到達時に無駄になるのは taint で中断される走査の 1 ブロック分のみ） */
         n = (IfNode *)if_arena_bump(m->a, 128 * sizeof(IfNode));
         m->nslab = n + 1;
         m->nslab_end = n + 128;
@@ -1196,7 +1197,8 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
                     ln_list_item(x, &m3)) break;
                 if ((xcs == '|' || xcs == '-' || xcs == ':' || xcs == '\t') &&
                     ln_is_table_delim(x)) break;
-                for (u32 k = 0; k < x.n; k++) if (x.p[k] == '|') { break; }
+                /* （かつて '|' 走査があったが副作用のない死コードと判明 → 除去）
+                 * 段落継続の '|' 行は表中継ぎではなく普通の段落行として扱う規約は不変。 */
             }
             j++;
         }

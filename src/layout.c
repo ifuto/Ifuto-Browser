@@ -11,6 +11,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h> /* 2-way 並列 layout（md fast-DOM のみ。glibc>=2.34 で ldd 不変） */
+#if defined(__SSE2__) || defined(__x86_64__)
+#include <emmintrin.h> /* ASCII 可視ラン一括分類（SSE2 は x86_64 基底。dispatch 不要） */
+#define IF_SSE2 1
+#endif
 
 
 /* ---- (style, avail_w) 幾何キャッシュ ---- */
@@ -24,7 +28,14 @@ typedef struct {
     u8 ok;
 } IfGeomEnt;
 #define IF_GEOM_SIZE 1024u
-typedef struct { IfGeomEnt tab[IF_GEOM_SIZE]; } IfGeomCache;
+typedef struct {
+    IfGeomEnt tab[IF_GEOM_SIZE];
+    /* 1 エントリ直前メモ: 同一 (st,w) の連続呼出（兄弟で style が同じ形状が支配的）を
+     * ハッシュ計算+tab 参照なしで返す。不変条件: last_e は tab 内の有効エントリを指す。 */
+    const IfGeomEnt *last_e;
+    const IfStyle *last_st;
+    i32 last_w;
+} IfGeomCache;
 
 typedef struct IfPiece {
     IfStr text;
@@ -40,13 +51,14 @@ static inline u64 if_rdtsc(void) { return 0; }
 #endif
 static int if_lp_on = -2; /* -2 = 未初期化 */
 static u64 LPF_TOTAL, LPF_IFC, LPF_FLAT, LPF_WRAP, LPF_ENDL, LPF_GEOM, LPF_CHILDREN;
-static u64 LPF_FITOK, LPF_FITNG;
+static u64 LPF_FITOK, LPF_FITNG, LPF_ELEM;
 __attribute__((destructor)) static void lpf_dump(void) {
     if (if_lp_on > 0)
-        fprintf(stderr, "LAYOUTPROF total=%llu ifc=%llu flat=%llu wrap=%llu endl=%llu geom=%llu children-sites=%llu fit_ok=%llu fit_ng=%llu (cycles)\n",
+        fprintf(stderr, "LAYOUTPROF total=%llu ifc=%llu flat=%llu wrap=%llu endl=%llu geom=%llu children-sites=%llu fit_ok=%llu fit_ng=%llu elem=%llu (cycles)\n",
                 (unsigned long long)LPF_TOTAL, (unsigned long long)LPF_IFC, (unsigned long long)LPF_FLAT,
                 (unsigned long long)LPF_WRAP, (unsigned long long)LPF_ENDL, (unsigned long long)LPF_GEOM,
-                (unsigned long long)LPF_CHILDREN, (unsigned long long)LPF_FITOK, (unsigned long long)LPF_FITNG);
+                (unsigned long long)LPF_CHILDREN, (unsigned long long)LPF_FITOK, (unsigned long long)LPF_FITNG,
+                (unsigned long long)LPF_ELEM);
 }
 static inline bool lpf(void) {
     if (if_lp_on == -2) { const char *e = getenv("IF_LAYOUT_PROF"); if_lp_on = (e && e[0] == '1') ? 1 : 0; }
@@ -162,9 +174,17 @@ static IfBox *new_box(IfLC *lc, u8 kind, IfNode *node, const IfStyle *st) {
 
 static const IfGeomEnt *geom_get(IfLC *lc, IfGeomCache *gc, const IfStyle *st, i32 avail_w) {
     u64 _t0; if (lpf()) _t0 = if_rdtsc(); else _t0 = 0;
+    if (__builtin_expect(st == gc->last_st && avail_w == gc->last_w, 1)) {
+        if (_t0) LPF_GEOM += if_rdtsc() - _t0;
+        return gc->last_e;
+    }
     u64 h = ((uintptr_t)st >> 4) * 2654435761u ^ (u64)(u32)avail_w * 40503u;
     IfGeomEnt *e = &gc->tab[h & (IF_GEOM_SIZE - 1)];
-    if (e->ok && e->st == st && e->w == avail_w) { if (_t0) LPF_GEOM += if_rdtsc() - _t0; return e; }
+    if (e->ok && e->st == st && e->w == avail_w) {
+        gc->last_e = e; gc->last_st = st; gc->last_w = avail_w;
+        if (_t0) LPF_GEOM += if_rdtsc() - _t0;
+        return e;
+    }
     float fs = st->font_size;
     e->st = st;
     e->w = avail_w;
@@ -194,6 +214,7 @@ static const IfGeomEnt *geom_get(IfLC *lc, IfGeomCache *gc, const IfStyle *st, i
     if (st->height.unit != IF_U_AUTO)
         e->height_spec = len_v(st->height, fs, lc->root_fs, avail_w);
     e->ok = 1;
+    gc->last_e = e; gc->last_st = st; gc->last_w = avail_w;
     if (_t0) LPF_GEOM += if_rdtsc() - _t0;
     return e;
 }
@@ -554,6 +575,8 @@ typedef struct {
     i32 content_w;
     i32 cx;
     bool pre0;
+    const IfStyle *lh_st; /* (st→lh) 1-entry メモ: 連続 TEXT の st はほぼ不変 */
+    float lh_val;
 } IfFitDom;
 
 /* TEXT piece 相当の処理（旧 ifc_try_fit の内側ループと逐語同一） */
@@ -562,10 +585,14 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st,
     IfWrap *w = fd->w;
     bool pre_p = (st && st->white_space == IF_WS_PRE) || fd->pre0;
     if (pre_p) return false;
-    /* wrap_text 冒頭の lh 畳込みと同じもの（ピース到着で必ず畳む） */
-    float fs = st ? st->font_size : 16.0f;
-    float lh = st && st->line_height > 0.0f ? st->line_height : fs * 1.2f;
-    if (lh > *max_lh_io) *max_lh_io = lh;
+    /* wrap_text 冒頭の lh 畳込みと同じもの（ピース到着で必ず畳む）。st は run 内で
+     * ほぼ不変なので (st→lh) を 1-entry メモ化（純粋キャッシュ、結果は同値） */
+    if (st != fd->lh_st) {
+        float fs = st ? st->font_size : 16.0f;
+        fd->lh_val = st && st->line_height > 0.0f ? st->line_height : fs * 1.2f;
+        fd->lh_st = st;
+    }
+    if (fd->lh_val > *max_lh_io) *max_lh_io = fd->lh_val;
 
     const u8 *s = (const u8 *)t.p;
     u32 n = t.n;
@@ -590,7 +617,22 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st,
         if (__builtin_expect(b0 >= 0x21 && b0 <= 0x7E, 1)) {
             /* ASCII 可視ラン（wrap のアトム規則と同じく 0x21-0x7E の連続） */
             u32 j = i + 1;
+#ifdef IF_SSE2
+            /* 16B 一括分類: 可視 ⇔ (0x20 < b) & (b < 0x7F)（符号比較で 0x80+ は負→不可視）。
+             * 停止位置はスカラ版の break 位置と厳密一致（先に見えない最初のバイト）。 */
+            while (j + 16 <= n) {
+                __m128i v = _mm_loadu_si128((const __m128i *)(s + j));
+                __m128i m = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(0x20)),
+                                          _mm_cmpgt_epi8(_mm_set1_epi8(0x7F), v));
+                unsigned mm = (unsigned)_mm_movemask_epi8(m);
+                if (mm != 0xFFFFu) { j += (u32)__builtin_ctz(~mm & 0xFFFFu); goto ascii_done; }
+                j += 16;
+            }
+#endif
             while (j < n) { u8 cc = s[j]; if (cc < 0x21 || cc > 0x7E) break; j++; }
+#ifdef IF_SSE2
+        ascii_done:;
+#endif
             wrap_push_merge(w, (const char *)s + i, j - i, w->content_x + cx,
                             (i32)(j - i), st);
             cx += (i32)(j - i);
@@ -600,18 +642,24 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st,
             u32 pos = i, cp;
             bool ok3 = lw_decode3(s, n, &pos, &cp);
             if (ok3) {
-                /* 3バイトグリフランの融合（旧 ifc_try_fit と同じ規則） */
+                /* 3バイトグリフランの融合（旧 ifc_try_fit と同じ規則）。
+                 * ok3（妥当 3 バイト列）の圏内では wrap_note_direct2 は恒等的に no-op:
+                 * cp==U+FFFD となる妥当 3 バイト列は EF BF BD のみであり、それは
+                 * direct2 が許容する唯一の置換例そのもの（畳込み省略は同値）。 */
                 int gw = lw_glyph_width(cp);
                 if (__builtin_expect(gw == 0, 0)) return false;
-                wrap_note_direct2(w, s, i, pos, cp);
                 u32 rend = pos;
                 i32 rw = gw;
                 while (rend < n) {
+                    /* width=2 確定帯を lead/継続バイトだけで先取り（utf8.h 参照。
+                     * 帯は decode3 成功 ∧ gw==2 の部分集合 → 同値。外は従来経路） */
+                    if (rend + 2 < n && if_utf8_band_w2(s[rend], s[rend + 1], s[rend + 2])) {
+                        rw += 2; rend += 3; continue;
+                    }
                     u32 p2 = rend, cp2;
                     if (!lw_decode3(s, n, &p2, &cp2)) break;
                     int gw2 = lw_glyph_width(cp2);
                     if (__builtin_expect(gw2 == 0, 0)) return false;
-                    wrap_note_direct2(w, s, rend, p2, cp2);
                     rw += gw2;
                     rend = p2;
                 }
@@ -685,7 +733,7 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
     {
         float lh0 = max_lh;
         u32 n_links0 = lc->n_links;
-        IfFitDom fd = { &w, lc, base_st, content_w, 0, pre };
+        IfFitDom fd = { &w, lc, base_st, content_w, 0, pre, NULL, 0.0f };
         bool any_text = false;
         IfNode *c = cur;
         for (; c; c = c->next_sibling) {
@@ -829,6 +877,7 @@ static const IfStyle IF_STYLE_FALLBACK = {
 };
 
 static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w) {
+    u64 _s0, _acc; if (lpf()) { _s0 = if_rdtsc(); _acc = 0; } else { _s0 = 0; _acc = 0; }
     const IfStyle *st = node->style ? node->style : &IF_STYLE_FALLBACK;
     IfBox *box = new_box(lc, IF_BOX_BLOCK, node, st);
     const IfGeomEnt *g = geom_get(lc, lc->geom, st, avail_w);
@@ -856,6 +905,7 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
             deco_add(lc, IF_DECO_HLINE, x, y + (bt ? 1 : 0), box->w, 1, 0, NULL, NULL, 0);
             if (deco_bg != UINT32_MAX) lc->lay->deco[deco_bg].h = box->h;
         }
+        if (_s0) LPF_ELEM += _acc + (if_rdtsc() - _s0);
         return box;
     }
 
@@ -866,7 +916,9 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
     }
 
     frame_push(lc, box); /* box の子追加は frame_top==box で O(1) tail を引く */
+    if (_s0) _acc += if_rdtsc() - _s0;
     i32 content_h = layout_children(lc, box, node, content_x, content_y, content_w);
+    if (_s0) _s0 = if_rdtsc();
     frame_pop(lc, box);
     if (g->height_spec >= 0 && g->height_spec > content_h)
         content_h = g->height_spec; /* 指定高はクリップせず拡張のみ（v0.1 近似） */
@@ -879,6 +931,7 @@ static IfBox *layout_element(IfLC *lc, IfNode *node, i32 ax, i32 ay, i32 avail_w
         if (deco_bg != UINT32_MAX) lc->lay->deco[deco_bg].h = box->h;
         if (deco_bd != UINT32_MAX) lc->lay->deco[deco_bd].h = box->h;
     }
+    if (_s0) LPF_ELEM += _acc + (if_rdtsc() - _s0);
     return box;
 }
 
