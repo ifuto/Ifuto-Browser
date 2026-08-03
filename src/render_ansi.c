@@ -4,6 +4,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h> /* 2-way 並列 sweep（glibc>=2.34 で ldd 不変） */
+
+/* ---- レンダ rdtsc ゾーン計測（IF_RENDER_PROF=1。構造読み専用: rdtsc ペア税 ~35-70cy/回を含む） ---- */
+#if defined(__x86_64__) || defined(__i386__)
+static inline u64 rz_rdtsc(void) { u32 lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((u64)hi << 32) | lo; }
+#else
+static inline u64 rz_rdtsc(void) { return 0; }
+#endif
+static int rz_on = -1;
+static inline bool rz(void) {
+    if (rz_on < 0) { const char *e = getenv("IF_RENDER_PROF"); rz_on = (e && e[0] == '1') ? 1 : 0; }
+    return rz_on > 0;
+}
+static unsigned long long RZ_GAP, RZ_DIRECT, RZ_FAST, RZ_SLOW, RZ_BLANK, RZ_FLUSH;
+static unsigned long long RN_GAP, RN_DIRECT, RN_FAST, RN_SLOW, RN_BLANK;
+__attribute__((destructor)) static void rz_dump(void) {
+    if (rz_on > 0)
+        fprintf(stderr, "RENDERPROF gap=%llu(%llu) direct=%llu(%llu) fast=%llu(%llu) slow=%llu(%llu) blank=%llu(%llu) flush=%llu (cycles)\n",
+                RZ_GAP, RN_GAP, RZ_DIRECT, RN_DIRECT, RZ_FAST, RN_FAST, RZ_SLOW, RN_SLOW, RZ_BLANK, RN_BLANK, RZ_FLUSH);
+}
 
 static unsigned long long CNT_PAINT, CNT_SHELL, CNT_SEGS, CNT_FILLBG, CNT_MARKER;
 static unsigned long long CNT_FILLBG_CELLS, CNT_MARKER_SIB, CNT_DEC;
@@ -487,16 +507,18 @@ static void row_paint_dec(IfRCell *row, i32 w, const IfDeco *d, i32 r) {
 
 /* 行スイープ発行。発行規約は if_render_emit_rows と一致（trim・行末リセット） */
 /* ---- バッチ書き出し（行ごと fwrite の消去。850k 行規模だと fwrite コール自体が律速） ---- */
-typedef struct { u8 *p; u64 n, cap; FILE *out; } IfBB;
+typedef struct { u8 *p; u64 n, cap; FILE *out; u8 *mem; u64 mem_n, mem_cap; } IfBB;
 static void bb_init(IfBB *b, FILE *out) {
     b->cap = 1u << 20;
     b->p = (u8 *)malloc(b->cap);
     if (!b->p) if_fatal("render: oom batch buffer");
     b->n = 0; b->out = out;
+    b->mem = NULL; b->mem_n = 0; b->mem_cap = 0;
 }
+static void bb_flush(IfBB *b);
 static void bb_ensure(IfBB *b, u64 k) {
     if (b->cap - b->n >= k) return;
-    if (b->n) { fwrite(b->p, 1, b->n, b->out); b->n = 0; }
+    if (b->n) bb_flush(b); /* FILE / メモリシンク共通（旧: 直接 fwrite） */
     if (b->cap < k) {
         while (b->cap < k) b->cap *= 2;
         u8 *np = (u8 *)realloc(b->p, b->cap);
@@ -513,7 +535,26 @@ static inline void bb_ch(IfBB *b, u8 c) {
     bb_ensure(b, 1);
     b->p[b->n++] = c;
 }
-static void bb_flush(IfBB *b) { if (b->n) { fwrite(b->p, 1, b->n, b->out); b->n = 0; } }
+static void bb_flush(IfBB *b) {
+    if (b->n) {
+        u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
+        if (b->out) {
+            fwrite(b->p, 1, b->n, b->out);
+        } else {
+            /* メモリシンク（並列 sweep の後半スレッド用。join 後に主スレッドが一括 fwrite） */
+            if (b->mem_cap - b->mem_n < b->n) {
+                while (b->mem_cap - b->mem_n < b->n) b->mem_cap = b->mem_cap ? b->mem_cap * 2 : (1u << 20);
+                u8 *nm = (u8 *)realloc(b->mem, b->mem_cap);
+                if (!nm) if_fatal("render: oom batch memsink");
+                b->mem = nm;
+            }
+            memcpy(b->mem + b->mem_n, b->p, b->n);
+            b->mem_n += b->n;
+        }
+        if (_t) RZ_FLUSH += rz_rdtsc() - _t;
+        b->n = 0;
+    }
+}
 
 /* no-ansi byte-direct 行の 1 ラン（seg バイト or 装飾の ─ 連打） */
 typedef struct { i32 x, w; const u8 *p; u32 n; u8 kind; } IfRRun;
@@ -523,6 +564,35 @@ enum { IF_RR_BYTES = 0, IF_RR_HLINE = 1 };
  * 失敗（seg 不整合・重複・未対応 deco）は何も出さず false（呼出側がセル経路へ）。
  * 正当性: LINE の IF_LF_DIRECT_BYTES は wrap 時に「全グリフ gw>0 かつ enc∘dec 恒等」を
  * 検査済み → seg バイトの連結 ≡ セル列の再エンコード列。trim は末尾 0x20 の除去で同値。 */
+/* cp_free（active が BG のみ）行の seg 直行: row_emit_fast が runs 構築+挿入ソートで
+ * 行う処理の nr=n_segs・deco 無し特殊形。segs は x 単調非減少（挿入ソートが no-op に
+ * なる前提）であれば走査一回で発行できる。生成するバイト列は row_emit_fast の
+ * gap/clip/trim 規則を「クリップ不発の圏内」で機械的に展開したものと同値:
+ *  - 全 seg が x>=0 ∧ x+w<=mx（右端跨ぎ clip 判定が恒真で失敗しない）
+ *  - x 非減少かつ非重複（runs[a].x < pos の堕落判定が不発）
+ *  - clip 分岐（x>mx, pos>=mx, pos+w>mx）は上記条件で全て不発
+ * 同値根拠は 1 行=1 セル列への写像が IF_LF_DIRECT_BYTES で byte 恒等であること
+ * （旧単一 seg 直行と同じ空手形）。条件違反時は false で row_emit_fast へ委譲。 */
+static bool row_emit_direct(IfBB *bb, const IfBox *b, i32 mx) {
+    if (!(b->_pad[0] & IF_LF_DIRECT_BYTES)) return false;
+    u64 mark = bb->n;
+    i32 pos = 0;
+    for (u32 u = 0; u < b->n_segs; u++) {
+        i32 x = b->segs[u].x, w = b->segs[u].w;
+        if (__builtin_expect(x < pos || x + w > mx, 0)) { bb->n = mark; return false; }
+        if (x > pos) {
+            bb_ensure(bb, (u64)(x - pos) + 8);
+            memset(bb->p + bb->n, ' ', (size_t)(x - pos));
+            bb->n += (u64)(x - pos);
+        }
+        bb_put(bb, b->segs[u].text.p, b->segs[u].text.n);
+        pos = x + w;
+    }
+    while (bb->n > mark && bb->p[bb->n - 1] == ' ') bb->n--;
+    bb_ch(bb, '\n');
+    return true;
+}
+
 static bool row_emit_fast(IfBB *bb, const IfLayout *lay, u32 *li_io,
                           const IfDeco **active, u32 n_active, i32 mx, i32 r) {
     u32 li = *li_io;
@@ -600,34 +670,49 @@ static bool row_emit_fast(IfBB *bb, const IfLayout *lay, u32 *li_io,
 }
 
 /* 行スイープ発行。発行規約は if_render_emit_rows と一致（trim・行末リセット） */
-void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
-    /* 幅は lay->width（旧 sweep 規約）。行数は lay->height と同値:
-     * 全 box/line は root の [y, y+h) に包含され lay->height = root.y+root.h であるため
-     * grid_max_walk の my は常に lay->height に一致する（包含の空手形。出力 sha256 が機械監査） */
-    i32 mx = lay->width;
-    if (mx < 1) mx = 1;
-    i32 my = lay->height;
-    if (my < 1) my = 1;
+/* [r0,r1) の行範囲を発行する本体。li0 = 最初の y>=r0 の line 添字（下界探索で確定）。
+ * 分割点での状態一意性（並列化の同値証明）:
+ *  - di/active は r0 時点で deco 前置走査により構築できる: active = {d: d.y<=r0<d.y+dh}
+ *    を deco[] 添字順（=追記順）で集めたもので、増分掃引が r0 到達時に持つ集合・順序と一致。
+ *  - pen（ansi）は既定のままでは分割できないため、並列は no-ansi 限定（呼出側で保証）。
+ *  - ギャップ充填の nl_y は r1 でクランプ（直列時 r1==my で不変。分割時は後半が自分の
+ *    区間を同じ規則で発行するため、'\n' 総数・content 行は区間和で厳密一致）。 */
+static void sweep_range(const IfLayout *lay, i32 mx, i32 r0, i32 r1, int ansi, u32 li0, IfBB *bb_ptr) {
     IfRCell *row = (IfRCell *)malloc((size_t)mx * sizeof(IfRCell));
     if (!row) if_fatal("render: oom row cells");
     u64 outcap = (u64)mx * 4 + 128;
     u8 *buf = (u8 *)malloc(outcap);
     if (!buf) if_fatal("render: oom row buffer");
-    IfBB bb; bb_init(&bb, out);
+    IfBB bb = *bb_ptr; /* 呼出側のバッファ状態を値で引き継ぎ、終端で書き戻す */
     IfPen cur = { (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
 
     /* deco の active 集合（追記順を保持したまま期限切れを惰性除去） */
     const IfDeco **active = (const IfDeco **)malloc(sizeof(IfDeco *) * 64);
     u32 n_active = 0, cap_active = 64;
-    u32 di = 0, li = 0;
+    u32 di = 0, li = li0;
 
-    for (i32 r = 0; r < my; r++) {
+    /* r0 時点の di/active を前置走査で構築（r0==0 では空集合・di=0 で従来と同一） */
+    while (di < lay->n_deco && lay->deco[di].y <= r0) {
+        const IfDeco *d = &lay->deco[di++];
+        i32 dh = d->h > 0 ? d->h : 1;
+        if (r0 < d->y + dh) {
+            if (n_active == cap_active) {
+                cap_active *= 2;
+                active = (const IfDeco **)realloc(active, sizeof(IfDeco *) * cap_active);
+                if (!active) if_fatal("render: oom deco active");
+            }
+            active[n_active++] = d;
+        }
+    }
+
+    for (i32 r = r0; r < r1; r++) {
         if (!ansi) {
             /* ギャップ一括充填: 次の LINE 到達までの区間 [r, nl_y) に
              * (a) active の非 BG deco、(b) 新たに開始する非 BG deco が無ければ、
              * 各行の発行は '\n' のみ（BG は no-ansi で不可視、cp_free/BG-only 規約と同値）。
              * di/active はここでは消費せず次行の正規経路に委ねるため状態は同期する。 */
-            i32 nl_y = (li < lay->n_lines) ? lay->lines[li]->y : my;
+            i32 nl_y = (li < lay->n_lines) ? lay->lines[li]->y : r1;
+            if (nl_y > r1) nl_y = r1; /* 分割区間では後半が自分の区間を発行（直列時 r1==my で不変） */
             if (nl_y > r) {
                 bool clean = true;
                 for (u32 k = 0; k < n_active; k++)
@@ -636,11 +721,13 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
                     for (u32 d2 = di; d2 < lay->n_deco && lay->deco[d2].y < nl_y; d2++)
                         if (lay->deco[d2].kind != IF_DECO_BG) { clean = false; break; }
                 if (clean) {
+                    u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
                     u64 gap = (u64)(nl_y - r);
                     bb_ensure(&bb, gap);
                     memset(bb.p + bb.n, '\n', (size_t)gap);
                     bb.n += gap;
                     r = nl_y - 1;
+                    if (_t) { RZ_GAP += rz_rdtsc() - _t; RN_GAP++; }
                     continue;
                 }
             }
@@ -671,6 +758,7 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
         }
         bool has_line = (li < lay->n_lines && lay->lines[li]->y == r);
         if (!has_line && n_active == 0) {
+            u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
             /* ブランク行（発行規約どおり） */
             if (ansi) {
                 bb_ensure(&bb, (u64)mx + 8);
@@ -679,6 +767,7 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
                 cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
             }
             bb_ch(&bb, '\n');
+            if (_t) { RZ_BLANK += rz_rdtsc() - _t; RN_BLANK++; }
             continue;
         }
         /* no-ansi かつ byte-direct 条件を満たす行はセルモデルを経由しない */
@@ -696,30 +785,30 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
                 continue;
             }
             if (has_line && fastable) {
-                /* 単一 seg 直行: row_emit_fast の nr==1/クリップ無し特例と逐語同値
-                 * （gap 空白→bb_put→trim→'\n'。IDM では内容行の大多数がこの形。
-                 *   cp_free（active が BG のみ）なら no-ansi 可視物は seg のみで同値） */
+                /* seg 直行（cp_free・単一行・クリップ不発の圏内）: row_emit_fast の
+                 * runs 構築/ソートを経ない一回走査版。発行バイト列は同値（関数頭参照） */
                 const IfBox *b0 = lay->lines[li];
                 if (cp_free &&
-                    (b0->_pad[0] & IF_LF_DIRECT_BYTES) && b0->n_segs == 1 &&
-                    b0->segs[0].x >= 0 && b0->segs[0].x + b0->segs[0].w <= mx &&
                     !(li + 1 < lay->n_lines && lay->lines[li + 1]->y == r)) {
-                    u64 mark = bb.n;
-                    i32 gx = b0->segs[0].x;
-                    bb_ensure(&bb, (u64)gx + b0->segs[0].text.n + 8);
-                    if (gx) { memset(bb.p + bb.n, ' ', (size_t)gx); bb.n += (u64)gx; }
-                    memcpy(bb.p + bb.n, b0->segs[0].text.p, b0->segs[0].text.n);
-                    bb.n += b0->segs[0].text.n;
-                    while (bb.n > mark && bb.p[bb.n - 1] == ' ') bb.n--;
-                    bb.p[bb.n++] = '\n';
-                    li++;
+                    u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
+                    if (row_emit_direct(&bb, b0, mx)) {
+                        li++;
+                        if (_t) { RZ_DIRECT += rz_rdtsc() - _t; RN_DIRECT++; }
+                        continue;
+                    }
+                    if (_t) RZ_SLOW += rz_rdtsc() - _t;
+                }
+                u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
+                if (row_emit_fast(&bb, lay, &li, active, n_active, mx, r)) {
+                    if (_t) { RZ_FAST += rz_rdtsc() - _t; RN_FAST++; }
                     continue;
                 }
-                if (row_emit_fast(&bb, lay, &li, active, n_active, mx, r))
-                    continue;
+                if (_t) RZ_SLOW += rz_rdtsc() - _t; /* row_emit_fast 失敗分は slow 側に寄せる */
             }
         }
         /* 行構成: [0,maxx] だけ既定充填（ansi は全幅必要） */
+        u64 _ts; if (rz()) _ts = rz_rdtsc(); else _ts = 0;
+        RN_SLOW++;
         i32 maxx = mx;
         if (!ansi) {
             maxx = 0;
@@ -785,10 +874,71 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
         if (ansi) { memcpy(buf + n, "\x1b[0m", 4); n += 4; cur = (IfPen){ (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 }; }
         buf[n++] = '\n';
         bb_put(&bb, buf, n);
+        if (_ts) RZ_SLOW += rz_rdtsc() - _ts;
     }
     bb_flush(&bb);
+    *bb_ptr = bb; /* バッファ状態（mem シンク含む）を呼出側へ書き戻す */
     free(bb.p);
     free(active);
     free(buf);
     free(row);
+}
+
+/* ---- 2-way 並列 sweep（no-ansi 限定） ----
+ * 後半区間をワーカ（メモリシンク）へ、前半を主スレッド（FILE 直書き）で同時進行し、
+ * join 後に B バッファを fwrite。バイト列は行 0..my の連結で直列 sweep と厳密一致
+ * （区間境界の状態一意性は sweep_range 頭書参照。kill switch: IF_RENDER_PAR=0） */
+typedef struct {
+    const IfLayout *lay;
+    i32 mx, r0, r1;
+    u32 li0;
+    IfBB *bb;
+} IfSweepArg;
+
+static void *sweep_worker(void *vp) {
+    const IfSweepArg *a = (const IfSweepArg *)vp;
+    sweep_range(a->lay, a->mx, a->r0, a->r1, 0, a->li0, a->bb);
+    return NULL;
+}
+
+void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
+    /* 幅は lay->width（旧 sweep 規約）。行数は lay->height と同値:
+     * 全 box/line は root の [y, y+h) に包含され lay->height = root.y+root.h であるため
+     * grid_max_walk の my は常に lay->height に一致する（包含の空手形。出力 sha256 が機械監査） */
+    i32 mx = lay->width;
+    if (mx < 1) mx = 1;
+    i32 my = lay->height;
+    if (my < 1) my = 1;
+
+    int par = 1;
+    { const char *e = getenv("IF_RENDER_PAR"); if (e && e[0] == '0') par = 0; }
+    if (ansi || !par || my < 1024 || lay->n_lines < 256 || !lay->lines) {
+        IfBB bb; bb_init(&bb, out);
+        sweep_range(lay, mx, 0, my, ansi, 0, &bb);
+        return;
+    }
+    /* 内容行数で二等分（split 行の同一 y は全て前半に含める: lower_bound 規則） */
+    u32 mid = lay->n_lines / 2;
+    i32 r_split = lay->lines[mid]->y;
+    if (r_split <= 0 || r_split >= my) {
+        IfBB bb; bb_init(&bb, out);
+        sweep_range(lay, mx, 0, my, ansi, 0, &bb);
+        return;
+    }
+    u32 li_b = mid;
+    while (li_b > 0 && lay->lines[li_b - 1]->y >= r_split) li_b--;
+
+    IfBB bbB; bb_init(&bbB, NULL); /* メモリシンク */
+    IfSweepArg argB = { lay, mx, r_split, my, li_b, &bbB };
+    pthread_t th;
+    int spawned = (pthread_create(&th, NULL, sweep_worker, &argB) == 0);
+    {
+        IfBB bbA; bb_init(&bbA, out);
+        sweep_range(lay, mx, 0, r_split, 0, 0, &bbA);
+    }
+    if (spawned) pthread_join(th, NULL);
+    else sweep_worker(&argB); /* pthread 生成失敗時は同分割を直列で（同値） */
+    if (bbB.mem_n) fwrite(bbB.mem, 1, bbB.mem_n, out);
+    free(bbB.mem);
+    /* 注意: bbB.p は sweep_range 内部で free 済み（書き戻された p は dangling） */
 }
