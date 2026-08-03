@@ -2,6 +2,40 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-08-03: 16MB IDM パイプライン総力戦 — fitdom 融合・並列 render・並列 parse/layout
+
+目標（ユーザー指示）: total < 150ms、内訳目安 parse 50 / style 40 / layout 40 / render 10。
+現在地（このコンテナ 1 物理コア×2HT 安住状態、median of 7、`--no-ansi --stats`）:
+
+| stage | ms (median) | 目標 | 状態 |
+|---|---|---|---|
+| read | 0.01 | — | mmap 相当 |
+| parse | 59.7 | 50 | 2-way 並列済（HT 限界 ~1.4x） |
+| style | 15.0 | 40 | **目標内**（UA-only memo + intern。18 unique styles） |
+| layout | 95.8 | 40 | 残課題の本体。2-way 並列済（~1.75x が効く） |
+| render | 16.7 | 10 | seg 直行 N 本化 + 2-way 並列 sweep で 24.8→16.7 |
+| **total** | **187.2** | **150** | **残 −37ms（layout が −56 の壁）** |
+
+本日の確定分（全て oracle 12/12 sha256・run_tests×2 608,259/0・golden・gui_smoke・ASAN で機械ロック）:
+- **fitdom（IFC の DOM 直接走査融合）**: flatten/pieces 配列を成功時（92.2%）に全廃。
+  失敗時は seg LIFO rewind + 全状態復帰で従来経路へ無痕フォールバック。
+- **並列 render**: sweep を [r0,r1) 区間独立化（分割点での deco/li 状態一意性を証明）、
+  no-ansi のみ 2-way。/dev/null への write はユーザ領域を読まないため flush 実質 0cy。
+- **geom (st,w) 1-entry 直前メモ**、fitdom 内 ASCII ラン SSE2 一括分類、
+  **if_utf8_band_w2**（CJK 幅 2 を lead バイト確定。全 512K 妥当 3B 組を網羅検証し
+  subset 性を機械証明。U+3040 穴を修復）、ok3 圏内 direct2 の恒等 no-op 論証による除去、
+  mnew 重複判定除去、段落継続ゲートの死コード（'|' 全走査）除去。
+- **style 2-way 並列は不採用**（正直な記録として残す）: body 直下 2 分割 + 専用
+  intern/cache/arena で値同値（visits 一致まで検証）まで作ったが、218k の部分木呼出コスト
+  （実測 ~220cy/call）が serial walk の利得を上回り **serial 18ms に対し ~37ms と 2 倍劣後**。
+  全コード撤去。threading が効くのは遅延束縛型（layout/parse）であって、メモ化済みの
+  軽量走査では呼出粒度の壁が支配になる——計測が負けを教えた案例。
+
+環境注記: このベンチ箱は 1 物理コア×2HT（LCG spin で裸スケール 0.99x を確認済）で、
+wall clock は隣接テナントで ±10-30% 揺れる。報告は quiet 状態の median、最適化判定は
+rdtsc ゾーンの cycles を一次情報とする。HT が効くのは遅延束縛型（layout ~1.75x）、
+ dependency-chain 型は伸びない（LCG 0.99x）。
+
 ## 2026-08-01: raster backend 起動時自動判定（CPU/GPU 判定の正直な実装）— 5.2× 高速 kernel を起動ごとに選定
 
 ifuto://settings の約束「CPU/GPU 自動判定」を実装。GPU は製品法則（ldd = linux-vdso/libc/ld (+libm)
