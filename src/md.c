@@ -94,6 +94,7 @@ typedef struct {
     u32 c_n, c_cap;
     u8 mode;              /* 0=empty 1=borrow 2=copy */
     u32 n_nodes;          /* ノード数のローカル計数（並列時はスレッド別。join で合算） */
+    u8 slim_attrs;        /* IF_MD_F_SLIM_ATTRS: 保持属性を A[href]/IMG[alt] に限定 */
     /* node slab: 生成は直列 bump（ノード単位の arena 呼出を slab refill に畳む） */
     IfNode *nslab, *nslab_end;
 } Mo;
@@ -323,20 +324,40 @@ static void mo_elem_store(Mo *m, bool push) {
     n->tag = g_pend.tag;
     n->u.tag_name = g_pend.name;
     if (g_pend.nattr) {
-        IfAttr *at = (IfAttr *)if_arena_alloc(m->a, g_pend.nattr * sizeof(IfAttr));
+        /* slim: レンダリング経路で読まれる属性のみ保持（A[href], IMG[alt]）。
+         * 落とした属性は DOM 上の ~30B/箇所の確保＋書込みを消す。読み手は
+         * layout.c の collect_link/IMG alt と dom dump のみ（dump は非 slim 経路）。
+         * 保持規則は if_md_parse_fast_f の契約と一致（name は emitter 由来の小文字） */
+        u32 kn = 0;
+        u8 ki[4];
         for (u32 i = 0; i < g_pend.nattr; i++) {
-            IfStr v = g_pend.av[i];
-            /* 値が persistent 範囲外なら arena に複製（脚注 id 等の生成文字列） */
-            if (v.n && !mo_persistent(m, v.p)) {
-                char *np = (char *)if_arena_alloc(m->a, v.n);
-                memcpy(np, v.p, v.n);
-                v = if_str(np, v.n);
+            bool keep = !m->slim_attrs; /* 非 slim は全保持 */
+            if (m->slim_attrs) {
+                IfStr an = g_pend.an[i];
+                keep = (g_pend.tag == IF_TAG_A && an.n == 4 &&
+                        memcmp(an.p, "href", 4) == 0) ||
+                       (g_pend.tag == IF_TAG_IMG && an.n == 3 &&
+                        memcmp(an.p, "alt", 3) == 0);
             }
-            at[i].name = g_pend.an[i];
-            at[i].value = v;
+            if (keep) ki[kn++] = (u8)i;
         }
-        n->attrs = at;
-        n->n_attrs = g_pend.nattr;
+        if (kn) {
+            IfAttr *at = (IfAttr *)if_arena_alloc(m->a, kn * sizeof(IfAttr));
+            for (u32 k = 0; k < kn; k++) {
+                u32 i = ki[k];
+                IfStr v = g_pend.av[i];
+                /* 値が persistent 範囲外なら arena に複製（脚注 id 等の生成文字列） */
+                if (v.n && !mo_persistent(m, v.p)) {
+                    char *np = (char *)if_arena_alloc(m->a, v.n);
+                    memcpy(np, v.p, v.n);
+                    v = if_str(np, v.n);
+                }
+                at[k].name = g_pend.an[i];
+                at[k].value = v;
+            }
+            n->attrs = at;
+            n->n_attrs = kn;
+        }
     }
     if (g_pend.tag == IF_TAG_STYLE) m->dom->has_style = 1;
     mattach(m->cur, n);
@@ -1365,13 +1386,14 @@ void if_md_to_html(IfArena *a, IfStr in, IfStr *out_html) {
 /* 高速経路: Markdown → DOM 直構築。
  * taint（T1..T5）を観測したら false を返して中間物を捨てる（呼び出し側が
  * 従来の 2 段経路で処理する。正しさは常に本パーサ側に集約）。 */
-static bool if_md_parse_fast_serial(IfArena *a, IfStr in, IfDom **out_dom) {
+static bool if_md_parse_fast_serial_f(IfArena *a, IfStr in, IfDom **out_dom, u8 flags) {
     /* T4: input NUL はトークナイザと意味が分かれるので fallback */
     if (in.n && memchr(in.p, 0, in.n)) return false;
     Mo m;
     memset(&m, 0, sizeof m);
     m.a = a;
     m.is_dom = true;
+    m.slim_attrs = (u8)(flags & IF_MD_F_SLIM_ATTRS);
     IfDom *dom = (IfDom *)if_arena_calloc(a, sizeof(IfDom));
     dom->arena = a;
     dom->n_nodes = 1;
@@ -1524,6 +1546,7 @@ typedef struct {
     IfStr slice;
     bool tainted;
     u32 n_nodes;
+    u8 slim_attrs;
 } MdSliceJob;
 
 static void *md_slice_run(void *arg) {
@@ -1532,6 +1555,7 @@ static void *md_slice_run(void *arg) {
     memset(&mb, 0, sizeof mb);
     mb.a = j->a;
     mb.is_dom = true;
+    mb.slim_attrs = j->slim_attrs;
     mb.dom = j->dom;
     mb.stk[0] = j->html;
     mb.stk[1] = j->stub;
@@ -1556,7 +1580,8 @@ static void *md_slice_run(void *arg) {
 /* DOM 直構築の入口: 安全分割点が見つかれば 2-way 並列、なければ従来の単走査。
  * 並列でも生成される DOM/フラグは単走査と逐語同値（分割点の証明は md_par_scan、
  * 接合規約は下記。検証: oracle sha256＋全テスト＋ASan が機械固定）。 */
-bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
+bool if_md_parse_fast_f(IfArena *a, IfStr in, IfDom **out_dom, u8 flags) {
+    const u8 slim = (u8)(flags & IF_MD_F_SLIM_ATTRS);
     if (in.n >= (1u << 20)) {
         const char *ep = getenv("IF_MD_PAR");
         bool par_on = !(ep && ep[0] == '0'); /* 殺しスイッチ（調査用。既定は並列） */
@@ -1568,6 +1593,7 @@ bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
                 memset(&m, 0, sizeof m);
                 m.a = a;
                 m.is_dom = true;
+                m.slim_attrs = slim;
                 IfDom *dom = (IfDom *)if_arena_calloc(a, sizeof(IfDom));
                 dom->arena = a;
                 dom->n_nodes = 1;
@@ -1610,7 +1636,7 @@ bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
                 stub->kind = IF_NODE_ELEMENT; stub->tag = IF_TAG_BODY; stub->ns = IF_NS_HTML;
                 stub->u.tag_name = IF_S("body");
                 MdSliceJob j;
-                j.a = &ab; j.dom = dom; j.html = html; j.stub = stub;
+                j.a = &ab; j.dom = dom; j.html = html; j.stub = stub; j.slim_attrs = slim;
                 j.full_p = in.p; j.full_n = in.n;
                 j.slice = if_str(splitp, (u32)(in.p + in.n - splitp));
                 j.tainted = false; j.n_nodes = 0;
@@ -1644,6 +1670,10 @@ bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
             }
         }
     }
-    return if_md_parse_fast_serial(a, in, out_dom);
+    return if_md_parse_fast_serial_f(a, in, out_dom, flags);
+}
+
+bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom) {
+    return if_md_parse_fast_f(a, in, out_dom, 0);
 }
 

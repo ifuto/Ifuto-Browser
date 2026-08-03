@@ -27,5 +27,9 @@ void if_md_to_html(IfArena *a, IfStr in, IfStr *out_html);
  * false なら従来の 2 段経路（if_md_to_html + if_parse_html）で処理すること。
  * true なら *out_dom に構築済み DOM が入る（同じ arena 所有）。 */
 bool if_md_parse_fast(IfArena *a, IfStr in, IfDom **out_dom);
+/* flags 付き版。IF_MD_F_SLIM_ATTRS: レンダリングで読まれない属性を格納しない
+ * （保持は A[href] / IMG[alt] のみ。--dump-dom が要求する全属性経路では使わない） */
+#define IF_MD_F_SLIM_ATTRS 0x01
+bool if_md_parse_fast_f(IfArena *a, IfStr in, IfDom **out_dom, u8 flags);
 
 #endif

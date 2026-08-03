@@ -161,7 +161,7 @@ int main(int argc, char **argv) {
          * dump-tokens / wptdom は「HTML 段」の観測点なので従来どおり 2 段で。
          * taint 観測時は従来経路へフォールバック（正しさは本パーサに集約） */
         if (mode == M_TOKENS || mode == M_WPTDOM || getenv("IFUTO_MD_SLOW") ||
-            !if_md_parse_fast(&a, input, &dom)) {
+            !if_md_parse_fast_f(&a, input, &dom, (mode == M_RENDER) ? IF_MD_F_SLIM_ATTRS : 0)) {
             IfStr md_html;
             if_md_to_html(&a, input, &md_html);
             input = md_html;
