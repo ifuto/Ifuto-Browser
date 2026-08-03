@@ -1071,28 +1071,31 @@ static void blocks_win(Mo *out, Fn *fn, Ln *ls, u32 lo, u32 hi, u32 depth) {
         }
         u32 q = _cs == '>' ? ln_quote(l) : 0;
         if (q) {
-            B qb; b_init(&qb, out->a);
             if (depth < 8) {
-                while (i < hi) {
-                    u32 w = ln_quote(ls[i]);
-                    if (!w) break;
-                    Ln x = { ls[i].p + w, ls[i].n - w };
-                    b_putn(&qb, x.p, x.n);
-                    b_putc(&qb, '\n');
-                    i++;
+                /* コピー不要路: 引用符 w を行ごとに除いた Ln 副窓を作って blocks_win を
+                 * 直接歩く。blocks_str(join) と同値の根拠:
+                 *   - join 内容 = 各行(x_k)＋'\n' → split で得られる行は {x_k} そのもの
+                 *   - 各行の切り出し p+=w/n-=w は元コードと完全同一
+                 *   - 行終端の '\n' は ls 側に含まれない（blocks_str 側は幻空行を捨てる）
+                 *   - borrow 先は原本（mo_range 登録済み）か CR 正規化コピー（同）を指す
+                 * よって emit されるイベント列・text バイト列は現行と完全一致。 */
+                u32 j = i;
+                while (j < hi && ln_quote(ls[j])) j++;
+                u32 cnt = j - i;
+                Ln stk[256];
+                Ln *wq = stk;
+                if (cnt > 256) wq = (Ln *)if_arena_alloc(out->a, (u64)cnt * sizeof(Ln));
+                for (u32 k = i; k < j; k++) {
+                    u32 w = ln_quote(ls[k]);
+                    wq[k - i].p = ls[k].p + w;
+                    wq[k - i].n = ls[k].n - w;
                 }
                 mo_open_push(out, IF_TAG_BLOCKQUOTE, "blockquote", 10);
                 mo_text_ch(out, '\n');
-                if (out->is_dom) {
-                    IfStr fin = b_finish(&qb); /* arena 恒久化（参照寿命） */
-                    mo_range(out, fin.p, fin.n);
-                    blocks_str(out, fn, fin, depth + 1);
-                } else {
-                    blocks_str(out, fn, if_str(qb.p ? qb.p : "", (u32)qb.n), depth + 1);
-                    b_drop(&qb);
-                }
+                blocks_win(out, fn, wq, 0, cnt, depth + 1);
                 mo_close(out, "blockquote", 10);
                 mo_text_ch(out, '\n');
+                i = j;
             } else {
                 u32 j = i;
                 while (j < hi && ln_quote(ls[j])) j++;
