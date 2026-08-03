@@ -603,8 +603,9 @@ typedef struct {
     float lh_val;
 } IfFitDom;
 
-/* TEXT piece 相当の処理（旧 ifc_try_fit の内側ループと逐語同一） */
-static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st,
+/* TEXT piece 相当の処理（旧 ifc_try_fit の内側ループと逐語同一）。
+ * clsf: TEXT ノードの IF_NF_TXTCLS_*（parse 確定の内容分類。0=未知は常に安全側） */
+static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st, u8 clsf,
                         float *max_lh_io, bool *any_io) {
     IfWrap *w = fd->w;
     bool pre_p = (st && st->white_space == IF_WS_PRE) || fd->pre0;
@@ -620,8 +621,27 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st,
 
     const u8 *s = (const u8 *)t.p;
     u32 n = t.n;
-    u32 i = 0;
     i32 cx = fd->cx;
+
+    /* parse 確定の内容分類による全走査省略（分類は下部スキャンと同じ述語: dom.h 参照） */
+    if (__builtin_expect(clsf != 0, 1)) {
+        i32 adv = -1;
+        if (clsf == IF_NF_TXTCLS_ASCII_VIS) adv = (i32)n;          /* 全バイト 0x21-0x7E */
+        else if (clsf == IF_NF_TXTCLS_CJK3W2) adv = (i32)(n / 3) * 2; /* 全 3B が幅 2 帯 */
+        if (adv >= 0) {
+            i32 nx = cx + adv;
+            /* 失敗境界: 直後の判定 `cx > content_w` と同じ（単一アトムのため一境界のみ）。
+             * 下位経路は push→失敗→全 pop なのに対しこちらは push しないが、
+             * 失敗時は駆動側が全 seg を LIFO 復帰するため正味状態は厳密一致 */
+            if (__builtin_expect(nx > fd->content_w, 0)) { fd->cx = nx; return false; }
+            wrap_push_merge(w, (const char *)s, n, w->content_x + cx, adv, st);
+            fd->cx = nx;
+            *any_io = true;
+            return true;
+        }
+    }
+
+    u32 i = 0;
     while (i < n) {
         u8 b0 = s[i];
         if (b0 == ' ' || b0 == '\t' || b0 == '\n' || b0 == '\r' || b0 == '\f') {
@@ -714,7 +734,7 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st,
 static bool fitdom_walk(IfFitDom *fd, IfNode *n, const IfStyle *st,
                         float *max_lh_io, bool *any_io) {
     if (n->kind == IF_NODE_TEXT)
-        return fitdom_text(fd, n->u.text, st, max_lh_io, any_io);
+        return fitdom_text(fd, n->u.text, st, n->flags, max_lh_io, any_io);
     if (n->kind != IF_NODE_ELEMENT) return true;
     const IfStyle *est = n->style ? n->style : st;
     if (n->style && n->style->display == IF_D_NONE) return true; /* flow から除去 */
@@ -728,7 +748,7 @@ static bool fitdom_walk(IfFitDom *fd, IfNode *n, const IfStyle *st,
         if (m < 0) m = 0;
         char *s = (char *)if_arena_alloc(fd->lc->arena, (u64)m);
         memcpy(s, buf, (u64)m);
-        return fitdom_text(fd, if_str(s, (u32)m), est, max_lh_io, any_io);
+        return fitdom_text(fd, if_str(s, (u32)m), est, 0, max_lh_io, any_io);
     }
     case IF_TAG_A:
         collect_link(fd->lc, n);

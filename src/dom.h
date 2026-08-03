@@ -67,6 +67,13 @@ typedef struct IfDoctype {
 
 /* IfNode.flags ビット */
 #define IF_NF_SLIM 0x01 /* slim-DOM で剃られた領域の印（接続・本文を構築しない） */
+/* TEXT ノードの内容分類（md parse が確定。描画に必要な幅を 0 追加走査で還元する）
+ *  - ASCII_VIS: 全バイト 0x21-0x7E → 可視幅 == n（空白・ゼロ幅・全角を含まない）
+ *  - CJK3W2: n%3==0 かつ全 3 バイト組が if_utf8_band_w2 → 可視幅 == 2*(n/3)
+ * 0（mixed）は常に安全側（layout の従来経路）。分類述語は layout の走査と同一定義。 */
+#define IF_NF_TXTCLS_ASCII_VIS 0x02
+#define IF_NF_TXTCLS_CJK3W2   0x04
+#define IF_NF_TXTCLS_MASK     0x06
 
 /* 法則「画面描画に関係ないものは DOM しない」の実装スイッチ（dom.c）。
  * true のとき script / template 配下の子孫・本文を DOM に構築しない

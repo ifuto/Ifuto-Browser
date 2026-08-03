@@ -31,6 +31,7 @@
 #include "md.h"
 #include "dom.h"
 #include "strutil.h"
+#include "utf8.h" /* if_utf8_band_w2（TEXT 内容分類 CJK3W2 判定の唯一の定義） */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h> /* realloc/free（string backend のステージング解放規約） */
@@ -216,6 +217,34 @@ static void mattach(IfNode *parent, IfNode *ch) {
 }
 
 /* 現在の run を TEXT ノードとして確定（open/close/void の前に必ず呼ぶ） */
+/* TEXT 内容分類（layout fitdom の再トークン化を消すための parse 確定メタデータ）。
+ * 分類述語は layout 側の走査条件と同一定義（結果の同値性は述語一致で保証）:
+ *  - ASCII_VIS 判定 = fitdom の ASCII 可視ラン走査が全バイト通過する条件そのもの
+ *  - CJK3W2 判定 = ok3 ランの全グリフが if_utf8_band_w2（⊂ decode 成功 ∧ 幅 2） */
+static u8 mo_txtcls(IfStr t) {
+    const u8 *s = (const u8 *)t.p;
+    u32 n = t.n;
+    u32 i = 0;
+#if defined(IF_MD_SIMD)
+    for (; i + 16 <= n; i += 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+        __m128i m = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(0x20)),
+                                  _mm_cmpgt_epi8(_mm_set1_epi8(0x7F), v));
+        if ((unsigned)_mm_movemask_epi8(m) != 0xFFFFu) goto not_ascii_vis;
+    }
+#endif
+    for (; i < n; i++) if (s[i] < 0x21 || s[i] > 0x7E) goto not_ascii_vis;
+    return IF_NF_TXTCLS_ASCII_VIS;
+not_ascii_vis:
+    if (n % 3 == 0) {
+        u32 j = 0;
+        for (; j + 2 < n; j += 3)
+            if (!if_utf8_band_w2(s[j], s[j + 1], s[j + 2])) break;
+        if (j == n) return IF_NF_TXTCLS_CJK3W2;
+    }
+    return 0;
+}
+
 static inline void run_flush(Mo *m) {
     u64 _t0; if (mpf()) _t0 = if_rdtsc_md(); else _t0 = 0;
     if (m->mode != 0) {
@@ -228,7 +257,7 @@ static inline void run_flush(Mo *m) {
         }
         if (t.n) {
             IfNode *n = mnew(m, IF_NODE_TEXT);
-            if (n) { n->u.text = t; mattach(m->cur, n); }
+            if (n) { n->u.text = t; n->flags |= mo_txtcls(t); mattach(m->cur, n); }
         }
         run_reset(m);
     }
