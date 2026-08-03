@@ -870,7 +870,7 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
     return c;
 }
 
-static IfBox *layout_element(IfLC *lc, IfNode *node, const IfStyle *pst,
+static IfBox *layout_element(IfLC *lc, IfNode *node, const IfStyle *st,
                              i32 ax, i32 ay, i32 avail_w);
 
 /* node の子を走査して配置し、content 高を返す（カーソル前進で O(N)） */
@@ -954,13 +954,12 @@ static const IfStyle IF_STYLE_FALLBACK = {
     .white_space = IF_WS_NORMAL,
 };
 
-static IfBox *layout_element(IfLC *lc, IfNode *node, const IfStyle *pst,
+static IfBox *layout_element(IfLC *lc, IfNode *node, const IfStyle *st,
                              i32 ax, i32 ay, i32 avail_w) {
     u64 _s0, _acc; if (lpf()) { _s0 = if_rdtsc(); _acc = 0; } else { _s0 = 0; _acc = 0; }
-    /* lazy: ELEMENT の st を解決（呼出側が親 st を pst で渡す。値は eager と同値）。
-     * eager: 従来（未適用時は FALLBACK） */
-    const IfStyle *st = lc->lazy ? lc_st_of(lc, node, pst)
-                                 : (node->style ? node->style : &IF_STYLE_FALLBACK);
+    /* st は呼出側で解決済み（ELEMENT の lazy 解決は layout_children ゲート 1 回だけ。
+     * 防御: NULL は style 未適用とみなし従来 FALLBACK） */
+    if (__builtin_expect(!st, 0)) st = &IF_STYLE_FALLBACK;
     IfBox *box = new_box(lc, IF_BOX_BLOCK, node, st);
     const IfGeomEnt *g = geom_get(lc, lc->geom, st, avail_w);
     i32 bl = g->bl, brd = g->brd, bt = g->bt, bbo = g->bbo;
@@ -1251,7 +1250,7 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         return lay2;
     }
 
-    IfBox *root = layout_element(&lc, body, html_st, 0, body_mt, width_cells);
+    IfBox *root = layout_element(&lc, body, bst, 0, body_mt, width_cells);
     lay->root = root;
     lay->height = root->y + root->h;
     lay->links = lc.links;
