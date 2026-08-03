@@ -73,6 +73,8 @@ typedef struct IfLayout {
 
 /* dom+style からレイアウトを構築。width はセル。失敗しない（壊れた構造は空行に落ちる）。 */
 IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells);
+/* 線形モード（CLI 行スイープ専用。BLOCK 箱を再利用し親接続を消す。全出力は同値） */
+IfLayout *if_layout_build_linear(IfArena *arena, IfDom *dom, i32 width_cells);
 
 void if_layout_dump(const IfLayout *lay, void *out_FILE);
 

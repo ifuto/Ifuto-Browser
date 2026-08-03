@@ -210,7 +210,9 @@ int main(int argc, char **argv) {
     double t3 = now_ms();
     double arena_after_style = (double)if_arena_reserved(&a);
 
-    IfLayout *lay = if_layout_build(&a, dom, width);
+    /* CLI 行スイープは box 木を参照しない → 線形モード（BLOCK 箱再利用）。dump-layout は従来経路 */
+    IfLayout *lay = (mode == M_LAYOUT) ? if_layout_build(&a, dom, width)
+                                       : if_layout_build_linear(&a, dom, width);
     if (mode == M_LAYOUT) {
         if_layout_dump(lay, stdout);
         if_arena_destroy(&a);

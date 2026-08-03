@@ -84,6 +84,12 @@ typedef struct {
     int frame_n;
     IfGeomCache *geom;
     IfLayout *lay;       /* lines ログ記録先 */
+    /* 線形モード（CLI 行スイープ専用）: BLOCK 箱は親接続・木 dump の対象外で、
+     * 戻り値 h のみが意味を持つ → 深さ分だけ生存するスクラッチから再利用する
+     * （arena への ~49MB の box stream と add_child/frame の接続作業を構造消去）。
+     * 不変条件: no_boxlink の LC では box 木を誰も辿らない（出力は lines[]/deco[] のみ）。 */
+    IfBox *box_pool;
+    u8 no_boxlink;
     u8 md_ws_stripped;   /* dom->md_ws_stripped のコピー（下記 mo_ws_sink 対応補正用） */
     IfNode *stop;        /* 並列シャードの spine 打ち止め（NULL=従来どおり兄弟末尾まで） */
 } IfLC;
@@ -119,6 +125,7 @@ static i32 len_v(IfLen l, float self_fs, float root_fs, i32 basis_w) {
 }
 
 static void box_add_child(IfLC *lc, IfBox *parent, IfBox *child) {
+    if (lc->no_boxlink) { (void)parent; (void)child; return; } /* 線形: 接続なし */
     child->next_sibling = NULL;
     IfBox *tail = NULL;
     bool use_frame = lc && lc->frame_n > 0 && lc->frame_box[lc->frame_n - 1] == parent;
@@ -131,12 +138,23 @@ static void box_add_child(IfLC *lc, IfBox *parent, IfBox *child) {
     if (use_frame) lc->frame_tail[lc->frame_n - 1] = child;
 }
 
+/* 線形モードの BLOCK 箱回収: 呼出側が child->h を読み終えた直後にのみ呼ぶ。
+* （スクラッチ返却。arena 確定の LINE 箱や root は絶対に返さない） */
+static inline void box_recycle(IfLC *lc, IfBox *b) {
+    if (lc->no_boxlink && b->kind == IF_BOX_BLOCK) {
+        b->next_sibling = lc->box_pool;
+        lc->box_pool = b;
+    }
+}
+
 /* IfBox 生成直後（子の構築を始める前）に frame を積み、構築完了で降ろす */
 static void frame_push(IfLC *lc, IfBox *box) {
+    if (lc->no_boxlink) return; /* 線形: 子接続をしないので frame も不要 */
     if (lc->frame_n < 512) { lc->frame_box[lc->frame_n] = box; lc->frame_tail[lc->frame_n] = NULL; }
     lc->frame_n++;
 }
 static void frame_pop(IfLC *lc, IfBox *box) {
+    if (lc->no_boxlink) return;
     lc->frame_n--;
     (void)box; /* 対称性のみ。depth 超過分は push で積まれないので pop も対称 */
     if (lc->frame_n < 0) lc->frame_n = 0;
@@ -157,7 +175,13 @@ static u32 deco_add(IfLC *lc, u8 kind, i32 x, i32 y, i32 w, i32 h, u32 argb,
 
 static IfBox *new_box(IfLC *lc, u8 kind, IfNode *node, const IfStyle *st) {
     /* calloc ではなく alloc + 全メンバ明示初期化（64B memset の依存チェインを避ける） */
-    IfBox *b = (IfBox *)if_arena_alloc(lc->arena, sizeof(IfBox));
+    IfBox *b;
+    if (kind == IF_BOX_BLOCK && lc->no_boxlink && lc->box_pool) {
+        b = lc->box_pool;          /* 線形: 深さ生存スクラッチから再利用 */
+        lc->box_pool = b->next_sibling;
+    } else {
+        b = (IfBox *)if_arena_alloc(lc->arena, sizeof(IfBox));
+    }
     b->first_child = NULL;
     b->next_sibling = NULL;
     b->node = node;
@@ -853,7 +877,9 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node,
         }
         IfBox *child = layout_element(lc, c, content_x, y, content_w);
         box_add_child(lc, box, child);
-        y += child->h;
+        i32 child_h = child->h;
+        box_recycle(lc, child); /* 線形モード以外では no-op */
+        y += child_h;
                 prev_mb = mb;
         if (lc->md_ws_stripped && ws_sink_parent(node->tag))
             prev_mb = 0; /* 旧 DOM では sink 容器直下の ws TEXT が ifc 経由で必ず
@@ -956,6 +982,7 @@ typedef struct IfLayShard {
     u8 bsides;
     i32 width_cells;
     u8 md_ws_stripped;
+    u8 no_boxlink;
     /* out */
     IfLayout *lay;
     i32 content_h;
@@ -972,6 +999,7 @@ static void layout_shard_run_body(IfLayShard *s) {
     lc.geom = (IfGeomCache *)if_arena_calloc(arena, sizeof(IfGeomCache));
     lc.lay = lay;
     lc.md_ws_stripped = s->md_ws_stripped;
+    lc.no_boxlink = s->no_boxlink;
     lc.stop = s->stop;
     IfBox *vroot = new_box(&lc, IF_BOX_BLOCK, NULL, s->body_st);
     lay->root = vroot;
@@ -1006,12 +1034,13 @@ static void shift_tree(IfBox *b, i32 dy) {
     }
 }
 
-IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
+static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 linear) {
     if (width_cells < 4) width_cells = 4;
     IfLayout *lay = (IfLayout *)if_arena_calloc(arena, sizeof(IfLayout));
     IfLC lc = { .arena = arena, .root_fs = 16.0f };
     lc.geom = (IfGeomCache *)if_arena_calloc(arena, sizeof(IfGeomCache));
     lc.lay = lay;
+    lc.no_boxlink = linear;
     lc.md_ws_stripped = dom->md_ws_stripped;
     lay->arena = arena;
     lay->width = width_cells;
@@ -1062,11 +1091,13 @@ IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
         sa.content_w = content_w; sa.bx = bx; sa.by = by; sa.box_w = box_w;
         sa.bsides = bsides;  /* 実 body の装飾は A が担当 */
         sa.width_cells = width_cells; sa.md_ws_stripped = 1;
+        sa.no_boxlink = linear;
         sb.arena = &ab; sb.vbody = *body; sb.vbody.first_child = mid; sb.stop = NULL;
         sb.body_st = bst; sb.content_x = content_x; sb.content_y = content_y;
         sb.content_w = content_w; sb.bx = bx; sb.by = by; sb.box_w = box_w;
         sb.bsides = 0;       /* B は body 装飾を出さない（A のみ） */
         sb.width_cells = width_cells; sb.md_ws_stripped = 1;
+        sb.no_boxlink = linear;
 
         pthread_t th;
         int rc = pthread_create(&th, NULL, layout_shard_thread, &sb);
@@ -1079,8 +1110,13 @@ IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
         if (bg->height_spec >= 0 && bg->height_spec > content_h)
             content_h = bg->height_spec; /* 指定高はクリップせず拡張のみ（layout_element 同値） */
 
-        /* B の全 y を H_A シフト（lines は DFS で確実に捕捉、deco は配列で） */
-        shift_tree(sb.vroot, hA);
+        /* B の全 y を H_A シフト（lines は DFS で確実に捕捉、deco は配列で）。
+         * 線形モードは box 木未接続のため lines[] 配列を直接シフト（同じ対象・同じ量） */
+        if (linear) {
+            for (u32 i = 0; i < sb.lay->n_lines; i++) sb.lay->lines[i]->y += hA;
+        } else {
+            shift_tree(sb.vroot, hA);
+        }
         for (u32 i = 0; i < sb.lay->n_deco; i++) sb.lay->deco[i].y += hA;
 
         IfLayout *lay2 = sa.lay;
@@ -1138,6 +1174,18 @@ IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
     lay->links = lc.links;
     lay->n_links = lc.n_links;
     return lay;
+}
+
+IfLayout *if_layout_build(IfArena *arena, IfDom *dom, i32 width_cells) {
+    return build_impl(arena, dom, width_cells, 0);
+}
+
+/* 線形モード入口（CLI 行スイープ専用）: 幾何・lines/deco/links の全出力が従来経路と
+ * 同値であることを oracle/idm・golden・tests がロックする。kill switch: IF_LAYOUT_LIN=0 */
+IfLayout *if_layout_build_linear(IfArena *arena, IfDom *dom, i32 width_cells) {
+    const char *e = getenv("IF_LAYOUT_LIN");
+    u8 linear = !(e && e[0] == '0');
+    return build_impl(arena, dom, width_cells, linear);
 }
 
 /* ---------- デバッグダンプ ---------- */
