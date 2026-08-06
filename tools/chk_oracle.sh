@@ -10,7 +10,7 @@ chk() { # chk <expected-sha> <label> <cmd...>
     if [ "$got" = "$exp" ]; then echo "OK   $label"; ok=$((ok+1));
     else echo "DIFF $label exp=$exp got=$got"; ng=$((ng+1)); fi
 }
-F=.arena/idm/forged.md
+F=oracle/forged.md   # 正本は tracked（.arena は再起動で消える）
 M2=.arena/idm/idm-2mb.md
 M16=.arena/idm/idm-16mb.md
 chk cce7e686bcd28731dbf14f341d2fcc9cd2e2d16381b06ccf502813fd1f3b61c8 forged.out    "$BIN" --no-ansi "$F"
