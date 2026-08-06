@@ -3,6 +3,8 @@
 
 CC      ?= cc
 SRC     := $(wildcard src/*.c)
+# 単一翻訳・LTO 一括ビルドのためヘッダは全て成員に列挙する
+# （ヘッダ変更で再ビルドが走らず古いバイナリを信用する事故の防除）
 ENGINE  := $(filter-out src/main.c,$(SRC))
 # Akl（自作 JS エンジン, C11/JIT なし）: v0.0 は DOM 未接続のため本体 ifuto には
 # リンクしない（200KB 天井維持。v0.4 統合時に実測で天井を再設定する — BENCH.md 台帳）。
@@ -22,11 +24,12 @@ $(BUILD):
 
 # GUI は TUI 廃止（2026-08-01）で単一 UI。ifuto 本体に統合（--gui / --shot）。
 GUISRC := $(wildcard src/gui/*.c)
-$(BUILD)/ifuto: $(SRC) $(GUISRC) | $(BUILD)
+HDRS    := $(wildcard src/*.h src/gui/*.h src/akl/*.h)
+$(BUILD)/ifuto: $(SRC) $(GUISRC) $(HDRS) | $(BUILD)
 	$(CC) $(BASE) $(REL) -o $@ $(SRC) $(GUISRC) $(LDFLAGS_REL) -lm
 
 # 開発用: sanitizer 付きバイナリ（テスト・手動検証は常にこちらで）
-$(BUILD)/ifuto-asan: $(SRC) $(GUISRC) | $(BUILD)
+$(BUILD)/ifuto-asan: $(SRC) $(GUISRC) $(HDRS) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -o $@ $(SRC) $(GUISRC) -lm
 
 gui: $(BUILD)/ifuto

@@ -1,6 +1,8 @@
 #include "fb.h"
 #include "font5x7.h"
+#include "font16.h"
 #include "../raster.h"
+#include "../utf8.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -56,11 +58,70 @@ void fb_glyph(IfFbStrip *s, i32 x_px, i32 y_px, u8 ch, u32 fg, u32 bg,
     }
 }
 
+void fb_glyph16(IfFbStrip *s, i32 x_px, i32 y_px, const void *rows16_, u32 fg, u32 bg,
+                bool bold, bool underline) {
+    const uint16_t *rows16 = (const uint16_t *)rows16_;
+    fb_rect(s, x_px, y_px, 2 * GUI_CELL_W, GUI_CELL_H, bg);
+    for (i32 r = 0; r < 16; r++) {
+        i32 yy = y_px + r;
+        if (yy < 0 || yy >= (i32)s->h_px) continue;
+        u32 row = rows16[r];
+        for (i32 c = 0; c < 16; c++) {
+            if (!(row & (0x8000u >> c))) continue;
+            i32 xx = x_px + c;
+            if (xx >= 0 && xx < (i32)s->w_px) s->px[(u64)yy * s->w_px + (u32)xx] = fg;
+            if (bold) {
+                i32 x2 = xx + 1;
+                if (x2 >= 0 && x2 < (i32)s->w_px)
+                    s->px[(u64)yy * s->w_px + (u32)x2] = fg;
+            }
+        }
+    }
+    if (underline) {
+        i32 uy = y_px + 13;
+        if (uy >= 0 && uy < (i32)s->h_px)
+            for (i32 c = 0; c < 2 * GUI_CELL_W; c++) {
+                i32 xx = x_px + c;
+                if (xx >= 0 && xx < (i32)s->w_px) s->px[(u64)uy * s->w_px + (u32)xx] = fg;
+            }
+    }
+}
+
+/* グリフ選択の一点化: コードポイント → 描画。
+ *   ASCII / box-drawing 外形等価 / 全角互換形（半角グリフ中央配置）/
+ *   font16（かな・カナ・記号）/ F16_TOFU（未収録全角の明示印。'?' 潰れ禁止）。
+ * cp==0x3000/空白は bg 矩形のみ。戻り値: 進んだセル幅（1 or 2）。 */
+i32 fb_glyph_cp(IfFbStrip *s, i32 x_px, i32 y_px, u32 cp, u32 fg, u32 bg,
+                bool bold, bool underline) {
+    if (cp == ' ') { fb_rect(s, x_px, y_px, GUI_CELL_W, GUI_CELL_H, bg); return 1; }
+    if (cp == 0x3000) { fb_rect(s, x_px, y_px, 2 * GUI_CELL_W, GUI_CELL_H, bg); return 2; }
+    if (cp >= 0x20 && cp <= 0x7E) { fb_glyph(s, x_px, y_px, (u8)cp, fg, bg, bold, underline); return 1; }
+    /* ASCII 外形付け替え: box-drawing 系は「構図の等価物」に落とす（豆腐回避） */
+    if ((cp >= 0x2500 && cp <= 0x257F) || cp == 0x2014 || cp == 0x2013) {
+        fb_glyph(s, x_px, y_px, '-', fg, bg, bold, underline); return 1;
+    }
+    if (cp == 0x2022) { /* 箇条書き小点（● は font16 に実字形があるため除外） */
+        fb_glyph(s, x_px, y_px, '*', fg, bg, bold, underline); return 1;
+    }
+    /* 全角 ASCII 互換形（ＡＢＣ１２３…）は半角グリフを 2 セル中央に */
+    if (cp >= 0xFF01 && cp <= 0xFF5E) {
+        fb_rect(s, x_px, y_px, 2 * GUI_CELL_W, GUI_CELL_H, bg);
+        fb_glyph(s, x_px + GUI_CELL_W / 2, y_px, (u8)(cp - 0xFEE0), fg, bg, bold, underline);
+        return 2;
+    }
+    const void *g16 = f16_lookup(cp);
+    if (!g16) g16 = F16_TOFU;
+    fb_glyph16(s, x_px, y_px, g16, fg, bg, bold, underline);
+    return 2;
+}
+
 void fb_text(IfFbStrip *s, i32 x_px, i32 y_px, const u8 *str, u32 n, u32 fg, u32 bg,
              bool bold, bool underline) {
-    for (u32 i = 0; i < n; i++) {
-        u8 ch = str[i];
-        if (ch >= 0x80) ch = '?'; /* 非 ASCII → 豆腐欄（'?')。表記安全性の規約 */
-        fb_glyph(s, x_px + (i32)i * GUI_CELL_W, y_px, ch, fg, bg, bold, underline);
+    u32 pos = 0, col = 0;
+    while (pos < n) {
+        u32 cp = if_utf8_decode(str, n, &pos);
+        if (!cp) break;
+        col += (u32)fb_glyph_cp(s, x_px + (i32)col * GUI_CELL_W, y_px, cp, fg, bg,
+                                bold, underline);
     }
 }

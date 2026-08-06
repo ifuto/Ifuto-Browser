@@ -105,12 +105,6 @@ typedef struct {
     IfFbStrip strip;
 } Painter;
 
-static void paint_cell(Painter *p, i32 col_px, i32 row_cell, u8 ch, u32 fg, u32 bg,
-                       u8 flags) {
-    i32 y_local_px = row_cell * GUI_CELL_H - (i32)p->y0_px;
-    fb_glyph(&p->strip, col_px, y_local_px, ch, fg, bg,
-             (flags & IF_F_BOLD) != 0, (flags & IF_F_ULINE) != 0);
-}
 
 /* 行 row_cell（セル行。0 起点で画面全体）を描く。gui 部（tabstrip/omni/status)は
  * ここで、文書部は grid から。 */
@@ -181,25 +175,13 @@ static void paint_screen_row(Gui *g, Painter *p, i32 row_cell) {
     fb_rect(&p->strip, 0, gy_local_px_top, (i32)p->strip.w_px, GUI_CELL_H, GUI_PAGE_BG);
     for (i32 col = 0; col < vg->w && col < g->w_cells; col++) {
         IfCell *cell = &vg->cells[(i64)(gy - vg->y_off) * vg->w + col];
-        if (cell->cp == 0) continue; /* 全角継続セル */
+        if (cell->cp == 0) continue; /* 全角継続セル（先頭セルの glyph16 が 2 セルぶん塗る） */
         u32 fg = ansi_to_rgb(cell->fg, GUI_PAGE_FG);
         u32 bg = ansi_to_rgb(cell->bg, GUI_PAGE_BG);
-        /* ASCII 外形付け替え: box-drawing 系は「構図の等価物」に落とす（豆腐回避） */
-        u8 ch = cell->cp <= 0x7E && cell->cp >= 0x20 ? (u8)cell->cp
-              : (cell->cp >= 0x2500 && cell->cp <= 0x257F) ? '-'
-              : (cell->cp == 0x2014 || cell->cp == 0x2013) ? '-' /* em/en dash */
-              : (cell->cp == 0x2022 || cell->cp == 0x25CF) ? '*' /* 箇条書き記号 */
-              : '?';
-        if (cell->cp == ' ') {
-            /* 空白でも bg が既定でなければ塗る */
-            if (bg != GUI_PAGE_BG)
-                fb_rect(&p->strip, col * GUI_CELL_W, gy_local_px_top,
-                        GUI_CELL_W, GUI_CELL_H, bg);
-            continue;
-        }
-        bool link_focus = t->link_idx >= 0;
-        paint_cell(p, col * GUI_CELL_W, row_cell, ch, fg, bg, cell->flags);
-        (void)link_focus;
+        /* グリフ選択はラスタ層（fb_glyph_cp）の責務: ASCII 外形付け替え・
+         * 全角互換形・font16（かな/カナ/記号）・明示豆腐を一点化する */
+        fb_glyph_cp(&p->strip, col * GUI_CELL_W, gy_local_px_top, cell->cp, fg, bg,
+                    (cell->flags & IF_F_BOLD) != 0, (cell->flags & IF_F_ULINE) != 0);
     }
 }
 
@@ -519,6 +501,8 @@ int if_gui_shot(const char *input_path, const char *out_ppm) {
     g.omni_focus = true;
     if (input_path) gui_load(&g, input_path, g.w_cells);
     bool ok = shot_ppm(&g, out_ppm);
+    if_chrome_destroy(&g.c); /* LSan 対象の正当解体（タブ「1 タブ 1 arena」ごと） */
     free(g.wcells);
+    free(g.rowhash);
     return ok ? 0 : 1;
 }
