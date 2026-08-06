@@ -1175,7 +1175,7 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         for (u32 k = 0; k < nch / 2; k++) mid = mid->next_sibling;
 
         IfArena ab;
-        if_arena_init(&ab, 1u << 22);
+        if_arena_init(&ab, 1u << 23);
         IfLayShard sa, sb;
         memset(&sa, 0, sizeof sa);
         memset(&sb, 0, sizeof sb);

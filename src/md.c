@@ -1631,7 +1631,7 @@ bool if_md_parse_fast_f(IfArena *a, IfStr in, IfDom **out_dom, u8 flags) {
 
                 /* B 側は専用 arena + stub body（mattach が実 body に触れないように） */
                 IfArena ab;
-                if_arena_init(&ab, 1u << 22);
+                if_arena_init(&ab, 1u << 23);
                 IfNode *stub = (IfNode *)if_arena_calloc(&ab, sizeof(IfNode));
                 stub->kind = IF_NODE_ELEMENT; stub->tag = IF_TAG_BODY; stub->ns = IF_NS_HTML;
                 stub->u.tag_name = IF_S("body");
