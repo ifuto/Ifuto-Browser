@@ -418,34 +418,49 @@ static void wrap_end_line(IfWrap *w, float max_lh) {
     if (align == IF_TA_CENTER && w->line_w < w->content_w) shift = (w->content_w - w->line_w) / 2;
     else if (align == IF_TA_RIGHT && w->line_w < w->content_w) shift = w->content_w - w->line_w;
 
-    IfBox *line = new_box(w->lc, IF_BOX_LINE, NULL, w->align_st);
-    line->x = w->content_x;
-    line->y = w->y;
-    line->w = w->line_w;
-    line->h = rows;
-    line->text_align = align;
     /* seg は arena 直接確定済み（無コピー）。align シフトだけ確定時に適用 */
-    if (w->n_segs) {
-        line->segs = w->seg_base;
-        line->n_segs = w->n_segs;
-        if (shift)
-            for (u32 i = 0; i < line->n_segs; i++) line->segs[i].x += shift;
-    }
-    line->_pad[0] = w->direct_all ? IF_LF_DIRECT_BYTES : 0;
+    if (w->n_segs && shift)
+        for (u32 i = 0; i < w->n_segs; i++) w->seg_base[i].x += shift;
+    u16 lflags = w->direct_all ? IF_LF_DIRECT_BYTES : 0;
     w->direct_all = 1; /* 次行は既定で有効（無効化は wrap_note_direct で畳む） */
-    box_add_child(w->lc, w->parent, line);
-    /* 行スイープ直接発行用のログ（生成順 = y 単調非減少） */
+    /* 木構築モードのみ IfBox を実体化（線形モードの LINE box は誰も読まない） */
+    if (!w->lc->no_boxlink) {
+        IfBox *line = new_box(w->lc, IF_BOX_LINE, NULL, w->align_st);
+        line->x = w->content_x;
+        line->y = w->y;
+        line->w = w->line_w;
+        line->h = rows;
+        line->text_align = align;
+        if (w->n_segs) {
+            line->segs = w->seg_base;
+            line->n_segs = w->n_segs;
+        }
+        line->_pad[0] = (u8)lflags;
+        box_add_child(w->lc, w->parent, line);
+    }
+    /* 行スイープ直接発行用のログ（生成順 = y 単調非減少）。sweep は y/segs/
+     * n_segs/flags 以外を読まない（全 src 監査済）→ 24B の値レコードで確定 */
     {
         IfLC *lc2 = w->lc;
         IfLayout *lay = lc2->lay;
         if (lay) {
-            if (__builtin_expect(lay->n_lines < lay->cap_lines, 1)) {
-                lay->lines[lay->n_lines++] = line;
-            } else {
-                lay->lines = (IfBox **)if_arena_grow(lc2->arena, lay->lines,
-                    &lay->cap_lines, lay->n_lines + 1, sizeof(IfBox *));
-                lay->lines[lay->n_lines++] = line;
+            IfRLine rl;
+            rl.segs = w->n_segs ? w->seg_base : NULL;
+            rl.n_segs = w->n_segs;
+            rl.y = w->y;
+            rl.flags = lflags;
+            rl._pad = 0;
+            IfLChunk *ck = lay->lines_tail;
+            if (__builtin_expect(!ck || ck->n == IF_LCHUNK_N, 0)) {
+                ck = (IfLChunk *)if_arena_alloc(lc2->arena, sizeof(IfLChunk));
+                ck->next = NULL;
+                ck->n = 0;
+                if (lay->lines_tail) lay->lines_tail->next = ck;
+                else lay->lines_head = ck;
+                lay->lines_tail = ck;
             }
+            ck->v[ck->n++] = rl;
+            lay->n_lines++;
         }
     }
     w->y += rows;
@@ -1195,7 +1210,8 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         /* B の全 y を H_A シフト（lines は DFS で確実に捕捉、deco は配列で）。
          * 線形モードは box 木未接続のため lines[] 配列を直接シフト（同じ対象・同じ量） */
         if (linear) {
-            for (u32 i = 0; i < sb.lay->n_lines; i++) sb.lay->lines[i]->y += hA;
+            for (IfLChunk *ck = sb.lay->lines_head; ck; ck = ck->next)
+                for (u32 i = 0; i < ck->n; i++) ck->v[i].y += hA;
         } else {
             shift_tree(sb.vroot, hA);
         }
@@ -1220,13 +1236,16 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         if (sa.deco_bg != UINT32_MAX) lay2->deco[sa.deco_bg].h = root->h;
         if (sa.deco_bd != UINT32_MAX) lay2->deco[sa.deco_bd].h = root->h;
         /* lines/deco 連結（単調区間が交差しないため memcpy 連結で統合） */
-        u32 nl = sa.lay->n_lines + sb.lay->n_lines;
-        IfBox **larr = (IfBox **)if_arena_alloc(arena, (u64)(nl ? nl : 1) * sizeof(IfBox *));
-        memcpy(larr, sa.lay->lines, (u64)sa.lay->n_lines * sizeof(IfBox *));
-        memcpy(larr + sa.lay->n_lines, sb.lay->lines, (u64)sb.lay->n_lines * sizeof(IfBox *));
-        lay2->lines = larr;
-        lay2->n_lines = nl;
-        lay2->cap_lines = nl;
+        /* lines 連結はチャンク列のポインタ接続（A 末尾→B 先頭。コピー・アドレス
+         * 再計算ともに不要: チャンクが値所有のため参照がそのまま生きる） */
+        if (sb.lay->lines_head) {
+            if (sa.lay->lines_tail) sa.lay->lines_tail->next = sb.lay->lines_head;
+            else sa.lay->lines_head = sb.lay->lines_head;
+            sa.lay->lines_tail = sb.lay->lines_tail;
+        }
+        lay2->lines_head = sa.lay->lines_head;
+        lay2->lines_tail = sa.lay->lines_tail;
+        lay2->n_lines = sa.lay->n_lines + sb.lay->n_lines;
         u32 nd = sa.lay->n_deco + sb.lay->n_deco;
         IfDeco *darr = (IfDeco *)if_arena_alloc(arena, (u64)(nd ? nd : 1) * sizeof(IfDeco));
         memcpy(darr, sa.lay->deco, (u64)sa.lay->n_deco * sizeof(IfDeco));

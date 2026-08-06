@@ -573,8 +573,41 @@ enum { IF_RR_BYTES = 0, IF_RR_HLINE = 1 };
  *  - clip 分岐（x>mx, pos>=mx, pos+w>mx）は上記条件で全て不発
  * 同値根拠は 1 行=1 セル列への写像が IF_LF_DIRECT_BYTES で byte 恒等であること
  * （旧単一 seg 直行と同じ空手形）。条件違反時は false で row_emit_fast へ委譲。 */
-static bool row_emit_direct(IfBB *bb, const IfBox *b, i32 mx) {
-    if (!(b->_pad[0] & IF_LF_DIRECT_BYTES)) return false;
+/* チャンク連結 lines 用のカーソル（順次 + 1 先読みのみ。O(1) 前進を保証するため
+ * 添字アクセスは禁止、ck/off を持ち回る。li は n_lines との境界判定用の台帳） */
+typedef struct { const IfLChunk *ck; u32 off; u32 li; } IfLCur;
+static inline const IfRLine *lcur_p(const IfLCur *c) { return &c->ck->v[c->off]; }
+static inline void lcur_next(IfLCur *c) {
+    c->li++;
+    if (++c->off == c->ck->n && c->ck->next) { c->ck = c->ck->next; c->off = 0; }
+}
+/* 1 要素先（存在しなければ NULL）。境界は n_lines 台帳で判定する */
+static inline const IfRLine *lcur_peek1(const IfLCur *c, u32 n_lines) {
+    if (c->li + 1 >= n_lines) return NULL;
+    if (c->off + 1 < c->ck->n) return &c->ck->v[c->off + 1];
+    return c->ck->next ? &c->ck->next->v[0] : NULL;
+}
+static inline IfLCur lcur_seek(const IfLayout *lay, u32 li) {
+    const IfLChunk *ck = lay->lines_head;
+    u32 base = 0;
+    while (ck && li >= base + ck->n) { base += ck->n; ck = ck->next; }
+    IfLCur c = { ck, ck ? li - base : 0, li };
+    return c;
+}
+/* 1 要素前へ（split 設定の逆戻り専用。単方向リストなのでチャンク跨ぎは
+ * 先頭から辿るが、跨ぎは総数で ~チャンク数回＝償却 O(chunks)） */
+static inline void lcur_prev(const IfLayout *lay, IfLCur *c) {
+    c->li--;
+    if (c->off > 0) { c->off--; return; }
+    const IfLChunk *k = lay->lines_head;
+    const IfLChunk *prev = NULL;
+    while (k && k != c->ck) { prev = k; k = k->next; }
+    c->ck = prev;
+    c->off = prev ? prev->n - 1 : 0;
+}
+
+static bool row_emit_direct(IfBB *bb, const IfRLine *b, i32 mx) {
+    if (!(b->flags & IF_LF_DIRECT_BYTES)) return false;
     u64 mark = bb->n;
     i32 pos = 0;
     for (u32 u = 0; u < b->n_segs; u++) {
@@ -593,12 +626,12 @@ static bool row_emit_direct(IfBB *bb, const IfBox *b, i32 mx) {
     return true;
 }
 
-static bool row_emit_fast(IfBB *bb, const IfLayout *lay, u32 *li_io,
+static bool row_emit_fast(IfBB *bb, const IfLayout *lay, IfLCur *cur_io,
                           const IfDeco **active, u32 n_active, i32 mx, i32 r) {
-    u32 li = *li_io;
-    const IfBox *b = lay->lines[li];
-    if (!(b->_pad[0] & IF_LF_DIRECT_BYTES)) return false;
-    if (li + 1 < lay->n_lines && lay->lines[li + 1]->y == r) return false; /* 同行複数行は堕落 */
+    const IfRLine *b = lcur_p(cur_io);
+    if (!(b->flags & IF_LF_DIRECT_BYTES)) return false;
+    const IfRLine *one = lcur_peek1(cur_io, lay->n_lines);
+    if (one && one->y == r) return false; /* 同行複数行は堕落 */
 
     /* ラン集合: segs（x 単調）+ marker/hline。BORDER は未対応、BG は no-ansi で無影響 */
     IfRRun runs[64];
@@ -665,7 +698,7 @@ static bool row_emit_fast(IfBB *bb, const IfLayout *lay, u32 *li_io,
     /* 末尾空白 trim（byte 0x20 ＝ セル ' ' の同値変換） */
     while (bb->n > mark && bb->p[bb->n - 1] == ' ') bb->n--;
     bb_ch(bb, '\n');
-    *li_io = li + 1;
+    lcur_next(cur_io);
     return true;
 }
 
@@ -689,7 +722,8 @@ static void sweep_range(const IfLayout *lay, i32 mx, i32 r0, i32 r1, int ansi, u
     /* deco の active 集合（追記順を保持したまま期限切れを惰性除去） */
     const IfDeco **active = (const IfDeco **)malloc(sizeof(IfDeco *) * 64);
     u32 n_active = 0, cap_active = 64;
-    u32 di = 0, li = li0;
+    u32 di = 0;
+    IfLCur lcu = lcur_seek(lay, li0);
 
     /* r0 時点の di/active を前置走査で構築（r0==0 では空集合・di=0 で従来と同一） */
     while (di < lay->n_deco && lay->deco[di].y <= r0) {
@@ -711,7 +745,7 @@ static void sweep_range(const IfLayout *lay, i32 mx, i32 r0, i32 r1, int ansi, u
              * (a) active の非 BG deco、(b) 新たに開始する非 BG deco が無ければ、
              * 各行の発行は '\n' のみ（BG は no-ansi で不可視、cp_free/BG-only 規約と同値）。
              * di/active はここでは消費せず次行の正規経路に委ねるため状態は同期する。 */
-            i32 nl_y = (li < lay->n_lines) ? lay->lines[li]->y : r1;
+            i32 nl_y = (lcu.li < lay->n_lines) ? lcur_p(&lcu)->y : r1;
             if (nl_y > r1) nl_y = r1; /* 分割区間では後半が自分の区間を発行（直列時 r1==my で不変） */
             if (nl_y > r) {
                 bool clean = true;
@@ -756,7 +790,7 @@ static void sweep_range(const IfLayout *lay, i32 mx, i32 r0, i32 r1, int ansi, u
             }
             k++;
         }
-        bool has_line = (li < lay->n_lines && lay->lines[li]->y == r);
+        bool has_line = (lcu.li < lay->n_lines && lcur_p(&lcu)->y == r);
         if (!has_line && n_active == 0) {
             u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
             /* ブランク行（発行規約どおり） */
@@ -787,19 +821,19 @@ static void sweep_range(const IfLayout *lay, i32 mx, i32 r0, i32 r1, int ansi, u
             if (has_line && fastable) {
                 /* seg 直行（cp_free・単一行・クリップ不発の圏内）: row_emit_fast の
                  * runs 構築/ソートを経ない一回走査版。発行バイト列は同値（関数頭参照） */
-                const IfBox *b0 = lay->lines[li];
-                if (cp_free &&
-                    !(li + 1 < lay->n_lines && lay->lines[li + 1]->y == r)) {
+                const IfRLine *b0 = lcur_p(&lcu);
+                const IfRLine *one = lcur_peek1(&lcu, lay->n_lines);
+                if (cp_free && !(one && one->y == r)) {
                     u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
                     if (row_emit_direct(&bb, b0, mx)) {
-                        li++;
+                        lcur_next(&lcu);
                         if (_t) { RZ_DIRECT += rz_rdtsc() - _t; RN_DIRECT++; }
                         continue;
                     }
                     if (_t) RZ_SLOW += rz_rdtsc() - _t;
                 }
                 u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
-                if (row_emit_fast(&bb, lay, &li, active, n_active, mx, r)) {
+                if (row_emit_fast(&bb, lay, &lcu, active, n_active, mx, r)) {
                     if (_t) { RZ_FAST += rz_rdtsc() - _t; RN_FAST++; }
                     continue;
                 }
@@ -813,13 +847,16 @@ static void sweep_range(const IfLayout *lay, i32 mx, i32 r0, i32 r1, int ansi, u
         if (!ansi) {
             maxx = 0;
             if (has_line) {
-                const IfBox *b = lay->lines[li];
+                const IfRLine *b = lcur_p(&lcu);
                 for (u32 u = 0; u < b->n_segs; u++)
                     if (b->segs[u].x + b->segs[u].w > maxx) maxx = b->segs[u].x + b->segs[u].w;
-                for (u32 u = li + 1; u < lay->n_lines && lay->lines[u]->y == r; u++) {
-                    const IfBox *b2 = lay->lines[u];
+                IfLCur c2 = lcu;
+                lcur_next(&c2);
+                while (c2.li < lay->n_lines && lcur_p(&c2)->y == r) {
+                    const IfRLine *b2 = lcur_p(&c2);
                     for (u32 v = 0; v < b2->n_segs; v++)
                         if (b2->segs[v].x + b2->segs[v].w > maxx) maxx = b2->segs[v].x + b2->segs[v].w;
+                    lcur_next(&c2);
                 }
             }
             for (u32 k = 0; k < n_active; k++) {
@@ -838,11 +875,11 @@ static void sweep_range(const IfLayout *lay, i32 mx, i32 r0, i32 r1, int ansi, u
         /* paint: deco（追記順）→ lines */
         for (u32 k = 0; k < n_active; k++)
             row_paint_dec(row, maxx, active[k], r);
-        while (li < lay->n_lines && lay->lines[li]->y == r) {
-            const IfBox *b = lay->lines[li];
+        while (lcu.li < lay->n_lines && lcur_p(&lcu)->y == r) {
+            const IfRLine *b = lcur_p(&lcu);
             for (u32 u = 0; u < b->n_segs; u++)
                 row_paint_text(row, maxx, b->segs[u].x, b->segs[u].text, b->segs[u].st);
-            li++;
+            lcur_next(&lcu);
         }
         /* 発行（emit_rows 同値） */
         u64 n = 0;
@@ -912,21 +949,27 @@ void if_render_emit_rows_sweep(FILE *out, const IfLayout *lay, int ansi) {
 
     int par = 1;
     { const char *e = getenv("IF_RENDER_PAR"); if (e && e[0] == '0') par = 0; }
-    if (ansi || !par || my < 1024 || lay->n_lines < 256 || !lay->lines) {
+    if (ansi || !par || my < 1024 || lay->n_lines < 256 || !lay->lines_head) {
         IfBB bb; bb_init(&bb, out);
         sweep_range(lay, mx, 0, my, ansi, 0, &bb);
         return;
     }
     /* 内容行数で二等分（split 行の同一 y は全て前半に含める: lower_bound 規則） */
+    /* lcur_seek は O(チャンク数)（~150）で split 設定時の 1 回だけ */
     u32 mid = lay->n_lines / 2;
-    i32 r_split = lay->lines[mid]->y;
+    IfLCur cm = lcur_seek(lay, mid);
+    i32 r_split = lcur_p(&cm)->y;
     if (r_split <= 0 || r_split >= my) {
         IfBB bb; bb_init(&bb, out);
         sweep_range(lay, mx, 0, my, ansi, 0, &bb);
         return;
     }
     u32 li_b = mid;
-    while (li_b > 0 && lay->lines[li_b - 1]->y >= r_split) li_b--;
+    while (li_b > 0) {
+        lcur_prev(lay, &cm);
+        if (lcur_p(&cm)->y < r_split) break;
+        li_b--;
+    }
 
     IfBB bbB; bb_init(&bbB, NULL); /* メモリシンク */
     IfSweepArg argB = { lay, mx, r_split, my, li_b, &bbB };

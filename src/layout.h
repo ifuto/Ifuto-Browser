@@ -53,6 +53,28 @@ typedef struct {
 
 typedef struct IfRowOps IfRowOps; /* render_ansi.c: 行スイープ発行の遅延構築 op 列 */
 
+/* 行スイープ直接発行のためのコンパクト行レコード（24B）。
+ * sweep が読むのは y / segs / n_segs / flags のみ（全 src 監査済）で、
+ * IfBox LINE（64B＋ポインタ間参照）は render 出力の決定に関与しない。 */
+typedef struct IfRLine {
+    const IfSeg *segs;
+    u32 n_segs;
+    i32 y;
+    u16 flags;          /* IF_LF_DIRECT_BYTES 等（IfBox._pad[0] と同じ意味） */
+    u16 _pad;
+} IfRLine;
+
+/* lines ログの格納: 値チャンクの連結リスト。
+ * arena の成長規約（旧バッファは回収不能）では flat×2 成長チェーンの死蔵が
+ * 支配的になる（実測 611k 行で ~50MB）ため、4096 項チャンクを継ぐ。
+ * メリット: 成長死蔵 ~0、並列 shard 結合がポインタ接続（コピー・y 再計算なし）。 */
+#define IF_LCHUNK_N 4096u
+typedef struct IfLChunk {
+    struct IfLChunk *next;
+    u32 n;
+    IfRLine v[IF_LCHUNK_N];
+} IfLChunk;
+
 typedef struct IfLayout {
     IfArena *arena;
     IfBox *root;
@@ -61,10 +83,10 @@ typedef struct IfLayout {
     IfLink *links;
     u32 n_links;
     /* 行スイープ直接発行（CLI 全量 dump のグリッドレス経路）用のログ。
-     * IfBox 構造は不変（GUI/テストは従来どおりボックスを歩く）。 */
-    IfBox **lines;         /* wrap_end_line の生成順 = DFS 順 = y 単調非減少 */
+     * IfBox 構造は不変（GUI/テスト/ダンプは従来どおりボックスを歩く）。 */
+    IfLChunk *lines_head;  /* wrap_end_line の生成順 = DFS 順 = y 単調非減少 */
+    IfLChunk *lines_tail;
     u32 n_lines;
-    u64 cap_lines;
     IfDeco *deco;          /* 装飾 op（DFS=paint 順。border/bg は y は開始、h は後埋め） */
     u32 n_deco;
     u64 cap_deco;
