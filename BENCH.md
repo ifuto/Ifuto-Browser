@@ -2,6 +2,42 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-08-03（午後追記）: 150ms ライン到達 — lazy style・IfRLine チャンク・引用コピー消去
+
+現在地（同一箱・午前と同じ計測規約、median of 7、`--no-ansi --stats`）:
+
+| stage | ms (median) | 目標 | 状態 |
+|---|---|---|---|
+| read | 0.01 | — | mmap 相当 |
+| parse | 61.4 | 50 | 引用ストリップのコピー消去込み。2-way 並列（HT ~1.4x） |
+| style | 0.0 | 40 | **段消去**（lazy style で layout 走査に畳み込み） |
+| layout | 74.9 | 40 | lazy style 吸収 + IfRLine でも残る本体 |
+| render | 15.2 | 10 | rline カーソル化込み |
+| **total** | **151.6** | **150** | **≪達成圏≫（quiet 帯 141.9-149.6。騒音帯は 175 まで揺れる）** |
+
+午後の確定分（全てオラクル sha256・run_tests×2・golden・gui・ASAN で機械ロック）:
+- **lazy computed style（style 段の消去）**: computed style は (tag, parent_st, root_fs)
+  の純粋関数（UA シートはタグセレクタのみ + md に author sheet は存在し得ない）。
+  全面走査（15ms・874k visits）をやめ layout の DFS 訪問時に参照箇所だけ解決。
+  解決規則は st_resolve_memo に一点化（compute_walk と同一手続き）。並列 shard は
+  arena 別 ctx。**paired median −18.1ms**（ELEMENT 二重解決の 1 回化込み）。
+  style=0ms 表記は「畳み込み」であり、決して style 計算をサボっていない（値は同値）。
+- **lines ログの IfRLine(24B) 値チャンク連結リスト化**: sweep が読むのは
+  y/segs/n_segs/flags のみと全 src 監査で確定 → IfBox LINE（64B×611k）と IfBox**
+  ログを消去。串刺し arena の ×2 成長チェーン死蔵も併発で根絶。
+  **layout arena 267,948 → 214,017KB（−54MB）。paired median +10.4ms 高速。**
+- **引用ストリップの中間コピー全廃**: `> ` 剥がし＋b_finish＋再分割（コピー 2 系統）を
+  Ln 副窓の直接再帰に置換（同値性はコード内証明注記）。ブロック構造コスト ~2-4ms。
+- **slim attrs（M_RENDER 限定）**: A[href]/IMG[alt] 以外を pend→arena 複製しない。
+  時間効果は誤差内（コーパスの属性体量が小さい）だがメモリ最小化法則として採用。
+- 不採用（計測で反証、記録だけ残す）: **MADV_POPULATE_WRITE 事前 populate** は
+  paired median +8ms 悪化（全 fault を直列化し並列 shard との overlap を殺す）。
+  **-march=native** は ±0（AVX2 は既に要点で手動導入済み+可搬性維持のため不採用）。
+
+memory 指標（同一バイナリ系統の arena_kb 系列: 決定的）:
+parse 151,552 → 147,456KB、style 155,648 → 147,456、layout **272,044 → 214,017**。
+peak RSS も同系で縮小（arena 272→214MB 減に追従）。
+
 ## 2026-08-03: 16MB IDM パイプライン総力戦 — fitdom 融合・並列 render・並列 parse/layout
 
 目標（ユーザー指示）: total < 150ms、内訳目安 parse 50 / style 40 / layout 40 / render 10。
