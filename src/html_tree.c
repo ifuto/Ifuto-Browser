@@ -356,6 +356,10 @@ static bool scope_barrier(const IfNode *n, IfScopeKind k) {
         case IF_TAG_APPLET: case IF_TAG_CAPTION: case IF_TAG_HTML: case IF_TAG_TABLE:
         case IF_TAG_TD: case IF_TAG_TH: case IF_TAG_MARQUEE: case IF_TAG_OBJECT:
         case IF_TAG_TEMPLATE:
+        case IF_TAG_SELECT: /* 現行仕様: select は in-scope 終端リストに含まれる
+                             * （whatwg/html#10557: "in select scope" 廃止＝通常の
+                             *   in scope へ統一。これにより select 開放中の </font> 等は
+                             *   対象要素が scope 外となり無視される — webkit02 font/select） */
             return true;
         default: return false;
         }
