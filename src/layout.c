@@ -70,6 +70,12 @@ typedef struct IfPiece {
     u8 br;   /* 1 = 強制改行 */
 } IfPiece;
 
+/* flatten 経路の <a> 表示矩形収集: piece 区間 [p0,p1) を DFS preorder（=piece 順、
+ * p0 単調）に記録し、wrap 連鎖で確定 seg 添字（open/close = 大域 seg 位置）へ写像
+ * → 行ログと交差解決する。木構築モード（no_boxlink=0）のみ記録。線形 CLI は
+ * 収集自体が発生しない（zero cost）。close=UINT32_MAX は未閉鎖（p1 未到達） */
+typedef struct { u32 link, p0, p1, open, close; } IfLinkPrec;
+
 /* ---- 開発用 rdtsc ゾーン計測（IF_LAYOUT_PROF=1 のときのみ。既定経路は分岐 1 個） ---- */
 #if defined(__x86_64__) || defined(__i386__)
 static inline u64 if_rdtsc(void) { u32 lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((u64)hi << 32) | lo; }
@@ -103,6 +109,9 @@ typedef struct {
      *   巻き戻し可能な pop のみを許し、スクラッチ二重書きは構造排除） */
     IfPiece *pieces_scratch;
     u64 pieces_scratch_cap;
+    IfLinkPrec *prec_scratch;  /* link span 収集のスクラッチ（pieces_scratch と同規約。
+                                * ifc ごとに n 0 リセットで再利用。木構築モードのみ消費） */
+    u64 prec_scratch_cap;
     /* box 構築時 tail（IfBox から last_child フィールドを追放した代替。子追加は
      * 親 box 構築中に集中かつ再帰スタック規律なので、frame に持って O(1) を保つ。
      * frame 深さ超過/不一致時は兄弟走査の正しいフォールバックに落ちる（性能のみ） */
@@ -290,7 +299,23 @@ typedef struct {
     IfPiece *pieces;   /* == lc->pieces_scratch（共有スクラッチ） */
     u32 n_pieces;
     IfLC *lc;
+    IfLinkPrec *prec;  /* == lc->prec_scratch（共有スクラッチ。NULL なら収集なし） */
+    u32 n_prec;
 } IfFlat;
+
+/* <a> の piece 区間を DFS preorder に追記（p0 単調が wrap 連鎖のカーソル前進を可能にする）。
+ * 破壊的上限 4096/ifc: 超過分は収集せず（巨大ナビバー等の異常系で wrap 連鎖の走査を
+ * 上限内に抑える。GUI 実用で到達しない） */
+static void flat_push_prec(IfFlat *f, u32 link, u32 p0, u32 p1) {
+    if (f->n_prec >= 4096) return;
+    f->prec = (IfLinkPrec *)if_arena_grow(f->lc->arena, f->prec, &f->lc->prec_scratch_cap,
+                                          f->n_prec + 1, sizeof(IfLinkPrec));
+    f->prec[f->n_prec].link = link;
+    f->prec[f->n_prec].p0 = p0;
+    f->prec[f->n_prec].p1 = p1;
+    f->prec[f->n_prec].close = UINT32_MAX;
+    f->n_prec++;
+}
 
 static void flat_push_grow(IfFlat *f, IfStr text, const IfStyle *st, u8 br);
 static inline void flat_push(IfFlat *f, IfStr text, const IfStyle *st, u8 br) {
@@ -347,7 +372,18 @@ static void flatten_into(IfFlat *f, IfNode *n, const IfStyle *st) {
         flat_push(f, if_str(s, (u32)m), est, 0);
         return;
     }
-    case IF_TAG_A: collect_link(f->lc, n); break;
+    case IF_TAG_A: {
+        /* <a> の piece 区間は「入口 — 子 flatten 完了位置」で厳密に切る
+         * （collect 不発（href 無し）なら記録自体しない: index 不整合を防ぐ） */
+        u32 ln0 = f->lc->n_links;
+        u32 p0 = f->n_pieces;
+        collect_link(f->lc, n);
+        bool rec = !f->lc->no_boxlink && f->lc->n_links != ln0;
+        for (IfNode *c = n->first_child; c; c = c->next_sibling)
+            flatten_into(f, c, est);
+        if (rec) flat_push_prec(f, ln0, p0, f->n_pieces);
+        return;
+    }
     default: break;
     }
     for (IfNode *c = n->first_child; c; c = c->next_sibling)
@@ -366,6 +402,8 @@ typedef struct {
     i32 line_w;
     const IfStyle *align_st;
     u8 direct_all;         /* 現行の全グリフが IF_LF_DIRECT_BYTES 条件を満たす */
+    u32 seg_hi;            /* この Wrap が wrap_end_line で確定した seg の累計
+                            * （ifc 局所の大域 seg 添字の基底。現行位置 = seg_hi + n_segs） */
 } IfWrap;
 
 /* direct のみ版（gw は呼出側が処理済み） */
@@ -493,6 +531,7 @@ static void wrap_end_line(IfWrap *w, float max_lh) {
         }
     }
     w->y += rows;
+    w->seg_hi += w->n_segs; /* ifc 局所 seg 累計（flatten 経路の link span 解決基底） */
     w->n_segs = 0;
     if (_e0) LPF_ENDL += if_rdtsc() - _e0;
 }
@@ -845,6 +884,20 @@ static bool fitdom_walk(IfFitDom *fd, IfNode *n, const IfStyle *st,
     return true;
 }
 
+/* links[link_idx] に表示矩形を 1 個追記する一点化（fused 単行経路・flatten 複数行
+ * 経路の共通終端）。arena は回収不能なので成長は「新割当+コピー」（GUI 規模・
+ * 木構築モードのみ。線形 CLI では呼出自体が発生しない） */
+static void link_span_add(IfLC *lc, u32 link_idx, i32 x0, i32 y0, i32 x1, i32 y1) {
+    /* lc->links が生配列（lay->links は build 末に束ねるため此処では NULL あり得） */
+    IfLink *L = &lc->links[link_idx];
+    IfLSpan *ns = (IfLSpan *)if_arena_alloc(lc->arena, (u64)(L->n_spans + 1) * sizeof(IfLSpan));
+    if (L->n_spans) memcpy(ns, L->spans, (u64)L->n_spans * sizeof(IfLSpan));
+    ns[L->n_spans].x0 = x0; ns[L->n_spans].y0 = y0;
+    ns[L->n_spans].x1 = x1; ns[L->n_spans].y1 = y1;
+    L->spans = ns;
+    L->n_spans++;
+}
+
 /* <a> の表示矩形を links[] に確定する。call 条件: fused-fit 成功の単行 ifc。
  * seg は fused 経路では ifc 内で単調蓄積する（wrap_end_line は ifc 末の 1 回）
  * ため [seg0, 次 arec.seg0 or 終端) がその <a> の表示範囲。単行ゆえ矩形は高々 1 個。
@@ -863,14 +916,53 @@ static void ifc_link_spans(IfLC *lc, const IfWrap *w, const IfLinkArec *arec, u3
             i32 e = w->seg_base[i].x + w->seg_base[i].w;
             if (e > x1) x1 = e;
         }
-        /* lc->links が生配列（lay->links は build 末に束ねるため此処では NULL あり得） */
-        IfLink *L = &lc->links[arec[r].link];
-        IfLSpan *ns = (IfLSpan *)if_arena_alloc(lc->arena, (u64)(L->n_spans + 1) * sizeof(IfLSpan));
-        if (L->n_spans) memcpy(ns, L->spans, (u64)L->n_spans * sizeof(IfLSpan));
-        ns[L->n_spans].x0 = x0; ns[L->n_spans].y0 = y0;
-        ns[L->n_spans].x1 = x1; ns[L->n_spans].y1 = y0 + rows;
-        L->spans = ns;
-        L->n_spans++;
+        link_span_add(lc, arec[r].link, x0, y0, x1, y0 + rows);
+    }
+}
+
+/* flatten 経路の <a> 表示矩形を「piece 区間→確定 seg 添字→行ログ交差」で解決する。
+ * call 条件: 従来経路（flatten + wrap 連鎖）の ifc 完了直後（w.seg_hi が ifc 全 seg
+ * を畳み込み済み、行ログ [ln_start, lay->n_lines) がこの ifc の行）。
+ * 解決規則: 大域 seg 添字 G（ifc 局所）で、open[k]=piece p0 到達時の G、
+ * close[k]=piece p1 到達時の G。行 L（seg 大域区間 [G0,G1)）との交差が非空なら
+ * 交差 seg の x 和集合を矩形 [G0 行の y, 次行の y) に追記。seg 合体による境界の
+ * 原子 1 個はみ出し近似は単行経路と同じ（ifc_link_spans 参照）。 */
+static void flat_link_spans(IfLC *lc, const IfWrap *w, const IfLinkPrec *prec, u32 n_prec,
+                            u32 ln_start) {
+    IfLayout *lay = lc->lay;
+    if (!lay || ln_start >= lay->n_lines) return;
+    /* 行ログの ifc 起点へ: チャンク累積で O（チャンク数）（GUI 規模で償却） */
+    const IfLChunk *ck = lay->lines_head;
+    u32 base = 0;
+    while (ck && ln_start >= base + ck->n) { base += ck->n; ck = ck->next; }
+    if (!ck) return;
+    u32 off = ln_start - base;
+    u32 G0 = 0;
+    for (u32 li = ln_start; li < lay->n_lines && ck; li++) {
+        const IfRLine *rl = &ck->v[off];
+        u32 G1 = G0 + rl->n_segs;
+        /* 次行の y（無ければ ifc 終端 = w->y。行高 rows>1 を含む厳密な矩形下端） */
+        const IfRLine *nl = NULL;
+        if (li + 1 < lay->n_lines) {
+            nl = (off + 1 < ck->n) ? &ck->v[off + 1]
+                 : ck->next ? &ck->next->v[0] : NULL;
+        }
+        i32 y1 = nl ? nl->y : w->y;
+        for (u32 k = 0; k < n_prec; k++) {
+            u32 s0 = prec[k].open > G0 ? prec[k].open : G0;
+            u32 s1 = prec[k].close < G1 ? prec[k].close : G1;
+            if (s1 <= s0) continue;
+            u32 i0 = s0 - G0, i1 = s1 - G0; /* 行内 seg 添字 */
+            i32 x0 = rl->segs[i0].x, x1 = rl->segs[i0].x + rl->segs[i0].w;
+            for (u32 i = i0 + 1; i < i1; i++) {
+                if (rl->segs[i].x < x0) x0 = rl->segs[i].x;
+                i32 e = rl->segs[i].x + rl->segs[i].w;
+                if (e > x1) x1 = e;
+            }
+            link_span_add(lc, prec[k].link, x0, rl->y, x1, y1);
+        }
+        G0 = G1;
+        if (++off == ck->n) { ck = ck->next; off = 0; }
     }
 }
 
@@ -879,7 +971,7 @@ static void ifc_link_spans(IfLC *lc, const IfWrap *w, const IfLinkArec *arec, u3
 static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *base_st,
                           i32 content_x, i32 *y_io, i32 content_w) {
     u64 _i0; if (lpf()) _i0 = if_rdtsc(); else _i0 = 0;
-    IfWrap w = { lc, content_x, content_w, *y_io, parent, NULL, 0, 0, base_st, 1 };
+    IfWrap w = { lc, content_x, content_w, *y_io, parent, NULL, 0, 0, base_st, 1, 0 };
     float max_lh = base_st && base_st->line_height > 0.0f ? base_st->line_height
                  : base_st ? base_st->font_size * 1.2f : 16.0f * 1.2f;
     bool pre = base_st && base_st->white_space == IF_WS_PRE;
@@ -925,7 +1017,9 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
     /* 従来経路: flatten + piece wrap 連鎖 */
     IfNode *c;
     {
-        IfFlat f = { lc->pieces_scratch, 0, lc }; /* スクラッチ再利用。run 内で消費が完結 */
+        /* link span 収集は木構築モードのみ（線形 CLI は no_boxlink ゲートで全分岐不発。
+         * prec は pieces_scratch と同規約（NULL 始まり・arena grow・ifc 毎 n 0 再利用） */
+        IfFlat f = { lc->pieces_scratch, 0, lc, lc->prec_scratch, 0 };
         u64 _f0; if (_i0) _f0 = if_rdtsc(); else _f0 = 0;
         for (c = cur; c; c = c->next_sibling) {
             if (c->kind == IF_NODE_ELEMENT) {
@@ -937,8 +1031,23 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
         }
         if (_f0) { LPF_FLAT += if_rdtsc() - _f0; }
 
+        /* piece 区間 → 確定 seg 添字の写像（prec エントリ自身が台帳。
+         * open/close = piece p / p1 到達時の大域 seg 位置 = w.seg_hi + w.n_segs。
+         * f.n_prec>0 のときだけ分岐が生きる（線形 CLI・<a> 無し ifc は完全に不発） */
+        u32 pc0 = 0;
+        u32 ln_start = (f.n_prec && lc->lay) ? lc->lay->n_lines : 0;
+
         bool any_text = false;
         for (u32 p = 0; p < f.n_pieces; p++) {
+            if (__builtin_expect(f.n_prec != 0, 0)) {
+                while (pc0 < f.n_prec && f.prec[pc0].p0 == p) {
+                    f.prec[pc0].open = w.seg_hi + w.n_segs;
+                    pc0++;
+                }
+                for (u32 k = 0; k < pc0; k++)
+                    if (f.prec[k].close == UINT32_MAX && f.prec[k].p1 == p)
+                        f.prec[k].close = w.seg_hi + w.n_segs;
+            }
             if (f.pieces[p].br) {
                 wrap_end_line(&w, max_lh);
                 max_lh = base_st && base_st->line_height > 0.0f ? base_st->line_height
@@ -953,7 +1062,14 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
         }
         if (w.n_segs > 0 || any_text)
             wrap_end_line(&w, max_lh);
+        if (__builtin_expect(pc0 != 0, 0)) {
+            /* p1==n_pieces で打ち止められた open は ifc 全末尾で閉じる */
+            for (u32 k = 0; k < pc0; k++)
+                if (f.prec[k].close == UINT32_MAX) f.prec[k].close = w.seg_hi + w.n_segs;
+            flat_link_spans(lc, &w, f.prec, pc0, ln_start);
+        }
         lc->pieces_scratch = f.pieces; /* スクラッチを後続 IFC に引き継ぐ（n は毎回 0 リセット） */
+        lc->prec_scratch = f.prec;
     }
     *y_io = w.y;
     if (_i0) LPF_IFC += if_rdtsc() - _i0;
@@ -1328,13 +1444,18 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         lay2->deco = darr;
         lay2->n_deco = nd;
         lay2->cap_deco = nd;
-        /* links: B を A の終番から再採番して連結（文書順同値） */
+        /* links: B を A の終番から再採番して連結（文書順同値）。
+         * B の span 矩形は shard 局所 y のままでは lines/deco/box と整合しない
+         * （B の全 y を hA シフトするのと同じ対象・同じ量）→ ここで一体補正する。
+         * 線形 CLI では span 未収集（n_spans==0）のため内側ループは常に空 */
         u32 nlk = sa.lay->n_links + sb.lay->n_links;
         IfLink *lk = (IfLink *)if_arena_alloc(arena, (u64)(nlk ? nlk : 1) * sizeof(IfLink));
         memcpy(lk, sa.lay->links, (u64)sa.lay->n_links * sizeof(IfLink));
         for (u32 i = 0; i < sb.lay->n_links; i++) {
             lk[sa.lay->n_links + i] = sb.lay->links[i];
             lk[sa.lay->n_links + i].n = sa.lay->n_links + i + 1;
+            IfLink *L = &lk[sa.lay->n_links + i];
+            for (u32 k = 0; k < L->n_spans; k++) { L->spans[k].y0 += hA; L->spans[k].y1 += hA; }
         }
         lay2->links = lk;
         lay2->n_links = nlk;

@@ -2,6 +2,53 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-08-07: flatten 経路リンク span 収集（複数行リンクのクリック可視化）+ shard B span y 未シフト修理
+
+- 機能: 複数行 wrap へ逃げた <a>（fused 失敗 → flatten 経路）の表示矩形を行ごとに
+  収集。piece 区間 [p0,p1) を flatten 時に DFS preorder で記録（IfLinkPrec）、
+  wrap 連鎖で大域 seg 添字（w.seg_hi + w.n_segs）へ写像、行ログとの厳密交差で
+  行別矩形を解決。span 追記は link_span_add に一点化。GUI の全リンクが
+  クリック/フォーカス可能になった（レイアウト的に行またぎしないリンクのみ、の
+  制約を解消）。
+- 併発修理（本機能の前提調査で同定した既存欠陥）: 並列 shard の tree モード
+  マージで shard B の span y が未シフトだった（lines/deco/box と同じ対象・
+  同じ量の hA 補正を追加）。回帰テストは serial/parallel の span 厳密一致
+  （修正除去で FAIL することを機械確認済み）。
+- コスト規律: 線形 CLI は no_boxlink ゲートで収集自体が不発（prec 未記録・
+  piece ループ分岐は f.n_prec==0 で完全死コード化）。hot path に残るのは
+  wrap_end_line の seg_hi 1 store/行のみ。動的割当なし（prec は pieces_scratch
+  と同規約のスクラッチ再利用）。
+- 機械オラクル: 16MB 出力は no-ansi / ANSI とも新旧 sha256 一致（byte-exact）。
+  chk_oracle 12/12、run_tests 両種 609,037 checks、golden、gui_smoke 32、
+  ASAN 4 シナリオ + tree 経路直行プローブの ASAN/UBSan 全クリーン。
+- 帯内 A/B（--no-ansi --stats、paired 7 組）: old median 177.87 / new median 165.93ms、
+  pair 勝敗 4/7（有意判定不能。帯騒音 ±20ms 級のため退化なしは騒音内で確認。
+  機構的増分上限 ≈0.2ms/852k 行 = 1 store/行のみ）。
+
+## 2026-08-07: ANSI emit セルモデル経由の消去（row_emit_ansi_fast。前節の「要調査項目」解決）
+
+- 構造確定（前節の疑いの答え）: ANSI の全 852,093 行が slow 全細胞経路に落ちていた
+  原因は **body の白 BG deco が全行で active**（UA シート body{background-color:#fff}
+  由来）で、no-ansi の fast path が全て `!ansi` 条件だったこと。BG は no-ansi では
+  無影響だが ANSI ではギャップ細胞の pen を変えるため、受理条件を広げるには
+  「BG 区間合成（active 追記順・後勝ち）→ bg ピース列駆動のギャップ発行」が必要。
+- 実装: `row_emit_ansi_fast`（render_ansi.c）。受理 deco は BG/MARKER/HLINE のみ
+  （BORDER は keep_pen 合成がセル依存のため slow 維持）。MARKER text は受理時に
+  wrap_note_direct と同条件の glyph 検査 + 幅和==w を課す。pen 遷移は slow 走査と
+  同一順（reset→bold→italic→uline→strike→fg→bg）に pen_emit で一点化。失敗は全量
+  巻き戻しで slow へ（cell 合成の再解釈はしない安全側規約）。
+- **機械オラクル**: 16MB 既定（ANSI）出力 120MB の **sha256 が新旧完全一致**
+  （e13eca16…）。--no-ansi 16MB も一致（d116800…）。chk_oracle 12/12
+  （idm-2mb.ansi 含む）、run_tests 両種 609,017 checks、golden、gui_smoke 32、
+  ASAN 4 シナリオ全 exit 0・エラー 0。
+- **実測（低速帯・paired A/B 7 組・total/emit とも 7/7 で new 優位）**:
+  既定 ANSI total: old median 834.88 → new median 242.08ms。
+  emit: old median 687.68 → new median 93.37ms。
+  RENDERPROF（rdtsc、構造読み）: slow 2,121 cy/行 → adir 297 cy/行（7.1x）。
+  slow 残存 0 行。静寂帯での再計測は有効帯で実施予定。
+- メモリ: 動的割当なし（runs[64] ≒2.5KB・pc[66×2] ≒1.6KB のスタックのみ。
+  「使わなければ使わないほど良い」公準維持）。
+
 ## 2026-08-07: GUI リンクのマウスクリック（IfLSpan ヒットテスト）+ 低速帯の記録
 
 - 機能: IfLink に IfLSpan 表示矩形列（木構築モードの fused-fit 成功・単行 ifc 内 <a>

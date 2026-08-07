@@ -49,9 +49,11 @@ typedef struct { i32 x0, y0, x1, y1; } IfLSpan; /* 表示矩形（セル座標 [
 typedef struct {
     u32 n;
     IfStr href;
-    /* クリック判定用の表示矩形列。収集は「fused-fit 成功の単行 ifc」内の <a> に
-     * 限定（複数行 wrap へ逃げた失敗経路・flatten 経路は未収集 → 台帳の残課題）。
-     * 木構築モード（no_boxlink=0）限定。線形 CLI では収集しない（零コスト保証） */
+    /* クリック判定用の表示矩形列。fused-fit 成功の単行 ifc は単矩形、複数行 wrap へ
+     * 逃げた flatten 経路は行ごとの部分矩形列（piece 範囲 × 行 seg 範囲の厳密交差で
+     * 解決。界の seg が同 st 合体した場合のみ矩形が原子 1 個分はみ出しうる近似は
+     * 単行経路と同じ）。木構築モード（no_boxlink=0）限定。線形 CLI は収集自体を
+     * しない（零コスト保証） */
     IfLSpan *spans;
     u32 n_spans;
 } IfLink;

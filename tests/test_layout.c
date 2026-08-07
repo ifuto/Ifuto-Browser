@@ -1,8 +1,10 @@
 #define _GNU_SOURCE /* open_memstream（差分オラクルのみで使用） */
 #include "tests.h"
 #include "../src/layout.h"
+#include "../src/md.h"
 #include "../src/render.h"
 #include "../src/utf8.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -250,11 +252,36 @@ void test_layout_linkspans(void) {
         CHECK(l1->spans[0].x1 - l1->spans[0].x0 == 9); /* "there now" */
     }
 
-    /* 複数行 wrap へ逃げる長文 ifc のリンクは未収集（台帳どおりの契約） */
+    /* 複数行 wrap（flatten 経路）のリンクは行ごとの部分矩形で収集される。
+     * 幾何は描画セルと厳密に対応（数値は描画出力との同値を機械監査済み） */
     {
-        IfFix f = build(&a,
-            "<p>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
-            "<a href=\"z.html\">wrapped link</a> cccccccccccccccccccccccccccccc dddd</p>", 30);
+        IfFix f = build(&a, "<p>ab <a href=\"z.html\">cd ef gh ij kl mn</a> op</p>", 14);
+        CHECK(f.l->n_links == 1);
+        const IfLink *L = &f.l->links[0];
+        CHECK(L->n_spans == 2);
+        /* L1 の link 部 "cd ef gh" は x=[4,12)、L2 の "ij kl mn" は x=[1,9)。
+         * 後続 "op" は矩形に含まれない */
+        CHECK(L->spans[0].x0 == 4 && L->spans[0].x1 == 12);
+        CHECK(L->spans[1].x0 == 1 && L->spans[1].x1 == 9);
+        /* y は行単調（続き行は前行の直下） */
+        CHECK(L->spans[1].y0 == L->spans[0].y1);
+        CHECK(L->spans[0].y1 > L->spans[0].y0);
+    }
+
+    /* <br> を跨ぐリンク（fused 失敗 → flatten）も各行に矩形が出る */
+    {
+        IfFix f = build(&a, "<p><a href=\"z2.html\">ab<br>cd</a></p>", 40);
+        CHECK(f.l->n_links == 1);
+        const IfLink *L = &f.l->links[0];
+        CHECK(L->n_spans == 2);
+        CHECK(L->spans[0].x0 == 1 && L->spans[0].x1 == 3); /* "ab" */
+        CHECK(L->spans[1].y0 == L->spans[0].y1);
+        CHECK(L->spans[1].x1 > L->spans[1].x0);
+    }
+
+    /* 空の <a>（表示 piece 無し）は collect されるが矩形は出ない */
+    {
+        IfFix f = build(&a, "<p>ab<a href=\"e.html\"></a> cd</p>", 40);
         CHECK(f.l->n_links == 1);
         CHECK(f.l->links[0].n_spans == 0);
     }
@@ -263,6 +290,44 @@ void test_layout_linkspans(void) {
     {
         IfFix f = build(&a, "<p><a>anchor only</a></p>", 40);
         CHECK(f.l->n_links == 0);
+    }
+
+    /* 並列 shard（tree モード 2 分割マージ）でも span の y は shift 済みで serial
+     * build と厳密一致する（shard B の span y 未シフト欠陥の回帰固定。B 内のリンク
+     * は深部に配置し、未シフトなら必ず serial 値と乖離する構造） */
+    {
+        char md[8192];
+        int m = 0;
+        for (int i = 0; i < 40; i++)
+            m += snprintf(md + m, sizeof md - (size_t)m, "paragraph %d text here.\n\n", i);
+        m += snprintf(md + m, sizeof md - (size_t)m, "[deep link](deep.html) tail.\n\n");
+        for (int i = 40; i < 80; i++)
+            m += snprintf(md + m, sizeof md - (size_t)m, "paragraph %d text here.\n\n", i);
+        IfLayout *ls, *lp;
+        {
+            IfDom *d = NULL;
+            CHECK(if_md_parse_fast(&a, if_str(md, (u32)m), &d) && d);
+            if_style_apply(&a, d);
+            setenv("IF_LAYOUT_PAR", "0", 1);
+            ls = if_layout_build(&a, d, 40);
+        }
+        {
+            IfDom *d = NULL;
+            CHECK(if_md_parse_fast(&a, if_str(md, (u32)m), &d) && d);
+            if_style_apply(&a, d);
+            setenv("IF_LAYOUT_PAR", "1", 1);
+            lp = if_layout_build(&a, d, 40);
+            unsetenv("IF_LAYOUT_PAR");
+        }
+        CHECK(ls->n_links == 1 && lp->n_links == 1);
+        CHECK(ls->links[0].n_spans >= 1 && lp->links[0].n_spans == ls->links[0].n_spans);
+        for (u32 k = 0; k < ls->links[0].n_spans; k++) {
+            CHECK(lp->links[0].spans[k].x0 == ls->links[0].spans[k].x0);
+            CHECK(lp->links[0].spans[k].x1 == ls->links[0].spans[k].x1);
+            CHECK(lp->links[0].spans[k].y0 == ls->links[0].spans[k].y0);
+            CHECK(lp->links[0].spans[k].y1 == ls->links[0].spans[k].y1);
+        }
+        CHECK(ls->links[0].spans[0].y0 > 40); /* 深部保証（hA 不発を検知可能にする） */
     }
 
     if_arena_destroy(&a);

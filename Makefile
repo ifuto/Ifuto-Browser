@@ -39,11 +39,11 @@ guismoke: $(BUILD)/ifuto
 	python3 tests/gui_smoke.py ./$(BUILD)/ifuto
 
 TESTSRC := $(wildcard tests/*.c)
-$(BUILD)/run_tests: $(TESTSRC) $(ENGINE) $(AKLSRC) | $(BUILD)
+$(BUILD)/run_tests: $(TESTSRC) $(ENGINE) $(AKLSRC) $(HDRS) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -Itests -o $@ $(TESTSRC) $(ENGINE) $(AKLSRC) -lm
 
 # akl の switch dispatch 側も丸ごと走査する双子バイナリ（片側だけの不具合を封殺）
-$(BUILD)/run_tests_switch: $(TESTSRC) $(ENGINE) $(AKLSRC) | $(BUILD)
+$(BUILD)/run_tests_switch: $(TESTSRC) $(ENGINE) $(AKLSRC) $(HDRS) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -DAKL_TEST_SWITCH_DISPATCH -Itests -o $@ $(TESTSRC) $(ENGINE) $(AKLSRC) -lm
 
 $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)

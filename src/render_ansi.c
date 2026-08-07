@@ -17,12 +17,12 @@ static inline bool rz(void) {
     if (rz_on < 0) { const char *e = getenv("IF_RENDER_PROF"); rz_on = (e && e[0] == '1') ? 1 : 0; }
     return rz_on > 0;
 }
-static unsigned long long RZ_GAP, RZ_DIRECT, RZ_FAST, RZ_SLOW, RZ_BLANK, RZ_FLUSH;
-static unsigned long long RN_GAP, RN_DIRECT, RN_FAST, RN_SLOW, RN_BLANK;
+static unsigned long long RZ_GAP, RZ_DIRECT, RZ_FAST, RZ_SLOW, RZ_BLANK, RZ_FLUSH, RZ_ADIR;
+static unsigned long long RN_GAP, RN_DIRECT, RN_FAST, RN_SLOW, RN_BLANK, RN_ADIR;
 __attribute__((destructor)) static void rz_dump(void) {
     if (rz_on > 0)
-        fprintf(stderr, "RENDERPROF gap=%llu(%llu) direct=%llu(%llu) fast=%llu(%llu) slow=%llu(%llu) blank=%llu(%llu) flush=%llu (cycles)\n",
-                RZ_GAP, RN_GAP, RZ_DIRECT, RN_DIRECT, RZ_FAST, RN_FAST, RZ_SLOW, RN_SLOW, RZ_BLANK, RN_BLANK, RZ_FLUSH);
+        fprintf(stderr, "RENDERPROF gap=%llu(%llu) direct=%llu(%llu) fast=%llu(%llu) slow=%llu(%llu) blank=%llu(%llu) adir=%llu(%llu) flush=%llu (cycles)\n",
+                RZ_GAP, RN_GAP, RZ_DIRECT, RN_DIRECT, RZ_FAST, RN_FAST, RZ_SLOW, RN_SLOW, RZ_BLANK, RN_BLANK, RZ_ADIR, RN_ADIR, RZ_FLUSH);
 }
 
 static unsigned long long CNT_PAINT, CNT_SHELL, CNT_SEGS, CNT_FILLBG, CNT_MARKER;
@@ -560,6 +560,45 @@ static void bb_flush(IfBB *b) {
 typedef struct { i32 x, w; const u8 *p; u32 n; u8 kind; } IfRRun;
 enum { IF_RR_BYTES = 0, IF_RR_HLINE = 1 };
 
+/* ---- ANSI 直行の共通部品（発行バイト列は slow 全細胞走査のものと厳密一致が契約） ---- */
+/* v ∈ [0,255] の十進化。snprintf("%u") と同一バイト列を手書きで出す（呼出が細かい） */
+static int u8_dec(char *p, u32 v) {
+    if (v >= 100) { p[0] = (char)('0' + v / 100); v %= 100; p[1] = (char)('0' + v / 10); p[2] = (char)('0' + (v % 10)); return 3; }
+    if (v >= 10) { p[0] = (char)('0' + v / 10); p[1] = (char)('0' + (v % 10)); return 2; }
+    p[0] = (char)('0' + v); return 1;
+}
+/* row_paint_text と同式の pen 計算（発行側・描画側が別実装に分岐しないための一点化） */
+static IfPen seg_pen(const IfStyle *st) {
+    IfPen p;
+    p.flags = 0;
+    if (st) {
+        p.fg = if_rgba_to_ansi(st->color);
+        p.bg = if_rgba_to_ansi(st->bg);
+        if (st->bold) p.flags |= IF_F_BOLD;
+        if (st->italic) p.flags |= IF_F_ITALIC;
+        if (st->underline) p.flags |= IF_F_ULINE;
+        if (st->strike) p.flags |= IF_F_STRIKE;
+    } else {
+        p.fg = (u8)IF_CELL_DEFAULT;
+        p.bg = (u8)IF_CELL_DEFAULT;
+    }
+    return p;
+}
+/* slow 走査の pen 遷移と同一順（reset→bold→italic→uline→strike→fg→bg）で SGR 列を発行 */
+static void pen_emit(IfBB *bb, const IfPen *p, IfPen *cur) {
+    if (p->fg == cur->fg && p->bg == cur->bg && p->flags == cur->flags) return;
+    char tmp[48]; int n = 0;
+    memcpy(tmp + n, "\x1b[0m", 4); n += 4;
+    if (p->flags & IF_F_BOLD) { memcpy(tmp + n, "\x1b[1m", 4); n += 4; }
+    if (p->flags & IF_F_ITALIC) { memcpy(tmp + n, "\x1b[3m", 4); n += 4; }
+    if (p->flags & IF_F_ULINE) { memcpy(tmp + n, "\x1b[4m", 4); n += 4; }
+    if (p->flags & IF_F_STRIKE) { memcpy(tmp + n, "\x1b[9m", 4); n += 4; }
+    if (p->fg != IF_CELL_DEFAULT) { memcpy(tmp + n, "\x1b[38;5;", 7); n += 7; n += u8_dec(tmp + n, p->fg); tmp[n++] = 'm'; }
+    if (p->bg != IF_CELL_DEFAULT) { memcpy(tmp + n, "\x1b[48;5;", 7); n += 7; n += u8_dec(tmp + n, p->bg); tmp[n++] = 'm'; }
+    bb_put(bb, tmp, (u64)n);
+    *cur = *p;
+}
+
 /* 行 r を byte-direct で発行試行。成功なら *li_io を 1 進めて true。
  * 失敗（seg 不整合・重複・未対応 deco）は何も出さず false（呼出側がセル経路へ）。
  * 正当性: LINE の IF_LF_DIRECT_BYTES は wrap 時に「全グリフ gw>0 かつ enc∘dec 恒等」を
@@ -702,6 +741,179 @@ static bool row_emit_fast(IfBB *bb, const IfLayout *lay, IfLCur *cur_io,
     return true;
 }
 
+/* ---- ANSI 版 runs 合流直行（row_emit_fast の ANSI 対応版 + BG 合成） ----
+ * slow 全細胞経路（[0,mx) 既定充填 → deco 追記順 paint → lines paint → trim 無し走査 →
+ * 無条件行末リセット）の発行バイト列をセルモデルなしに再構成する。受理する deco は
+ * BG / MARKER / HLINE のみ（BORDER は keep_pen 合成がセルモデル依存のため slow へ）。
+ * 同値証明:
+ *  - BG は「cp を触らず bg だけを上書きする」操作で、active 内の追記順に後勝ち。
+ *    → [0,mx) を BG 区間の端点で切断した「bg ピース列」を行ごとに合成すれば、
+ *    ギャップ細胞列の pen は各ピースで (fg=既定, bg=ピース, flags=0) に一定。
+ *    cell 走査はピース先頭細胞でのみ pen 遷移する → ギャップ発行はピース単位の
+ *    pen 遷移 + 空白 memset に厳密対応する（row_paint_dec の idx==既定 早期 return
+ *    は合成側でも同一条件で skip するため、 skip された BG が先行 BG を上書き
+ *    しないことも一致）。
+ *  - MARKER/HLINE/lines は全て BG より後に paint される → ランとして常に上位層。
+ *    各ランは pen が細胞列上で一定（row_paint_text のフルペン上書き / cprun の
+ *    keep_pen=false）、かつ cp==0 継続細胞は slow が比較自体を skip するため、
+ *    ラン区間の走査バイト ≡ テキスト生バイト（MARKER は受理時に wrap_note_direct
+ *    と同条件の glyph 検査 + 幅和==w を課す。lines は DIRECT_BYTES が保証）。
+ *  - ラン同士の重複・右端 clip 跨ぎ・x 逆転は全て false（→ slow）に倒し、
+ *    cell 合成の再解釈を一切しない（row_emit_fast と同じ安全側規約）。
+ *  - HLINE の右端 clip はセル単位で再現可能（w を mx-pos に詰めて ─ 連打）なので
+ *    row_emit_fast と同じ規則で許容する。 */
+typedef struct { i32 x0, x1; u8 bg; } IfBgPc;
+
+/* [a,b) のギャップを bg ピース列で発行（ピース先頭でのみ pen 遷移 → 空白 memset） */
+static void gap_emit_pieces(IfBB *bb, const IfBgPc *pc, u32 npc, i32 a, i32 b, IfPen *cur) {
+    for (u32 i = 0; i < npc; i++) {
+        if (pc[i].x1 <= a) continue;
+        if (pc[i].x0 >= b) break; /* ピースは x 昇順・非重複 */
+        i32 s = pc[i].x0 > a ? pc[i].x0 : a;
+        i32 e = pc[i].x1 < b ? pc[i].x1 : b;
+        IfPen p = { (u8)IF_CELL_DEFAULT, pc[i].bg, 0 };
+        pen_emit(bb, &p, cur);
+        bb_ensure(bb, (u64)(e - s) + 8);
+        memset(bb->p + bb->n, ' ', (size_t)(e - s));
+        bb->n += (u64)(e - s);
+    }
+}
+
+static bool row_emit_ansi_fast(IfBB *bb, const IfLayout *lay, IfLCur *cur_io,
+                               const IfDeco **active, u32 n_active, i32 mx, i32 r, IfPen *cur) {
+    static const IfPen PDEF = { (u8)IF_CELL_DEFAULT, (u8)IF_CELL_DEFAULT, 0 };
+    const IfRLine *b = NULL;
+    bool has_line = (cur_io->li < lay->n_lines && lcur_p(cur_io)->y == r);
+    if (has_line) {
+        b = lcur_p(cur_io);
+        if (!(b->flags & IF_LF_DIRECT_BYTES)) return false;
+        const IfRLine *one = lcur_peek1(cur_io, lay->n_lines);
+        if (one && one->y == r) return false; /* 同行複数行は堕落 */
+    }
+
+    /* (1) BG 合成: [0,mx) の bg ピース列（active 追記順・後勝ち。<=32 枚まで受理） */
+    IfBgPc pc[66], tmp_pc[66];
+    u32 npc = 1;
+    pc[0].x0 = 0; pc[0].x1 = mx; pc[0].bg = (u8)IF_CELL_DEFAULT;
+    {
+        u32 n_bg = 0;
+        for (u32 k = 0; k < n_active; k++)
+            if (active[k]->kind == IF_DECO_BG) n_bg++;
+        if (n_bg > 32) return false; /* 異常系は slow へ（ピース数 2*n_bg+1 の上限保護） */
+        for (u32 k = 0; k < n_active; k++) {
+            const IfDeco *d = active[k];
+            if (d->kind != IF_DECO_BG) continue;
+            u8 idx = if_rgba_to_ansi(d->argb);
+            if (idx == IF_CELL_DEFAULT && (d->argb & 0xFF) < 128) continue; /* row_paint_dec と同一 skip */
+            i32 x0 = d->x < 0 ? 0 : d->x, x1 = d->x + d->w > mx ? mx : d->x + d->w;
+            if (x1 <= x0) continue;
+            u32 q = 0;
+            for (u32 i = 0; i < npc; i++) {
+                if (pc[i].x1 <= x0 || pc[i].x0 >= x1) { tmp_pc[q++] = pc[i]; continue; }
+                if (pc[i].x0 < x0) { tmp_pc[q].x0 = pc[i].x0; tmp_pc[q].x1 = x0; tmp_pc[q].bg = pc[i].bg; q++; }
+                tmp_pc[q].x0 = pc[i].x0 > x0 ? pc[i].x0 : x0;
+                tmp_pc[q].x1 = pc[i].x1 < x1 ? pc[i].x1 : x1;
+                tmp_pc[q].bg = idx; q++;
+                if (pc[i].x1 > x1) { tmp_pc[q].x0 = x1; tmp_pc[q].x1 = pc[i].x1; tmp_pc[q].bg = pc[i].bg; q++; }
+            }
+            for (u32 i = 0; i < q; i++) pc[i] = tmp_pc[i];
+            npc = q;
+        }
+    }
+
+    /* (2) ラン集合: segs（x 単調）+ MARKER/HLINE（row_emit_fast と同一手順 + pen） */
+    typedef struct { i32 x, w; const u8 *p; u32 n; u8 kind; IfPen pen; } IfRRunA;
+    IfRRunA runs[64];
+    u32 nr = 0;
+    if (has_line) {
+        for (u32 u = 0; u < b->n_segs; u++) {
+            if (nr == 64) return false;
+            runs[nr].x = b->segs[u].x; runs[nr].w = b->segs[u].w;
+            runs[nr].p = (const u8 *)b->segs[u].text.p; runs[nr].n = b->segs[u].text.n;
+            runs[nr].kind = IF_RR_BYTES;
+            runs[nr].pen = seg_pen(b->segs[u].st);
+            nr++;
+        }
+    }
+    for (u32 k = 0; k < n_active; k++) {
+        const IfDeco *d = active[k];
+        if (d->kind == IF_DECO_BG) continue; /* 合成済み（cp を触らないためランには出ない） */
+        if (nr == 64) return false;
+        if (d->kind == IF_DECO_MARKER) {
+            /* text の glyph 検査（wrap_note_direct と同条件。幅和==w も paint 同値に必須） */
+            const u8 *s = (const u8 *)d->text;
+            u32 tn = d->tlen, i = 0, i0;
+            i32 wsum = 0;
+            while (i < tn) {
+                i0 = i;
+                u32 cp = if_utf8_decode(s, tn, &i);
+                int gw = if_glyph_width(cp);
+                if (gw <= 0) return false;
+                if (cp == IF_CP_REPLACEMENT &&
+                    !(i - i0 == 3 && s[i0] == 0xEF && s[i0 + 1] == 0xBF && s[i0 + 2] == 0xBD))
+                    return false;
+                wsum += gw;
+            }
+            if (wsum != d->w) return false;
+            runs[nr].x = d->x; runs[nr].w = d->w;
+            runs[nr].p = (const u8 *)d->text; runs[nr].n = d->tlen;
+            runs[nr].kind = IF_RR_BYTES;
+            runs[nr].pen = seg_pen(d->st);
+            nr++;
+        } else if (d->kind == IF_DECO_HLINE) {
+            runs[nr].x = d->x; runs[nr].w = d->w;
+            runs[nr].p = NULL; runs[nr].n = 0;
+            runs[nr].kind = IF_RR_HLINE;
+            runs[nr].pen = PDEF;
+            nr++;
+        } else {
+            return false; /* BORDER 等は slow へ */
+        }
+    }
+    /* x 昇順へ挿入ソート（segs は既に単調、deco は小数。安定 sort で row_emit_fast と同順） */
+    for (u32 a = 1; a < nr; a++) {
+        IfRRunA t = runs[a];
+        u32 c = a;
+        while (c > 0 && runs[c - 1].x > t.x) { runs[c] = runs[c - 1]; c--; }
+        runs[c] = t;
+    }
+
+    /* (3) 発行: ラン間ギャップはピース駆動、ランは pen 遷移 + 生バイト（巻き戻し可能） */
+    u64 mark = bb->n;
+    IfPen save = *cur;
+    i32 pos = 0;
+    for (u32 a = 0; a < nr; a++) {
+        if (runs[a].x < pos) { bb->n = mark; *cur = save; return false; } /* 重複はセル経路へ */
+        if (runs[a].x > pos) {
+            i32 ge = runs[a].x > mx ? mx : runs[a].x;
+            if (ge > pos) gap_emit_pieces(bb, pc, npc, pos, ge, cur);
+            pos = runs[a].x;
+        }
+        if (pos >= mx) break; /* viewport 右端でクリップ（slow の cx<w 判定の同値） */
+        if (runs[a].kind == IF_RR_HLINE) {
+            i32 w = runs[a].w;
+            if (pos + w > mx) w = mx - pos; /* セル単位 clip は HLINE だけ許容 */
+            if (w > 0) { /* w<=0 の空ランは細胞を持たない → pen 遷移も発生しない */
+                pen_emit(bb, &PDEF, cur);
+                bb_ensure(bb, (u64)w * 3 + 8);
+                for (i32 k = 0; k < w; k++) { memcpy(bb->p + bb->n, "\xE2\x94\x80", 3); bb->n += 3; }
+            }
+            pos += runs[a].w;
+        } else {
+            /* クリップ: 右端を跨ぐ bytes ランは再構成不能のため堕落 */
+            if (pos + runs[a].w > mx) { bb->n = mark; *cur = save; return false; }
+            pen_emit(bb, &runs[a].pen, cur);
+            bb_put(bb, runs[a].p, runs[a].n);
+            pos += runs[a].w;
+        }
+    }
+    if (mx > pos) gap_emit_pieces(bb, pc, npc, pos, mx, cur); /* 末尾ギャップ */
+    bb_put(bb, "\x1b[0m\n", 5); /* 無条件リセット + 改行（slow と同一手順） */
+    *cur = PDEF;
+    if (has_line) lcur_next(cur_io);
+    return true;
+}
+
 /* 行スイープ発行。発行規約は if_render_emit_rows と一致（trim・行末リセット） */
 /* [r0,r1) の行範囲を発行する本体。li0 = 最初の y>=r0 の line 添字（下界探索で確定）。
  * 分割点での状態一意性（並列化の同値証明）:
@@ -839,6 +1051,16 @@ static void sweep_range(const IfLayout *lay, i32 mx, i32 r0, i32 r1, int ansi, u
                 }
                 if (_t) RZ_SLOW += rz_rdtsc() - _t; /* row_emit_fast 失敗分は slow 側に寄せる */
             }
+        }
+        /* ANSI も byte-direct + BG/MARKER/HLINE 合成可能な行はセルモデルを経由しない。
+         * 発行バイト列は slow 全細胞経路と厳密一致する設計（row_emit_ansi_fast 頭の証明参照） */
+        if (ansi) {
+            u64 _t; if (rz()) _t = rz_rdtsc(); else _t = 0;
+            if (row_emit_ansi_fast(&bb, lay, &lcu, active, n_active, mx, r, &cur)) {
+                if (_t) { RZ_ADIR += rz_rdtsc() - _t; RN_ADIR++; }
+                continue;
+            }
+            if (_t) RZ_SLOW += rz_rdtsc() - _t; /* row_emit_ansi_fast 失敗分は slow 側に寄せる */
         }
         /* 行構成: [0,maxx] だけ既定充填（ansi は全幅必要） */
         u64 _ts; if (rz()) _ts = rz_rdtsc(); else _ts = 0;
