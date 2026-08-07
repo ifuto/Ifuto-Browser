@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* open_memstream（dump-styles oracle） */
 #include "tests.h"
 #include "../src/css_blink.h"
 #include <string.h>
@@ -248,6 +249,51 @@ void test_css(void) {
             CHECK(p && p->style && p->style->bold);
         }
         if_arena_destroy(&ha);
+    }
+
+    /* --dump-styles（devtools 観測点）の固定文字列オラクル。
+     * 全フィールドの第一原理検証: html=UA block/fs16/黒不透明、head=UA none、
+     * body=UA 8px margin/白 bg/lh=16*1.2、p=UA block + inline style
+     * （margin shorthand 2 値 → 2px 3% 2px 3%、#0f0 → #00ff00ff）。
+     * nodes=6 = document/html/head/body/p/#text、styled=4 = ELEMENT 総数。 */
+    {
+        IfDom *d = parse_doc(&a, "<p style=\"margin:2px 3%; color:#0f0\">x</p>");
+        char *bp = NULL; size_t bn = 0;
+        FILE *os = open_memstream(&bp, &bn);
+        CHECK(os != NULL);
+        if (os) {
+            if_style_dump(d, os);
+            fclose(os);
+            static const char EXP[] =
+                "#styles\n"
+                "<html> display=block text-align=left white-space=normal font-size=16px line-height=auto width=auto height=auto margin=0px 0px 0px 0px padding=0px 0px 0px 0px border-width=0 0 0 0 border-color=#00000000 color=#000000ff background=#00000000 bold=0 italic=0 underline=0 strike=0\n"
+                "  <head> display=none text-align=left white-space=normal font-size=16px line-height=auto width=auto height=auto margin=0px 0px 0px 0px padding=0px 0px 0px 0px border-width=0 0 0 0 border-color=#00000000 color=#000000ff background=#00000000 bold=0 italic=0 underline=0 strike=0\n"
+                "  <body> display=block text-align=left white-space=normal font-size=16px line-height=19.2px width=auto height=auto margin=8px 8px 8px 8px padding=0px 0px 0px 0px border-width=0 0 0 0 border-color=#00000000 color=#000000ff background=#ffffffff bold=0 italic=0 underline=0 strike=0\n"
+                "    <p> display=block text-align=left white-space=normal font-size=16px line-height=19.2px width=auto height=auto margin=2px 3% 2px 3% padding=0px 0px 0px 0px border-width=0 0 0 0 border-color=#00000000 color=#00ff00ff background=#00000000 bold=0 italic=0 underline=0 strike=0\n"
+                "; nodes=6 styled=4\n";
+            CHECK(bn == sizeof(EXP) - 1 && memcmp(bp, EXP, bn) == 0);
+            free(bp);
+        }
+        /* カスケード未実行（--no-style 相当）の正直な姿 */
+        {
+            IfDom *d2 = if_parse_html(&a, if_str("<p>x</p>", 8));
+            char *bp2 = NULL; size_t bn2 = 0;
+            FILE *os2 = open_memstream(&bp2, &bn2);
+            CHECK(os2 != NULL);
+            if (os2) {
+                if_style_dump(d2, os2);
+                fclose(os2);
+                static const char EXP2[] =
+                    "#styles\n"
+                    "<html> (no style)\n"
+                    "  <head> (no style)\n"
+                    "  <body> (no style)\n"
+                    "    <p> (no style)\n"
+                    "; nodes=6 styled=0\n";
+                CHECK(bn2 == sizeof(EXP2) - 1 && memcmp(bp2, EXP2, bn2) == 0);
+                free(bp2);
+            }
+        }
     }
 
     if_arena_destroy(&a);

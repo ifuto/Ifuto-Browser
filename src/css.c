@@ -4,6 +4,7 @@
 #include "css.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 /* ================= レキサ的補助 ================= */
 
@@ -1489,4 +1490,65 @@ bool if_md_style_lazy_ok(const IfDom *dom) {
     if (!dom || !dom->md_ws_stripped || dom->has_style) return false;
     const char *e = getenv("IF_STYLE_LAZY"); /* kill switch */
     return !(e && e[0] == '0');
+}
+
+/* ================= computed style dump（devtools 観測点） =================
+ * --dump-styles の中身。DOM を文書順に歩き、ELEMENT ノードの computed style を
+ * 1 行/要素で決定的に印刷する。IfStyle の全フィールドを固定順で完全に出す
+ * （省略しないのは差分検証のため: カスケード変更がどのフィールドを動かしたかが
+ * 行 diff で一意に読める）。style==NULL（--no-style でカスケード未実行）の要素は
+ * (no style) と正直に出す。出力は locale 非依存（本プログラムは setlocale を
+ * 呼ばない = C locale 固定。%.6g は float の 6 桁丸めで 19.2px 級を厳密再現） */
+
+static void sd_len(FILE *out, IfLen l) {
+    if (l.unit == IF_U_AUTO) { fputs("auto", out); return; }
+    fprintf(out, "%.6g", (double)l.v);
+    fputs(l.unit == IF_U_PX ? "px" : l.unit == IF_U_EM ? "em" :
+          l.unit == IF_U_REM ? "rem" : l.unit == IF_U_PT ? "pt" : "%", out);
+}
+
+static void sd_len4(FILE *out, const IfLen v[4]) {
+    for (int i = 0; i < 4; i++) { if (i) fputc(' ', out); sd_len(out, v[i]); }
+}
+
+static void sd_node(const IfNode *n, FILE *out, int depth, u32 *n_styled) {
+    if (n->kind != IF_NODE_ELEMENT) return;
+    for (int i = 0; i < depth; i++) fputs("  ", out);
+    fprintf(out, "<%s>", n->u.tag_name.p ? n->u.tag_name.p : "?");
+    const IfStyle *st = n->style;
+    if (!st) fputs(" (no style)\n", out);
+    else {
+        (*n_styled)++;
+        fprintf(out, " display=%s text-align=%s white-space=%s font-size=%.6gpx line-height=",
+            st->display == IF_D_BLOCK ? "block" : st->display == IF_D_LIST_ITEM ? "list-item" :
+            st->display == IF_D_NONE ? "none" : "inline",
+            st->text_align == IF_TA_CENTER ? "center" : st->text_align == IF_TA_RIGHT ? "right" : "left",
+            st->white_space == IF_WS_PRE ? "pre" : "normal",
+            (double)st->font_size);
+        if (st->line_height > 0.0f) fprintf(out, "%.6gpx", (double)st->line_height);
+        else fputs("auto", out);
+        fputs(" width=", out);  sd_len(out, st->width);
+        fputs(" height=", out); sd_len(out, st->height);
+        fputs(" margin=", out);  sd_len4(out, st->margin);
+        fputs(" padding=", out); sd_len4(out, st->padding);
+        fprintf(out, " border-width=%.6g %.6g %.6g %.6g",
+                (double)st->border_w[0], (double)st->border_w[1],
+                (double)st->border_w[2], (double)st->border_w[3]);
+        fprintf(out, " border-color=#%08x color=#%08x background=#%08x",
+                st->border_color, st->color, st->bg);
+        fprintf(out, " bold=%d italic=%d underline=%d strike=%d\n",
+                (int)st->bold, (int)st->italic, (int)st->underline, (int)st->strike);
+    }
+    for (const IfNode *c = n->first_child; c; c = c->next_sibling)
+        sd_node(c, out, depth + 1, n_styled);
+}
+
+void if_style_dump(const IfDom *dom, void *out_FILE) {
+    FILE *out = (FILE *)out_FILE;
+    if (!dom || !dom->root) { fputs("(empty dom)\n", out); return; }
+    fputs("#styles\n", out);
+    u32 n_styled = 0;
+    for (const IfNode *c = dom->root->first_child; c; c = c->next_sibling)
+        sd_node(c, out, 0, &n_styled);
+    fprintf(out, "; nodes=%u styled=%u\n", dom->n_nodes, n_styled);
 }

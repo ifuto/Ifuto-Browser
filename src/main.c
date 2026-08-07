@@ -94,6 +94,7 @@ static void usage(FILE *f) {
           "  --dump-layout    print box tree\n"
           "  --dump-tokens    print HTML tokens\n"
           "  --dump-wptdom    print DOM in html5lib tree-construction format\n"
+          "  --dump-styles    print computed styles per element (devtools)\n"
           "  --gui            interactive GUI (single supported UI; TUI は廃止)\n"
           "  --shot OUT.ppm   headless full-page raster to PPM (GUI 検証経路)\n"
           "  --md             force Markdown parsing (auto for .md/.markdown files)\n"
@@ -129,7 +130,7 @@ static int show_paths(void) {
 int main(int argc, char **argv) {
     i32 width = 100;
     int ansi = 1, do_style = 1, links = 0, stats = 0, force_md = 0;
-    enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM, M_GUI } mode = M_RENDER;
+    enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM, M_STYLES, M_GUI } mode = M_RENDER;
     const char *path = NULL, *shot = NULL;
     bool legacy_ui = false;
 
@@ -141,6 +142,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dump-layout") == 0) mode = M_LAYOUT;
         else if (strcmp(argv[i], "--dump-tokens") == 0) mode = M_TOKENS;
         else if (strcmp(argv[i], "--dump-wptdom") == 0) mode = M_WPTDOM;
+        else if (strcmp(argv[i], "--dump-styles") == 0) mode = M_STYLES;
         else if (strcmp(argv[i], "--gui") == 0) mode = M_GUI;
         else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) shot = argv[++i];
         else if (strcmp(argv[i], "--ui") == 0) { mode = M_GUI; legacy_ui = true; }
@@ -229,6 +231,15 @@ int main(int argc, char **argv) {
     }
     double t3 = now_ms();
     double arena_after_style = (double)if_arena_reserved(&a);
+
+    /* devtools 観測点: style 適用直後の computed style を全要素ダンプして終了
+     * （layout 以降へは進まない。style_lazy は M_RENDER 専用なので本経路は常に
+     * eager 適用済み。--no-style 併用時はカスケード未実行の正直な姿が出る） */
+    if (mode == M_STYLES) {
+        if_style_dump(dom, stdout);
+        if_arena_destroy(&a);
+        return 0;
+    }
 
     /* CLI 行スイープは box 木を参照しない → 線形モード（BLOCK 箱再利用）。dump-layout は従来経路 */
     IfLayout *lay = (mode == M_LAYOUT) ? if_layout_build(&a, dom, width)

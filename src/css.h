@@ -130,6 +130,11 @@ float if_css_resolve_len(IfLen l, float self_fs, float root_fs); /* px へ（PCT
 /* DOM に計算済みスタイルを付与する（UA シート + <style> 要素 + inline style）。 */
 void if_style_apply(IfArena *a, IfDom *dom);
 
+/* computed style ダンプ（devtools 観測点。--dump-styles）。
+ * ELEMENT ノードを文書順に 1 行/要素で決定的に印刷（全フィールド固定順・省略なし）。
+ * style==NULL の要素は (no style)。out_FILE は FILE *（stdio 非依存にするため void *）。 */
+void if_style_dump(const IfDom *dom, void *out_FILE);
+
 bool if_css_match_selector(const IfNode *n, const IfSelector *sel);
 
 /* 監査・差分検証用の kill switch（既定 0 = RuleSet 索引経路）。1 にすると全ノードで
