@@ -404,6 +404,11 @@ typedef struct {
     u8 direct_all;         /* 現行の全グリフが IF_LF_DIRECT_BYTES 条件を満たす */
     u32 seg_hi;            /* この Wrap が wrap_end_line で確定した seg の累計
                             * （ifc 局所の大域 seg 添字の基底。現行位置 = seg_hi + n_segs） */
+    /* merge-hit 判定のレジスタ常駐化（seg 配列最終要素の二重ロード消去）。
+     * 整合規約: 真値は常に seg_base[n_segs-1] から導出可能。push 確定点で更新、
+     * pop/巻き戻しで pm_st=NULL に無効化（n_segs==0 ゲートでも陳腐化は読まれない） */
+    const IfStyle *pm_st;
+    const char *pm_end;
 } IfWrap;
 
 /* direct のみ版（gw は呼出側が処理済み） */
@@ -428,13 +433,12 @@ static inline void wrap_note_direct(IfWrap *w, const u8 *base, u32 from, u32 to,
 static void wrap_push_seg(IfWrap *w, IfStr text, i32 x, i32 width, const IfStyle *st);
 static inline void wrap_push_merge(IfWrap *w, const char *p, u32 n, i32 x, i32 width, const IfStyle *st) {
     if (n == 0) return;
-    if (w->n_segs) {
+    if (__builtin_expect(w->n_segs != 0 && w->pm_st == st && w->pm_end == p, 1)) {
         IfSeg *last = &w->seg_base[w->n_segs - 1];
-        if (last->st == st && last->text.p + last->text.n == p) {
-            last->text.n += n;
-            last->w += width;
-            return;
-        }
+        last->text.n += n;
+        last->w += width;
+        w->pm_end = p + n;
+        return;
     }
     wrap_push_seg(w, if_str(p, n), x, width, st);
 }
@@ -462,10 +466,12 @@ static inline void wrap_push_seg(IfWrap *w, IfStr text, i32 x, i32 width, const 
         w->seg_base[w->n_segs].w = width;
         w->seg_base[w->n_segs].st = st;
         w->n_segs++;
+        w->pm_st = st; w->pm_end = text.p + text.n;
         return;
     }
     s->text = text; s->x = x; s->w = width; s->st = st;
     w->n_segs++;
+    w->pm_st = st; w->pm_end = text.p + text.n;
 }
 
 /* 行尾の折り畳み空白 pop（巻き戻し可能なのは seg 系列が最新端のときだけ） */
@@ -473,6 +479,7 @@ static inline void wrap_pop_last_seg(IfWrap *w) {
     IfSeg *last = &w->seg_base[w->n_segs - 1];
     if_arena_rewind_last(w->lc->arena, last, sizeof(IfSeg));
     w->n_segs--;
+    w->pm_st = NULL; /* 陳腐化防止（次 push は必ず wrap_push_seg 経由で再設定） */
 }
 
 static void wrap_end_line(IfWrap *w, float max_lh) {
@@ -1004,7 +1011,7 @@ static void flat_link_spans(IfLC *lc, const IfWrap *w, const IfLinkPrec *prec, u
 static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *base_st,
                           i32 content_x, i32 *y_io, i32 content_w) {
     u64 _i0; if (lpf()) _i0 = if_rdtsc(); else _i0 = 0;
-    IfWrap w = { lc, content_x, content_w, *y_io, parent, NULL, 0, 0, base_st, 1, 0 };
+    IfWrap w = { lc, content_x, content_w, *y_io, parent, NULL, 0, 0, base_st, 1, 0, NULL, NULL };
     float max_lh = base_st && base_st->line_height > 0.0f ? base_st->line_height
                  : base_st ? base_st->font_size * 1.2f : 16.0f * 1.2f;
     bool pre = base_st && base_st->white_space == IF_WS_PRE;
@@ -1118,6 +1125,8 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node, const IfStyle *ba
     i32 y = content_y;
     i32 prev_mb = 0;
     u32 li_ord = 0; /* ol 番号: この親の LIST_ITEM li を出現順に数える（draw_marker 同値） */
+    /* ws 相殺補正は親タグのみの関数 → ループ不変（旧: 子毎に switch 評価） */
+    const bool sinkp = lc->md_ws_stripped && ws_sink_parent(node->tag);
     IfNode *c = node->first_child;
     while (c && c != lc->stop) {
         /* sibling 鎖は arena 上で MB 級ストライドに散る → 次ノードを処理中に先読み。
@@ -1175,7 +1184,7 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node, const IfStyle *ba
         box_recycle(lc, child); /* 線形モード以外では no-op */
         y += child_h;
                 prev_mb = mb;
-        if (lc->md_ws_stripped && ws_sink_parent(node->tag))
+        if (sinkp)
             prev_mb = 0; /* 旧 DOM では sink 容器直下の ws TEXT が ifc 経由で必ず
                           * prev_mb を 0 にしていた → 剥がし後の同値補正（md.c 参照） */
         c = c->next_sibling;
