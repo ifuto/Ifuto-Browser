@@ -97,6 +97,10 @@ typedef struct {
     u8 slim_attrs;        /* IF_MD_F_SLIM_ATTRS: 保持属性を A[href]/IMG[alt] に限定 */
     /* node slab: 生成は直列 bump（ノード単位の arena 呼出を slab refill に畳む） */
     IfNode *nslab, *nslab_end;
+    /* parent override（B slice 専用）: stub 直下への attach 時のみ ch->parent を
+     * 実 body に直書きする（誕生時点で正しい値 → 接合後の parent 修繕ウォークは
+     * 構造不要。深い子への誤適用は anchor 一致条件で除外）。非 B では両方 NULL */
+    IfNode *povr_anchor, *povr_to;
 } Mo;
 
 static void mo_taint(Mo *m) { m->tainted = true; }
@@ -210,8 +214,8 @@ static inline IfNode *mnew(Mo *m, IfNodeKind kind) {
     return n;
 }
 
-static void mattach(IfNode *parent, IfNode *ch) {
-    ch->parent = parent;
+static void mattach(const Mo *m, IfNode *parent, IfNode *ch) {
+    ch->parent = (m->povr_to && parent == m->povr_anchor) ? m->povr_to : parent;
     if (parent->last_child) parent->last_child->next_sibling = ch;
     else parent->first_child = ch;
     parent->last_child = ch;
@@ -258,7 +262,7 @@ static inline void run_flush(Mo *m) {
         }
         if (t.n) {
             IfNode *n = mnew(m, IF_NODE_TEXT);
-            if (n) { n->u.text = t; n->flags |= mo_txtcls(t); mattach(m->cur, n); }
+            if (n) { n->u.text = t; n->flags |= mo_txtcls(t); mattach(m, m->cur, n); }
         }
         run_reset(m);
     }
@@ -360,7 +364,7 @@ static void mo_elem_store(Mo *m, bool push) {
         }
     }
     if (g_pend.tag == IF_TAG_STYLE) m->dom->has_style = 1;
-    mattach(m->cur, n);
+    mattach(m, m->cur, n);
     if (push) {
         if (m->sp >= 128) { mo_taint(m); return; }
         m->stk[m->sp++] = n;
@@ -382,7 +386,7 @@ static inline void mo_open_push(Mo *m, u16 tag, const char *nm, u32 nl) {
     if (__builtin_expect(!n || m->tainted, 0)) return;
     n->tag = tag;
     n->u.tag_name = if_str(nm, nl);
-    mattach(m->cur, n);
+    mattach(m, m->cur, n);
     if (__builtin_expect(m->sp >= 128, 0)) { mo_taint(m); return; }
     m->stk[m->sp++] = n;
     m->cur = n;
@@ -399,7 +403,7 @@ static inline void mo_open_void(Mo *m, u16 tag, const char *nm, u32 nl) {
     if (__builtin_expect(!n || m->tainted, 0)) return;
     n->tag = tag;
     n->u.tag_name = if_str(nm, nl);
-    mattach(m->cur, n);
+    mattach(m, m->cur, n);
 }
 
 static void mo_open_end(Mo *m) { /* 開始タグ閉じ＋要素をスタックへ */
@@ -1408,18 +1412,18 @@ static bool if_md_parse_fast_serial_f(IfArena *a, IfStr in, IfDom **out_dom, u8 
     html->kind = IF_NODE_ELEMENT; html->tag = IF_TAG_HTML; html->ns = IF_NS_HTML;
     html->u.tag_name = IF_S("html");
     dom->n_nodes++;
-    mattach(root, html);
+    mattach(&m, root, html);
     m.cur = root;
     IfNode *head = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
     head->kind = IF_NODE_ELEMENT; head->tag = IF_TAG_HEAD; head->ns = IF_NS_HTML;
     head->u.tag_name = IF_S("head");
     dom->n_nodes++;
-    mattach(html, head);
+    mattach(&m, html, head);
     IfNode *body = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
     body->kind = IF_NODE_ELEMENT; body->tag = IF_TAG_BODY; body->ns = IF_NS_HTML;
     body->u.tag_name = IF_S("body");
     dom->n_nodes++;
-    mattach(html, body);
+    mattach(&m, html, body);
     m.stk[0] = html;
     m.stk[1] = body;
     m.sp = 2;
@@ -1541,9 +1545,8 @@ typedef struct {
     IfArena *a;
     IfDom *dom;
     IfNode *html, *stub;
-    IfNode *body;        /* 実 body ノード（stub 直下子の parent 修繕を本スレッド内で
-                          * 完結させるための宛先。修繕は join 前の main 逐次ウォークだった
-                          * ものを B 側へ畳み込んだもので、指す値は規約どおり実 body） */
+    IfNode *body;        /* 実 body ノード（mb.povr_to の宛先。stub 直下子の parent
+                          * は attach 時点でこれに直書きされる） */
     const char *full_p;
     u32 full_n;
     IfStr slice;
@@ -1564,6 +1567,8 @@ static void *md_slice_run(void *arg) {
     mb.stk[1] = j->stub;
     mb.sp = 2;
     mb.cur = j->stub;
+    mb.povr_anchor = j->stub;
+    mb.povr_to = j->body;
     mo_range(&mb, j->full_p, j->full_n);
     Fn fnb;
     memset(&fnb, 0, sizeof fnb);
@@ -1571,11 +1576,6 @@ static void *md_slice_run(void *arg) {
     fnb.is_dom = true;
     blocks_str(&mb, &fnb, j->slice, 0);
     run_flush(&mb);
-    /* stub 直下子の parent 修繕をここで行う（本スレッド生成の鎖を本スレッドが
-     * 直すので join 後の main 逐次ウォークは不要。直す対象は自分の arena 内の
-     * 自分が書いたノードのみで、A 側との競合は構造上ありえない） */
-    for (IfNode *c = j->stub->first_child; c; c = c->next_sibling)
-        c->parent = j->body;
     fn_free(&fnb);
     free(mb.c_buf);
     j->tainted = mb.tainted;
@@ -1615,17 +1615,17 @@ bool if_md_parse_fast_f(IfArena *a, IfStr in, IfDom **out_dom, u8 flags) {
                 html->kind = IF_NODE_ELEMENT; html->tag = IF_TAG_HTML; html->ns = IF_NS_HTML;
                 html->u.tag_name = IF_S("html");
                 dom->n_nodes++;
-                mattach(root, html);
+                mattach(&m, root, html);
                 IfNode *head = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
                 head->kind = IF_NODE_ELEMENT; head->tag = IF_TAG_HEAD; head->ns = IF_NS_HTML;
                 head->u.tag_name = IF_S("head");
                 dom->n_nodes++;
-                mattach(html, head);
+                mattach(&m, html, head);
                 IfNode *body = (IfNode *)if_arena_calloc(a, sizeof(IfNode));
                 body->kind = IF_NODE_ELEMENT; body->tag = IF_TAG_BODY; body->ns = IF_NS_HTML;
                 body->u.tag_name = IF_S("body");
                 dom->n_nodes++;
-                mattach(html, body);
+                mattach(&m, html, body);
                 m.stk[0] = html;
                 m.stk[1] = body;
                 m.sp = 2;
