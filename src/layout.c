@@ -13,6 +13,33 @@
 #include <pthread.h> /* 2-way 並列 layout（md fast-DOM のみ。glibc>=2.34 で ldd 不変） */
 #if defined(__SSE2__) || defined(__x86_64__)
 #include <emmintrin.h> /* ASCII 可視ラン一括分類（SSE2 は x86_64 基底。dispatch 不要） */
+#include <immintrin.h> /* AVX2 版可視ラン走査（target attr + runtime dispatch、md.c 同型） */
+
+/* ASCII 可視ランの終端（最初の非可視バイト位置）。可視 ⇔ 0x21<=b<=0x7E。
+ * 判定: r = b-0x21（epu8 wrap）は in-range で 0x00-0x5D、out-range で 0x5E-0xFF。
+ * t = r^0x80 とおくと out-range ⟺ t >s8 0xDD(=0x5D^0x80)。境界 4 点は機械検証済:
+ * b=0x20→r=0xFF→t=0x7F>−35 stop / b=0x21→t=−128 no-stop / b=0x7E→t=0xDD no-stop /
+ * b=0x7F→t=0xDE>−35 stop。停止位置はスカラ規則（最初に範囲外のバイト）と厳密一致。 */
+__attribute__((target("avx2"))) static u32 lw_ascii_run_end_avx2(const u8 *s, u32 n, u32 i) {
+    const __m256i off = _mm256_set1_epi8(0x21);
+    const __m256i flip = _mm256_set1_epi8((char)0x80);
+    const __m256i lim = _mm256_set1_epi8((char)0xDD);
+    for (; i + 32 <= n; i += 32) {
+        __m256i b = _mm256_loadu_si256((const __m256i *)(s + i));
+        __m256i t = _mm256_xor_si256(_mm256_sub_epi8(b, off), flip);
+        unsigned m = (unsigned)_mm256_movemask_epi8(_mm256_cmpgt_epi8(t, lim));
+        if (m) return i + (u32)__builtin_ctz(m);
+    }
+    return i; /* 末尾 32B 未満は呼び出し側のスカラが続きから処理 */
+}
+
+static u32 lw_ascii_run_end(const u8 *s, u32 n, u32 i) {
+    static int have_avx2 = -1;
+    if (__builtin_expect(have_avx2 < 0, 0))
+        have_avx2 = __builtin_cpu_supports("avx2") ? 1 : 0;
+    if (have_avx2) return lw_ascii_run_end_avx2(s, n, i);
+    return i;
+}
 #define IF_SSE2 1
 #endif
 
@@ -526,6 +553,8 @@ static void wrap_text(IfWrap *w, IfStr text, const IfStyle *st, bool pre,
         i32 atom_w = 0;
         if (b0 >= 0x21 && b0 <= 0x7E) {
             u32 j = i + 1;
+            /* AVX2 で 32B ずつ走査（停止位置はスカラ規則と厳密一致）、残りはスカラ */
+            j = lw_ascii_run_end(s, n, j);
             while (j < n) { u8 cc = s[j]; if (cc < 0x21 || cc > 0x7E) break; j++; }
             atom_w = (i32)(j - i);
             i = j;
