@@ -269,6 +269,41 @@ def main():
     else:
         check(False, "[focus] dims stable")
 
+    # リンクホバー可視化（IF_SHOT_HOVER フック。対話 MotionNotify と同一 paint 経路。
+    # 差分は「リンク文書行帯」+「statusbar 帯（href 表示）」のちょうど 2 帯が契約）
+    def shot_hov(out, hov=None):
+        e = dict(env)
+        if hov is not None:
+            e["IF_SHOT_HOVER"] = hov
+        else:
+            e.pop("IF_SHOT_HOVER", None)
+        r = subprocess.run([gui, "--shot", out, flinks], env=e,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode
+    h0_p = os.path.join(tmp, "hover.h0.ppm")
+    h0b_p = os.path.join(tmp, "hover.h0b.ppm")
+    hoob_p = os.path.join(tmp, "hover.oob.ppm")
+    check(shot_hov(h0_p, "0") == 0, "[hover] hover=0 shot exit 0")
+    check(shot_hov(h0b_p, "0") == 0, "[hover] hover=0 (2nd) shot exit 0")
+    check(shot_hov(hoob_p, "999") == 0, "[hover] hover=999 shot exit 0")
+    check(sha256(h0_p) == sha256(h0b_p), "[hover] hovered raster deterministic")
+    check(sha256(h0_p) != sha256(base_p), "[hover] hover changes raster")
+    check(sha256(hoob_p) == sha256(base_p), "[hover] out-of-range hover == unhovered")
+    w3, h3, ph = read_ppm(h0_p)
+    hbands = set()
+    if (w3, h3) == (w, h):
+        n = w * h
+        status_band = h // 16 - 1
+        for i in range(n):
+            o, q = i * 3, i * 3
+            if pb[o:o+3] != ph[q:q+3]:
+                hbands.add((i // w) // 16)
+        check(len(hbands) == 2 and status_band in hbands
+              and hbands.issubset(set(range(2, status_band + 1))),
+              f"[hover] diff confined to link band + status band {sorted(hbands)}")
+    else:
+        check(False, "[hover] dims stable")
+
     print("----")
     if FAIL:
         print(f"gui_smoke: FAIL ({len(FAIL)})")

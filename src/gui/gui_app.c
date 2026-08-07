@@ -60,6 +60,12 @@ typedef struct {
     i32 w_cells, h_cells;
     char status[96];
     bool need_repaint;
+    /* ホバー中リンク（マウスポインタ直下）。hover_tab はタブ切替跨ぎの陳腐化
+     * 防止（hover_idx は現タブの links 添字としてのみ有効。NULL で無ホバー）。
+     * status_saved はホバーで statusbar を href 表示に上書きする前の退避 */
+    i32 hover_idx;
+    IfTab *hover_tab;
+    char status_saved[96];
     /* viewport 窓グリッドのキャッシュ（[scroll, scroll+vh) のみ materialize。
      * 文書長に比例しない: 「表示しない分は持たない」。再構築は scroll/tab/寸法の変化時のみ） */
     IfCell *wcells;
@@ -89,6 +95,27 @@ static bool gui_focus_cell(const IfLink *fl, i32 gy, i32 col) {
         if (gy >= fl->spans[s].y0 && gy < fl->spans[s].y1 &&
             col >= fl->spans[s].x0 && col < fl->spans[s].x1) return true;
     return false;
+}
+
+/* ホバー中リンク（矩形未収集のリンクは可視化なし — focus と同じ規則） */
+static const IfLink *gui_hover_link(Gui *g) {
+    const IfTab *t = if_chrome_cur(&g->c);
+    if (!t || !t->lay || g->hover_tab != t || g->hover_idx < 0 ||
+        g->hover_idx >= (i32)t->lay->n_links) return NULL;
+    const IfLink *L = &t->lay->links[g->hover_idx];
+    return L->n_spans ? L : NULL;
+}
+
+/* (col,gy) 文書座標のリンク添字ヒットテスト（クリック/ホバー共用の一点化） */
+static i32 gui_link_hit(const IfTab *t, i32 col, i32 gy) {
+    if (!t || !t->lay) return -1;
+    for (u32 i = 0; i < t->lay->n_links; i++) {
+        const IfLink *L = &t->lay->links[i];
+        for (u32 s = 0; s < L->n_spans; s++)
+            if (col >= L->spans[s].x0 && col < L->spans[s].x1 &&
+                gy >= L->spans[s].y0 && gy < L->spans[s].y1) return (i32)i;
+    }
+    return -1;
 }
 
 static const IfGrid *gui_view_grid(Gui *g) {
@@ -189,12 +216,14 @@ static void paint_screen_row(Gui *g, Painter *p, i32 row_cell) {
     i32 gy_local_px_top = row_cell * GUI_CELL_H - (i32)p->y0_px;
     fb_rect(&p->strip, 0, gy_local_px_top, (i32)p->strip.w_px, GUI_CELL_H, GUI_PAGE_BG);
     const IfLink *fl = gui_focus_link(t);
+    const IfLink *hl = gui_hover_link(g);
     for (i32 col = 0; col < vg->w && col < g->w_cells; col++) {
         IfCell *cell = &vg->cells[(i64)(gy - vg->y_off) * vg->w + col];
         if (cell->cp == 0) continue; /* 全角継続セル（先頭セルの glyph16 が 2 セルぶん塗る） */
         u32 fg = ansi_to_rgb(cell->fg, GUI_PAGE_FG);
         u32 bg = ansi_to_rgb(cell->bg, GUI_PAGE_BG);
         if (fl && gui_focus_cell(fl, gy, col)) { bg = 0xbfe3ff; fg = 0x10243f; }
+        else if (hl && gui_focus_cell(hl, gy, col)) { bg = 0xd8e7ff; } /* ホバーは focus より薄い強調 */
         /* グリフ選択はラスタ層（fb_glyph_cp）の責務: ASCII 外形付け替え・
          * 全角互換形・font16（かな/カナ/記号）・明示豆腐を一点化する */
         fb_glyph_cp(&p->strip, col * GUI_CELL_W, gy_local_px_top, cell->cp, fg, bg,
@@ -282,6 +311,7 @@ static void gui_open_href(Gui *g, IfStr href, const IfTab *t) {
 }
 
 static void gui_load(Gui *g, const char *path, i32 width_cells) {
+    g->hover_idx = -1; g->hover_tab = NULL; /* 遷移でホバー対象は失効 */
     if (if_chrome_open(&g->c, path, width_cells)) {
         gui_sync_omni(g);
         IfTab *t = if_chrome_cur(&g->c);
@@ -335,6 +365,15 @@ static u32 gui_row_hash(Gui *g, i32 row) {
             for (u32 s = 0; s < fl->n_spans; s++)
                 if (gy >= fl->spans[s].y0 && gy < fl->spans[s].y1) {
                     h ^= 0x85EBCA6Bu + (u32)t->link_idx * 0x9E3779B1u;
+                    break;
+                }
+        /* ホバーリンクの交差行: ホバー移動時に旧位置・新位置の双方の行が
+         * 変化扱いとなるよう salt を混ぜる（focus と同じ不変条件）*/
+        const IfLink *hl = gui_hover_link(g);
+        if (hl)
+            for (u32 s = 0; s < hl->n_spans; s++)
+                if (gy >= hl->spans[s].y0 && gy < hl->spans[s].y1) {
+                    h ^= 0x27D4EB2Fu + (u32)g->hover_idx * 0x9E3779B1u;
                     break;
                 }
     }
@@ -500,24 +539,45 @@ static int gui_run_x(const char *initial) {
             g.omni_focus = ev.y < (i32)(2 * GUI_CELL_H);
             if (!g.omni_focus && ev.code == 1) {
                 IfTab *t = if_chrome_cur(&g.c);
-                if (t && t->lay) {
-                    i32 col = ev.x / GUI_CELL_W;
-                    i32 gy = ev.y / GUI_CELL_H - ROWS_TOP + t->scroll;
-                    for (u32 i = 0; i < t->lay->n_links; i++) {
-                        const IfLink *L = &t->lay->links[i];
-                        for (u32 s = 0; s < L->n_spans; s++) {
-                            const IfLSpan *sp = &L->spans[s];
-                            if (col >= sp->x0 && col < sp->x1 && gy >= sp->y0 && gy < sp->y1) {
-                                t->link_idx = (i32)i; /* クリック = フォーカス（Chrome 流） */
-                                gui_open_href(&g, L->href, t);
-                                goto click_done;
-                            }
-                        }
-                    }
+                i32 col = ev.x / GUI_CELL_W;
+                i32 gy = ev.y / GUI_CELL_H - ROWS_TOP + (t ? t->scroll : 0);
+                i32 hit = gui_link_hit(t, col, gy);
+                if (hit >= 0) {
+                    t->link_idx = hit; /* クリック = フォーカス（Chrome 流） */
+                    gui_open_href(&g, t->lay->links[hit].href, t);
                 }
-            click_done:;
             }
             gui_repaint_x(x, win, &p, &g, w_px, h_px);
+            break;
+        }
+        case IF_XEV_MOTION: {
+            /* ホバー: ポインタ直下のリンクを statusbar に href 表示 + 矩形を
+             * 薄く強調（普通のブラウザの hover 挙動）。再描画は対象変更時のみ
+             * （motion イベント律は塗り分けではなく状態遷移に畳む） */
+            IfTab *t = if_chrome_cur(&g.c);
+            i32 vh2 = g.h_cells - ROWS_TOP - ROWS_BOT;
+            i32 vr = ev.y / GUI_CELL_H - ROWS_TOP;
+            i32 hit = -1;
+            if (t && vr >= 0 && vr < vh2)
+                hit = gui_link_hit(t, ev.x / GUI_CELL_W, t->scroll + vr);
+            bool was = g.hover_tab != NULL; /* ホバー有効状態は hover_tab で判定 */
+            if (hit != g.hover_idx || (hit >= 0 && g.hover_tab != t)) {
+                if (!was && hit >= 0)
+                    memcpy(g.status_saved, g.status, sizeof g.status_saved);
+                g.hover_idx = hit;
+                g.hover_tab = hit >= 0 ? t : NULL;
+                if (hit >= 0) {
+                    IfStr hr = t->lay->links[hit].href;
+                    char hm[96];
+                    u32 hn = hr.p && hr.n < sizeof hm ? hr.n : 0;
+                    if (hn) memcpy(hm, hr.p, hn);
+                    hm[hn] = 0;
+                    statusf(&g, hm);
+                } else if (was) {
+                    statusf(&g, g.status_saved);
+                }
+                gui_repaint_x(x, win, &p, &g, w_px, h_px);
+            }
             break;
         }
         case IF_XEV_KEY: {
@@ -699,6 +759,25 @@ int if_gui_shot(const char *input_path, const char *out_ppm) {
             IfTab *t = if_chrome_cur(&g.c);
             if (t && t->lay && end != fo && li >= 0 && li < (long)t->lay->n_links)
                 t->link_idx = (i32)li;
+        }
+    }
+    /* 検査フック: IF_SHOT_HOVER=N でホバー中の描画を再現する（矩形強調 +
+     * statusbar href 表示。対話 MotionNotify 処理と同一 paint/hash 経路。
+     * 範囲外・解析失敗は無ホバーとして未ホバー shot とバイト一致が oracle） */
+    {
+        const char *ho = getenv("IF_SHOT_HOVER");
+        if (ho && *ho) {
+            char *end = NULL;
+            long li = strtol(ho, &end, 10);
+            IfTab *t = if_chrome_cur(&g.c);
+            if (t && t->lay && end != ho && li >= 0 && li < (long)t->lay->n_links) {
+                g.hover_idx = (i32)li;
+                g.hover_tab = t;
+                IfStr hr = t->lay->links[li].href;
+                u32 hn = hr.p && hr.n < sizeof g.status ? hr.n : 0;
+                if (hn) memcpy(g.status, hr.p, hn);
+                g.status[hn] = 0;
+            }
         }
     }
     bool ok = shot_ppm(&g, out_ppm);

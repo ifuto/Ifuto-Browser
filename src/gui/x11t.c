@@ -244,7 +244,7 @@ u32 x11_window(IfX *x, u32 w, u32 h, const char *title) {
     p32(req + 28, 0x1 | 0x800); /* CWBackPixel | CWEventMask */
     p32(req + 32, x->white);
     p32(req + 36, 0x1 /*KeyPress*/ | 0x4 /*ButtonPress*/ | 0x8000 /*Exposure*/ |
-                   0x20000 /*StructureNotify*/);
+                   0x40 /*PointerMotion*/ | 0x20000 /*StructureNotify*/);
     if (!wr_all(x, req, 40)) goto bad;
     /* ChangeProperty: WM_NAME (STRING=31) */
     {
@@ -455,6 +455,11 @@ bool x11_next_event(IfX *x, IfXev *ev) {
         case 4: /* ButtonPress */
             ev->kind = IF_XEV_BUTTON;
             ev->code = buf[1];
+            ev->x = (short)g16(buf + 24);
+            ev->y = (short)g16(buf + 26);
+            return true;
+        case 6: /* MotionNotify */
+            ev->kind = IF_XEV_MOTION;
             ev->x = (short)g16(buf + 24);
             ev->y = (short)g16(buf + 26);
             return true;

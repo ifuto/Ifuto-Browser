@@ -18,6 +18,13 @@
   実ソケット経由の file 版ラスタ完全一致を含む）、ifuto-asan で live fetch
   4 形態（CL/301/chunked/close）+ 16MB + dump-dom + --shot http 全クリーン。
 
+### 同日追記: GUI リンクホバー（パイプライン非接触）
+- x11t.c MotionNotify + gui_app.c のみ（エンジン層ゼロ差分）。16MB byte-exact
+  sha256 = d11680089da0fc6e58308fa19622865b19919e261b9caafa484baf4bc7321ab4 一致。
+  gui_smoke +7 = 51 checks（IF_SHOT_HOVER 契約: 差分 2 帯限定・範囲外==無ホバー
+  バイト一致・2 回确定性）。run_tests 両種 609,198 不変、ASAN shot/hover-shot
+  /16MB クリーン。
+
 ## 2026-08-07: flatten 経路リンク span 収集（複数行リンクのクリック可視化）+ shard B span y 未シフト修理
 
 - 機能: 複数行 wrap へ逃げた <a>（fused 失敗 → flatten 経路）の表示矩形を行ごとに

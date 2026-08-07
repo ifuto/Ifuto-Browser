@@ -55,7 +55,15 @@
   使わないほど良い」に拠る限定 — 線形 CLI 経路は no_boxlink で矩形収集自体を skip、
   差分は collect の 2 store のみで誤差級）、左クリックで
   ヒットテスト → 相対 join/絶対パス/http 遷移。anchor は未取得のためステータス表示。
-  残課題: ホバー。
+  ~~残課題: ホバー~~ → **達成（2026-08-07）**: x11t に PointerMotion/MotionNotify を
+  追加（Xlib 非依存は不変）。MotionNotify → 一点化ヒットテスト gui_link_hit
+  （クリック経路もこれに統合）→ 状態遷移時のみ statusbar href 表示 + リンク矩形の
+  薄強調（focus 0xbfe3ff に対し hover 0xd8e7ff、fg 不変）。motion イベント律は
+  塗り分けず「対象変更時のみ再描画」に畳む。ホバー有効状態は hover_tab!=NULL で
+  判定（起動直後の status 消去・タブ切替跨ぎ陳腐化を構造除外）。行 hash salt は
+  focus と同規則（0x27D4EB2F）。遷移（gui_load）でホバー失効。
+  ヘッドレス oracle: IF_SHOT_HOVER=N が対話と同一 paint 経路を再現、
+  gui_smoke で「差分はリンク文書行帯+statusbar 帯のちょうど 2 帯」を契約化（+7 checks）。
   ~~複数行 wrap へ逃げたリンク・flatten 経路の矩形未収集~~ → **解消（2026-08-07）**:
   piece 区間 → 大域 seg 添字 → 行ログ交差の 3 段解決で行ごとの部分矩形を収集
   （GUI の全表示リンクがクリック/フォーカス可能）。併発修理: 並列 shard tree

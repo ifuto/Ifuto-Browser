@@ -19,13 +19,13 @@ typedef struct {
     u8  code;     /* key: keysym-low（0x20-0x7E は ASCII 通し） */
     u32 keysym;   /* KeyPress の keysym（BackSpace 等の特殊値含む） */
     u32 state;    /* modifier mask（Shift=1, Control=4） */
-    i32 x, y;     /* ButtonPress 座標 / ConfigureNotify は (w,h) */
+    i32 x, y;     /* ButtonPress/MotionNotify 座標 / ConfigureNotify は (w,h) */
     u32 aux;      /* ClientMessage の atom 等 */
 } IfXev;
 
 enum {
     IF_XEV_NONE = 0, IF_XEV_EXPOSE, IF_XEV_KEY, IF_XEV_BUTTON,
-    IF_XEV_CONFIGURE, IF_XEV_CLIENTMSG
+    IF_XEV_CONFIGURE, IF_XEV_CLIENTMSG, IF_XEV_MOTION
 };
 
 /* キーシム（X 規格の固定値のうち使用するもの） */
