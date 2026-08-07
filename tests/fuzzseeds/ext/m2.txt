@@ -1,0 +1,7 @@
+# comment
+
+  name  :  spaced  
+version: 2.0
+entry: a.js
+permissions: log
+

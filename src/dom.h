@@ -95,10 +95,12 @@ typedef struct IfNode {
     u32 n_attrs;
     const struct IfStyle *style; /* カスケード後に付与（intern 所有・不変。監査: 全消費者 read-only） */
     struct IfNode *parent, *first_child, *last_child, *next_sibling;
-    /* template のみ: 「content」文書フラグメント（子はここに入る。子リストは常空）。
-     * WPT serializer の "content" 行はこのノード経由で辿られる。 */
-    struct IfNode *content;
 } IfNode;
+/* template の「content」文書フラグメントは全ノード中きわめて稀（0〜数個/文書）なため
+ * IfNode から追い出し IfDom 側の rare-data 写像で持つ（88B→80B。16MB md で
+ * 1.6M ノード×8B ≈ −12.3MiB の parse arena 削減。Chromium RareData と同型の思想）。
+ * 参照は if_dom_tpl_content / if_dom_tpl_set_content のみ（フィールド直アクセス廃止）。 */
+typedef struct IfTplMapEnt { IfNode *tpl, *content; } IfTplMapEnt;
 
 typedef struct {
     IfArena *arena;      /* 所有 */
@@ -114,6 +116,9 @@ typedef struct {
     IfNode *md_body_mid;  /* md 2-slice パースの分割境界 = body 直下の「B 側先頭子」
                            * （レイアウト並列化の子数計数/中点ウォークを構造消去するための
                            *   ヒント。非 slice 経路・HTML では NULL。性能のみで生出力不変） */
+    /* template rare-data 写像（開放番地法。cap=0 は未構築 = 文書に template 無し） */
+    IfTplMapEnt *tpl_map;
+    u32 tpl_map_n, tpl_map_cap;
 } IfDom;
 
 /* 入力はドキュメント寿命中生存していること（ページ arena にコピーして呼ぶのが安全）。 */
@@ -126,6 +131,11 @@ bool        if_tag_is_rawtext(u16 tag);
 
 IfStr       if_dom_attr(const IfNode *n, const char *name_ci); /* なければ empty */
 bool        if_dom_has_class(const IfNode *n, IfStr cls);
+
+/* template rare-data: content フラグメントの側車写像（IfNode のみから分離。上記参照）。
+ * tpl 未登録なら NULL。set は template 開始時に 1 度だけ（再 set は上書き） */
+IfNode     *if_dom_tpl_content(const IfDom *d, const IfNode *tpl);
+void        if_dom_tpl_set_content(IfDom *d, IfNode *tpl, IfNode *content);
 
 /* 子要素をドキュメント順に列挙 */
 static inline IfNode *if_node_first_elem_child(IfNode *n) {

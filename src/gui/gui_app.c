@@ -780,6 +780,9 @@ int if_gui_shot(const char *input_path, const char *out_ppm) {
             }
         }
     }
+    /* toast（拡張 E1 の status 効果・lazy_load 失敗等）が残っていれば描画前に
+     * 表面化する（対話 GUI の repaint 前 gui_toast と同一契約。toast 無ければ no-op） */
+    gui_toast(&g);
     bool ok = shot_ppm(&g, out_ppm);
     if_chrome_destroy(&g.c); /* LSan 対象の正当解体（タブ「1 タブ 1 arena」ごと） */
     free(g.wcells);

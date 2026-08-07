@@ -18,22 +18,24 @@ static IfDom *parse(IfArena *a, const char *html) {
 }
 
 /* slim-DOM テスト用: 本文中に needle を含む TEXT ノードが居るか（content 辺も潜る） */
-static bool sl_tree_text_has(const IfNode *n, const char *needle) {
+static bool sl_tree_text_has(const IfDom *d, const IfNode *n, const char *needle) {
     size_t nl = strlen(needle);
     if (n->kind == IF_NODE_TEXT && n->u.text.n >= nl) {
         for (u32 i = 0; i + nl <= n->u.text.n; i++)
             if (memcmp(n->u.text.p + i, needle, nl) == 0) return true;
     }
     for (const IfNode *c = n->first_child; c; c = c->next_sibling)
-        if (sl_tree_text_has(c, needle)) return true;
-    if (n->content && sl_tree_text_has(n->content, needle)) return true;
+        if (sl_tree_text_has(d, c, needle)) return true;
+    IfNode *tc = if_dom_tpl_content(d, n); /* template rare-data 辺 */
+    if (tc && sl_tree_text_has(d, tc, needle)) return true;
     return false;
 }
-static bool sl_tree_tag_exists(const IfNode *n, u16 tag) {
+static bool sl_tree_tag_exists(const IfDom *d, const IfNode *n, u16 tag) {
     if (n->kind == IF_NODE_ELEMENT && n->tag == tag) return true;
     for (const IfNode *c = n->first_child; c; c = c->next_sibling)
-        if (sl_tree_tag_exists(c, tag)) return true;
-    if (n->content && sl_tree_tag_exists(n->content, tag)) return true;
+        if (sl_tree_tag_exists(d, c, tag)) return true;
+    IfNode *tc = if_dom_tpl_content(d, n); /* template rare-data 辺 */
+    if (tc && sl_tree_tag_exists(d, tc, tag)) return true;
     return false;
 }
 
@@ -176,8 +178,8 @@ void test_html(void) {
             IfArena fa; if_arena_init(&fa, 1 << 16);
             IfDom *d = if_parse_html(&fa, if_str(doc, (u32)strlen(doc)));
             CHECK(d != NULL);
-            CHECK(sl_tree_text_has(d->root, "script-body-vanish")); /* full では居る */
-            CHECK(sl_tree_tag_exists(d->root, IF_TAG_DIV));
+            CHECK(sl_tree_text_has(d, d->root, "script-body-vanish")); /* full では居る */
+            CHECK(sl_tree_tag_exists(d, d->root, IF_TAG_DIV));
             full_nodes = d->n_nodes;
             if_arena_destroy(&fa);
         }
@@ -188,14 +190,14 @@ void test_html(void) {
         CHECK(d != NULL);
         /* title は tab 表示情報 → 残る。style 本文は cascade が読む → 残る */
         CHECK(if_str_eq(d->title, IF_S("KeepMe")));
-        CHECK(sl_tree_tag_exists(d->root, IF_TAG_SCRIPT)); /* root は marker として残る */
-        CHECK(sl_tree_tag_exists(d->root, IF_TAG_TEMPLATE));
-        CHECK(sl_tree_text_has(d->root, "alpha") && sl_tree_text_has(d->root, "bold-stays"));
+        CHECK(sl_tree_tag_exists(d, d->root, IF_TAG_SCRIPT)); /* root は marker として残る */
+        CHECK(sl_tree_tag_exists(d, d->root, IF_TAG_TEMPLATE));
+        CHECK(sl_tree_text_has(d, d->root, "alpha") && sl_tree_text_has(d, d->root, "bold-stays"));
         /* script の本文・template の子孫は DOM に存在しない（content 辺も探索済み） */
-        CHECK(!sl_tree_text_has(d->root, "script-body-vanish"));
-        CHECK(!sl_tree_text_has(d->root, "t-body-vanish"));
-        CHECK(sl_tree_text_has(d->root, ".keep"));         /* style 本文は残す設計 */
-        CHECK(!sl_tree_tag_exists(d->root, IF_TAG_DIV));   /* template 下 div 無し */
+        CHECK(!sl_tree_text_has(d, d->root, "script-body-vanish"));
+        CHECK(!sl_tree_text_has(d, d->root, "t-body-vanish"));
+        CHECK(sl_tree_text_has(d, d->root, ".keep"));         /* style 本文は残す設計 */
+        CHECK(!sl_tree_tag_exists(d, d->root, IF_TAG_DIV));   /* template 下 div 無し */
         /* ノード数は full より厳密に少ない（剃りの証跡を数値で） */
         CHECK(d->n_nodes < full_nodes);
         if_arena_destroy(&sa);
@@ -204,7 +206,7 @@ void test_html(void) {
             IfArena ra; if_arena_init(&ra, 1 << 16);
             IfDom *d2 = if_parse_html(&ra, if_str(doc, (u32)strlen(doc)));
             CHECK(d2 && d2->n_nodes == full_nodes);
-            CHECK(sl_tree_text_has(d2->root, "script-body-vanish"));
+            CHECK(sl_tree_text_has(d2, d2->root, "script-body-vanish"));
             if_arena_destroy(&ra);
         }
     }

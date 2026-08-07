@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE /* madvise 宣言の正当公開（厳格 -std=c11 では glibc が隠す。
+                         * 下の ABI 定数 #ifndef 群はこの定義で dead 化するが harmless */
 #include "arena.h"
 #include <stdlib.h>
 #include <string.h>

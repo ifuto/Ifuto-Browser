@@ -1,0 +1,4 @@
+name: crlf
+version: 1
+entry: e.js
+permissions: status

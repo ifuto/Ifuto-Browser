@@ -7,6 +7,7 @@
 #include "md.h"
 #include "net.h"
 #include "ifuto_pages.h"
+#include "ext.h" /* 拡張 E1（chrome_init 走査結線） */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,6 +124,8 @@ static void set_toast(IfChrome *c, const char *msg) {
     c->toast[n] = 0;
 }
 
+void if_chrome_toast(IfChrome *c, const char *msg) { set_toast(c, msg); } /* 拡張 E1 用の公開窓口（chrome.h 参照） */
+
 static char *dup_cap(const char *s, u32 cap) {
     u32 n = (u32)strlen(s);
     if (n >= cap) n = cap - 1;
@@ -198,11 +201,24 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
         free(doc);
         return false;
     }
-    /* v0.2: .md は HTML に前段変換（CLI と同一ゲート。多層防御は共通パーサ側） */
-    IfStr md_html;
-    if (if_path_is_md(path)) { if_md_to_html(doc, input, &md_html); input = md_html; }
-    if_dom_slim = true; /* 実ブラウズ法則: 画面描画に関係ないものは DOM しない */
-    t->dom = if_parse_html(doc, input);
+    /* v0.2: .md は HTML に前段変換（CLI と同一ゲート。多層防御は共通パーサ側）。
+     * v0.3: DOM 直構築の高速経路を先に試す（CLI main.c と同一構造。汚染時は
+     * 2 段経路が同じ結論へ至る = 多層防御不変。GUI は flags=0（full attrs 保持）:
+     * リンク収集・将来の #id アンカー参照が属性を読む。CLI の SLIM_ATTRS は
+     * 線形レンダ専用の剃りで GUI には適用しない） */
+    if (if_path_is_md(path)) {
+        if (getenv("IFUTO_MD_SLOW") ||
+            !if_md_parse_fast_f(doc, input, &t->dom, 0)) {
+            IfStr md_html;
+            if_md_to_html(doc, input, &md_html);
+            input = md_html;
+            if_dom_slim = true;
+            t->dom = if_parse_html(doc, input);
+        }
+    } else {
+        if_dom_slim = true; /* 実ブラウズ法則: 画面描画に関係ないものは DOM しない */
+        t->dom = if_parse_html(doc, input);
+    }
     if_style_apply(doc, t->dom);
     if (t->doc) if_arena_destroy(t->doc);
     free(t->doc);
@@ -258,6 +274,21 @@ void if_chrome_init(IfChrome *c, IfFsOps fs) {
     c->quit_armed_at = -1;
     c->now = 0;
     if_store_init(&c->store, &c->fs, /*create=*/true); /* 失敗は enabled=false で no-op */
+    /* 拡張 E1（docs/EXTENSIONS.md）: --ext 指定があれば優先（開けなければエラー行）、
+     * 無ければ既定 <store>/ext（不在は黙殺）。IFUTO_NO_EXT=1 は全面停止の救済
+     * スイッチ。失敗は拡張単位で打切られ本体初期化は中断しない */
+    {
+        const char *noext = getenv("IFUTO_NO_EXT");
+        if (!(noext && noext[0] == '1')) {
+            const char *xd = if_ext_dir();
+            if (xd) if_ext_scan_and_run(c, xd, stderr, true);
+            else if (c->store.enabled) {
+                char dbuf[IF_STORE_DIR_CAP + 8];
+                snprintf(dbuf, sizeof dbuf, "%s/ext", c->store.dir);
+                if_ext_scan_and_run(c, dbuf, stderr, false);
+            }
+        }
+    }
 }
 
 void if_chrome_destroy(IfChrome *c) {

@@ -194,6 +194,48 @@ void if_dom_dump(const IfDom *dom, void *out_FILE) {
             dom->title.p ? dom->title.p : "");
 }
 
+/* ---- template content rare-data 側車（IfNode 88B→80B 分離の受け皿） ----
+ * 開放番地法・線形 probe・cap 2 冪・負荷率 0.7 で倍長再ハッシュ。template は
+ * 文書あたり 0〜数個が典型で、md fast-DOM では struct 上出現しない（cap=0 のまま
+ * = ゼロコスト）。key は arena 若番ポインタ: 8B アライン下位を捨てて乗算ハッシュ。 */
+
+static u32 tpl_hash(const IfNode *p) {
+    return (u32)(((uintptr_t)p >> 4) * 2654435761u);
+}
+
+IfNode *if_dom_tpl_content(const IfDom *d, const IfNode *tpl) {
+    if (!d || !d->tpl_map_cap) return NULL;
+    u32 m = d->tpl_map_cap - 1, i = tpl_hash(tpl) & m;
+    for (;;) {
+        IfNode *k = d->tpl_map[i].tpl;
+        if (!k) return NULL;
+        if (k == tpl) return d->tpl_map[i].content;
+        i = (i + 1) & m;
+    }
+}
+
+void if_dom_tpl_set_content(IfDom *d, IfNode *tpl, IfNode *content) {
+    if ((d->tpl_map_n + 1) * 10 >= d->tpl_map_cap * 7) {
+        u32 ncap = d->tpl_map_cap ? d->tpl_map_cap * 2 : 8;
+        IfTplMapEnt *nt = (IfTplMapEnt *)if_arena_calloc(d->arena, (u64)ncap * sizeof(IfTplMapEnt));
+        for (u32 i = 0; i < d->tpl_map_cap; i++) {
+            IfTplMapEnt e = d->tpl_map[i];
+            if (!e.tpl) continue;
+            u32 m = ncap - 1, j = tpl_hash(e.tpl) & m;
+            while (nt[j].tpl) j = (j + 1) & m;
+            nt[j] = e;
+        }
+        d->tpl_map = nt; d->tpl_map_cap = ncap;
+    }
+    u32 m = d->tpl_map_cap - 1, i = tpl_hash(tpl) & m;
+    for (;;) {
+        IfNode *k = d->tpl_map[i].tpl;
+        if (!k) { d->tpl_map[i].tpl = tpl; d->tpl_map[i].content = content; d->tpl_map_n++; return; }
+        if (k == tpl) { d->tpl_map[i].content = content; return; } /* 再 set は上書き */
+        i = (i + 1) & m;
+    }
+}
+
 /* ---- html5lib tree-construction 形式シリアライザ（採点用） ---- */
 
 static void ser_indent(FILE *o, int depth) {
@@ -210,11 +252,10 @@ static int attr_name_cmp(const void *a, const void *b) {
     return (x->name.n > y->name.n) - (x->name.n < y->name.n);
 }
 
-/* template は子を「content」擬似ノード配下として出力する（html5lib 形式）。
- * 実装は content フラグメントを分離していない（近似、台帳記載済み）。 */
-static void ser_children(const IfNode *n, FILE *o, int depth);
+/* template は子を「content」擬似ノード配下として出力する（html5lib 形式）。 */
+static void ser_children(const IfDom *dom, const IfNode *n, FILE *o, int depth);
 
-static void ser_node(const IfNode *n, FILE *o, int depth) {
+static void ser_node(const IfDom *dom, const IfNode *n, FILE *o, int depth) {
     switch (n->kind) {
     case IF_NODE_TEXT:
         fputc('|', o); fputc(' ', o); ser_indent(o, depth); fputc('"', o);
@@ -271,25 +312,26 @@ static void ser_node(const IfNode *n, FILE *o, int depth) {
             memcmp(n->u.tag_name.p, "template", 8) == 0) {
             fputc('|', o); fputc(' ', o); ser_indent(o, depth + 1);
             fputs("content\n", o);
-            /* content 分離実装後: 子は content フラグメント配下（要素子は常空） */
-            ser_children(n->content ? n->content : n, o, depth + 2);
+            /* 子は content フラグメント（IfDom 側の rare-data 写像）配下（要素子は常空） */
+            IfNode *tc = if_dom_tpl_content(dom, n);
+            ser_children(dom, tc ? tc : n, o, depth + 2);
         } else {
-            ser_children(n, o, depth + 1);
+            ser_children(dom, n, o, depth + 1);
         }
         return;
     }
     case IF_NODE_DOCUMENT:
-        ser_children(n, o, depth);
+        ser_children(dom, n, o, depth);
         return;
     }
 }
 
-static void ser_children(const IfNode *n, FILE *o, int depth) {
-    for (const IfNode *c = n->first_child; c; c = c->next_sibling) ser_node(c, o, depth);
+static void ser_children(const IfDom *dom, const IfNode *n, FILE *o, int depth) {
+    for (const IfNode *c = n->first_child; c; c = c->next_sibling) ser_node(dom, c, o, depth);
 }
 
 void if_dom_serialize_wpt(const IfDom *dom, void *out_FILE) {
     FILE *out = (FILE *)out_FILE;
     if (!dom || !dom->root) return;
-    ser_children(dom->root, out, 0);
+    ser_children(dom, dom->root, out, 0);
 }

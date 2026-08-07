@@ -66,6 +66,9 @@ typedef struct IfChrome {
 
 void  if_chrome_init(IfChrome *c, IfFsOps fs);
 void  if_chrome_destroy(IfChrome *c);
+/* トーストの公開窓口（拡張サブシステム E1 が status 効果を流すために使用。
+ * 内部実体は set_toast と同一（1 行・上書き・切詰め）） */
+void  if_chrome_toast(IfChrome *c, const char *msg);
 
 /* タブ操作。open は path をロードして新タブ（新タブをアクティブに）。失敗時 false で toast 設定。
  * 状態変化（open/close/new/switch/group）は即座に session.txt へ保存する（crash 復元のため）。 */

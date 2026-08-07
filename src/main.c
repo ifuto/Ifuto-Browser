@@ -12,6 +12,7 @@
 #include "render.h"
 #include "gui/gui.h"
 #include "chrome.h"
+#include "ext.h"
 #include "net.h"
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -101,6 +102,7 @@ static void usage(FILE *f) {
           "  --slim-dom       drop display-irrelevant subtrees (script/template) from DOM\n"
           "  --links          print collected links\n"
           "  --stats          print timing/memory stats to stderr\n"
+          "  --ext DIR        load extensions from DIR at chrome init (GUI/--shot。E1)\n"
           "  --show-paths     list persisted-data paths (INV-9; no side effects)\n", f);
 }
 
@@ -150,6 +152,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--stats") == 0) stats = 1;
         else if (strcmp(argv[i], "--md") == 0) force_md = 1;
         else if (strcmp(argv[i], "--slim-dom") == 0) if_dom_slim = true;
+        else if (strcmp(argv[i], "--ext") == 0 && i + 1 < argc) if_ext_set_dir(argv[++i]);
         else if (strcmp(argv[i], "--show-paths") == 0) return show_paths();
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) { usage(stdout); return 0; }
         else if (argv[i][0] == '-' && argv[i][1] != 0) { usage(stderr); return 2; }

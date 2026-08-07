@@ -209,7 +209,6 @@ static inline IfNode *mnew(Mo *m, IfNodeKind kind) {
     n->attrs = NULL; n->n_attrs = 0;
     n->style = NULL;
     n->parent = n->first_child = n->last_child = n->next_sibling = NULL;
-    n->content = NULL;
     if (_t0) MP_MNEW += if_rdtsc_md() - _t0;
     return n;
 }

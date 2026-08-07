@@ -26,5 +26,7 @@ chk 6b022fcd2290d24f718ec11294f1c75b1a99531443f268f3e36c6d7a59670cb4 idm-2mb.w16
 chk 31036ced7d7cc96e70be2679995c1d51c939ecb684a24f8c4cc0e9d8bc086840 idm-2mb.ansi "$BIN" "$M2"
 chk 564f2ee9d421a88e34b7b8d69bbba058a4047d7ef3f67eb9064feb6fa77135f0 idm-2mb.dom  "$BIN" --dump-dom "$M2"
 chk 1186bf92885b8fe6281a537dd2a96e82efd455ecd79919b3f9ec2054920ab9c2 forged.styles "$BIN" --dump-styles "$F"
+# serial（IF_MD_PAR=0）≡ sliced（既定 2-slice 並列）の差分オラクル（expected は idm-2mb.out と同値への一致が機械意味）
+chk c092c35dcdcc1c1c17379748fb418c3d303ec65c2345152a54cee20fa0230116 idm-2mb.serial env IF_MD_PAR=0 "$BIN" --no-ansi "$M2"
 echo "oracle: ok=$ok ng=$ng"
 [ "$ng" -eq 0 ]

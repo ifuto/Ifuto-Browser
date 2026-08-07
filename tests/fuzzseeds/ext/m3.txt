@@ -1,0 +1,4 @@
+name: dup
+name: dup2
+version: 1
+entry: x.js

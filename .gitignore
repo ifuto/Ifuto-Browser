@@ -10,3 +10,5 @@ bench/results/
 artifacts/
 .arena/
 ifuto-backup.bundle
+gmon.out
+gmon.sum

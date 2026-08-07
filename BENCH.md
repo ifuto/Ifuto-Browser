@@ -2,6 +2,98 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-08-07: 拡張 E1 shipped（docs/EXTENSIONS.md）— 本体サイズ・起動コスト・機械オラクル
+
+- **内容**: manifest.txt ローダー（行ベース・純粋パーサ src/ext_manifest.c）+
+  `--ext DIR` / 既定 `$IFUTO_HOME/ext` 自動走査（辞書順決定性を qsort で構造保証）+
+  拡張ごと独立 AklRT（製品既定 budget。akl_tune 不呼出）+ **戻り値効果**スキーマ
+  （status → 起動トースト、log → stderr 行）。設計時の「ホスト関数バインド」案は
+  **akl に native 登録層が存在しない**確定により置き換え（呼べる API ゼロ =
+  IO 不能が機構。doc §3 に凍結）。
+- **本体サイズ（strip 済み LTO/gc-sections ビルド）**:
+  **326,472 → 433,032 B（+106,560 B = +32.6%）**。
+  内訳は akl インタプリタ全量 + ext 結線（旧台帳の akl スタンドアロン差分
+  45,392B は測定条件の異なる別指標で、本体差分としては +106.5KB が実測。
+  ldd: linux-vdso/libm/libc/ld のみで依存増ゼロ = 製品法則維持）。
+  Makefile の旧 comment「v0.0 は DOM 未接続のため本体にリンクしない」は E1 で
+  消滅した前提として更新済み。
+- **起動コスト（shot(doc.html)、9 連 median）**: 拡張なし 33.1ms /
+  明示 DIR 不在 28.2ms（= 拡張機構の固定費は測定誤差内、opendir 1 回のみ）/
+  実拡張 5 個（status/log 2 個 loaded + while(1) 1 個 budget 死 + 異形 2 個）
+  53.7ms（+20.6ms は拡張の実行コスト自体。budget 死は <10s 条件で実測 ~ms 級）。
+- **機械オラクル（全緑）**: `tests/ext_smoke.py` 10 checks（① budget 死で本体継続
+  ② 未知 permission FAILED ③ 異形 FAILED ④ [ext] golden ⑤ toast raster 化の
+  PPM 帯域限定差分 ⑥ IFUTO_NO_EXT=1 救済 ⑦ 既定自動ロード ⑧ 明示 DIR 不在報告）を
+  通常/ASAN 両 binary で。`fuzz_ext`（パーサ不変条件・決定性 2 回監査・64KB 上限
+  両側）を `make fuzz` 連結（500 iters 0 crash）。既存全ゲート不変
+  （oracle 14/14・623,907 checks ×2・WPT 1726/1726・gui_smoke・golden・ASAN 16mb）。
+- 台帳メモ（GUI shot 経路の副産物修正）: shot は paint 前の toast 表面化が
+  未配線だった（対話ループのみ gui_toast）。拡張 status 効果の可視化のため
+  `if_gui_shot` も同一契約に揃えた（toast 無しの既存シナリオでは no-op =
+  gui_smoke の全ラスタオラクル不変を機械確認済み）。
+- **CLI 起動速度（P2 再計測・akl 統合後の健全性確認）**: tiny render（プロセス
+  spawn 込み 300 連）median 1.88ms / min 1.40ms。旧台帳の cold 1.55ms（TUI 時代）
+  と同帯 = +106KB の akl 統合で CLI 起動に測定可能な劣化なし（page-in コストは
+  sub-ms 級、gc-sections で未参照面は落ちる）。
+- 未実装（doc §8 に明記）: ページを読む/書く権限、ホスト関数 API（akl native
+  登録層の新設が先行課題）、イベント駆動、拡張間通信、自動更新。
+
+## 2026-08-07: chrome/GUI の md ロードを fast-DOM 直構築へ（P2 起動速度・P1 メモリ）
+
+- **発見（gprof、--shot 16MB が実測 875ms の調査）**: GUI/chrome 経路（tab_load）は
+  md を **2 段フォールバック経路**（md_to_html ＋ 全量 WHATWG HTML パース）でのみ
+  処理しており、CLI で採択済みの md fast-DOM 直構築（~52ms/16MB）が未配線だった。
+  内訳（1 タブあたり、gprof 4 ロード分を按分）: if_parse_html ~205ms +
+  tab_build_view ~137ms + md_to_html ~65ms。
+  【2026-08-07 訂正: 本節は当初「セッション復元が全タブを eager ロード」と
+  記したが誤り。`if_chrome_restore` は **active タブのみ即ロード（lazy_load）で
+  他タブは切替時遅延** が既に実装済みだった。gprof の tab_load=4 は
+  2 run 合算 ×（active 復元 1 + 入力タブ 1）の読み違い。観測された 875ms は
+  「active の旧 16MB タブ + 新規入力 16MB タブ」の 2 ロードが輻輳したもので、
+  背景タブの eager 化は存在しない。lazy restore を残件とした記述も取り消す
+  — 台帳規則により訂正は抹消せず追記で残す】
+- **変更（chrome.c tab_load のみ・CLI 無接触）**: md ロードで if_md_parse_fast_f
+  （flags=0 = full attrs。GUI はリンク収集・将来の #id 参照が属性を読むため
+  CLI の SLIM_ATTRS は適用しない）を先に試し、汚染時は従来 2 段経路へフォール
+  バック（main.c と同一構造 = 多層防御不変）。レイアウト側の md_ws_stripped 補正は
+  build_impl（木/線形共通コア）が既に担保。
+- **効果（16MB IDM、IFUTO_NO_STORE=1 単一タブ --shot）**:
+  paired 7 組 7/7: **752→231ms median（−69%）**。
+  RSS（子プロセス単独 ru_maxrss）: **360,200→303,324 KB（−56.9MB、−15.8%）**
+  （中間 HTML 文字列 ~18MB + IfNode 80B 効果 + 2 段 DOM 過渡分の複合）。
+- **oracle**: shot PPM が新旧で **byte-exact 一致**（sha256 2d238037…、3 回再現）。
+  gui_smoke の md shot oracle が本経路を機械固定。ASAN shot（2mb/16mb・スレッド
+  含む fast path）クリーン。run_tests 両種 623,907 0 fail、WPT 1726/1726、
+  oracle 14/14、golden 不変。
+- 残件（台帳・未着手）: 【訂正により取り消し — lazy restore は実装済み。
+  上記訂正ブロック参照】
+
+## 2026-08-07: IfNode 88B→80B（template content の rare-data 分離）— P1 省メモリ
+
+- **変更**: 全ノード中きわめて稀（0〜数個/文書）な template 専用フィールド
+  `IfNode.content`（8B）を構造体から追い出し、IfDom 側の開放番地写像
+  （線形 probe・cap 2 冪・負荷 0.7 倍長。Chromium RareData と同型）へ移管。
+  参照 API は `if_dom_tpl_content` / `if_dom_tpl_set_content` のみ（dom.c）。
+  IfNode **88B→80B**（実測 sizeof）。md fast-DOM は template を構造上生成しないため
+  map は未構築のまま（cap=0 = ゼロコスト）。
+- **メモリ効果（16MB IDM、--no-ansi --stats、3 連発 median）**:
+  **peak_rss 239,028→224,744 KB（−14,284 KB ≈ −14.0MB、−6.0%）**。
+  使用量差は 1,616,804 ノード×8B = 12.63MB で、+1.7MB の超過分は THP 2MB ページ
+  粒度の丸め（MADV_HUGEPAGE 有効）と整合。arena_kb parse=147,456 不変は予定通り
+  （8MB ブロック確保は不変。削減は *touch ページ数* に出る = RSS が正直な指標）。
+- **性能（paired 9 組・交互、旧 vs 新）**: parse 52.72→51.84、total 129.15→126.68、
+  新有利 6/9（弱証拠として記録。採択根拠は RSS −14MB と機構的 strictly-better:
+  md mnew は store 1 本減、非 template 分岐構造は同一、byte-exact、メモリコスト
+  増なし — 台帳規則に合致）。
+- **検証**: oracle 13/13（両 16MB sha256 一致 = byte-exact）、run_tests 両種
+  609,362 checks 0 fail、WPT **1726/1726（100.0%）を通常/ASAN 両 binary で確認**
+  （template.dat 全件が side-table の実オラクル）、template 100 個ストレス
+  （map 倍長 8→128 経路）ASAN クリーン。
+- 監査メモ: `->content` 参照は parser 6 箇所＋serializer 1 箇所＋md.c 初期化 1 箇所
+  ＋テスト補助 2 関数に閉じていた（置換は回数アサート付き機械適用）。
+  IfSeg(32B)/IfBox(64B 明示設計)/IfRLine(24B 明示設計) はフィールド精査の結果
+  縮小余地なし（x/w は --width 100000 上限により i32 必須）→ park 台帳。
+
 ## 2026-08-07: 騒音帯 total ≤150ms への制約引き上げと達成（ユーザー指示による方針転換）
 
 - **方針転換**: 「150ms 判定は静寂帯でのみ有効」を撤廃。ユーザー命令により

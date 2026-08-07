@@ -134,7 +134,10 @@ static IfPlace place(IfTB *b) {
     IfNode *target = top(b);
     IfPlace r = { target, NULL };
     if (!b->foster) {
-        if (target->tag == IF_TAG_TEMPLATE && target->content) r.parent = target->content;
+        if (target->tag == IF_TAG_TEMPLATE) {
+            IfNode *tc = if_dom_tpl_content(b->dom, target);
+            if (tc) r.parent = tc;
+        }
         return r;
     }
     switch (target->tag) {
@@ -142,7 +145,10 @@ static IfPlace place(IfTB *b) {
     case IF_TAG_THEAD: case IF_TAG_TR:
         break;
     default:
-        if (target->tag == IF_TAG_TEMPLATE && target->content) r.parent = target->content;
+        if (target->tag == IF_TAG_TEMPLATE) {
+            IfNode *tc = if_dom_tpl_content(b->dom, target);
+            if (tc) r.parent = tc;
+        }
         return r;
     }
     i32 iti = -1, ita = -1;
@@ -152,7 +158,8 @@ static IfPlace place(IfTB *b) {
     }
     if (iti >= 0 && (ita < 0 || iti > ita)) {
         IfNode *t = b->stack[iti];
-        r.parent = t->content ? t->content : t; /* foster 時は最新 template の content */
+        IfNode *tcf = if_dom_tpl_content(b->dom, t);
+        r.parent = tcf ? tcf : t; /* foster 時は最新 template の content */
         return r;
     }
     if (ita < 0) { /* table 不在: fragment 相当。body があれば body、無ければ html */
@@ -456,7 +463,8 @@ static void tpl_start(IfTB *b, const IfTok *tok) {
     afe_insert_marker(b);
     insert_element(b, tok, true);
     IfNode *t = top(b);
-    if (!t->content) t->content = new_node(b, IF_NODE_DOCUMENT);
+    if (!if_dom_tpl_content(b->dom, t))
+        if_dom_tpl_set_content(b->dom, t, new_node(b, IF_NODE_DOCUMENT));
     /* WHATWG 13.2.6.4.8 "in template"（旧 in-body 近似では template.dat の table 系
      * 23 件が系統的に外れていた。2026-08-01 計測で本実装が台帳全体で優位と確定） */
     if (b->n_tpl < sizeof b->tpl_modes) b->tpl_modes[b->n_tpl++] = (u8)M_IN_TEMPLATE;
@@ -497,7 +505,8 @@ static bool tpl_content_has_real(IfTB *b) {
         IfNode *n = b->stack[i - 1];
         if (n->tag == IF_TAG_TEMPLATE && n->ns == IF_NS_HTML) { tpl = n; break; }
     }
-    IfNode *c = tpl && tpl->content ? tpl->content->first_child : NULL;
+    IfNode *tc = tpl ? if_dom_tpl_content(b->dom, tpl) : NULL;
+    IfNode *c = tc ? tc->first_child : NULL;
     for (; c; c = c->next_sibling) {
         if (c->kind != IF_NODE_ELEMENT) continue;
         if (c->tag == IF_TAG_UNKNOWN) return true;
@@ -814,7 +823,10 @@ static void move_children(IfNode *src, IfNode *dst) {
 /* 適切な挿入位置を「任意 target に対して」計算（AAA の再 anchor で使用） */
 static IfPlace place_for(IfTB *b, IfNode *target) {
     IfPlace r = { target, NULL };
-    if (target->tag == IF_TAG_TEMPLATE && target->content) r.parent = target->content;
+    if (target->tag == IF_TAG_TEMPLATE) {
+        IfNode *tc = if_dom_tpl_content(b->dom, target);
+        if (tc) r.parent = tc;
+    }
     switch (target->tag) {
     case IF_TAG_TABLE: case IF_TAG_TBODY: case IF_TAG_TFOOT:
     case IF_TAG_THEAD: case IF_TAG_TR: {
@@ -825,7 +837,8 @@ static IfPlace place_for(IfTB *b, IfNode *target) {
         }
         if (iti >= 0 && (ita < 0 || iti > ita)) {
             IfNode *t = b->stack[iti];
-            r.parent = t->content ? t->content : t;
+            IfNode *tcf = if_dom_tpl_content(b->dom, t);
+            r.parent = tcf ? tcf : t;
             r.before = NULL;
             return r;
         }

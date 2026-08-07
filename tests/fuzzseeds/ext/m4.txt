@@ -1,0 +1,6 @@
+name: esc
+version: 1
+entry: ../evil.js
+permissions: net
+unknown-key: z
+no-colon-here

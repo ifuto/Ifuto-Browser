@@ -1,0 +1,11 @@
+ifuto-session 1
+url 1 /tmp/a.md
+title 1 A Page
+scroll 1 120
+url 2 http://example.com/x
+title 2 Example
+group 2 work
+scroll 2 0
+active 2
+end
+junk after end marker
