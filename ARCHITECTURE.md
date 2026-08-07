@@ -107,6 +107,30 @@ v0.1 の支配項は render（~43ms/2MB）→ layout（~23ms）。parse 10ms・s
 クリティカルパス外の最適化はしない。次に攻めるなら: render emit バッチ化・セル構造の bit-pack・空白 seg 併合。
 平均ではなく大文書のワーストケースを見るのがこのプロジェクトの作法。
 
+### 7.1 v0.3（2026-08 現行）支配構造とイベント直結パイプライン設計
+
+16MB 線形 CLI の gprof 自己時間（20 run 累積、`-pg -fno-ipa-icf`・LTO 非適用のため
+コール過多測で % は構造読み専用）: build_impl 11.4 / wrap_push_merge 8.5 / fitdom_text 7.5 /
+layout_children 6.9 / layout_element 4.2 / wrap_text 4.2 / sweep_range 4.1 / scan_special_avx2 3.6 /
+layout_ifc 3.2 / md_parse_fast_f 3.1 / run_flush 2.8 / arena_new_block 2.4（THP stall 課金）/
+mo_open_push 2.4 / row_emit_direct 2.4 / geom_get 2.2 / blocks_win 2.2 / mo_close 2.0 / mo_text 2.0%。
+
+現在の 3 段構造: **md→DOM(1.6M ノード書込) → layout が DOM を再読(2 pass: fitdom+wrap) →
+render が lines を再読**。段ごとの強制トラフィック（書込 ~140MB + 全量再読 ×2-3）が
+上限律速。イベント直結化 = md が構造イベント（open/close/text）を発行し、
+layout がブロック完成ごとに消費する融合段にして DOM 素材化を局所に閉じ込める案。
+
+確定している設計判断（着手前に真として固定）:
+- **表・リスト・引用は先読みが要る**: ブロック全体の子を見て幅改行が決まる構造は
+  「ブロック局所バッファ」まで縮退可能。文書全体の保持が必要なのはリンク目次と
+  並列 layout の中間点だけ → 保持は (tag, attrs 最小, テキスト範囲) の幽霊骨格でよい。
+- **byte-exact オラクルが命綱**: 融合しても最終発行ビットは現行と 1bit も変えない
+  （chk_oracle 12/12 + w40/w160/dom/links/ansi の全一致を逐次検証）。
+- **2 pass → 1 pass 化は段階投入**: まず fitdom の融合（DOM 再読 1 回消去）、
+  ついで DOM 局所化。見積もり便益は DOM トラフィック消去で -25~35ms（推定・上限）。
+- 既判の不採用（再挑戦禁止）: POPULATE_WRITE 一括化・arena 16MB・-O3・style 2-way 並列。
+  静的 micro 系列（AVX2 可視ラン等）は機構的優位のみを採用。
+
 ## 8. 開発規律
 
 - ビルドは `-Wall -Wextra -Wshadow -Wstrict-prototypes -Wwrite-strings` 警告ゼロ維持。
