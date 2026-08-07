@@ -52,6 +52,10 @@ $(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) | $(BUILD)
 $(BUILD)/fuzz_akl: fuzz/fuzz_akl.c $(AKLSRC) | $(BUILD)
 	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_akl.c $(AKLSRC) -lm
 
+# リモート入力面（net.c の URL/resolve/head/dechunk）も同じ穴倉で打つ
+$(BUILD)/fuzz_net: fuzz/fuzz_net.c src/net.c src/net.h src/arena.c src/common.c | $(BUILD)
+	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_net.c src/net.c src/arena.c src/common.c -lm
+
 .PHONY: test golden fuzz bench clean size conformance guard vsx aklbench gui guismoke akltest
 
 test: $(BUILD)/run_tests $(BUILD)/run_tests_switch cxxtest
@@ -77,9 +81,10 @@ cxxtest: $(BUILD)/test_v8compat
 golden: $(BUILD)/ifuto-asan
 	tests/run_golden.sh ./$(BUILD)/ifuto-asan
 
-fuzz: $(BUILD)/fuzz_html $(BUILD)/fuzz_akl
+fuzz: $(BUILD)/fuzz_html $(BUILD)/fuzz_akl $(BUILD)/fuzz_net
 	fuzz/run_fuzz.sh ./$(BUILD)/fuzz_html 500
 	fuzz/run_fuzz.sh ./$(BUILD)/fuzz_akl 500
+	IFUZZ_SEEDS=tests/fuzzseeds/net fuzz/run_fuzz.sh ./$(BUILD)/fuzz_net 500
 
 bench: $(BUILD)/ifuto
 	bench/bench.sh ./$(BUILD)/ifuto

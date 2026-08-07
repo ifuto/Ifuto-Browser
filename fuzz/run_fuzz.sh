@@ -18,15 +18,20 @@ binary = os.environ["IFUZZ_BIN"]
 tmp = os.environ["IFUZZ_TMP"]
 
 seeds = []
-for d in ("tests/pages", "tests/golden"):
-    if os.path.isdir(d):
-        for f in os.listdir(d):
-            if f.endswith(".html"):
-                seeds.append(open(os.path.join(d, f), "rb").read())
+seed_dir = os.environ.get("IFUZZ_SEEDS")
+if seed_dir and os.path.isdir(seed_dir):
+    for f in sorted(os.listdir(seed_dir)):
+        seeds.append(open(os.path.join(seed_dir, f), "rb").read())
+else:
+    for d in ("tests/pages", "tests/golden"):
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.endswith(".html"):
+                    seeds.append(open(os.path.join(d, f), "rb").read())
 if not seeds:
     seeds = [b"<p>seed</p>"]
 
-interesting = [b"<", b">", b"&", b'"', b"'", b"<!--", b"-->", b"</", b"{", b"}",
+interesting = [b"<", b">", b"&", b"\r\n\r\n", b"chunked", b"http://", b"Content-Length:", b"\v", b"0x", b"/..", b'"', b"'", b"<!--", b"-->", b"</", b"{", b"}",
                b":", b";", b"@", b"<!-->", b"\x00", b"\xff", b"\xc3\x28", b"&#x110000;",
                b"<style>", b"</style>", b"!important", b"display:none", b"<li>", b"&#0;"]
 
