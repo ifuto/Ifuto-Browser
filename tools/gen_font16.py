@@ -1753,6 +1753,64 @@ K(0x6708, lambda r: (H(r, 3, 4, 11), V(r, 4, 3, 11),
                      h1(r, 12, 3, 4), h1(r, 13, 2, 3), V(r, 11, 3, 12),
                      h1(r, 13, 9, 10), H(r, 6, 6, 9), H(r, 9, 6, 9)))        # 月
 
+# ---- 第 2 陣（ifuto 自ドキュメント頻出 + 頻度上位 18 字）----
+K(0x8868, lambda r: (H(r, 1, 5, 10), H(r, 4, 4, 11), H(r, 7, 3, 12),
+                     V(r, 7, 1, 12), h1(r, 13, 6, 7),
+                     sweep(r, 8, 5, 13, 2), sweep(r, 8, 10, 12, 13)))        # 表
+K(0x793A, lambda r: (H(r, 1, 5, 10), H(r, 4, 3, 12), V(r, 7, 6, 12),
+                     h1(r, 13, 6, 8), rect(r, 8, 4, 10, 5),
+                     rect(r, 8, 10, 10, 11)))                                # 示
+K(0x753B, lambda r: (H(r, 1, 3, 12), H(r, 4, 4, 11), V(r, 4, 4, 9),
+                     V(r, 10, 4, 9), H(r, 6, 6, 9), V(r, 7, 5, 8),
+                     H(r, 9, 4, 11), V(r, 3, 10, 12), V(r, 11, 10, 12),
+                     H(r, 12, 3, 12)))                                       # 画
+K(0x6587, lambda r: (rect(r, 1, 7, 2, 8), H(r, 4, 3, 12),
+                     sweep(r, 6, 8, 14, 2), sweep(r, 6, 7, 13, 13)))         # 文
+K(0x5B57, lambda r: (rect(r, 1, 7, 2, 8), h1(r, 3, 3, 4), H(r, 3, 5, 12),
+                     H(r, 6, 3, 10), V(r, 7, 7, 12), H(r, 10, 2, 13),
+                     h1(r, 13, 5, 7)))                                       # 字
+K(0x5B66, lambda r: (rect(r, 0, 4, 1, 5), rect(r, 0, 7, 1, 8),
+                     rect(r, 0, 10, 1, 11), h1(r, 3, 3, 4), H(r, 3, 5, 12),
+                     H(r, 6, 4, 10), V(r, 7, 7, 12), H(r, 10, 3, 12),
+                     h1(r, 13, 5, 7)))                                       # 学
+K(0x751F, lambda r: (sweep(r, 1, 7, 3, 5, 1), H(r, 4, 4, 11), V(r, 7, 3, 13),
+                     H(r, 8, 4, 11), H(r, 12, 2, 13)))                       # 生
+K(0x540D, lambda r: (sweep(r, 0, 7, 3, 4, 1), sweep(r, 1, 8, 6, 2, 1),
+                     rect(r, 3, 5, 4, 6), H(r, 9, 5, 11), V(r, 5, 9, 13),
+                     V(r, 10, 9, 13), H(r, 13, 5, 11)))                      # 名
+K(0x5148, lambda r: (sweep(r, 0, 7, 2, 5, 1), H(r, 3, 4, 11), V(r, 7, 1, 6),
+                     H(r, 6, 2, 13), sweep(r, 8, 6, 13, 3),
+                     V(r, 10, 8, 11), h1(r, 12, 10, 13), h1(r, 13, 12, 13))) # 先
+K(0x4ECA, lambda r: (sweep(r, 1, 8, 5, 3), sweep(r, 1, 9, 5, 14),
+                     rect(r, 6, 6, 7, 7), H(r, 9, 4, 11), V(r, 10, 9, 13)))  # 今
+K(0x4F1A, lambda r: (sweep(r, 1, 7, 4, 2), sweep(r, 1, 9, 4, 14),
+                     H(r, 6, 4, 11), H(r, 9, 5, 10),
+                     sweep(r, 10, 7, 12, 5), h1(r, 13, 3, 12)))              # 会
+K(0x793E, lambda r: (rect(r, 1, 2, 2, 3), H(r, 4, 1, 6), sweep(r, 5, 3, 7, 1),
+                     V(r, 3, 4, 13), rect(r, 8, 4, 10, 5),
+                     H(r, 6, 8, 13), V(r, 10, 6, 12), H(r, 12, 7, 14)))      # 社
+K(0x5408, lambda r: (sweep(r, 1, 7, 4, 2), sweep(r, 1, 9, 4, 14),
+                     H(r, 6, 6, 9), H(r, 9, 5, 10), V(r, 5, 9, 13),
+                     V(r, 9, 9, 13), H(r, 13, 5, 10)))                       # 合
+K(0x540C, lambda r: (H(r, 2, 3, 12), V(r, 3, 2, 14), V(r, 12, 2, 13),
+                     h1(r, 14, 10, 12), H(r, 5, 5, 10), H(r, 8, 5, 9),
+                     V(r, 5, 8, 12), V(r, 9, 9, 12), H(r, 12, 5, 9)))        # 同
+K(0x5185, lambda r: (H(r, 3, 3, 12), V(r, 3, 3, 13), V(r, 12, 3, 12),
+                     h1(r, 13, 10, 12), rect(r, 5, 7, 6, 8),
+                     sweep(r, 6, 8, 11, 5), sweep(r, 6, 8, 11, 11)))         # 内
+K(0x5916, lambda r: (sweep(r, 0, 6, 2, 4, 1), sweep(r, 1, 7, 6, 2, 1),
+                     rect(r, 3, 4, 4, 5), V(r, 10, 1, 13),
+                     rect(r, 6, 12, 8, 14)))                                 # 外
+K(0x5DE6, lambda r: (H(r, 2, 4, 12), sweep(r, 3, 7, 10, 1),
+                     H(r, 6, 7, 13), V(r, 9, 6, 12), H(r, 12, 6, 13)))       # 左
+K(0x53F3, lambda r: (H(r, 2, 4, 12), sweep(r, 3, 7, 10, 1),
+                     H(r, 7, 6, 12), V(r, 6, 7, 13), V(r, 11, 7, 13),
+                     H(r, 12, 6, 12)))                                       # 右
+K(0x898B, lambda r: (H(r, 1, 3, 9), V(r, 3, 1, 9), V(r, 8, 1, 9),
+                     h1(r, 4, 4, 7), h1(r, 7, 4, 7), H(r, 9, 3, 9),
+                     sweep(r, 10, 5, 14, 2), V(r, 10, 10, 12),
+                     h1(r, 13, 10, 14), h1(r, 12, 12, 14)))                  # 見
+
 # ---- 濁音/半濁音の合成指定: cp → (ベース cp, mark)。mark: 'd' 濁点 / 'h' 半濁点 ----
 SYNTH = {}
 def _daku(start, end):   # 連続する濁音 cp 列（ベース = cp-1）
@@ -1827,6 +1885,13 @@ def build():
 def emit(glyphs, path):
     cps = sorted(glyphs)
     index = {}
+    for i, cp in enumerate(cps):
+        index[cp] = i
+    # F16_INDEX は uint8 + 0xFF sentinel: 0x3000 帯 glyph の slot が 255 に
+    # 達したら生成時点で爆ぜさせる（黙って u8 桁落ちするより生成失敗が誠実）
+    _band_slots = [index[cp] for cp in cps if 0x3000 <= cp < 0x3100]
+    assert not _band_slots or max(_band_slots) < 0xFF, \
+        '0x3000 band slot overflow: switch F16_INDEX to uint16 like F16_EXTRA_SLOT'
     with open(path, 'w') as f:
         w = f.write
         w("/* Ifuto GUI — 自前全角 16x16 ドットフォント（機械生成: tools/gen_font16.py）\n")
@@ -1852,7 +1917,7 @@ def emit(glyphs, path):
         w("#define F16_N_EXTRA %d\n" % len(extra))
         w("static const uint16_t F16_EXTRA_CP[F16_N_EXTRA] = {%s};\n" %
           ",".join("0x%04X" % cp for cp in extra))
-        w("static const uint8_t F16_EXTRA_SLOT[F16_N_EXTRA] = {%s};\n\n" %
+        w("static const uint16_t F16_EXTRA_SLOT[F16_N_EXTRA] = {%s};\n\n" %
           ",".join(str(index[cp]) for cp in extra))
         w("/* 未収録全角文字の豆腐（外枠 + 斜線: 「未対応」の明示印。「?」潰れ禁止規約） */\n")
         tofu = []
