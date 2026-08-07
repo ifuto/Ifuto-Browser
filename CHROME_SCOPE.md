@@ -50,7 +50,12 @@
   クリックもフォーカスを設定（Chrome 流）。副次修正: Ctrl+Tab の比較が '\x09' で
   デッド条件（keysym は常に 0xFF09）だった不具合を修正。ヘッドレス oracle:
   IF_SHOT_FOCUS による focus shot が非差分1帯限定であることを gui_smoke で固定。
-  残未達: italic 傾斜、HTTP 取得（v0.2 後半〜）。セッション復元の GUI 配線は達成（上記）。
+  残未達: HTTP 取得（v0.2 後半〜）。セッション復元の GUI 配線・~~italic 傾斜~~ は達成。
+  italic は描画後 shear（oblique）: 行毎固定シフト（上ほど +3px、下端 4 行不動で
+  アンダーライン直行）、右クリップ・左 bg 補填、全角は 2 セル一括。エンジンは
+  st→IF_F_ITALIC→cell は従来どおり流れていたため fb/gui 層の接続のみ（2026-08-07）。
+  数値検証: <u><em> の下線行インクランがセル幅ぴったり（80/40/32px）の直行、
+  <em> 非下線行に長ランなし。証跡 docs/gui-italic.png。
 
 ## 0. 位置づけ
 

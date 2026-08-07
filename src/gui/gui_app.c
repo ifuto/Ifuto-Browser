@@ -198,7 +198,8 @@ static void paint_screen_row(Gui *g, Painter *p, i32 row_cell) {
         /* グリフ選択はラスタ層（fb_glyph_cp）の責務: ASCII 外形付け替え・
          * 全角互換形・font16（かな/カナ/記号）・明示豆腐を一点化する */
         fb_glyph_cp(&p->strip, col * GUI_CELL_W, gy_local_px_top, cell->cp, fg, bg,
-                    (cell->flags & IF_F_BOLD) != 0, (cell->flags & IF_F_ULINE) != 0);
+                    (cell->flags & IF_F_BOLD) != 0, (cell->flags & IF_F_ULINE) != 0,
+                    (cell->flags & IF_F_ITALIC) != 0);
     }
 }
 

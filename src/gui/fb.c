@@ -87,32 +87,66 @@ void fb_glyph16(IfFbStrip *s, i32 x_px, i32 y_px, const void *rows16_, u32 fg, u
     }
 }
 
+/* 斜体化（oblique shear）: 描画済みグリフ矩形に行毎の固定シフトを掛ける。
+ * 上ほど右へ（最大 +3px）、下端 4 行は不動（アンダーライン行 r=13 が滑らない
+ * よう zero 帯に収める）。右端は矩形内でクリップ（斜体が隣セルを侵さない）、
+ * 左端の空きは bg 補填。真の italic 字形フォントは持たない v0.3 形。 */
+static void fb_shear(IfFbStrip *s, i32 x, i32 y, i32 w_px, u32 bg) {
+    for (i32 r = 0; r < GUI_CELL_H; r++) {
+        i32 off = (GUI_CELL_H - 2 - r) / 4;  /* 3,3,3,3, 2,2,2,2, 1,1,1,1, 0,0,0,0 */
+        if (off <= 0) continue;
+        i32 yy = y + r;
+        if (yy < 0 || yy >= (i32)s->h_px) continue;
+        u32 *row = s->px + (u64)yy * s->w_px;
+        for (i32 c = w_px - 1 - off; c >= 0; c--) { /* 右から（上書き防止） */
+            i32 xs = x + c, xd = xs + off;
+            if (xs >= 0 && xs < (i32)s->w_px && xd >= 0 && xd < (i32)s->w_px)
+                row[xd] = row[xs];
+        }
+        for (i32 c = 0; c < off; c++) {              /* 左端の空きは bg 補填 */
+            i32 xv = x + c;
+            if (xv >= 0 && xv < (i32)s->w_px) row[xv] = bg;
+        }
+    }
+}
+
 /* グリフ選択の一点化: コードポイント → 描画。
  *   ASCII / box-drawing 外形等価 / 全角互換形（半角グリフ中央配置）/
- *   font16（かな・カナ・記号）/ F16_TOFU（未収録全角の明示印。'?' 潰れ禁止）。
- * cp==0x3000/空白は bg 矩形のみ。戻り値: 進んだセル幅（1 or 2）。 */
+ *   font16（かな・カナ・漢字・記号）/ F16_TOFU（未収録全角の明示印。'?' 潰れ禁止）。
+ * cp==0x3000/空白は bg 矩形のみ（shear も掛けない）。戻り値: 進んだセル幅（1 or 2） */
 i32 fb_glyph_cp(IfFbStrip *s, i32 x_px, i32 y_px, u32 cp, u32 fg, u32 bg,
-                bool bold, bool underline) {
+                bool bold, bool underline, bool italic) {
+    i32 cells;
     if (cp == ' ') { fb_rect(s, x_px, y_px, GUI_CELL_W, GUI_CELL_H, bg); return 1; }
     if (cp == 0x3000) { fb_rect(s, x_px, y_px, 2 * GUI_CELL_W, GUI_CELL_H, bg); return 2; }
-    if (cp >= 0x20 && cp <= 0x7E) { fb_glyph(s, x_px, y_px, (u8)cp, fg, bg, bold, underline); return 1; }
-    /* ASCII 外形付け替え: box-drawing 系は「構図の等価物」に落とす（豆腐回避） */
-    if ((cp >= 0x2500 && cp <= 0x257F) || cp == 0x2014 || cp == 0x2013) {
-        fb_glyph(s, x_px, y_px, '-', fg, bg, bold, underline); return 1;
+    if (cp >= 0x20 && cp <= 0x7E) {
+        fb_glyph(s, x_px, y_px, (u8)cp, fg, bg, bold, underline);
+        cells = 1;
     }
-    if (cp == 0x2022) { /* 箇条書き小点（● は font16 に実字形があるため除外） */
-        fb_glyph(s, x_px, y_px, '*', fg, bg, bold, underline); return 1;
+    /* ASCII 外形付け替え: box-drawing 系は「構図の等価物」に落とす（豆腐回避） */
+    else if ((cp >= 0x2500 && cp <= 0x257F) || cp == 0x2014 || cp == 0x2013) {
+        fb_glyph(s, x_px, y_px, '-', fg, bg, bold, underline);
+        cells = 1;
+    }
+    else if (cp == 0x2022) { /* 箇条書き小点（● は font16 に実字形があるため除外） */
+        fb_glyph(s, x_px, y_px, '*', fg, bg, bold, underline);
+        cells = 1;
     }
     /* 全角 ASCII 互換形（ＡＢＣ１２３…）は半角グリフを 2 セル中央に */
-    if (cp >= 0xFF01 && cp <= 0xFF5E) {
+    else if (cp >= 0xFF01 && cp <= 0xFF5E) {
         fb_rect(s, x_px, y_px, 2 * GUI_CELL_W, GUI_CELL_H, bg);
         fb_glyph(s, x_px + GUI_CELL_W / 2, y_px, (u8)(cp - 0xFEE0), fg, bg, bold, underline);
-        return 2;
+        cells = 2;
     }
-    const void *g16 = f16_lookup(cp);
-    if (!g16) g16 = F16_TOFU;
-    fb_glyph16(s, x_px, y_px, g16, fg, bg, bold, underline);
-    return 2;
+    else {
+        const void *g16 = f16_lookup(cp);
+        if (!g16) g16 = F16_TOFU;
+        fb_glyph16(s, x_px, y_px, g16, fg, bg, bold, underline);
+        cells = 2;
+    }
+    if (italic)
+        fb_shear(s, x_px, y_px, cells * GUI_CELL_W, bg);
+    return cells;
 }
 
 void fb_text(IfFbStrip *s, i32 x_px, i32 y_px, const u8 *str, u32 n, u32 fg, u32 bg,
@@ -122,6 +156,6 @@ void fb_text(IfFbStrip *s, i32 x_px, i32 y_px, const u8 *str, u32 n, u32 fg, u32
         u32 cp = if_utf8_decode(str, n, &pos);
         if (!cp) break;
         col += (u32)fb_glyph_cp(s, x_px + (i32)col * GUI_CELL_W, y_px, cp, fg, bg,
-                                bold, underline);
+                                bold, underline, false); /* chrome 文字列は正立） */
     }
 }

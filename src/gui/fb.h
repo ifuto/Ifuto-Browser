@@ -36,7 +36,7 @@ void fb_glyph16(IfFbStrip *s, i32 x_px, i32 y_px, const void *rows16, u32 fg, u3
 /* コードポイント → グリフ選択の一点化（ASCII/box-drawing/全角互換形/font16/明示豆腐）。
  * 戻り値は進んだセル幅（1 or 2） */
 i32 fb_glyph_cp(IfFbStrip *s, i32 x_px, i32 y_px, u32 cp, u32 fg, u32 bg,
-                bool bold, bool underline);
+                bool bold, bool underline, bool italic);
 
 /* 文字列（セル列数ならセル制約でクリップされるのではなく呼出側責任。UTF-8 は
  * 非 ASCII バイトを tofu に落とす規約） */
