@@ -24,7 +24,11 @@
 - grid は viewport 窓のみ（`if_render_grid_rows_into`）: 1 万行文書で grid 保有は 38.4 KB。
 - chrome ロード経路で **slim-DOM 既定 ON**（script/template 配下は DOM に構築しない）。
 - ヘッドレス検証: `--shot OUT.ppm PAGE`（`make guismoke`、17 checks）＋ PNG 目視 QA。
-- 台帳（未達、優先度順）: CJK フォント（現 tofu 表示）、italic 傾斜、リンクのマウスクリック、
+- 台帳（未達、優先度順）: ~~CJK フォント（現 tofu 表示）~~ → **達成（2026-08-06, 61f8acf）**:
+  自前 16x16 全角フォント 215 字（ひらがな・カタカナ全量＋CJK 句読点・全角互換形・
+  幾何学図形・矢印・UI 記号、tools/gen_font16.py の 8x8 手設計 → 2x 拡大＋濁点合成。
+  外部フォント持ち込みゼロ）。漢字は当面 F16_TOFU の明示印（外枠＋斜線）で区別可能、
+  常用漢字の段階投入が続課題。残未達: italic 傾斜、リンクのマウスクリック、
   セッション復元の GUI 配線、HTTP 取得（v0.2 後半〜）。
 
 ## 0. 位置づけ
