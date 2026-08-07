@@ -9,6 +9,9 @@
   4. 非白画素率 > 5%（真っ白 = 描画破綻を検出）
   5. 決定性: 同一入力 2 回の sha256 が一致（ラスタが揺れない）
   6. script/template 満載ページ（slim-DOM 経路）でも落ちずに描画する
+  7. セッション永続化（IFUTO_HOME 隔離）: shot(page) で session.txt に url が
+     記録され、shot(無引数) は復元で同一ラスタを返す。2 ページ連続起動で
+     旧タブも session に残る（autosave のクラッバー = データ喪失を防ぐ契約）
 """
 import hashlib
 import os
@@ -75,11 +78,16 @@ def main():
                 "<template><div>invisible tile</div></template>"
                 "<p>visible omega text</p>")
 
+    # 内容 oracle シナリオはストア無効（ラスタがセッション履歴で揺れない契約。
+    # セッション契約のみ専用ホームで別検査。IFUTO_NO_STORE は本番 kill switch）
+    home = os.path.join(tmp, "ifuto-home")
+    env = dict(os.environ, IFUTO_HOME=home, IFUTO_NO_STORE="1")
+
     for name, page in (("md", md), ("heavy", html)):
         out1 = os.path.join(tmp, name + ".1.ppm")
         out2 = os.path.join(tmp, name + ".2.ppm")
         for out in (out1, out2):
-            r = subprocess.run([gui, "--shot", out, page],
+            r = subprocess.run([gui, "--shot", out, page], env=env,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             check(r.returncode == 0, f"[{name}] --shot exit 0")
             check(os.path.exists(out), f"[{name}] ppm written")
@@ -92,8 +100,44 @@ def main():
 
     # usage 違反で落ち方も契約通りか（未知フラグは exit 2）
     r = subprocess.run([gui, "--bogus"], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+                       stderr=subprocess.DEVNULL, env=env)
     check(r.returncode == 2, "unknown flag exits 2")
+
+    # セッション永続化: 隔離ストアで A 起動 → 無引数起動が復元で同一ラスタ、
+    # さらに B 起動後も A が session に残る（restore-first のクラッバー防止契約）
+    home2 = os.path.join(tmp, "ifuto-home2")
+    env2 = dict(env)
+    env2.pop("IFUTO_NO_STORE", None)
+    env2["IFUTO_HOME"] = home2
+    sess = os.path.join(home2, "session.txt")
+    outa = os.path.join(tmp, "sess.a.ppm")
+    outrest = os.path.join(tmp, "sess.rest.ppm")
+    r = subprocess.run([gui, "--shot", outa, md], env=env2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check(r.returncode == 0, "[sess] shot(page) exit 0")
+    check(os.path.exists(sess), "[sess] session.txt written")
+    have_a = os.path.exists(sess) and md.encode() in open(sess, "rb").read()
+    check(have_a, "[sess] session records page url")
+    r = subprocess.run([gui, "--shot", outrest], env=env2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check(r.returncode == 0, "[sess] shot(no page; restore) exit 0")
+    def cropped_sha(path, drop_bottom_px):
+        w, h, px = read_ppm(path)
+        keep = w * (h - drop_bottom_px) * 3
+        return hashlib.sha256(px[:keep]).hexdigest()
+    # ステータス行（下端 1 セル行）は初回ロード通知の文言差がありうるため
+    # ラスタ一致はそれ以外の全域（tabstrip+omni+viewport）で比較する
+    check(os.path.exists(outrest)
+          and cropped_sha(outrest, 16) == cropped_sha(outa, 16),
+          "[sess] restore renders identical raster")
+    outb = os.path.join(tmp, "sess.b.ppm")
+    r = subprocess.run([gui, "--shot", outb, html], env=env2,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check(r.returncode == 0, "[sess] shot(page B) exit 0")
+    have_both = (os.path.exists(sess)
+                 and html.encode() in open(sess, "rb").read()
+                 and md.encode() in open(sess, "rb").read())
+    check(have_both, "[sess] reopening another page keeps previous tabs (no clobber)")
 
     # リンクフォーカス可視化（IF_SHOT_FOCUS フック。対話 Tab/Enter と同一 paint 経路）
     flinks = os.path.join(tmp, "focus.html")
@@ -101,12 +145,12 @@ def main():
         f.write("<!doctype html><title>Focus</title><h1>links</h1>"
                 "<p><a href=\"a.html\">open sesame page link</a> and text</p>")
     def shot(out, focus=None):
-        env = dict(os.environ)
+        e = dict(env)
         if focus is not None:
-            env["IF_SHOT_FOCUS"] = focus
+            e["IF_SHOT_FOCUS"] = focus
         else:
-            env.pop("IF_SHOT_FOCUS", None)
-        r = subprocess.run([gui, "--shot", out, flinks], env=env,
+            e.pop("IF_SHOT_FOCUS", None)
+        r = subprocess.run([gui, "--shot", out, flinks], env=e,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return r.returncode
     base_p = os.path.join(tmp, "focus.base.ppm")

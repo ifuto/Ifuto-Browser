@@ -17,6 +17,9 @@ bool if_store_init(IfStore *s, const IfFsOps *fs, bool create) {
     s->fs = fs;
     if (!fs->write_file || !fs->append || !fs->mkpath || !fs->exists || !fs->read_file)
         return false; /* 書き込み不能な fs = ストア無効（静かに no-op） */
+    /* IFUTO_NO_STORE: 痕跡を残さない明示 kill switch（QA の --shot ラスタ oracle が
+     * セッション履歴で揺れないよう、保存も復元も丸ごと止める） */
+    if (getenv("IFUTO_NO_STORE")) return false;
 
     const char *base = getenv("IFUTO_HOME");
     char d[IF_STORE_DIR_CAP];

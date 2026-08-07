@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define GUI_DEF_W_PX 1000
 #define GUI_DEF_H_PX 720
@@ -235,6 +236,19 @@ static void statusf(Gui *g, const char *s) {
     snprintf(g->status, sizeof g->status, "%s", s);
 }
 
+/* chrome モデルの toast を statusbar へ表面化（共通の 1 行通知流路） */
+static void gui_toast(Gui *g) {
+    if (g->c.toast_len) statusf(g, g->c.toast);
+}
+
+/* omnibox を現タブ url に同期（タブ切替・復元でも omnibox は常に真実を示す） */
+static void gui_sync_omni(Gui *g) {
+    IfTab *t = if_chrome_cur(&g->c);
+    const char *u = (t && t->url) ? t->url : "";
+    snprintf(g->omni, sizeof g->omni, "%s", u);
+    g->omni_len = (u32)strlen(g->omni);
+}
+
 /* href を開く。http(s) は未取得のためステータス表示で止める（v0.3 台帳）。
  * 相対参照は現タブ url の dirname 基準で join（URL 正規化の v0.1 形） */
 static void gui_open_href(Gui *g, IfStr href, const IfTab *t) {
@@ -256,8 +270,7 @@ static void gui_open_href(Gui *g, IfStr href, const IfTab *t) {
 
 static void gui_load(Gui *g, const char *path, i32 width_cells) {
     if (if_chrome_open(&g->c, path, width_cells)) {
-        snprintf(g->omni, sizeof g->omni, "%s", path);
-        g->omni_len = (u32)strlen(g->omni);
+        gui_sync_omni(g);
         IfTab *t = if_chrome_cur(&g->c);
         statusf(g, t && t->title ? t->title : "loaded");
     } else {
@@ -420,12 +433,26 @@ static int gui_run_x(const char *initial) {
     IfFsOps fs = { if_fs_exists_real, if_fs_read_real, NULL,
                    if_fs_write_real, if_fs_append_real, if_fs_mkpath_real };
     if_chrome_init(&g.c, fs);
-    g.c.now = 0; /* GUI v0.2 は永続セッションを拾わない（store 読み込み無し） */
+    g.c.now = (i64)time(NULL); /* 履歴の timestamp（open 時に store へ書かれる） */
     u32 w_px = GUI_DEF_W_PX, h_px = GUI_DEF_H_PX;
     g.w_cells = (i32)(w_px / GUI_CELL_W);
     g.h_cells = (i32)(h_px / GUI_CELL_H);
-    g.omni_focus = true;
-    if (initial) gui_load(&g, initial, g.w_cells);
+    if (if_chrome_restore(&g.c, g.w_cells) > 0) {
+        /* 前回セッション（session.txt: 永続化）。active のみ即ロード、
+         * 他タブは切替時 lazy_load（chrome モデルの規約どおり）。
+         * initial 指定時も先に復元する: しない場合、autosave が旧セッションを
+         * 未表示のまま上書きして失う（データ喪失の防止が優先。CLI 単発起動でも同規則） */
+        if (!initial) statusf(&g, "前回のセッションを復元しました");
+        gui_sync_omni(&g);
+    } else if (!initial) {
+        if_chrome_new_blank(&g.c);
+        g.omni_focus = true;
+    }
+    gui_toast(&g); /* lazy_load 失敗等の toast があれば表面化 */
+    if (initial) {
+        g.omni_focus = true;
+        gui_load(&g, initial, g.w_cells);
+    }
     Painter p;
     fb_init(&p.strip, w_px);
 
@@ -434,6 +461,7 @@ static int gui_run_x(const char *initial) {
     while (running) {
         IfXev ev;
         if (!x11_next_event(x, &ev)) { fputs("ifuto-gui: X connection lost\n", stderr); break; }
+        g.c.now = (i64)time(NULL); /* ユーザ駆動 Hz 級: イベント毎に時刻を追従 */
         switch (ev.kind) {
         case IF_XEV_EXPOSE:
         case IF_XEV_CONFIGURE:
@@ -483,7 +511,26 @@ static int gui_run_x(const char *initial) {
             bool ctrl = (ev.state & 4) != 0;
             u32 ks = ev.keysym;
             if (ctrl) {
-                if (ks == 'q' || ks == 'Q') { running = false; break; }
+                if (ks == 'q' || ks == 'Q') {
+                    if (if_chrome_quit(&g.c, g.c.now)) running = false;
+                    else { gui_toast(&g); gui_repaint_x(x, win, &p, &g, w_px, h_px); }
+                    break;
+                }
+                if (ks == 'r' || ks == 'R') { /* Ctrl+R リロード */
+                    g.win_tab = NULL; /* wingrid キャッシュ陳腐化（lay 再構築のため） */
+                    bool okr = if_chrome_reload(&g.c, g.w_cells);
+                    gui_toast(&g);
+                    if (okr) statusf(&g, "reloaded");
+                    g.omni_focus = false;
+                    gui_repaint_x(x, win, &p, &g, w_px, h_px);
+                    break;
+                }
+                if (ks == 'd' || ks == 'D') { /* ブックマーク トグル（store 連動） */
+                    if_chrome_bookmark_cur(&g.c);
+                    gui_toast(&g);
+                    gui_repaint_x(x, win, &p, &g, w_px, h_px);
+                    break;
+                }
                 if (ks == 'l' || ks == 'L') { g.omni_focus = true; gui_repaint_x(x, win, &p, &g, w_px, h_px); break; }
                 if (ks == 't' || ks == 'T') {
                     IfTab *t = if_chrome_new_blank(&g.c);
@@ -500,7 +547,11 @@ static int gui_run_x(const char *initial) {
                 /* keycode_to_keysym は ctrl では index を変えないため Tab は
                  * 常に XK_TAB (0xFF09) で届く（旧来の '\x09' 比較は不発のデッド条件だった） */
                 if (ks == XK_TAB || ks == 'i' /* Ctrl+Tab / Ctrl+I でタブ切替 */) {
-                    if (g.c.n_tabs > 1) if_chrome_switch(&g.c, (g.c.active + 1) % g.c.n_tabs, g.w_cells);
+                    if (g.c.n_tabs > 1) {
+                        if_chrome_switch(&g.c, (g.c.active + 1) % g.c.n_tabs, g.w_cells);
+                        gui_sync_omni(&g); /* 切替後も omnibox は現タブの真実を示す */
+                        gui_toast(&g);     /* lazy_load 失敗等を表面化 */
+                    }
                     gui_repaint_x(x, win, &p, &g, w_px, h_px);
                     break;
                 }
@@ -511,7 +562,15 @@ static int gui_run_x(const char *initial) {
                     if (g.omni_len) g.omni[--g.omni_len] = 0;
                 } else if (ks == XK_RETURN) {
                     g.omni[g.omni_len] = 0;
-                    if (g.omni_len) gui_load(&g, g.omni, g.w_cells);
+                    if (g.omni_len) {
+                        /* omnibox 解決: 絶対 / cwd 相対の実在検査とスキーム明示拒否
+                         * （resolve 失敗時に生パスを黙って開かない = INV-3） */
+                        char out[4096];
+                        i32 rc = if_chrome_resolve(&g.c, g.omni, ".", out, sizeof out);
+                        if (rc == 0) gui_load(&g, out, g.w_cells);
+                        else if (rc == 1) statusf(&g, "http(s) は未取得（v0.3 台帳）");
+                        else statusf(&g, "見つかりません");
+                    }
                     g.omni_focus = false;
                 } else if (ev.code >= 0x20 && ev.code <= 0x7E) {
                     omni_insert(&g, ev.code);
@@ -558,8 +617,18 @@ static int gui_run_x(const char *initial) {
                 }
                 dirty = true;
             }
+            else if (ks == 'r') { /* リロード（F5 非対応端末もあるため素のキーも割当） */
+                g.win_tab = NULL; /* wingrid キャッシュ陳腐化（lay 再構築のため） */
+                bool okr = if_chrome_reload(&g.c, g.w_cells);
+                gui_toast(&g);
+                if (okr) statusf(&g, "reloaded");
+                dirty = true;
+            }
             else if (ks == '/') { g.omni_focus = true; dirty = true; }
-            else if (ks == 'q') { running = false; }
+            else if (ks == 'q') {
+                if (if_chrome_quit(&g.c, g.c.now)) running = false;
+                else { gui_toast(&g); dirty = true; }
+            }
             if (dirty) {
                 /* 差分スクロール: 純粋なスクロール変化なら CopyArea で
                  * 画面をずらし露出行だけ描く（全面再 paint/再送を回避）。
@@ -600,6 +669,11 @@ int if_gui_shot(const char *input_path, const char *out_ppm) {
     g.w_cells = 125; /* 1000px 相当 */
     g.h_cells = 45;  /* 720px 相当 */
     g.omni_focus = true;
+    /* 起動規則は対話 GUI（gui_run_x）と完全に同一: 常に restore-first、引数ページは
+     * 追加タブ（autosave のクラッバー=データ喪失を全起動経路で防ぐ）。
+     * 内容 oracle シナリオは IFUTO_NO_STORE=1 でストア自体を止めて揺れを外す
+     * （gui_smoke の環境分離として固定）。無引数+復元あり = 復元 oracle */
+    if (if_chrome_restore(&g.c, g.w_cells) > 0 && !input_path) gui_sync_omni(&g);
     if (input_path) gui_load(&g, input_path, g.w_cells);
     /* 検査フック: IF_SHOT_FOCUS=N でフォーカスリンク確定後の描画を再現する
      * （対話キー操作と同一の paint/hash 経路。範囲外・解析失敗は無フォーカスとして

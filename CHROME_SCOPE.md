@@ -23,7 +23,11 @@
 - タブ帯/オムニボックス/ステータスバー + キー駆動。IfChrome モデルは TUI と同一（二重実装なし）。
 - grid は viewport 窓のみ（`if_render_grid_rows_into`）: 1 万行文書で grid 保有は 38.4 KB。
 - chrome ロード経路で **slim-DOM 既定 ON**（script/template 配下は DOM に構築しない）。
-- ヘッドレス検証: `--shot OUT.ppm PAGE`（`make guismoke`、17 checks）＋ PNG 目視 QA。
+- ヘッドレス検証: `--shot OUT.ppm PAGE`（`make guismoke`、32 checks）＋ PNG 目視 QA。
+- セッション永続化（達成 2026-08-07）: restore-first 起動（引数指定時も旧タブ温存で
+  追加タブ化。autosave の autosave-clobber = データ喪失を構造的に防止）、active 即ロード+
+  他 lazy_load、IFUTO_NO_STORE kill switch、omnibox のタブ切替/復元時同期、
+  Ctrl+R/r リロード（wingrid 陳腐化付き）、Ctrl+D ブックマーク、3 秒 2 連打 quit 確認。
 - 台帳（未達、優先度順）: ~~CJK フォント（現 tofu 表示）~~ → **達成（2026-08-06, 61f8acf）**:
   自前 16x16 全角フォント 215 字（ひらがな・カタカナ全量＋CJK 句読点・全角互換形・
   幾何学図形・矢印・UI 記号、tools/gen_font16.py の 8x8 手設計 → 2x 拡大＋濁点合成。
@@ -40,7 +44,7 @@
   クリックもフォーカスを設定（Chrome 流）。副次修正: Ctrl+Tab の比較が '\x09' で
   デッド条件（keysym は常に 0xFF09）だった不具合を修正。ヘッドレス oracle:
   IF_SHOT_FOCUS による focus shot が非差分1帯限定であることを gui_smoke で固定。
-  残未達: italic 傾斜、セッション復元の GUI 配線、HTTP 取得（v0.2 後半〜）。
+  残未達: italic 傾斜、HTTP 取得（v0.2 後半〜）。セッション復元の GUI 配線は達成（上記）。
 
 ## 0. 位置づけ
 
