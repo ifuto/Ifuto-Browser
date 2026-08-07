@@ -1450,6 +1450,7 @@ void if_style_lazy_init(IfStyleLazy *lz, IfArena *a) {
     lz->ctab = (IfStCacheEnt *)if_arena_calloc(a, IF_STCACHE_SIZE * sizeof(IfStCacheEnt));
     lz->rfs = 16.0f;
     lz->m_pk = 0; lz->m_k2 = 0; lz->m_st = NULL; /* 1-entry memo: 空（k2 下位 bit の 1 埋まりで 0 非合法） */
+    lz->m_pkb = 0; lz->m_k2b = 0; lz->m_stb = NULL; /* 2 番スロット */
 }
 
 const IfStyle *if_style_lazy_get(IfStyleLazy *lz, IfNode *n, const IfStyle *parent_st, float rfs) {
@@ -1467,8 +1468,20 @@ const IfStyle *if_style_lazy_get(IfStyleLazy *lz, IfNode *n, const IfStyle *pare
         n->style = lz->m_st;
         return lz->m_st;
     }
+    /* 2 番スロット（body 直下の (body_st,p) ↔ (body_st,h2) 級の相互追い出しを吸収）。
+     * ヒット時は 1 番へ昇格スワップ（LRU 2 段。値の一意性は 1 番と同じ根拠） */
+    if (lz->m_k2b == k2 && lz->m_pkb == pk && !node_has_inline_style(n)) {
+        const IfStyle *st2 = lz->m_stb;
+        lz->m_stb = lz->m_st; lz->m_pkb = lz->m_pk; lz->m_k2b = lz->m_k2;
+        lz->m_st = st2;  lz->m_pk = pk;      lz->m_k2 = k2;
+        n->style = st2;
+        return st2;
+    }
     const IfStyle *st = st_resolve_memo(lz->arena, lz->ctab, n, parent_st, rfs, ss, 1, &lz->in);
-    if (!node_has_inline_style(n)) { lz->m_pk = pk; lz->m_k2 = k2; lz->m_st = st; }
+    if (!node_has_inline_style(n)) {
+        lz->m_stb = lz->m_st; lz->m_pkb = lz->m_pk; lz->m_k2b = lz->m_k2;
+        lz->m_st = st; lz->m_pk = pk; lz->m_k2 = k2;
+    }
     return st;
 }
 

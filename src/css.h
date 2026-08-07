@@ -162,6 +162,8 @@ typedef struct IfStyleLazy {
      * ため ctab 追い出しと無関係に成立。兄弟走査は同キー連打が支配的（li*, td*, p*） */
     uintptr_t m_pk, m_k2;     /* m_k2==0 は空（k2 の下位 bit は常に 1 埋まりで 0 非合法） */
     const IfStyle *m_st;
+    uintptr_t m_pkb, m_k2b;   /* 2 番スロット（LRU。body 直下の交互アクセスを吸収） */
+    const IfStyle *m_stb;
 } IfStyleLazy;
 void  if_style_lazy_init(IfStyleLazy *lz, IfArena *a);
 /* ELEMENT 専用（TEXT 等は呼ばない。従来パスでも非 ELEMENT は style NULL のまま） */
