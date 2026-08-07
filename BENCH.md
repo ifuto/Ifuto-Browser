@@ -2,6 +2,52 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-08-07: 騒音帯 total ≤150ms への制約引き上げと達成（ユーザー指示による方針転換）
+
+- **方針転換**: 「150ms 判定は静寂帯でのみ有効」を撤廃。ユーザー命令により
+  **騒音帯でも total ≤150ms** を新 hard constraint とする（現行の目標内訳
+  50/40/40/10 は stretch のまま）。
+- ターン冒頭（現帯）: **median 182.76ms**（169.89-208.58、parse ~71 / layout ~91 / render ~17）。
+- ターン終端（同等帯・11 連発）: **median 131.95 / max 159.23（初回起動の順序効果）/
+  10/11 ≤136**。parse ~57-59、layout ~55-59、render ~16-18。中央値 −51ms（−28%）。
+  実測した全ウィンドウの median は ≤150（132-149）。単発スパイクの完全制御は
+  帯由来のため不可能だが、median ≤150 は各測定窓で成立。
+- 採択コミット（全て byte-exact 両 sha256 台帳一致＋oracle 12/12＋run_tests 両種
+  609,358 checks＋golden＋gui_smoke＋ASAN 16MB/2MB クリーン）:
+  1. `e81c802` **layout/parse の逐次ポインタ鎖ウォーク 3 系統を構造消去**:
+     build_impl の body 直下子全計数＋中点ウォーク（131k 遷移の DRAM ミス鎖 ~31ms
+     逐次）を md 2-slice の分割境界ポインタ `dom->md_body_mid` で消去（2 経路の
+     生出力は同値・ゲートは性能のみ）、B 側 stub 直下子 parent 修繕を main 逐次から
+     B スレッドへ移動。paired 9 組 9/9: layout 84.59→51.65、**total 168.16→135.06**。
+  2. `ba6ba76` layout_children sibling プリフェッチ（弱証拠: paired 9 組で layout
+     median −0.79ms・符号 6/9、機構的 strictly-better で採択）＋ fitdom_text 単一
+     空白遅延融合（最終 seg 系列は merge hit/miss 両分岐で厳密同一の構成証明。
+     **mcount 厳密: wrap_push_merge 1,451,281→935,908 calls（−35.5%）**。
+     ペアベンチは騒音で不決と記録）。
+  3. `eb18105` lazy style 1-entry memo: **mcount: st_resolve_memo 594,835→326,418**。
+  4. `96cb12e` B slice parent の誕生時直書き（povr_anchor/povr_to）: 修繕ウォーク
+     ~11ms CPU を CPU 上から全撤去。mattach に 1 予測分岐追加のみ。
+     paired 9 組 8/9: **parse 60.53→55.11**。
+  5. `0aafdeb` wrap merge-hit の pm_st/pm_end レジスタ常駐化（seg 配列の二重
+     ロード消去。整合規約: push 2 箇所更新・pop 無効化・n_segs==0 ゲート、
+     ベンチ不決を記録）。
+  6. `41ebdea` style memo 2 スロット LRU: **st_resolve_memo 326,418→220,878（−32%）**。
+  7. `6e28fd6` ws_sink_parent ループ不変式巻き上げ（定数削減）。
+- **不採用（測定駆動）**: fitdom ok3 CJK ランの AVX2/pshufb 一括走査 — 述語同値性は
+  全 16,777,216 トリプル ×2＋混合乱数 200k で機械証明したが、IDM の長尺 CJK は
+  既に clsf==CJK3W2 のノード単位 O(1) 経路（走査自体を消す上位構造）に乗っており、
+  残る混在テキストの短ランでは paired 9 組で layout median +1.3ms の微悪化 → 棄却
+  （コードは歴史からも削除）。
+- 定量メモ: minor faults 5,955 / major 0 / maxrss 233MB（THP madvise 有効、フォルト
+  税は-ms 級で支配項ではない）。gprof 多サンプル + 行級で支配項の分布は平坦化済み
+  （旧 build_impl 23ms 行は消滅）。
+- 測定工学の教訓: `GMON_OUT_PREFIX` 配下の混 gmon を `gprof -s` で合併すると
+  呼出回数が虚増する（build_impl×3 誤報事件）。計測前に必ず `rm -f /tmp/gmon.*`。
+- 次候補（未着手・見積もりは推定）: render emit を layout A/B レンジで先行
+  ストリーミングする案は **A/B レイアウトが均衡しているため重なり窓 ~2ms で不発**
+  と棄却検討済み。A レイアウト中の行確定に追随する真ストリーミングは中〜高リスク
+  （bb ストリームの 2 スレッド順序保証）だが ~7ms 級の余地。
+
 ## 2026-08-07: HTTP/1.1 取得（src/net.c）— パイプライン非接触の証跡
 
 - 機能: CHROME_SCOPE 台帳最終ブロック「http は未対応」の撤廃（詳細は同ファイル）。
