@@ -1541,6 +1541,9 @@ typedef struct {
     IfArena *a;
     IfDom *dom;
     IfNode *html, *stub;
+    IfNode *body;        /* 実 body ノード（stub 直下子の parent 修繕を本スレッド内で
+                          * 完結させるための宛先。修繕は join 前の main 逐次ウォークだった
+                          * ものを B 側へ畳み込んだもので、指す値は規約どおり実 body） */
     const char *full_p;
     u32 full_n;
     IfStr slice;
@@ -1568,6 +1571,11 @@ static void *md_slice_run(void *arg) {
     fnb.is_dom = true;
     blocks_str(&mb, &fnb, j->slice, 0);
     run_flush(&mb);
+    /* stub 直下子の parent 修繕をここで行う（本スレッド生成の鎖を本スレッドが
+     * 直すので join 後の main 逐次ウォークは不要。直す対象は自分の arena 内の
+     * 自分が書いたノードのみで、A 側との競合は構造上ありえない） */
+    for (IfNode *c = j->stub->first_child; c; c = c->next_sibling)
+        c->parent = j->body;
     fn_free(&fnb);
     free(mb.c_buf);
     j->tainted = mb.tainted;
@@ -1636,7 +1644,7 @@ bool if_md_parse_fast_f(IfArena *a, IfStr in, IfDom **out_dom, u8 flags) {
                 stub->kind = IF_NODE_ELEMENT; stub->tag = IF_TAG_BODY; stub->ns = IF_NS_HTML;
                 stub->u.tag_name = IF_S("body");
                 MdSliceJob j;
-                j.a = &ab; j.dom = dom; j.html = html; j.stub = stub; j.slim_attrs = slim;
+                j.a = &ab; j.dom = dom; j.html = html; j.stub = stub; j.body = body; j.slim_attrs = slim;
                 j.full_p = in.p; j.full_n = in.n;
                 j.slice = if_str(splitp, (u32)(in.p + in.n - splitp));
                 j.tainted = false; j.n_nodes = 0;
@@ -1655,14 +1663,15 @@ bool if_md_parse_fast_f(IfArena *a, IfStr in, IfDom **out_dom, u8 flags) {
                 if_arena_absorb(a, &ab); /* B 側の全確保を主 arena の寿命に畳む */
                 if_arena_destroy(&ab);
                 if (tainted) return false; /* 2 段経路が同じ結論へ至る（T5 含む） */
-                /* body 子列の接合: A 末尾 → B stub 先頭。B 直下の parent を実 body へ */
+                /* body 子列の接合: A 末尾 → B stub 先頭（B 直下子の parent 修繕は
+                 * B スレッドが完了済み。ここは鎖の継ぎ目 2 書きのみの O(1)） */
                 if (stub->first_child) {
                     if (!body->first_child) body->first_child = stub->first_child;
                     else body->last_child->next_sibling = stub->first_child;
                     body->last_child = stub->last_child;
-                    for (IfNode *c = stub->first_child; c; c = c->next_sibling)
-                        c->parent = body;
                 }
+                /* レイアウト並列化への分割ヒント（ちょうど byte 半分境界の子） */
+                dom->md_body_mid = stub->first_child;
                 dom->n_nodes = total;
                 dom->md_ws_stripped = 1;
                 *out_dom = dom;

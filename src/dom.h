@@ -109,8 +109,11 @@ typedef struct {
     IfStr title;         /* <title> のテキスト（見つからなければ empty） */
     u8 has_selectedcontent; /* parse 中に <selectedcontent> を観測（post-pass clone の走査スイッチ） */
     u8 has_style;         /* <style> 要素を観測（author sheet 収集の走査スイッチ） */
-    u8 md_ws_stripped;    /* md fast path: 純ブロック容器直下の ws-only TEXT を生成しなかった
+    u8 md_ws_stripped;    /* md fast path: 純粋ブロック容器直下の ws-only TEXT を生成しなかった
                            * （layout は当該容器で兄弟相殺を旧 DOM 同値に補正する） */
+    IfNode *md_body_mid;  /* md 2-slice パースの分割境界 = body 直下の「B 側先頭子」
+                           * （レイアウト並列化の子数計数/中点ウォークを構造消去するための
+                           *   ヒント。非 slice 経路・HTML では NULL。性能のみで生出力不変） */
 } IfDom;
 
 /* 入力はドキュメント寿命中生存していること（ページ arena にコピーして呼ぶのが安全）。 */

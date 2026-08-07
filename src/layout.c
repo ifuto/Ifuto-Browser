@@ -1344,11 +1344,18 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
     i32 body_mt = len_v(bst->margin[0], body_fs, 16.0f, width_cells);
 
     /* 並列可否: md fast-DOM（md_ws_stripped）かつ body の直下子が十分に多いこと。
-     * 子数は 2 分割のために一度だけ数える（O(直下子)）。HTML/小文書は従来経路。 */
+     * md 2-slice パースは分割境界の子ポインタ（md_body_mid = byte 半分境界）を既知
+     * として渡す → 大文書では直下子の全計数・中点ウォーク（どちらも DRAM ミス鎖の
+     * 逐次ポインタチェイス: 16MB IDM で ~131k 遷移 ~31ms 実測）を構造消去する。
+     * ヒント非所持（serial md / HTML / 小文書）は従来の計数経路。ゲートのみの差で
+     * 2 経路の生出力は oracle/テストが固定する同値関係にある。 */
     u32 nch = 0;
+    IfNode *mid_hint = NULL;
     const char *ep = dom->md_ws_stripped ? getenv("IF_LAYOUT_PAR") : NULL;
     if (dom->md_ws_stripped && !(ep && ep[0] == '0')) {
-        for (IfNode *c = body->first_child; c; c = c->next_sibling) nch++;
+        mid_hint = dom->md_body_mid;
+        if (mid_hint) nch = (dom->n_nodes >= 4096) ? 64 : 0;
+        else for (IfNode *c = body->first_child; c; c = c->next_sibling) nch++;
     }
     if (nch >= 64) {
         /* body 自身の幾何を layout_element と同じ手順で先に確定する（bst は上で解決済） */
@@ -1362,8 +1369,12 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         i32 content_y = by + bt + pad_t;
         i32 box_w = bl + pad_l + content_w + pad_r + brd;
 
-        IfNode *mid = body->first_child;
-        for (u32 k = 0; k < nch / 2; k++) mid = mid->next_sibling;
+        /* ヒントがあれば中点ウォーク自体を消去（A 範囲は [first_child, hint)） */
+        IfNode *mid = mid_hint;
+        if (!mid) {
+            mid = body->first_child;
+            for (u32 k = 0; k < nch / 2; k++) mid = mid->next_sibling;
+        }
 
         IfArena ab;
         if_arena_init(&ab, 1u << 23);
