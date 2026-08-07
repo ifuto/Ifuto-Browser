@@ -1654,6 +1654,105 @@ EXTRA = {
 ],
 }
 
+# ---- 漢字（16x16 ネイティブ、ストローク宣言 DSL）----
+# 8x8 正本の 2x 拡大では画数の多い漢字が潰れるため、漢字だけは 16x16 を直接
+# 設計する。一貫性の作法: 主画は 2px 太さ（かなの 8x8 論理 1 画素 = 2px と同じ
+# 視覚ウェイト）、配置だけ 1px 分解能を使う。台帳の「常用漢字の段階投入」枠。
+def _k():
+    return [bytearray(b"." * 16) for _ in range(16)]
+
+def _alloc(rows, c0, c1, r0, r1):   # 塗り範囲を安全クリップ
+    c0 = max(0, c0); r0 = max(0, r0)
+    c1 = min(15, c1); r1 = min(15, r1)
+    return c0, c1, r0, r1
+
+def H(rows, r, c0, c1):     # 横画 2px 太（r, r+1）
+    c0, c1, r, r1 = _alloc(rows, c0, c1, r, r + 1)
+    for rr in range(r, r1 + 1):
+        for c in range(c0, c1 + 1): rows[rr][c] = ord('#')
+
+def V(rows, c, r0, r1):     # 縦画 2px 太（c, c+1）
+    c0, c1, r0, r1 = _alloc(rows, c, c + 1, r0, r1)
+    for rr in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1): rows[rr][c] = ord('#')
+
+def h1(rows, r, c0, c1):    # 横画 1px（末端処理・短画用）
+    c0, c1, r, _ = _alloc(rows, c0, c1, r, r)
+    for c in range(c0, c1 + 1): rows[r][c] = ord('#')
+
+def v1(rows, c, r0, r1):    # 縦画 1px
+    c, cc, r0, r1 = _alloc(rows, c, c, r0, r1)
+    for rr in range(r0, r1 + 1): rows[rr][c] = ord('#')
+
+def rect(rows, r0, c0, r1, c1):
+    c0, c1, r0, r1 = _alloc(rows, c0, c1, r0, r1)
+    for rr in range(r0, r1 + 1):
+        for c in range(c0, c1 + 1): rows[rr][c] = ord('#')
+
+def sweep(rows, r0, c0, r1, c1, th=2):
+    """(r0,c0)→(r1,c1) への斜走（左払い/右払い）。行毎に線形補間、太さ th px。"""
+    if r1 < r0: r0, c0, r1, c1 = r1, c1, r0, c0
+    span = (r1 - r0) or 1
+    for rr in range(r0, r1 + 1):
+        c = round(c0 + (c1 - c0) * (rr - r0) / span)
+        c0c, c1c, _, _ = _alloc(rows, c, c + th - 1, rr, rr)
+        for cc in range(c0c, c1c + 1): rows[rr][cc] = ord('#')
+
+G16 = {}   # cp -> 16 行 × 16 文字（漢字のみの規約。かな/記号は 8x8 正本のまま）
+def K(cp, fn):
+    rows = _k()
+    fn(rows)
+    G16[cp] = [bytes(r).decode('ascii') for r in rows]
+
+# ---- 第 1 陣（新聞頻度上位 + 低画数優先 24 字）----
+K(0x4E00, lambda r: H(r, 7, 2, 13))                                          # 一
+K(0x4E8C, lambda r: (H(r, 4, 5, 10), H(r, 10, 2, 13)))                       # 二
+K(0x4E09, lambda r: (H(r, 3, 4, 11), H(r, 7, 4, 11), H(r, 12, 2, 13)))       # 三
+K(0x4E0A, lambda r: (H(r, 13, 2, 14), V(r, 8, 4, 12), H(r, 4, 8, 13)))       # 上
+K(0x4E0B, lambda r: (H(r, 3, 2, 14), V(r, 7, 3, 13),
+                     h1(r, 8, 10, 12), h1(r, 9, 10, 12),
+                     h1(r, 10, 9, 11), h1(r, 11, 9, 11)))                    # 下
+K(0x4E2D, lambda r: (V(r, 3, 3, 10), V(r, 11, 3, 10),
+                     H(r, 3, 3, 12), H(r, 9, 3, 12), V(r, 7, 1, 13)))        # 中
+K(0x5927, lambda r: (V(r, 7, 1, 6), H(r, 4, 2, 13),
+                     sweep(r, 6, 6, 13, 2), sweep(r, 6, 9, 13, 13)))         # 大
+K(0x5C0F, lambda r: (V(r, 7, 3, 11), H(r, 12, 5, 8),
+                     rect(r, 7, 3, 9, 4), rect(r, 7, 11, 9, 12)))            # 小
+K(0x4EBA, lambda r: (rect(r, 1, 8, 2, 9),
+                     sweep(r, 3, 7, 13, 2), sweep(r, 3, 10, 13, 14)))        # 人
+K(0x5165, lambda r: (sweep(r, 1, 6, 13, 13), sweep(r, 2, 10, 12, 3)))        # 入
+K(0x5C71, lambda r: (V(r, 7, 3, 12), V(r, 4, 6, 12), V(r, 11, 6, 12),
+                     H(r, 12, 4, 12)))                                       # 山
+K(0x5DDD, lambda r: (V(r, 4, 2, 13), V(r, 7, 4, 11), V(r, 11, 2, 13)))       # 川
+K(0x53E3, lambda r: (H(r, 4, 4, 11), H(r, 11, 4, 11),
+                     V(r, 4, 4, 12), V(r, 10, 4, 12)))                       # 口
+K(0x65E5, lambda r: (H(r, 2, 5, 11), H(r, 7, 6, 9), H(r, 12, 5, 11),
+                     V(r, 5, 2, 13), V(r, 10, 2, 13)))                       # 日
+K(0x76EE, lambda r: (H(r, 2, 3, 12), H(r, 6, 5, 10), H(r, 9, 5, 10),
+                     H(r, 12, 3, 12), V(r, 3, 2, 13), V(r, 11, 2, 13)))      # 目
+K(0x767D, lambda r: (h1(r, 0, 7, 8), h1(r, 1, 6, 7),
+                     H(r, 2, 3, 11), H(r, 7, 5, 9), H(r, 12, 3, 11),
+                     V(r, 3, 2, 12), V(r, 10, 2, 12)))                       # 白
+K(0x767E, lambda r: (H(r, 1, 2, 14), H(r, 4, 4, 11), H(r, 8, 6, 9),
+                     H(r, 12, 4, 11), V(r, 4, 4, 11), V(r, 10, 4, 11)))      # 百
+K(0x5343, lambda r: (h1(r, 1, 7, 9), h1(r, 2, 6, 8),
+                     V(r, 7, 3, 14), H(r, 4, 2, 13)))                        # 千
+K(0x4E07, lambda r: (H(r, 2, 2, 13), H(r, 5, 4, 11), V(r, 10, 5, 11),
+                     h1(r, 12, 8, 9), sweep(r, 6, 7, 13, 3)))                # 万
+K(0x5186, lambda r: (H(r, 2, 3, 12), V(r, 3, 3, 13), V(r, 11, 3, 13),
+                     V(r, 7, 5, 7), H(r, 9, 6, 9), H(r, 13, 3, 12)))         # 円
+K(0x672C, lambda r: (V(r, 7, 1, 13), H(r, 4, 2, 13),
+                     sweep(r, 6, 6, 11, 3), sweep(r, 6, 9, 11, 13),
+                     H(r, 11, 3, 12)))                                       # 本
+K(0x6728, lambda r: (V(r, 7, 1, 13), H(r, 4, 2, 13),
+                     sweep(r, 6, 6, 12, 2), sweep(r, 6, 9, 12, 14)))         # 木
+K(0x5E74, lambda r: (h1(r, 1, 6, 8), h1(r, 2, 5, 7), h1(r, 3, 4, 6),
+                     V(r, 7, 2, 13), H(r, 4, 5, 10), rect(r, 5, 4, 6, 5),
+                     H(r, 7, 4, 11), H(r, 11, 2, 13)))                       # 年
+K(0x6708, lambda r: (H(r, 3, 4, 11), V(r, 4, 3, 11),
+                     h1(r, 12, 3, 4), h1(r, 13, 2, 3), V(r, 11, 3, 12),
+                     h1(r, 13, 9, 10), H(r, 6, 6, 9), H(r, 9, 6, 9)))        # 月
+
 # ---- 濁音/半濁音の合成指定: cp → (ベース cp, mark)。mark: 'd' 濁点 / 'h' 半濁点 ----
 SYNTH = {}
 def _daku(start, end):   # 連続する濁音 cp 列（ベース = cp-1）
@@ -1701,12 +1800,26 @@ def rows16(rows8):
     assert len(out) == 16
     return out
 
+def bits16(rows):   # 16 文字の行リスト → 16bit 値列（bit15=左列。rows16 経路と整合）
+    assert len(rows) == 16
+    out = []
+    for rr in rows:
+        assert len(rr) == 16 and set(rr) <= set('#.')
+        v = 0
+        for c in range(16):
+            if rr[c] == '#': v |= 0x8000 >> c
+        out.append(v)
+    return out
+
 def build():
     glyphs = {}   # cp -> [16 個の 16bit]
     for cp, rows in G.items():
         glyphs[cp] = rows16(rows)
     for cp, rows in EXTRA.items():
         glyphs[cp] = rows16(rows)
+    for cp, rows in G16.items():
+        assert cp not in glyphs, "kanji cp collides with 8x8 source"
+        glyphs[cp] = bits16(rows)
     for cp, (base, mark) in SYNTH.items():
         glyphs[cp] = rows16(synth_glyph(G[base], mark))
     return glyphs
@@ -1717,7 +1830,8 @@ def emit(glyphs, path):
     with open(path, 'w') as f:
         w = f.write
         w("/* Ifuto GUI — 自前全角 16x16 ドットフォント（機械生成: tools/gen_font16.py）\n")
-        w(" * 直接編集禁止。対象: CJK 記号 + ひらがな + カタカナ（漢字は F16_TOFU 明示）。\n")
+        w(" * 直接編集禁止。対象: CJK 記号 + ひらがな + カタカナ + 漢字（段階投入、\n")
+        w(" * 16x16 ネイティブ設計。未収録漢字は F16_TOFU 明示）。\n")
         w(" * 各グリフ 16 行 × 16bit（bit15=最左列）。1 グリフ = 2 セル (16x16px) ぶん。 */\n")
         w("#ifndef IFUTO_GUI_FONT16_H\n#define IFUTO_GUI_FONT16_H\n\n#include <stdint.h>\n\n")
         w("#define F16_BASE 0x3000u\n#define F16_SPAN 0x100u\n#define F16_ROWS 16\n")
@@ -1765,8 +1879,8 @@ def emit(glyphs, path):
         w("    return NULL;\n")
         w("}\n\n#endif\n")
     total = len(cps)
-    print("%s: %d glyphs (%d base + %d synth), tofu 1" %
-          (path, total, len(G), len(SYNTH)))
+    print("%s: %d glyphs (%d kana/sym + %d kanji + %d synth), tofu 1" %
+          (path, total, len(G) + len(EXTRA), len(G16), len(SYNTH)))
 
 if __name__ == "__main__":
     import sys
