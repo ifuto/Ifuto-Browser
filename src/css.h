@@ -157,6 +157,11 @@ typedef struct IfStyleLazy {
     IfStyleIntern in;
     IfStCacheEnt *ctab;         /* IF_STCACHE_SIZE の直接マップ（arena calloc） */
     float rfs;                  /* rem 基準。html 解決後に呼出側が 1 度だけ確定 */
+    /* 1 エントリメモ（st_resolve_memo と同一キー規則 (parent_st, tag|name)）。
+     * (pk,k2)→st の写像は UA シートのみの lazy 前提の下で関数的（intern 安定）な
+     * ため ctab 追い出しと無関係に成立。兄弟走査は同キー連打が支配的（li*, td*, p*） */
+    uintptr_t m_pk, m_k2;     /* m_k2==0 は空（k2 の下位 bit は常に 1 埋まりで 0 非合法） */
+    const IfStyle *m_st;
 } IfStyleLazy;
 void  if_style_lazy_init(IfStyleLazy *lz, IfArena *a);
 /* ELEMENT 専用（TEXT 等は呼ばない。従来パスでも非 ELEMENT は style NULL のまま） */

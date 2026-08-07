@@ -1449,11 +1449,27 @@ void if_style_lazy_init(IfStyleLazy *lz, IfArena *a) {
     lz->in.tab = NULL; lz->in.cap = 0; lz->in.n = 0; lz->in.a = a;
     lz->ctab = (IfStCacheEnt *)if_arena_calloc(a, IF_STCACHE_SIZE * sizeof(IfStCacheEnt));
     lz->rfs = 16.0f;
+    lz->m_pk = 0; lz->m_k2 = 0; lz->m_st = NULL; /* 1-entry memo: 空（k2 下位 bit の 1 埋まりで 0 非合法） */
 }
 
 const IfStyle *if_style_lazy_get(IfStyleLazy *lz, IfNode *n, const IfStyle *parent_st, float rfs) {
     const IfStyleSheet *ss[1] = { lz->sheet };
-    return st_resolve_memo(lz->arena, lz->ctab, n, parent_st, rfs, ss, 1, &lz->in);
+    /* 1 エントリメモ: キー規則は st_resolve_memo と同一。inline style 持ちは memo
+     * 経路に乗せない（st_resolve_memo の tab 経路ゲートと同じ条件で値の一意性を保つ）。
+     * hit 時も n->style への書き戻しは省略しない（361/878 行等の直接読みが書き戻し
+     * 副作用に依存するため、tab hit 経路と副作用を完全に揃える） */
+    uintptr_t pk = (uintptr_t)parent_st;
+    uintptr_t k2 = (n->tag != IF_TAG_UNKNOWN)
+        ? (((uintptr_t)n->tag << 1) | 1u)
+        : (uintptr_t)n->u.tag_name.p;
+    if (__builtin_expect(lz->m_k2 == k2 && lz->m_pk == pk, 1) &&
+        __builtin_expect(!node_has_inline_style(n), 1)) {
+        n->style = lz->m_st;
+        return lz->m_st;
+    }
+    const IfStyle *st = st_resolve_memo(lz->arena, lz->ctab, n, parent_st, rfs, ss, 1, &lz->in);
+    if (!node_has_inline_style(n)) { lz->m_pk = pk; lz->m_k2 = k2; lz->m_st = st; }
+    return st;
 }
 
 bool if_md_style_lazy_ok(const IfDom *dom) {
