@@ -231,3 +231,39 @@ void test_layout(void) {
 
     if_arena_destroy(&a);
 }
+
+void test_layout_linkspans(void) {
+    IfArena a; if_arena_init(&a, 1 << 20);
+
+    /* fused-fit 成功（単行 ifc）の <a> は表示矩形が収集される */
+    {
+        IfFix f = build(&a, "<p><a href=\"x.html\">go</a> and <a href=\"y.html\">there now</a></p>", 40);
+        CHECK(f.l->n_links == 2);
+        const IfLink *l0 = &f.l->links[0], *l1 = &f.l->links[1];
+        CHECK(l0->n_spans == 1 && l1->n_spans == 1);
+        /* y は文書内 1 行目帯で一致、x は "go" < "there now"、幅は正 */
+        CHECK(l0->spans[0].y0 == l1->spans[0].y0 && l0->spans[0].y1 > l0->spans[0].y0);
+        CHECK(l0->spans[0].x1 <= l1->spans[0].x0 || l0->spans[0].x1 <= l1->spans[0].x1);
+        CHECK(l0->spans[0].x1 > l0->spans[0].x0 && l0->spans[0].x1 <= 40);
+        /* 表示テキスト "go" は x0..x1 = 2 セル帯に収まる */
+        CHECK(l0->spans[0].x1 - l0->spans[0].x0 == 2);
+        CHECK(l1->spans[0].x1 - l1->spans[0].x0 == 9); /* "there now" */
+    }
+
+    /* 複数行 wrap へ逃げる長文 ifc のリンクは未収集（台帳どおりの契約） */
+    {
+        IfFix f = build(&a,
+            "<p>aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+            "<a href=\"z.html\">wrapped link</a> cccccccccccccccccccccccccccccc dddd</p>", 30);
+        CHECK(f.l->n_links == 1);
+        CHECK(f.l->links[0].n_spans == 0);
+    }
+
+    /* href なしの <a> は collect されない */
+    {
+        IfFix f = build(&a, "<p><a>anchor only</a></p>", 40);
+        CHECK(f.l->n_links == 0);
+    }
+
+    if_arena_destroy(&a);
+}

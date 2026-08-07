@@ -44,9 +44,16 @@ typedef struct IfBox {
     u8 _pad[2];
 } IfBox;
 
+typedef struct { i32 x0, y0, x1, y1; } IfLSpan; /* 表示矩形（セル座標 [x0,x1)×[y0,y1)） */
+
 typedef struct {
     u32 n;
     IfStr href;
+    /* クリック判定用の表示矩形列。収集は「fused-fit 成功の単行 ifc」内の <a> に
+     * 限定（複数行 wrap へ逃げた失敗経路・flatten 経路は未収集 → 台帳の残課題）。
+     * 木構築モード（no_boxlink=0）限定。線形 CLI では収集しない（零コスト保証） */
+    IfLSpan *spans;
+    u32 n_spans;
 } IfLink;
 
 #include "render_sweep.h"

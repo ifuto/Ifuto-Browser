@@ -319,6 +319,8 @@ static void collect_link(IfLC *lc, IfNode *a) {
     lc->links = (IfLink *)if_arena_grow(lc->arena, lc->links, &lc->links_cap, lc->n_links + 1, sizeof(IfLink));
     lc->links[lc->n_links].n = lc->n_links + 1;
     lc->links[lc->n_links].href = href;
+    lc->links[lc->n_links].spans = NULL;
+    lc->links[lc->n_links].n_spans = 0;
     lc->n_links++;
 }
 
@@ -656,6 +658,8 @@ static inline bool lw_decode3(const u8 *s, u32 n, u32 *io, u32 *cp_out) {
  *    旧 ifc_try_fit のピース処理と逐語同一（TEXT ノード == piece）。
  *  - 失敗時は seg 系列を LIFO rewind、line_w/direct/any/lh/links を全復帰し
  *    従来経路（flatten + wrap 連鎖）へ無痕でフォールバック。 */
+typedef struct { u32 link; u32 seg0, seg1; } IfLinkArec;
+
 typedef struct {
     IfWrap *w;
     IfLC *lc;
@@ -665,7 +669,12 @@ typedef struct {
     bool pre0;
     const IfStyle *lh_st; /* (st→lh) 1-entry メモ: 連続 TEXT の st はほぼ不変 */
     float lh_val;
-} IfFitDom;
+    /* <a> ヒットテスト幾何: ifc 内の (link_idx, 開始 seg) を記録し、成功確定後に
+     * 表示矩形へ解決する（木構築モード限定。失敗では n_links 復帰とともに破棄） */
+    IfLinkArec *arec;
+    u32 arec_n;
+    u64 arec_cap; /* 要素数（if_arena_grow 契約: cap/need は要素、esz=sizeof）*/
+ } IfFitDom;
 
 /* TEXT piece 相当の処理（旧 ifc_try_fit の内側ループと逐語同一）。
  * clsf: TEXT ノードの IF_NF_TXTCLS_*（parse 確定の内容分類。0=未知は常に安全側） */
@@ -808,15 +817,61 @@ static bool fitdom_walk(IfFitDom *fd, IfNode *n, const IfStyle *st,
         memcpy(s, buf, (u64)m);
         return fitdom_text(fd, if_str(s, (u32)m), est, 0, max_lh_io, any_io);
     }
-    case IF_TAG_A:
+    case IF_TAG_A: {
+        /* <a> の表示 seg 範囲は「入口位置 — 子 walk 完了位置」で厳密に切る
+         * （collect 不発（href 無し）なら記録自体しない: index 不整合を防ぐ） */
+        u32 ln0 = fd->lc->n_links;
+        u32 s0 = fd->w->n_segs;
         collect_link(fd->lc, n);
-        break;
+        bool rec = !fd->lc->no_boxlink && fd->lc->n_links != ln0;
+        for (IfNode *c = n->first_child; c; c = c->next_sibling)
+            if (!fitdom_walk(fd, c, est, max_lh_io, any_io)) return false;
+        if (rec) {
+            if (fd->arec_n + 1 > fd->arec_cap)
+                fd->arec = (IfLinkArec *)if_arena_grow(fd->lc->arena, fd->arec, &fd->arec_cap,
+                                                       fd->arec_n + 1, sizeof(IfLinkArec));
+            fd->arec[fd->arec_n].link = ln0;
+            fd->arec[fd->arec_n].seg0 = s0;
+            fd->arec[fd->arec_n].seg1 = fd->w->n_segs;
+            fd->arec_n++;
+        }
+        return true;
+    }
     default:
         break;
     }
     for (IfNode *c = n->first_child; c; c = c->next_sibling)
         if (!fitdom_walk(fd, c, est, max_lh_io, any_io)) return false;
     return true;
+}
+
+/* <a> の表示矩形を links[] に確定する。call 条件: fused-fit 成功の単行 ifc。
+ * seg は fused 経路では ifc 内で単調蓄積する（wrap_end_line は ifc 末の 1 回）
+ * ため [seg0, 次 arec.seg0 or 終端) がその <a> の表示範囲。単行ゆえ矩形は高々 1 個。
+ * 近似の明示: 界の seg が同 st 合体した場合、矩形は原子 1 個分はみ出しうる
+ * （クリック領域がごく僅かに広い。UA のリンク配色で通常不発） */
+static void ifc_link_spans(IfLC *lc, const IfWrap *w, const IfLinkArec *arec, u32 nrec,
+                           u32 nsegs, i32 y0, i32 rows) {
+    if (rows < 1) rows = 1;
+    for (u32 r = 0; r < nrec; r++) {
+        u32 s0 = arec[r].seg0, s1 = arec[r].seg1;
+        if (s1 > nsegs) s1 = nsegs; /* 捕捉契約外の参照を防ぐ防御クランプ */
+        if (s1 <= s0) continue;
+        i32 x0 = w->seg_base[s0].x, x1 = x0 + w->seg_base[s0].w;
+        for (u32 i = s0 + 1; i < s1; i++) {
+            if (w->seg_base[i].x < x0) x0 = w->seg_base[i].x;
+            i32 e = w->seg_base[i].x + w->seg_base[i].w;
+            if (e > x1) x1 = e;
+        }
+        /* lc->links が生配列（lay->links は build 末に束ねるため此処では NULL あり得） */
+        IfLink *L = &lc->links[arec[r].link];
+        IfLSpan *ns = (IfLSpan *)if_arena_alloc(lc->arena, (u64)(L->n_spans + 1) * sizeof(IfLSpan));
+        if (L->n_spans) memcpy(ns, L->spans, (u64)L->n_spans * sizeof(IfLSpan));
+        ns[L->n_spans].x0 = x0; ns[L->n_spans].y0 = y0;
+        ns[L->n_spans].x1 = x1; ns[L->n_spans].y1 = y0 + rows;
+        L->spans = ns;
+        L->n_spans++;
+    }
 }
 
 /* インライン run の先頭ノードから連続するインラインレベルを IFC に流し込み、
@@ -835,7 +890,7 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
     {
         float lh0 = max_lh;
         u32 n_links0 = lc->n_links;
-        IfFitDom fd = { &w, lc, base_st, content_w, 0, pre, NULL, 0.0f };
+        IfFitDom fd = { &w, lc, base_st, content_w, 0, pre, NULL, 0.0f, NULL, 0, 0 };
         bool any_text = false;
         IfNode *c = cur;
         for (; c; c = c->next_sibling) {
@@ -850,8 +905,11 @@ static IfNode *layout_ifc(IfLC *lc, IfBox *parent, IfNode *cur, const IfStyle *b
         }
         if (_i0) LPF_FITOK++;
         w.line_w = fd.cx;
+        i32 y0 = w.y;
+        u32 nsegs0 = w.n_segs; /* wrap_end_line は n_segs を 0 戻しするため先に捕捉 */
         if (w.n_segs > 0 || any_text)
             wrap_end_line(&w, max_lh);
+        if (fd.arec_n) ifc_link_spans(lc, &w, fd.arec, fd.arec_n, nsegs0, y0, w.y - y0);
         *y_io = w.y;
         if (_i0) LPF_IFC += if_rdtsc() - _i0;
         return c;

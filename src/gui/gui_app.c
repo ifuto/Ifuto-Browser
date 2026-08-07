@@ -213,8 +213,29 @@ static bool shot_ppm(Gui *g, const char *path) {
 }
 
 /* ---- X11 メインループ ---- */
+static void gui_load(Gui *g, const char *path, i32 width_cells);
+
 static void statusf(Gui *g, const char *s) {
     snprintf(g->status, sizeof g->status, "%s", s);
+}
+
+/* href を開く。http(s) は未取得のためステータス表示で止める（v0.3 台帳）。
+ * 相対参照は現タブ url の dirname 基準で join（URL 正規化の v0.1 形） */
+static void gui_open_href(Gui *g, IfStr href, const IfTab *t) {
+    char buf[960], msg[1024];
+    if (!href.p || href.n == 0 || href.n >= sizeof buf) return;
+    memcpy(buf, href.p, href.n);
+    buf[href.n] = 0;
+    if (buf[0] == '#') { statusf(g, "anchor は未対応"); return; }
+    if (strstr(buf, "://")) { snprintf(msg, sizeof msg, "http は未対応: %.80s", buf); statusf(g, msg); return; }
+    if (buf[0] == '/') { gui_load(g, buf, g->w_cells); return; }
+    /* 相対 join: 現 url の最後の '/' までを基底に */
+    const char *base = t && t->url ? t->url : "";
+    const char *sl = strrchr(base, '/');
+    char joined[1024];
+    if (sl) snprintf(joined, sizeof joined, "%.*s/%s", (int)(sl - base), base, buf);
+    else snprintf(joined, sizeof joined, "%s", buf);
+    gui_load(g, joined, g->w_cells);
 }
 
 static void gui_load(Gui *g, const char *path, i32 width_cells) {
@@ -408,9 +429,28 @@ static int gui_run_x(const char *initial) {
             if (ev.aux == wm_del) running = false;
             break;
         case IF_XEV_BUTTON: {
-            /* ビューポートのクリック: omnibox 行ならフォーカス、以下は将来リンク */
+            /* 左クリック: オムニボックス行はフォーカス。文書部はリンクのヒットテスト
+             * （span 未収集のリンク — 複数行 wrap 等 — は v0.3 台帳の残課題） */
             g.omni_focus = ev.y < (i32)(2 * GUI_CELL_H);
-            if (g.omni_focus) gui_repaint_x(x, win, &p, &g, w_px, h_px);
+            if (!g.omni_focus && ev.code == 1) {
+                IfTab *t = if_chrome_cur(&g.c);
+                if (t && t->lay) {
+                    i32 col = ev.x / GUI_CELL_W;
+                    i32 gy = ev.y / GUI_CELL_H - ROWS_TOP + t->scroll;
+                    for (u32 i = 0; i < t->lay->n_links; i++) {
+                        const IfLink *L = &t->lay->links[i];
+                        for (u32 s = 0; s < L->n_spans; s++) {
+                            const IfLSpan *sp = &L->spans[s];
+                            if (col >= sp->x0 && col < sp->x1 && gy >= sp->y0 && gy < sp->y1) {
+                                gui_open_href(&g, L->href, t);
+                                goto click_done;
+                            }
+                        }
+                    }
+                }
+            click_done:;
+            }
+            gui_repaint_x(x, win, &p, &g, w_px, h_px);
             break;
         }
         case IF_XEV_KEY: {
