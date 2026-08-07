@@ -723,24 +723,12 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st, u8 clsf,
             continue;
         }
         if (__builtin_expect(b0 >= 0x21 && b0 <= 0x7E, 1)) {
-            /* ASCII 可視ラン（wrap のアトム規則と同じく 0x21-0x7E の連続） */
+            /* ASCII 可視ラン（wrap のアトム規則と同じく 0x21-0x7E の連続）。
+             * AVX2/SSE2-替代の 32B 一括走査で wrap 側と同じ助っ人に統一。
+             * 停止位置はスカラ規則と厳密一致（lw_ascii_run_end 参照） */
             u32 j = i + 1;
-#ifdef IF_SSE2
-            /* 16B 一括分類: 可視 ⇔ (0x20 < b) & (b < 0x7F)（符号比較で 0x80+ は負→不可視）。
-             * 停止位置はスカラ版の break 位置と厳密一致（先に見えない最初のバイト）。 */
-            while (j + 16 <= n) {
-                __m128i v = _mm_loadu_si128((const __m128i *)(s + j));
-                __m128i m = _mm_and_si128(_mm_cmpgt_epi8(v, _mm_set1_epi8(0x20)),
-                                          _mm_cmpgt_epi8(_mm_set1_epi8(0x7F), v));
-                unsigned mm = (unsigned)_mm_movemask_epi8(m);
-                if (mm != 0xFFFFu) { j += (u32)__builtin_ctz(~mm & 0xFFFFu); goto ascii_done; }
-                j += 16;
-            }
-#endif
+            j = lw_ascii_run_end(s, n, j);
             while (j < n) { u8 cc = s[j]; if (cc < 0x21 || cc > 0x7E) break; j++; }
-#ifdef IF_SSE2
-        ascii_done:;
-#endif
             wrap_push_merge(w, (const char *)s + i, j - i, w->content_x + cx,
                             (i32)(j - i), st);
             cx += (i32)(j - i);
