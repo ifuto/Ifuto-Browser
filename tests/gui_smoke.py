@@ -98,6 +98,96 @@ def main():
         check(nw > 0.05, f"[{name}] non-white coverage {nw:.1%} > 5%")
         check(sha256(out1) == sha256(out2), f"[{name}] deterministic raster")
 
+    # ---- HTTP 取得（v0.3: http:// を普通のブラウザと同様に開く）----
+    # loopback サーバで黒盒検査: file と同一バイト列を CL / 301 / chunked で
+    # 供給し、文書領域ラスタが一致することを契約とする
+    import http.server
+    import socket as _sock
+    import threading
+
+    ref_html = (b"<!doctype html><title>RefSame</title>"
+                b"<h1>shared alpha text</h1><p>shared omega tail</p>"
+                b"<table border=1><tr><td>1</td><td>2</td></tr></table>")
+    ref_file = os.path.join(tmp, "ref.html")
+    with open(ref_file, "wb") as f:
+        f.write(ref_html)
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/a.html":
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(ref_html)))
+                self.end_headers(); self.wfile.write(ref_html)
+            elif self.path == "/redir":
+                self.send_response(301); self.send_header("Location", "/a.html")
+                self.send_header("Content-Length", "0"); self.end_headers()
+            elif self.path == "/chunked":
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                half = len(ref_html) // 2
+                for seg in (ref_html[:half], ref_html[half:]):
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(seg), seg))
+                self.wfile.write(b"0\r\n\r\n")
+            elif self.path == "/loop":
+                self.send_response(302); self.send_header("Location", "/loop")
+                self.send_header("Content-Length", "0"); self.end_headers()
+            else:
+                self.send_response(404)
+                self.send_header("Content-Length", str(len(ref_html)))
+                self.end_headers()
+                self.wfile.write(ref_html.replace(b"alpha", b"missing"))
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = "http://127.0.0.1:%d" % port
+
+    def shot(page, out):
+        return subprocess.run([gui, "--shot", out, page], env=env,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def viewport_sha(path):  # tabstrip/omni(上2行)/status(下1行)を除く文書領域
+        w, h, px = read_ppm(path)
+        return hashlib.sha256(px[2 * 16 * w * 3:(h - 16) * w * 3]).hexdigest()
+
+    outf = os.path.join(tmp, "http.file.ppm")
+    check(shot(ref_file, outf).returncode == 0, "[http] --shot local ref exit 0")
+    outa = os.path.join(tmp, "http.a.ppm")
+    r = shot(base + "/a.html", outa)
+    check(r.returncode == 0, "[http] --shot http:// exit 0")
+    if r.returncode == 0:
+        w, h, px = read_ppm(outa)
+        check((w, h) == (1000, 720), f"[http] dims {w}x{h} == 1000x720")
+        check(viewport_sha(outa) == viewport_sha(outf),
+              "[http] http page renders same document raster as file")
+    for label, pth in (("redir", "/redir"), ("chunked", "/chunked")):
+        outx = os.path.join(tmp, "http." + label + ".ppm")
+        r = shot(base + pth, outx)
+        check(r.returncode == 0, f"[http] {label} exit 0")
+        if r.returncode == 0:
+            check(viewport_sha(outx) == viewport_sha(outa),
+                  f"[http] {label} renders same document raster")
+    check(shot(base + "/404page", os.path.join(tmp, "http.404.ppm")).returncode == 0,
+          "[http] 404 renders body (exit 0)")
+    # CLI 経路（read_all 直 fetch）
+    r = subprocess.run([gui, "--no-ansi", base + "/a.html"], env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    check(r.returncode == 0 and b"shared alpha text" in r.stdout,
+          "[http] CLI fetch renders document text")
+    _t = _sock.socket(); _t.bind(("127.0.0.1", 0))
+    dead = _t.getsockname()[1]; _t.close()
+    r = subprocess.run([gui, "--no-ansi", "http://127.0.0.1:%d/x" % dead], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check(r.returncode != 0, "[http] refused connection fails cleanly")
+    r = subprocess.run([gui, "--no-ansi", base + "/loop"], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    check(r.returncode != 0, "[http] redirect loop fails cleanly")
+    srv.shutdown()
+
     # usage 違反で落ち方も契約通りか（未知フラグは exit 2）
     r = subprocess.run([gui, "--bogus"], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, env=env)

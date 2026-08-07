@@ -1,6 +1,6 @@
 /* Ifuto Browser — CLI フロントエンド v0.1
  * 使い方: ifuto [--width N] [--no-ansi] [--no-style] [--dump-dom|--dump-layout|--dump-tokens]
- *               [--stats] FILE | -
+ *               [--stats] FILE | http://URL | -
  */
 #define _POSIX_C_SOURCE 200809L /* clock_gettime */
 #include "common.h"
@@ -12,6 +12,7 @@
 #include "render.h"
 #include "gui/gui.h"
 #include "chrome.h"
+#include "net.h"
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -29,6 +30,18 @@ static double now_ms(void) {
 }
 
 static IfStr read_all(IfArena *a, const char *path) {
+    /* http:// はネットワーク取得（v0.3）。以後の pipeline はファイル入力と同一 */
+    if (strncmp(path, "http://", 7) == 0) {
+        IfStr body;
+        u32 status = 0;
+        const char *err = NULL;
+        if (!if_http_get(a, path, &body, &status, &err)) {
+            fprintf(stderr, "ifuto: cannot fetch %s: %s\n", path, err);
+            exit(1);
+        }
+        (void)status; /* 404 等でもボディを処理（404 ページ描画は正常動作） */
+        return body;
+    }
     /* まず mmap を試す: 入力のユーザランド複製を避け、読み切り clean page は
      * カーネルがメモリ逼迫時に退避できる（巨大文書の RSS 削減の構造的一歩。
      * ゼロコピー設計の tokenizer/DOM 参照がそのまま mmap 上に乗る）。
@@ -73,7 +86,7 @@ static IfStr read_all(IfArena *a, const char *path) {
 
 static void usage(FILE *f) {
     fputs("ifuto v0.1 — the strongest lightweight browser (core slice)\n"
-          "usage: ifuto [options] FILE | -\n"
+          "usage: ifuto [options] FILE | http://URL | -\n"
           "  --width N        viewport cell width (default 100)\n"
           "  --no-ansi        plain text output (no SGR colors)\n"
           "  --no-style       skip stylesheet application\n"

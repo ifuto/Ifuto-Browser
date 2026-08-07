@@ -2,6 +2,22 @@
 
 **軽量は測定可能か、嘘つきかのどちらかである。** このファイルは Ifuto の公式ベースライン。
 
+## 2026-08-07: HTTP/1.1 取得（src/net.c）— パイプライン非接触の証跡
+
+- 機能: CHROME_SCOPE 台帳最終ブロック「http は未対応」の撤廃（詳細は同ファイル）。
+  150ms ミッションとの整合をここに固定する。
+- ホットパイルへの接触面積: CLI ファイル経路の差分は read_all 冒頭の
+  `strncmp(path, "http://", 7)` 1 回のみ（parse/style/layout/render のコードは不変）。
+- 証跡: 16MB `--no-ansi` sha256 = d11680089da0fc6e58308fa19622865b19919e261b9caafa484baf4bc7321ab4、
+  ANSI = e13eca16d35b8f0462d1698be10750f931599924d8f177414b3a13c68478d126
+  （いずれも前ターン台帳と一致 = byte-exact）。5 発実測（現低速帯）:
+  total 163.09/171.77/171.82/212.50/217.43ms — 帯ベースライン（~180-220ms）内。
+  静寂帯判定値は前ターン台帳（145.2ms）を維持。
+- 検証: run_tests/run_tests_switch 両種 609,198 checks 0 fail（test_http +81）、
+  chk_oracle 12/12、golden 1/1、gui_smoke PASS（+12 = 44 checks。loopback サーバ
+  実ソケット経由の file 版ラスタ完全一致を含む）、ifuto-asan で live fetch
+  4 形態（CL/301/chunked/close）+ 16MB + dump-dom + --shot http 全クリーン。
+
 ## 2026-08-07: flatten 経路リンク span 収集（複数行リンクのクリック可視化）+ shard B span y 未シフト修理
 
 - 機能: 複数行 wrap へ逃げた <a>（fused 失敗 → flatten 経路）の表示矩形を行ごとに

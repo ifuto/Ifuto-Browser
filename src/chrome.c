@@ -5,6 +5,7 @@
 #include "chrome.h"
 #include "css.h"
 #include "md.h"
+#include "net.h"
 #include "ifuto_pages.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,10 +165,22 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
     if (!doc) if_fatal("oom: doc arena");
     if_arena_init(doc, 1 << 18);
     IfStr input;
+    bool is_http = strncmp(path, "http://", 7) == 0;
     /* ifuto:// 内部ページ（普通のブラウザの settings/history 相当）はローカル情報を
      * HTML として生成して通常 DOM 経路に乗せる（多層防御 = 共通パーサに統一） */
-    if (!if_ifuto_page(doc, path, c, &input))
-        input = c->fs.read_file(doc, path, c->fs.ctx);
+    if (!if_ifuto_page(doc, path, c, &input)) {
+        if (is_http) {
+            /* v0.3: http:// を取得。404 等でも応答ボディを描画する
+             * （普通のブラウザが 404 ページを表示するのと同じ）。
+             * ネットワーク失敗のみロード失敗（input.p = NULL） */
+            const char *err = NULL;
+            u32 status = 0;
+            if (!if_http_get(doc, path, &input, &status, &err))
+                input = if_str(NULL, 0);
+        } else {
+            input = c->fs.read_file(doc, path, c->fs.ctx);
+        }
+    }
     /* read_file 失敗の判定: 空ファイルは合法、失敗は ctx 別の手段が必要 →
      * ファイルサイズ 0 との区別は stat のみ存在で担保する（内部ページは stat 評価を飛ばす） */
     else if (!input.p) {
@@ -175,7 +188,12 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
         free(doc);
         return false;
     }
-    if (input.n == 0 && strncmp(path, "ifuto://", 8) != 0 && !c->fs.exists(path, c->fs.ctx)) {
+    if (!input.p) { /* fetch/read の NULL 失敗をここで一元判定 */
+        if_arena_destroy(doc);
+        free(doc);
+        return false;
+    }
+    if (input.n == 0 && !is_http && strncmp(path, "ifuto://", 8) != 0 && !c->fs.exists(path, c->fs.ctx)) {
         if_arena_destroy(doc);
         free(doc);
         return false;

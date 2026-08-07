@@ -54,7 +54,7 @@
   fused-fit 成功の単行 ifc 内 <a> のみ表示矩形（IfLSpan）を収集（「メモリは使わなければ
   使わないほど良い」に拠る限定 — 線形 CLI 経路は no_boxlink で矩形収集自体を skip、
   差分は collect の 2 store のみで誤差級）、左クリックで
-  ヒットテスト → 相対 join/絶対パスで遷移。http(s)/anchor は未取得のためステータス表示。
+  ヒットテスト → 相対 join/絶対パス/http 遷移。anchor は未取得のためステータス表示。
   残課題: ホバー。
   ~~複数行 wrap へ逃げたリンク・flatten 経路の矩形未収集~~ → **解消（2026-08-07）**:
   piece 区間 → 大域 seg 添字 → 行ログ交差の 3 段解決で行ごとの部分矩形を収集
@@ -66,7 +66,21 @@
   クリックもフォーカスを設定（Chrome 流）。副次修正: Ctrl+Tab の比較が '\x09' で
   デッド条件（keysym は常に 0xFF09）だった不具合を修正。ヘッドレス oracle:
   IF_SHOT_FOCUS による focus shot が非差分1帯限定であることを gui_smoke で固定。
-  残未達: HTTP 取得（v0.2 後半〜）。セッション復元の GUI 配線・~~italic 傾斜~~ は達成。
+  ~~HTTP 取得~~ → **達成（2026-08-07）**: src/net.c 新設。http:// のみ
+  （https/userinfo/IPv6 bracket は明示拒否 — 曖昧解釈しない）。非ブロッキング
+  connect(8s poll) + SO_SNDTIMEO/SO_RCVTIMEO(10s)、Connection: close で EOF
+  読み、上限 32MB。CL/chunked(デチャンク)/close までの 3 形態、case-insensitive
+  ヘッダ解析、301/302/303/307/308 を ≤5 回追跡（absolute/scheme-relative/
+  絶対/相対/クエリ置換を解決、scheme 付き非 http は拒否）。404 等でもボディ描画
+  （普通のブラウザの 404 ページ表示と同じ）。配線はチョークポイント 3 箇所のみ:
+  chrome.c tab_load・gui_app.c gui_open_href（「http は未対応」撤廃＋
+  scheme-relative // 補完＋bare-authority join 修理）・main.c read_all。
+  黒盒契約: gui_smoke が loopback サーバ経由で file 版との文書領域ラスタ
+  **完全一致**を固定（取得 HTML とローカル HTML の描画等価性を画素で証明）、
+  CLI fetch 本文検査・拒否/リダイレクトループの清浄失敗も契約化（+12 checks）。
+  白盒: tests/test_http.c で URL 分解/解決/ヘッダ解析/dechunk を +81 checks。
+  CLI ファイル経路は不変（16MB byte-exact sha256 台帳一致）。
+  セッション復元の GUI 配線・~~italic 傾斜~~ は達成。
   italic は描画後 shear（oblique）: 行毎固定シフト（上ほど +3px、下端 4 行不動で
   アンダーライン直行）、右クリップ・左 bg 補填、全角は 2 セル一括。エンジンは
   st→IF_F_ITALIC→cell は従来どおり流れていたため fb/gui 層の接続のみ（2026-08-07）。

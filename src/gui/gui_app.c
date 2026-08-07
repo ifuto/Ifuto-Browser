@@ -250,7 +250,7 @@ static void gui_sync_omni(Gui *g) {
     g->omni_len = (u32)strlen(g->omni);
 }
 
-/* href を開く。http(s) は未取得のためステータス表示で止める（v0.3 台帳）。
+/* href を開く。http:// は取得して表示（v0.3）。他 scheme はステータス表示で止める。
  * 相対参照は現タブ url の dirname 基準で join（URL 正規化の v0.1 形） */
 static void gui_open_href(Gui *g, IfStr href, const IfTab *t) {
     char buf[960], msg[1024];
@@ -258,14 +258,26 @@ static void gui_open_href(Gui *g, IfStr href, const IfTab *t) {
     memcpy(buf, href.p, href.n);
     buf[href.n] = 0;
     if (buf[0] == '#') { statusf(g, "anchor は未対応"); return; }
-    if (strstr(buf, "://")) { snprintf(msg, sizeof msg, "http は未対応: %.80s", buf); statusf(g, msg); return; }
+    if (strncmp(buf, "http://", 7) == 0) { gui_load(g, buf, g->w_cells); return; }
+    if (buf[0] == '/' && buf[1] == '/') { /* scheme-relative → http 補完 */
+        char full[1024];
+        snprintf(full, sizeof full, "http:%s", buf);
+        gui_load(g, full, g->w_cells);
+        return;
+    }
+    if (strstr(buf, "://")) { snprintf(msg, sizeof msg, "未対応 scheme: %.80s", buf); statusf(g, msg); return; }
     if (buf[0] == '/') { gui_load(g, buf, g->w_cells); return; }
     /* 相対 join: 現 url の最後の '/' までを基底に */
     const char *base = t && t->url ? t->url : "";
+    bool http_base = strncmp(base, "http://", 7) == 0;
     const char *sl = strrchr(base, '/');
     char joined[1024];
-    if (sl) snprintf(joined, sizeof joined, "%.*s/%s", (int)(sl - base), base, buf);
-    else snprintf(joined, sizeof joined, "%s", buf);
+    if (sl && (!http_base || sl >= base + 7)) /* http:// 内側の '/' は基底境界にしない */
+        snprintf(joined, sizeof joined, "%.*s/%s", (int)(sl - base), base, buf);
+    else if (http_base) /* authority のみで path 無し → 末尾に付ける */
+        snprintf(joined, sizeof joined, "%s/%s", base, buf);
+    else
+        snprintf(joined, sizeof joined, "%s", buf);
     gui_load(g, joined, g->w_cells);
 }
 
