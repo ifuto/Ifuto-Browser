@@ -32,7 +32,8 @@ enum {
 enum {
     XK_BACKSPACE = 0xFF08, XK_TAB = 0xFF09, XK_RETURN = 0xFF0D, XK_ESCAPE = 0xFF1B,
     XK_DELETE = 0xFFFF, XK_LEFT = 0xFF51, XK_UP = 0xFF52, XK_RIGHT = 0xFF53,
-    XK_DOWN = 0xFF54, XK_PRIOR = 0xFF55, XK_NEXT = 0xFF56
+    XK_DOWN = 0xFF54, XK_PRIOR = 0xFF55, XK_NEXT = 0xFF56,
+    XK_ISO_LEFTTAB = 0xFE20 /* Shift+Tab は多くのキーマップでこのシムを返す */
 };
 
 /* 接続。$DISPLAY（":0" 形）から接続先を決める。失敗時 NULL + stderr に理由 */

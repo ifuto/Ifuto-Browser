@@ -95,6 +95,46 @@ def main():
                        stderr=subprocess.DEVNULL)
     check(r.returncode == 2, "unknown flag exits 2")
 
+    # リンクフォーカス可視化（IF_SHOT_FOCUS フック。対話 Tab/Enter と同一 paint 経路）
+    flinks = os.path.join(tmp, "focus.html")
+    with open(flinks, "w") as f:
+        f.write("<!doctype html><title>Focus</title><h1>links</h1>"
+                "<p><a href=\"a.html\">open sesame page link</a> and text</p>")
+    def shot(out, focus=None):
+        env = dict(os.environ)
+        if focus is not None:
+            env["IF_SHOT_FOCUS"] = focus
+        else:
+            env.pop("IF_SHOT_FOCUS", None)
+        r = subprocess.run([gui, "--shot", out, flinks], env=env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return r.returncode
+    base_p = os.path.join(tmp, "focus.base.ppm")
+    f0_p = os.path.join(tmp, "focus.f0.ppm")
+    f0b_p = os.path.join(tmp, "focus.f0b.ppm")
+    oob_p = os.path.join(tmp, "focus.oob.ppm")
+    check(shot(base_p) == 0, "[focus] base shot exit 0")
+    check(shot(f0_p, "0") == 0, "[focus] focus=0 shot exit 0")
+    check(shot(f0b_p, "0") == 0, "[focus] focus=0 (2nd) shot exit 0")
+    check(shot(oob_p, "999") == 0, "[focus] focus=999 shot exit 0")
+    check(sha256(f0_p) == sha256(f0b_p), "[focus] focused raster deterministic")
+    check(sha256(f0_p) != sha256(base_p), "[focus] focus changes raster")
+    check(sha256(oob_p) == sha256(base_p), "[focus] out-of-range focus == unfocused")
+    # 差分はセル行帯（16px）の 1 帯のみに限定される（単行リンクの span 矩形契約）
+    w, h, pb = read_ppm(base_p)
+    w2, h2, pf = read_ppm(f0_p)
+    bands = set()
+    if (w2, h2) == (w, h):
+        n = w * h
+        for i in range(n):
+            o, q = i * 3, i * 3
+            if pb[o:o+3] != pf[q:q+3]:
+                bands.add((i // w) // 16)
+        check(len(bands) == 1 and bands.issubset(set(range(2, 44))),
+              f"[focus] diff confined to one doc cell-row band {sorted(bands)}")
+    else:
+        check(False, "[focus] dims stable")
+
     print("----")
     if FAIL:
         print(f"gui_smoke: FAIL ({len(FAIL)})")

@@ -76,6 +76,20 @@ typedef struct {
 } Gui;
 
 /* 現タブの viewport 窓グリッドを（必要時のみ再構築して）返す。文書なしなら NULL。 */
+/* フォーカス中リンク（キーボード Tab/Enter・クリックで確定）の表示矩形に (gy,col)
+ * が含まれるか。n_spans=0 のリンク（複数行 wrap 経路等・台帳残課題）は可視化なし */
+static const IfLink *gui_focus_link(const IfTab *t) {
+    if (!t || !t->lay || t->link_idx < 0 || t->link_idx >= (i32)t->lay->n_links) return NULL;
+    const IfLink *fl = &t->lay->links[t->link_idx];
+    return fl->n_spans ? fl : NULL;
+}
+static bool gui_focus_cell(const IfLink *fl, i32 gy, i32 col) {
+    for (u32 s = 0; s < fl->n_spans; s++)
+        if (gy >= fl->spans[s].y0 && gy < fl->spans[s].y1 &&
+            col >= fl->spans[s].x0 && col < fl->spans[s].x1) return true;
+    return false;
+}
+
 static const IfGrid *gui_view_grid(Gui *g) {
     IfTab *t = if_chrome_cur(&g->c);
     i32 vh = g->h_cells - ROWS_TOP - ROWS_BOT;
@@ -173,11 +187,13 @@ static void paint_screen_row(Gui *g, Painter *p, i32 row_cell) {
     }
     i32 gy_local_px_top = row_cell * GUI_CELL_H - (i32)p->y0_px;
     fb_rect(&p->strip, 0, gy_local_px_top, (i32)p->strip.w_px, GUI_CELL_H, GUI_PAGE_BG);
+    const IfLink *fl = gui_focus_link(t);
     for (i32 col = 0; col < vg->w && col < g->w_cells; col++) {
         IfCell *cell = &vg->cells[(i64)(gy - vg->y_off) * vg->w + col];
         if (cell->cp == 0) continue; /* 全角継続セル（先頭セルの glyph16 が 2 セルぶん塗る） */
         u32 fg = ansi_to_rgb(cell->fg, GUI_PAGE_FG);
         u32 bg = ansi_to_rgb(cell->bg, GUI_PAGE_BG);
+        if (fl && gui_focus_cell(fl, gy, col)) { bg = 0xbfe3ff; fg = 0x10243f; }
         /* グリフ選択はラスタ層（fb_glyph_cp）の責務: ASCII 外形付け替え・
          * 全角互換形・font16（かな/カナ/記号）・明示豆腐を一点化する */
         fb_glyph_cp(&p->strip, col * GUI_CELL_W, gy_local_px_top, cell->cp, fg, bg,
@@ -286,6 +302,15 @@ static u32 gui_row_hash(Gui *g, i32 row) {
             return 0x811C9DC5u;
         u32 w = (u32)(vg->w < g->w_cells ? vg->w : g->w_cells);
         h = fnv1a32(&vg->cells[(i64)(gy - vg->y_off) * vg->w], (u64)w * sizeof(IfCell), h);
+        /* フォーカスリンクの交差行: フォーカス移動時に旧位置・新位置の双方の行が
+         * 変化扱いとなるよう salt を doc 座標 gy の関数として混ぜる（スクロール不変）*/
+        const IfLink *fl = gui_focus_link(t);
+        if (fl)
+            for (u32 s = 0; s < fl->n_spans; s++)
+                if (gy >= fl->spans[s].y0 && gy < fl->spans[s].y1) {
+                    h ^= 0x85EBCA6Bu + (u32)t->link_idx * 0x9E3779B1u;
+                    break;
+                }
     }
     return h ? h : 1; /* 0 は「未描画」予約 */
 }
@@ -442,6 +467,7 @@ static int gui_run_x(const char *initial) {
                         for (u32 s = 0; s < L->n_spans; s++) {
                             const IfLSpan *sp = &L->spans[s];
                             if (col >= sp->x0 && col < sp->x1 && gy >= sp->y0 && gy < sp->y1) {
+                                t->link_idx = (i32)i; /* クリック = フォーカス（Chrome 流） */
                                 gui_open_href(&g, L->href, t);
                                 goto click_done;
                             }
@@ -471,7 +497,9 @@ static int gui_run_x(const char *initial) {
                     gui_repaint_x(x, win, &p, &g, w_px, h_px);
                     break;
                 }
-                if (ks == '\x09' || ks == 'i' /* Ctrl+Tab 近似: X の Tab に Ctrl が載る */) {
+                /* keycode_to_keysym は ctrl では index を変えないため Tab は
+                 * 常に XK_TAB (0xFF09) で届く（旧来の '\x09' 比較は不発のデッド条件だった） */
+                if (ks == XK_TAB || ks == 'i' /* Ctrl+Tab / Ctrl+I でタブ切替 */) {
                     if (g.c.n_tabs > 1) if_chrome_switch(&g.c, (g.c.active + 1) % g.c.n_tabs, g.w_cells);
                     gui_repaint_x(x, win, &p, &g, w_px, h_px);
                     break;
@@ -493,19 +521,52 @@ static int gui_run_x(const char *initial) {
             }
             i32 vh = g.h_cells - ROWS_TOP - ROWS_BOT;
             bool dirty = false;
+            bool focus_change = false;
             IfTab *tpre = if_chrome_cur(&g.c);
             i32 spre = tpre ? tpre->scroll : 0;
             if (ks == XK_DOWN || ks == 'j') { if_chrome_scroll(&g.c, 1, vh); dirty = true; }
             else if (ks == XK_UP || ks == 'k') { if_chrome_scroll(&g.c, -1, vh); dirty = true; }
             else if (ks == XK_NEXT) { if_chrome_scroll(&g.c, vh, vh); dirty = true; }
             else if (ks == XK_PRIOR) { if_chrome_scroll(&g.c, -vh, vh); dirty = true; }
+            else if ((ks == XK_TAB || ks == XK_ISO_LEFTTAB) && !ctrl) {
+                /* リンクフォーカス巡回（Shift=逆方向）。n_spans=0 のリンクも巡回対象
+                 * （href は全リンクにある。可視矩形のない経路は台帳残課題どおり） */
+                IfTab *t = if_chrome_cur(&g.c);
+                i32 delta = (ks == XK_ISO_LEFTTAB || (ev.state & 1)) ? -1 : +1;
+                i32 li = if_chrome_link_move(&g.c, delta);
+                if (li < 0) statusf(&g, "リンクなし");
+                if (t && t->lay && li >= 0) {
+                    const IfLink *L = &t->lay->links[li];
+                    char m[1088];
+                    snprintf(m, sizeof m, "link %d/%u: %.*s", li + 1, t->lay->n_links,
+                             (int)(L->href.n > 1000 ? 1000 : L->href.n), L->href.p ? L->href.p : "");
+                    statusf(&g, m);
+                    /* 最初の span が viewport 外ならそこへ跳ぶ */
+                    if (L->n_spans) {
+                        i32 ty = L->spans[0].y0;
+                        if (ty < t->scroll || ty >= t->scroll + vh)
+                            if_chrome_scroll(&g.c, ty - 2 - t->scroll, vh);
+                    }
+                }
+                dirty = true; focus_change = true;
+            }
+            else if (ks == XK_RETURN) {
+                IfTab *t = if_chrome_cur(&g.c);
+                if (t && t->lay && t->link_idx >= 0 && t->link_idx < (i32)t->lay->n_links) {
+                    gui_open_href(&g, t->lay->links[t->link_idx].href, t);
+                    focus_change = true;
+                }
+                dirty = true;
+            }
             else if (ks == '/') { g.omni_focus = true; dirty = true; }
             else if (ks == 'q') { running = false; }
             if (dirty) {
                 /* 差分スクロール: 純粋なスクロール変化なら CopyArea で
-                 * 画面をずらし露出行だけ描く（全面再 paint/再送を回避） */
+                 * 画面をずらし露出行だけ描く（全面再 paint/再送を回避）。
+                 * フォーカス変化・文書再読込が絡む場合は行 hash の陳腐化を避ける
+                 * ため CopyArea を使わず内容比較で最小再描する（安全性優先） */
                 IfTab *tpost = if_chrome_cur(&g.c);
-                i32 d = (tpre && tpre == tpost) ? tpost->scroll - spre : 0;
+                i32 d = (tpre && tpre == tpost && !focus_change) ? tpost->scroll - spre : 0;
                 if (d != 0)
                     gui_scroll_copy(x, win, &g, w_px, d, vh);
                 gui_repaint_x(x, win, &p, &g, w_px, h_px);
@@ -540,6 +601,19 @@ int if_gui_shot(const char *input_path, const char *out_ppm) {
     g.h_cells = 45;  /* 720px 相当 */
     g.omni_focus = true;
     if (input_path) gui_load(&g, input_path, g.w_cells);
+    /* 検査フック: IF_SHOT_FOCUS=N でフォーカスリンク確定後の描画を再現する
+     * （対話キー操作と同一の paint/hash 経路。範囲外・解析失敗は無フォーカスとして
+     * 未フォーカス shot とバイト一致することが oracle（gui_smoke で固定）） */
+    {
+        const char *fo = getenv("IF_SHOT_FOCUS");
+        if (fo && *fo) {
+            char *end = NULL;
+            long li = strtol(fo, &end, 10);
+            IfTab *t = if_chrome_cur(&g.c);
+            if (t && t->lay && end != fo && li >= 0 && li < (long)t->lay->n_links)
+                t->link_idx = (i32)li;
+        }
+    }
     bool ok = shot_ppm(&g, out_ppm);
     if_chrome_destroy(&g.c); /* LSan 対象の正当解体（タブ「1 タブ 1 arena」ごと） */
     free(g.wcells);

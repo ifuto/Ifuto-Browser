@@ -33,8 +33,13 @@
   使わないほど良い」に拠る限定 — 線形 CLI 経路は no_boxlink で矩形収集自体を skip、
   差分は collect の 2 store のみで誤差級）、左クリックで
   ヒットテスト → 相対 join/絶対パスで遷移。http(s)/anchor は未取得のためステータス表示。
-  残課題: 複数行 wrap へ逃げたリンク・flatten 経路は矩形未収集（クリック不可）、
-  キーボードのリンク操作（Tab 遷移/Enter 決定/フォーカス可視化）、ホバー。
+  残課題: 複数行 wrap へ逃げたリンク・flatten 経路は矩形未収集（クリック不可）、ホバー。
+  ~~キーボードのリンク操作~~ → **達成（2026-08-07）**: Tab/Shift+Tab（XK_ISO_LEFTTAB
+  両受理）でフォーカス巡回（span 無しリンクも href 提示で巡回）、Enter で遷移、
+  フォーカスは行 hash salt + paint フックで矩形強調（差分 repaint 整合）。
+  クリックもフォーカスを設定（Chrome 流）。副次修正: Ctrl+Tab の比較が '\x09' で
+  デッド条件（keysym は常に 0xFF09）だった不具合を修正。ヘッドレス oracle:
+  IF_SHOT_FOCUS による focus shot が非差分1帯限定であることを gui_smoke で固定。
   残未達: italic 傾斜、セッション復元の GUI 配線、HTTP 取得（v0.2 後半〜）。
 
 ## 0. 位置づけ
