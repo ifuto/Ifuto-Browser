@@ -754,6 +754,14 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st, u8 clsf,
     }
 
     u32 i = 0;
+    /* 単一 ' ' run の空白セル遅延（pend）: 現行は [空白 1B push] → [トークン push] の
+     * 2 回で、merge-hit 時も miss 時（空白とトークンは必ずソース連続・同一 style）も
+     * 最終 seg 系列が一意に定まる。遅延して 1 回の融合 push（[空白+トークン]）に畳んでも
+     * 最終系列は厳密に同一 — hit: 両方連続 merge で [..空白+トークン] ≡、
+     * miss: 空白新 seg＋トークン連続 merge → [空白+トークン] ≡。push 回数は半減する。
+     * 単一 ' ' のみ対象（複数 ws/tab は即時経路で現行と逐語同一）。pend 生存中は
+     * cx がちょうど +1 進んでおり、flush 位置は常に cx-1 / ソース位置は次トークン直前。 */
+    u8 pend = 0;
     while (i < n) {
         u8 b0 = s[i];
         if (b0 == ' ' || b0 == '\t' || b0 == '\n' || b0 == '\r' || b0 == '\f') {
@@ -761,8 +769,13 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st, u8 clsf,
             u32 j = i + 1;
             while (j < n && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' ||
                              s[j] == '\r' || s[j] == '\f')) j++;
+            if (pend) { /* 連 ws run 前に確定（現在位置の 1B 手前 = pend バイト） */
+                wrap_push_merge(w, (const char *)s + i - 1, 1, w->content_x + cx - 1, 1, st);
+                pend = 0;
+            }
             if (cx > 0 && cx < w->content_w) {
-                if (s[j - 1] == ' ') wrap_push_merge(w, (const char *)s + j - 1, 1,
+                if (j - i == 1 && b0 == ' ') pend = 1; /* 単一 ' ' → 遅延 */
+                else if (s[j - 1] == ' ') wrap_push_merge(w, (const char *)s + j - 1, 1,
                                                    w->content_x + cx, 1, st);
                 else wrap_push_seg(w, IF_S(" "), w->content_x + cx, 1, st);
                 cx += 1;
@@ -777,8 +790,14 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st, u8 clsf,
             u32 j = i + 1;
             j = lw_ascii_run_end(s, n, j);
             while (j < n) { u8 cc = s[j]; if (cc < 0x21 || cc > 0x7E) break; j++; }
-            wrap_push_merge(w, (const char *)s + i, j - i, w->content_x + cx,
-                            (i32)(j - i), st);
+            if (pend) {
+                wrap_push_merge(w, (const char *)s + i - 1, (j - i) + 1,
+                                w->content_x + cx - 1, (i32)(j - i) + 1, st);
+                pend = 0;
+            } else {
+                wrap_push_merge(w, (const char *)s + i, j - i, w->content_x + cx,
+                                (i32)(j - i), st);
+            }
             cx += (i32)(j - i);
             *any_io = true;
             i = j;
@@ -807,7 +826,13 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st, u8 clsf,
                     rw += gw2;
                     rend = p2;
                 }
-                wrap_push_merge(w, (const char *)s + i, rend - i, w->content_x + cx, rw, st);
+                if (pend) {
+                    wrap_push_merge(w, (const char *)s + i - 1, (rend - i) + 1,
+                                    w->content_x + cx - 1, rw + 1, st);
+                    pend = 0;
+                } else {
+                    wrap_push_merge(w, (const char *)s + i, rend - i, w->content_x + cx, rw, st);
+                }
                 cx += rw;
                 *any_io = true;
                 i = rend;
@@ -818,7 +843,13 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st, u8 clsf,
                 int gw = lw_glyph_width(cp);
                 if (__builtin_expect(gw == 0, 0)) return false;
                 wrap_note_direct2(w, s, i, pos, cp);
-                wrap_push_merge(w, (const char *)s + i, pos - i, w->content_x + cx, gw, st);
+                if (pend) {
+                    wrap_push_merge(w, (const char *)s + i - 1, (pos - i) + 1,
+                                    w->content_x + cx - 1, gw + 1, st);
+                    pend = 0;
+                } else {
+                    wrap_push_merge(w, (const char *)s + i, pos - i, w->content_x + cx, gw, st);
+                }
                 cx += gw;
                 *any_io = true;
                 i = pos;
@@ -826,6 +857,8 @@ static bool fitdom_text(IfFitDom *fd, IfStr t, const IfStyle *st, u8 clsf,
         }
         if (__builtin_expect(cx > fd->content_w, 0)) { fd->cx = cx; return false; }
     }
+    if (pend) /* 行末空白セル（現行と同じ順番・位置で最後に確定。バイトは s[n-1]） */
+        wrap_push_merge(w, (const char *)s + n - 1, 1, w->content_x + cx - 1, 1, st);
     fd->cx = cx;
     return true;
 }
@@ -1087,6 +1120,9 @@ static i32 layout_children(IfLC *lc, IfBox *box, IfNode *node, const IfStyle *ba
     u32 li_ord = 0; /* ol 番号: この親の LIST_ITEM li を出現順に数える（draw_marker 同値） */
     IfNode *c = node->first_child;
     while (c && c != lc->stop) {
+        /* sibling 鎖は arena 上で MB 級ストライドに散る → 次ノードを処理中に先読み。
+         * c->next_sibling の読み自体は c が常駐のため単一 load（追加ポインタ追従なし） */
+        __builtin_prefetch(c->next_sibling, 0, 3);
         /* lazy: ELEMENT の st をここで解決（値は eager 全面走査と同値）。
          * eager: 従来どおり c->style（NULL = style 未適用 = 判定不発） */
         const IfStyle *cst = (c->kind == IF_NODE_ELEMENT) ? lc_st_of(lc, c, base_st) : NULL;
