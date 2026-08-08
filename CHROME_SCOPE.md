@@ -1,6 +1,12 @@
 # CHROME_SCOPE.md — クローム（chrome/UI）層スコープ裁定台帳
 
-日付: 2026-07-28（§0.1 追記 2026-07-29）/ 対象ブランチ: `arena/019fa7cf-ifuto-browser` / 状態: 裁定ドラフト（コストは全て**推定**、天井は全て**提案**）
+日付: 2026-07-28（§0.1 追記 2026-07-29、§0.2 追記 2026-08-07）/ 対象ブランチ: `arena/019fa7cf-ifuto-browser` / 状態: 裁定ドラフト（コストは全て**推定**、天井は全て**提案**）
+
+> **鮮度注記（2026-08-07）**: 本文中「TUI」「ifuto-gui」「QuickJS 埋込提案」の記述は
+> 裁定時点のもの。現行は **TUI 廃止・GUI（生 X11）単一 UI・単一バイナリ`build/ifuto`・
+> JS エンジンは Akl 自作**（QuickJS 案は §0.1 の Akl 決定で却下済）であり、現行値は
+> BENCH.md / ARCHITECTURE.md を正とする。裁定の理屈（棄却根拠・天井の考え方）は
+> 現在も拘束力を持つため残す。
 
 ## 0.1 最終形の宣言（2026-07-29 ユーザ決定）
 
@@ -14,16 +20,20 @@
 - ストリーミング: 「最適化してから処理する」一段構えの禁止。解析・レイアウト・描画は到着データで逐次進める
   （現行 token 駆動 parser は既にこの形）。
 
-## 0.2 v0.2 GUI マイルストーン実績（2026-07-31 記録）
+## 0.2 GUI マイルストーン実績（2026-08-07 現行形）
 
-§0.1 の最終形宣言に対する第一段を実装・検証した（詳細な計測は BENCH.md 冒頭節）。
-- `build/ifuto-gui`（195,088 B、ldd = vdso/libc/ld のみ）: 生 X11 プロトコル直接実装
-  （Xlib/XCB 不使用。CreateWindow/PutImage/GetKeyboardMapping 等、Xauthority 対応）。
-- 自前 5x7 ビットマップフォント + 8 セル行ストリップのストリーミング描画（全面バックバッファ非保持）。
-- タブ帯/オムニボックス/ステータスバー + キー駆動。IfChrome モデルは TUI と同一（二重実装なし）。
-- grid は viewport 窓のみ（`if_render_grid_rows_into`）: 1 万行文書で grid 保有は 38.4 KB。
-- chrome ロード経路で **slim-DOM 既定 ON**（script/template 配下は DOM に構築しない）。
-- ヘッドレス検証: `--shot OUT.ppm PAGE`（`make guismoke`、32 checks）＋ PNG 目視 QA。
+§0.1 の最終形宣言に対する第一段を実装・検証した（現行値は BENCH.md）。
+- **単一バイナリ `build/ifuto`（433,032 B、ldd = vdso/libm/libc/ld のみ）** に統合済:
+  生 X11 プロトコル直接実装の GUI（`--gui`）と CLI が同居（`ifuto-gui` 別体は廃止。
+  TUI/`--ui` も廃止、GUI が単一 UI）。
+- 自前フォント（5x7 + 16x16 全角、かな全量・漢字 103 字 = 第 5 陣まで）+ 行ストリップ描画。
+- タブ帯/オムニボックス/ステータスバー + キー駆動 + リンク hover/クリック。
+- grid は viewport 窓のみ（`if_render_grid_rows_into`）。
+- chrome ロード経路で **slim-DOM 既定 ON** + **md fast-DOM 直構築**（HTML 往復消去、
+  shot 16MB で total −69%・RSS −56.9MB の実測効果、byte-exact 検証済）。
+- ヘッドレス検証: `--shot OUT.ppm PAGE`（`make guismoke` = gui_smoke.py **51 checks**）。
+- WPT 適合: tree-construction **実行可能 100.0%**（fragment 196 件を含む。
+  ARCHITECTURE.md v0.2 行を正とする）。
 - セッション永続化（達成 2026-08-07）: restore-first 起動（引数指定時も旧タブ温存で
   追加タブ化。autosave の autosave-clobber = データ喪失を構造的に防止）、active 即ロード+
   他 lazy_load、IFUTO_NO_STORE kill switch、omnibox のタブ切替/復元時同期、
@@ -312,13 +322,13 @@
 | 53 | 電卓/単位変換 | ブラウジング価値ゼロの式パーサ保守負債 + 攻撃面増。`bc` の管轄。w_complexity 罰を回収できない |
 | 102 | サイト別ズーム | 整数セルグリッドにズーム概念は存在しない（グリフ 1=1 セル）。意図（見やすさ記憶）は「サイト別幅記憶」で満たす |
 
-**SQLite 不採用（永続化全般の根拠）**: SQLite amalgamation（sqlite3.c）のコンパイル済み code サイズはおおよそ 1 MB 級（推定、-O2 x86-64）。**現行バイナリ全体（80,248 B 実測）の 12 倍超** をブックマーク管理のためだけに積むのは w_footprint=0.20 の下で即棄却。データ量（ブックマーク 10^4 件想定）に対しフラットテキストの parse は ms 級（推定）で十分。H5（実績ある部品の採用）は「コストが天井を破る」ため明示的根拠付きで棄却した、と記録する。
+**SQLite 不採用（永続化全般の根拠）**: SQLite amalgamation（sqlite3.c）のコンパイル済み code サイズはおおよそ 1 MB 級（推定、-O2 x86-64）。**裁定時点のバイナリ全体（80,248 B 実測）の 12 倍超** をブックマーク管理のためだけに積むのは w_footprint=0.20 の下で即棄却。データ量（ブックマーク 10^4 件想定）に対しフラットテキストの parse は ms 級（推定）で十分。H5（実績ある部品の採用）は「コストが天井を破る」ため明示的根拠付きで棄却した、と記録する。
 
-## 6. 順位づけと QuickJS との比較（U に基づく）
+## 6. 順位づけと JS 埋込案との比較（U に基づく）
 
 - 本 106 項目は**正確性（w_correctness=0.20）を一切改善しない** → v0.2 適合性マイルストーンより上位には置けない（U の直接帰結）。
-- ただし **chrome/TUI は埋め込み JS（現 v0.4 QuickJS 案）より先に置くことを推薦**する。根拠:
-  - フットプリント: chrome 推定 +40–80 KB vs QuickJS 推定 +600–900 KB（stripped）。**約 10 倍差**。
+- ただし **chrome は JS 埋込より先に置くことを推薦**する（Quill/QuickJS 案は §0.1 で Akl 自作に置換確定。以下のコスト比較も Akl 前提で成立・拡大）。根拠:
+  - フットプリント: chrome 推定 +40–80 KB vs QuickJS 推定 +600–900 KB（stripped）。Akl は更に軽い（BENCH 台帳）。**約 10 倍差**。
   - セキュリティ: chrome は新規攻撃面ほぼゼロ（端末エスケープ不変条件は既存） vs JS は JIT 相当の解釈系全体が面増加。
   - ユーザ提示の不満は全て chrome 層。robustness/maintainability 点も chrome が上。
 - よってロードマップ案: v0.2（適合）→ v0.3（ネットワーク/ラスタ）→ **v-chrome（本書）** → JS（再査定付き）。v0.4 スロットの QuickJS は別途 U 再審査を要請する。

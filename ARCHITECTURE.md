@@ -25,7 +25,7 @@
 | メモリ | ページ単位 arena | per-object malloc/free + 所有権地獄 | dangling を構造的に不可能にする |
 | プロセス | 単一プロセス | サイト分離マルチプロセス | v0.1 の攻撃面最小化のため。v0.5 で見直す（§6） |
 | GPU | バックエンド境界 + ソフトラスタ先行 | いきなり Vulkan/D3D12/Metal | この Linux コンテナで検証不能なコードは書かない |
-| JS | なし | QuickJS ではない（まだ） | DOM API が固まるまでは攻撃面だけ増える |
+| JS | Akl（自作、C11・JIT なし、v0.4 台帳行） | QuickJS 埋込・JIT 系 | 攻撃面とメモリを構造排除（E1 で拡張実行として本体巻取済） |
 
 ## 2. 不変条件（コードに課された法）
 
@@ -47,18 +47,19 @@
 | ~~`<title>`/`<textarea>` は RAWTEXT~~ → **RCDATA 化済み**（文字参照デコード + textarea 先頭 LF 規則） | 解消 | 済 |
 | `display:inline-block` → inline、table 系 display → block | 一部サイトで組版差 | v0.3+ |
 | ~~コメント/doctype は DOM に残さない~~ → **保持に変更**（PI `<?target data?>` も PI として区別） | 解消 | 済 |
-| foreign content（SVG/MathML） | コアは実装済み: ns 入域/復帰・integration points・breakout・case 調整・CDATA・serializer prefix。未実装: `<select>` 等の foreign 内特殊規則、annotation-xml の encoding 以外、`</br>` 等の細則 | v0.2 継続 |
-| template は **content DocumentFragment 分離済み**（serializer は content を遊歩）。ただし "in template" 挿入モードは未採用: 現行 spec 版を作って採点するとベンダー済 template.dat と **ネット −1** で乖離（データが旧世代アルゴリズム前提と判断、台帳に記録）。tpl mode = M_IN_BODY 接地で 83/111 | 新 spec 世代のデータに入れ替えるときモード郡を再投入 | v0.2 継続 |
-| 奇行系: ~~quirks モードなし~~ → **quirks 判定実装済**（DOCTYPE 完全表 + initial→before-html 遷移バグ根治で実効化, 97.3%）。~~foster parenting なし~~ → 実装済。~~adoption agency は近似~~ → 厳密版実装済 | 壊れた HTML でのツリー差異 | tree-construction 採点中（§6.1）。残塊は template.dat（データ世代乖離, 23）と webkit02（5）が主 |
+| foreign content（SVG/MathML） | 実装済み: ns 入域/復帰・integration points・breakout 完全表（listing/menu/meta/nobr/ruby 含む）・case 調整・CDATA・serializer prefix・foreign `</p>`/`</br>` の HTML 再処理規則 | 解消（WPT foreign-fragment 66 件で網羅） |
+| template は **content DocumentFragment 分離済み** + **"in template" 挿入モード実装済**（table トークン routing・frame 無視・EOF の template pop。現行世代の template.dat も全合格） | 解消 | 済 |
+| fragment 解析（innerHTML 相当、WHATWG 13.4）も **実装済**: 仮想 html root + 仮想 context 要素（adjusted current node）+ reset appropriately の fragment 基底 + raw/rcdata の "appropriate end tag 非合致" 規則 | skip は `#script-on` 12 件のみ（scripting UA 前提・恒久） | 済（`--fragment CTX`、1922/1922 = 100.0%） |
+| 奇行系: quirks 判定・foster parenting・厳密 adoption agency・foreign breakout 完全表・全実体参照 2,125 名（全て実装済） | 壊れた HTML でのツリー差異ゼロ | **tree-construction 100.0%**（実行可能 1,922 件全合格、残りは script-on 12 のみ） |
 | 入力 CR/CRLF → LF 正規化なし | `\r` 含む入力でツリー差異の可能性 | v0.2 継続（入力前処理に正規化層） |
-| isindex/`<title>` の body→head 移動等非推奨規則 | 該当テストのみ失敗 | 非推奨要素は後回し（実害なしと判断） |
-| フォントは端末依存・等幅のみ、斜体/太字は SGR 属性 | 実フォントレンダリングなし | v0.3（GPU/ソフトピクセル） |
-| GUI v0.2: 生 X11 プロトコル（Xlib/XCB 不リンク）、自前 5x7 フォント、8 セル行ストリップ描画（全面バックバッファ非保持）。ldd は vdso/libc/ld のみ | 台帳: ASCII 外形のみ（CJK は tofu）、斜体の傾斜未実装、sup/sub なし、リンクのマウスクリック未接続、セッション復元なし | CJK フォント戦略（v0.3）、italic/mouse（v0.2 継続） |
+| isindex/body↔head 移動等の非推奨・特殊規則 | 全合格（isindex.dat 4/4 含む全件） | 解消 |
+| フォント: CLI は SGR 属性（太字/斜体/下線/打消）、GUI は自前ピクセルフォント + 太字の横オフセット重ね + 斜体の oblique shear（fb.c）。等幅 | 真ベクターフォント/AA なし | ソフトラスタ品質の段階改善（要検証設計） |
+| GUI: 生 X11 プロトコル単一 UI（Xlib/XCB 不リンク、TUI は廃止）、自前 5x7+16x16 フォント（かな全量・CJK 第 5 陣まで 103 kanji）、タブ/omnibox/status・リンククリック・hover・セッション永続化（原子書込・遅延復元）・`--shot` 決定ラスタ検証（51 checks）。ldd は vdso/libm/libc/ld のみ | 台帳（続課題）: 漢字第 6 陣以降の補完、anchor 遷移、`make jsdiff`、斜体傾斜 | CJK フォント段階投入・akl DOM バインド（v0.4） |
 | slim-DOM（法則「画面描画に関係ないものは DOM しない」）: script/template 配下を DOM 非構築。**style は cascade が本文を読むので剃らない**。構築状態機械は完全実行、root は marker 残置 | 剃りバイト分はゼロコピー入力 arena がタブ寿命で保持するため現状はノードヘッダ+走査回避に限定（BENCH.md 実測） | 入力 compaction（v0.3 本丸）、slim 変異 fuzz、attrs 側の tokenizer 層剃り |
-| レンダ grid は viewport 窓のみ materialize（`IfGrid.y_off`、TUI/GUI 共用ビルダ） | 窓再構築はスクロール/リサイズ/タブ切替ごとに O(boxes) クリップ走査 | 差分ペイント（v0.3 候補） |
+| レンダ grid は viewport 窓のみ materialize（`IfGrid.y_off`、GUI/CLI 共用ビルダ） | 窓再構築はスクロール/リサイズ/タブ切替ごとに O(boxes) クリップ走査 | 差分ペイント（v0.3 候補） |
 | Markdown 表示: `.md` は md.c が多層防御つき HTML に変換して共通パイプラインへ（生 HTML 素通し禁止） | MD の入れ子深度上限で飽和（quote 8 / list 16） | MD 全構文網羅（v0.3 継続） |
 | 画像・メディアはプレースホルダ | 実デコードなし | v0.3 |
-| http/https 未取得（ファイルのみ） | ネットワークなし | v0.2: HTTP/1.1 → v0.3: TLS(BearSSL 等の battle-tested 物。自作 TLS は禁止） |
+| HTTP/1.1 取得は **実装済**（src/net.c、防御的 4 パーサ + fuzz_net。plaintext のみ） | TLS は未取得（https 不可） | v0.3+: TLS（BearSSL 等の battle-tested 物。自作 TLS は禁止） |
 
 ## 4. セキュリティモデル（防御的。現状の残存攻撃面を隠さない）
 
@@ -93,8 +94,8 @@ layout（座標系は差し替え可能）──→ [backend 境界: 矩形/文�
 | 版 | 内容 | 完了の客観基準 |
 |---|---|---|
 | v0.1 ✅ | 垂直スライス: パース〜端末描画。テスト・fuzz・ベンチ・ゴールデン | 本コミット |
-| v0.2 | **適合性マイルストーン（進行中）**: WPT tree-construction 採点ハーネス `make conformance`（`tests/wpt-tree-construction/`、WPT@0acb81f ピン留め・ベンダー済 61 ファイル 1,934 テスト）。公開スコアの推移: 41.4%（714/1726, 初期採点）→ 49.0%（PI・RCDATA・comment/doctype・終了タグ規則）→ 56.5%（foreign content コア）→ 60.0%（1036/1726, 2026-07-28）→ 65.5%（table モード群 + foster parenting + template content）→ 71.3%（active formatting elements + adoption agency algorithm）→ 74.2%（script-data escaped/double-escaped 状態機械）→ 79.3%（ruby 暗示閉鎖・select/option・NULL 処理・frameset モード）→ 80.0%（template in-body 接地）→ 81.6%（1409/1726: 全 WHATWG 名前・数値実体参照 2,125 名）→ 82.3%（scope バリアの namespace 正式化: MathML mi/mo/mn/ms/mtext/annotation-xml + SVG foreignObject/desc/title を既定スコープの遮断要素に）→ **88.1%（1521/1726, 2026-07-29 現在: frameset-ok flag 全規則・in-head 適合化（void 集合と textarea の body 側移行）・after-head from-head 経路・in-body frameset 規則・`<image>`→`<img>` quirk・button scope-close・空白 peel）** → 96.8%〜97.0%（in-table-text flush ordering 全 table 系モード化 + foster 規則厳密化）→ **97.3%（1679/1726, 2026-07-31: initial モードが DOCTYPE 受理後に before-html へ遷移しない長期潜伏バグを根治し quirks 判定を実効化。quirks01 全通過、quirks 系 +4 件）**。分母は fragment(#document-fragment) 208 件を skip した実行可能件数。残塊: tests1（20）、template（23: データ乖離、台帳参照）、webkit02（18）、tests10（13: foreign-in-table 配置）、tests17（10: in-table select モード未実装で 3/13）、plain-text-unsafe（11）、tests19（8: AAA+foster 残）、tests26（7: AAA 残）、tests6（5）。以降: マージン相殺親子貫通、テーブルレイアウト、HTTP/1.1 クライアント（plaintext のみ。防御的パーサ付き） | 合格率の単調増加（後退は台帳に理由を記す） |
-| v-chrome ✅ | **TUI クローム（ユーザ決定で v0.2 より前倒し、2026-07-29）**: slice-1 = タブ・オムニボックス・スクロール・リンクフォーカス・ステータス帯（C1 メモリ計装）。slice-2 = 永続化（C2: session/history/bookmarks を tmp→rename→fsync で単一 dir 原子管理、遅延ロード復元 50 tab 0.11 ms 実測）・`?`タブ検索（INV-8 完全形）・`@`グループ最小形（#11 の TUI 表現）・`--show-paths`（INV-9）。天井は CHROME_SCOPE §1、全項目実測済（BENCH.md）。残: グループ折りたたみ・プリセット（INV-4）・履歴/ブックマーク連携のオムニボックス候補（INV-3）・ダッシュボード（§8 照合の opt-in 標準プリセット）は slice-3+ | 天井全項目を実測で満たす + PTY e2e 15 checks 緑 |
+| v0.2 ✅ | **適合性マイルストーン（2026-08-07 完了）**: WPT tree-construction 採点ハーネス（`tests/wpt-tree-construction/`、WPT master `5b6a1e6` ピン・61 ファイル 1,934 テスト byte-exact 一致を照合済）。**実行可能 1,922/1,922 = 100.0%**（skip は `#script-on` 12 件のみ = scripting UA 前提・恒久）。fragment 解析（WHATWG 13.4）実装で #document-fragment 196 件も全合格。WHATWG 全実体参照 2,125 名・quirks・foster・AAA・table モード群・in-template・foreign content 完全表まで搭載。HTTP/1.1 クライアント（src/net.c、plaintext・防御的 4 パーサ + fuzz_net）も搭載済。以降: TLS（v0.3+。BearSSL 等。自作 TLS 禁止）、マージン相殺親子貫通、テーブルレイアウト | 100.0% 維持（後退は全件 oracle で即検出） |
+| v-chrome ✅ | **GUI クローム（製品最終形）**: 生 X11 単一 UI（TUI は廃止、`--ui` は案内のみ）にタブ・オムニボックス・スクロール・リンクフォーカス/hover/クリック・ステータス帯を実装。slice-2 永続化（session/history/bookmarks を tmp→rename→fsync で単一 dir 原子管理・遅延復元・restore-first 起動）・自前フォント（5x7 + 16x16 全角、かな全量・漢字 103 字）・`--shot` 決定ラスタ検証（gui_smoke 51 checks）・md fast-DOM ロード・拡張 E1（akl、戻り値効果スキーマ、docs/EXTENSIONS.md）。残: グループ折りたたみ・プリセット・履歴/ブックマーク連携の候補・ダッシュボード、漢字第 6 陣、anchor 遷移 | 全ゲート緑 + GUI smoke 緑 |
 | v0.3 | ソフトピクセルラスタ + backend 境界凍結（**製品の最終形は GUI（2026-07-29 ユーザ決定）**。TUI/ANSI 層はこの headless コンテナでの正確性・性能ゲート用途の検証バックエンドと位置づける。`exe を開いて Edge/Chrome と同じように使える` が最終形） + 画像デコード（まず BMP/PNG 静的、ImageMagick には頼らない）+ Vulkan（このコンテナで headless 検証可能なら） | 同一文書のセル版・ピクセル版で視覚一貫 |
 | v0.4 | **Akl（自作 JS エンジン、ユーザ決定 2026-07-29）**: C11・JIT なし（JIT=攻撃面+メモリの両方を排除。W^X 全域、実行可能書き込みページゼロを構造保証。ユーザ提示動機「半分弱のウイルス無効化」は未検証値として扱い、検証可能な不変条件のみをここに採用する）。値は NaN-boxed 8B、ヒープ参照は obj 配列の u32 index。**v0.0 ✅（2026-07-29）: 字句 → recursive-descent → one-pass codegen → 全検証 verifier（opcode/即値/ジャンプ先境界/locals 参照/命令開始 bitmap）→ スタック VM**（計画の木歩きより強い形で着陸。dispatch は computed-goto/switch のデュアル構成で実測裁定 = goto 既定、1.005〜1.295×, BENCH.md。NaN/Inf 定数・ToString 往復最短精度・短絡生値・loose/strict 等価・全 budget fail-stop まで入る）。**v0.1: 配列/オブジェクト + mark-sweep GC**。DOM バインディング（querySelector・textContent・style 書換）は GC 安定後。**v0.2 ✅（2026-07-31）: JS 例外（throw/try/catch/finally、cross-frame 巻き戻し、v0.1 限界=try 越境 break/continue は明白な compile エラー）+ CoJIT（静的検証駆動の AOT 特化、runtime codegen ゼロで JIT 禁止に抵触しない。特化後は verify 再走査＋on/off 差分オラクルで機械監査）+ 例外機構の cold 分離（inline 展開で arith+24%/branch+42% のレイアウト悪化を同定・復元）** | JS からのレイアウト再計算が end-to-end で動く |
 | v0.4b | **array-DOM（ユーザ提示「ツリーを Array に」を採択）**: IfNode をポインタの森から u32 index リンクの巨大配列へ。目的はメモリ理論極限（ノード当たりバイト数を半減見積——計測値を BENCH.md に出してから移行。未計測の見積 promise は書かない）| 移行前後で全ゲート無変化 + ノード当たりバイト数の公開 |
@@ -103,8 +104,8 @@ layout（座標系は差し替え可能）──→ [backend 境界: 矩形/文�
 
 ## 7. 性能モデル（Amdahl の現在地）
 
-v0.1 の支配項は render（~43ms/2MB）→ layout（~23ms）。parse 10ms・style 8ms は未支配。
-クリティカルパス外の最適化はしない。次に攻めるなら: render emit バッチ化・セル構造の bit-pack・空白 seg 併合。
+現行支配項は **parse → layout**（2MB 文書で parse 7.2 / layout 7.9 / render 2.4 / style 0.0ms、16MB で parse 56.5 / layout 66.1 / render 15.3ms。実測値は BENCH.md を正とする）。
+style は lazy 化で支配外。クリティカルパス外の最適化はしない。
 平均ではなく大文書のワーストケースを見るのがこのプロジェクトの作法。
 
 ### 7.1 v0.3（2026-08 現行）支配構造とイベント直結パイプライン設計
@@ -125,7 +126,7 @@ layout がブロック完成ごとに消費する融合段にして DOM 素材�
   「ブロック局所バッファ」まで縮退可能。文書全体の保持が必要なのはリンク目次と
   並列 layout の中間点だけ → 保持は (tag, attrs 最小, テキスト範囲) の幽霊骨格でよい。
 - **byte-exact オラクルが命綱**: 融合しても最終発行ビットは現行と 1bit も変えない
-  （chk_oracle 12/12 + w40/w160/dom/links/ansi の全一致を逐次検証）。
+  （chk_oracle 14/14: forged/2MB/16MB × out/ansi/w40/w160/dom/links/styles + serial≡sliced の全一致を逐次検証）。
 - **2 pass → 1 pass 化は段階投入**: まず fitdom の融合（DOM 再読 1 回消去）、
   ついで DOM 局所化。見積もり便益は DOM トラフィック消去で -25~35ms（推定・上限）。
 - 既判の不採用（再挑戦禁止）: POPULATE_WRITE 一括化・arena 16MB・-O3・style 2-way 並列。

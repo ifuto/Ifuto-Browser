@@ -17,28 +17,27 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 
 ## 実測（計測法: BENCH.md / `make bench` / `make tuibench`）
 
-| 指標 | v0.1 (CLI) | 現在（v0.2, TUI + ストア込み） |
+| 指標 | v0.1 (CLI) | 現在（v0.3-dev, GUI + ストア込み） |
 |---|---|---|
-| バイナリ ifuto（stripped・LTO） | 80 KB | **214.6 KB**（219,776 B。新天井 240 KB。増分主体は md.c） |
-| バイナリ ifuto-gui（同上 GUI） | — | **190.5 KB**（195,088 B。ldd は vdso/libc/ld のみ） |
-| コールドスタート | 1.1 ms（spawn 込み） | **1.55 ms**（fork/exec→TUI 初描画、median） |
+| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **422.9 KB**（433,032 B。旧天井 240 KB を akl 拡張機構統合（+106.6 KB）で更新済。ldd = vdso/libm/libc/ld のみ） |
+| コールドスタート | 1.1 ms（spawn 込み） | **min 1.40 ms / median 1.66 ms**（CLI tiny render 300 連、2026-08-07 実測） |
 | 空タブ UI 常駐 RSS | — | **1.43 MB**（天井 4 MB） |
 | アンロード済み 50 タブ メタ | — | **14.7 KB**（天井 2 MB） |
 | 50 タブのセッション復元 | — | **0.11 ms**（天井 100 ms、遅延ロード込み） |
-| TUI アイドル CPU / 描画 | — | **0 % / 0 B**（INV-5: read ブロックのみ） |
-| 18KB 文書 | 1 ms / ピーク RSS 1.9 MB | 変わらず（同一エンジン） |
-| 2MB ストレス文書 | 86 ms / ピーク RSS 52 MB | 同上（内訳と改善計画は BENCH.md） |
+| GUI アイドル CPU / 描画 | — | **0 % / 0 B**（INV-5: read ブロックのみ） |
+| 18KB 文書 | 1 ms / ピーク RSS 1.9 MB | ms 級維持（エンジン全体高速化済） |
+| 2MB ストレス文書 | 86 ms / ピーク RSS 52 MB | **17.5 ms / ピーク RSS 35.7 MB**（2026-08-07 騒音帯実測、BENCH.md） |
 
 ## ビルドと実行
 
 ```sh
 make            # build/ifuto（リリース: -O2 LTO stripped。GUI 統合済み単一バイナリ）
-make test       # 単体テスト 608k checks ×2 dispatch（ASan+UBSan+LSan 常時）
+make test       # 単体テスト 623,749 checks ×2 dispatch（ASan+UBSan+LSan 常時）
 make guismoke   # GUI を X なしで検証（--shot ラスタ + 画素検査）
 make golden     # 描画の厳密 diff テスト
 make fuzz       # mutation fuzz + ASan
 make bench      # サイズ/起動/時間/RSS の測定（CLI）
-make conformance # WPT tree-construction 採点（現 97.3%, 1679/1726, 2026-07-31）
+make conformance # WPT tree-construction 採点（実行可能 100.0%, 1922/1922, fragment 196 件含む。skip は script-on 12 のみ）
 
 ./build/ifuto --gui local_page.html        # GUI 起動（X11 必要。Ctrl+L/T/W/Q, 矢印, PgUp/PgDn）
 ./build/ifuto --shot out.ppm page.md       # ヘッドレス: 同パイプラインでフルラスタ PPM
