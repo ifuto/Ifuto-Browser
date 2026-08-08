@@ -17,6 +17,7 @@ void test_ifuto_pages(void);
 void test_akl(void);
 void test_script(void);
 void test_compact(void);
+void test_charset(void);
 void test_md(void);
 void test_md_slice_oracle(void);
 void test_raster(void);
@@ -45,6 +46,8 @@ int main(void) {
     RUN(test_script);
     fprintf(stderr, "[compact]\n");
     RUN(test_compact);
+    fprintf(stderr, "[charset]\n");
+    RUN(test_charset);
     fprintf(stderr, "[md]\n");
     RUN(test_md);
     RUN(test_md_slice_oracle);

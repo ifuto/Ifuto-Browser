@@ -228,6 +228,8 @@ bool if_http_head_parse(const u8 *buf, u64 n, IfHttpHead *out) {
                 if (ci_mem(v, ve, "chunked")) out->chunked = true;
             } else if (nl == 8 && ci_eq(cur, colon, "location", 8)) {
                 out->location = if_str((const char *)v, (u32)(ve - v));
+            } else if (nl == 12 && ci_eq(cur, colon, "content-type", 12)) {
+                out->content_type = if_str((const char *)v, (u32)(ve - v));
             }
         }
         cur = lf + 1;
@@ -360,7 +362,8 @@ static bool send_all(int fd, const u8 *p, size_t n) {
 
 /* 1 回分の GET（redirect は追わない）。成功で body（デコード済）を返す */
 static bool fetch_once(IfArena *a, const IfHttpUrl *u, IfStr *out_body,
-                       u32 *out_status, IfStr *out_loc, const char **err) {
+                       u32 *out_status, IfStr *out_loc, IfStr *out_ctype,
+                       const char **err) {
     int fd = connect_one(u->host, u->port);
     if (fd == -2) { *err = E_DNS; return false; }
     if (fd < 0) { *err = E_CONN; return false; }
@@ -402,6 +405,7 @@ static bool fetch_once(IfArena *a, const IfHttpUrl *u, IfStr *out_body,
     if (!if_http_head_parse(buf, n, &h)) { *err = E_RESP; return false; }
     *out_status = h.status;
     *out_loc = h.location;
+    if (out_ctype) *out_ctype = h.content_type;
     u64 bn = n - h.body_off;
     const u8 *bp = buf + h.body_off;
     if (h.chunked) {
@@ -420,6 +424,11 @@ static bool fetch_once(IfArena *a, const IfHttpUrl *u, IfStr *out_body,
 
 bool if_http_get(IfArena *a, const char *url, IfStr *out_body, u32 *out_status,
                  const char **err) {
+    return if_http_get_ex(a, url, out_body, out_status, NULL, err);
+}
+
+bool if_http_get_ex(IfArena *a, const char *url, IfStr *out_body, u32 *out_status,
+                    IfStr *out_content_type, const char **err) {
     char cur[1024];
     if (strlen(url) >= sizeof cur) { *err = E_URL; return false; }
     snprintf(cur, sizeof cur, "%s", url);
@@ -427,7 +436,7 @@ bool if_http_get(IfArena *a, const char *url, IfStr *out_body, u32 *out_status,
         IfHttpUrl u;
         if (!if_http_parse_url(cur, &u)) { *err = E_URL; return false; }
         IfStr loc = if_str(NULL, 0);
-        if (!fetch_once(a, &u, out_body, out_status, &loc, err)) return false;
+        if (!fetch_once(a, &u, out_body, out_status, &loc, out_content_type, err)) return false;
         bool redir = (*out_status == 301 || *out_status == 302 ||
                       *out_status == 303 || *out_status == 307 ||
                       *out_status == 308) && loc.p && loc.n;

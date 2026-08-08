@@ -9,6 +9,9 @@ Markdown 表示（`.md` 自動検出）+
 **`<script>` akl 実行**（v0.3: 文書順・style 適用前・失敗は script 単位で隔離して描画継続。
 `document.title`/`getElementById`/`textContent` 等の最小 DOM バインド + `console.log`。
 JIT は恒久禁止の自作インタプリタ。凍結正本: docs/SCRIPTING.md）+
+**文字コード変換**（v0.3: Shift_JIS 系 / EUC-JP → UTF-8 正規化。HTTP charset > BOM >
+meta prescan > UTF-8 既定。変換表は python codec 生成の再生成一致オラクル凍結、
+波ダッシュ 6 件は cp932 採用と明記。凍結正本: docs/CHARSET.md）+
 **viewport 窓グリッド**（grid は文書全体ではなく可視窓のみ materialize）+
 ローカル永続化（セッション・履歴・ブックマーク。全て tmp→rename→fsync の原子書換）。
 
@@ -22,7 +25,7 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 
 | 指標 | v0.1 (CLI) | 現在（v0.3-dev, GUI + ストア込み） |
 |---|---|---|
-| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **442.9 KB**（453,512 B。akl 拡張機構＋ネイティブ層/オブジェクト＋`<script>` 実行配線（+12.3 KB）統合。ldd = vdso/libm/libc/ld のみ） |
+| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **490.9 KB**（502,664 B。akl 拡張機構＋ネイティブ層/オブジェクト＋`<script>` 実行配線＋文字コード変換表（SJIS/EUC-JP、+49.2 KB）統合。ldd = vdso/libm/libc/ld のみ） |
 | コールドスタート | 1.1 ms（spawn 込み） | **min 1.40 ms / median 1.66 ms**（CLI tiny render 300 連、2026-08-07 実測） |
 | 空タブ UI 常駐 RSS | — | **1.43 MB**（天井 4 MB） |
 | アンロード済み 50 タブ メタ | — | **14.7 KB**（天井 2 MB） |
@@ -35,7 +38,7 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 
 ```sh
 make            # build/ifuto（リリース: -O2 LTO stripped。GUI 統合済み単一バイナリ）
-make test       # 単体テスト 623,897 checks ×2 dispatch（ASan+UBSan+LSan 常時）
+make test       # 単体テスト 623,986 checks ×2 dispatch（ASan+UBSan+LSan 常時）
 make guismoke   # GUI を X なしで検証（--shot ラスタ + 画素検査）
 make golden     # 描画の厳密 diff テスト
 make fuzz       # mutation fuzz + ASan

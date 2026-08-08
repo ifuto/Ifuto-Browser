@@ -32,5 +32,15 @@ chk c092c35dcdcc1c1c17379748fb418c3d303ec65c2345152a54cee20fa0230116 idm-2mb.ser
 S=oracle/script.html
 chk 13655f7074599cfe39fcb756bd3f02b44b92125087f35286340ff957e2f5291b script.out    "$BIN" --no-ansi "$S"
 chk afb095effd08167731a4d3aa41924cd7bcdc9bd20ccf97847375a2b80ee4be5e script.killed env IF_SCRIPT=0 "$BIN" --no-ansi "$S"
+# 文字コード層（v0.3 A1）: Shift_JIS / EUC-JP の E2E byte-exact（meta charset 検出 → UTF-8 正規化
+# → 描画/DOM。波ダッシュ cp932 採用・NEC/IBM 拡張・SS3 0212・半角カナを fixture に内包。
+# sjis.dom/eucjp.dom は --dump-dom の DOCTYPE/COMMENT 表示修正（v0.3）後の値で凍結）
+chk 9dd9246fa8886c99b193910d02f216e4416f8d78f3b3ae99eb3decd5aa30e69c sjis.out    "$BIN" --no-ansi oracle/sjis.html
+chk a07a5cb171c0f6f44dc0355dbf1ed62866e825f82d234c09c1988ef994b0eced sjis.dom    "$BIN" --dump-dom oracle/sjis.html
+chk d8340987f8314299840399b6dc7d28b997b0483306721a6125909c3e65768abe eucjp.out   "$BIN" --no-ansi oracle/eucjp.html
+chk 8042b383ceca03aff92ab25799b8dcf16646fc38de4d93425a826f5979b4113d eucjp.dom   "$BIN" --dump-dom oracle/eucjp.html
+# 変換表の再生成一致オラクル（python codec が正本。表の手編集・退行を機械封殺）
+if python3 tools/gen_charset.py --verify >/dev/null; then echo "OK   charset.tables"; ok=$((ok+1));
+else echo "DIFF charset.tables"; ng=$((ng+1)); fi
 echo "oracle: ok=$ok ng=$ng"
 [ "$ng" -eq 0 ]

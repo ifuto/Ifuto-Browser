@@ -16,7 +16,13 @@
 - 起動速度は ` /bin/true` 経路での最小/中央値に subprocess wall time を使う
   （`/usr/bin/time` 非存在、bash 組込の `time` のみ）。
 
-## 現行スナップショット（2026-08-08 計測・`build/ifuto` 453,512B）
+## 現行スナップショット（2026-08-08 計測・`build/ifuto` 502,664B）
+
+直前差分（A1 文字コード層, docs/CHARSET.md）: SJIS/EUC-JP 変換表 +49,152B。
+md ミッション経路は関門外（`if (!md_doc)` ゲート）のまま、A1 後の n=7 再計測は
+median **122.23ms**・peak_rss 224,988KB（帯内一致・回帰なし。同時並行 fuzz 計測の
+215ms 汚染値は棄却・静粛状態再計測で確定。台帳として方法論違反を記録する）。
+
 
 （前回 441,224B から +12,288B: `<script>` akl 実行配線（src/script.c）+ DOM
 最小変更面 + AklHandleVTab。**script 実行配線の pipeline 影響は構造的ゼロ** =
@@ -62,7 +68,7 @@ walk 型代替案（parse 後に DOM 全走査で差替）は**実測棄却**: c
   **約 −170MB** が本意の効用（省メモリ法則 = truth が多タブで効く領域）。
 - CLI ミッション経路は 1 行も変更されていないことを固定: flag OFF の A/B 7 対
   （嵐帯 ±10ms 中、中央差 −4.2ms、符号 3:4 = 回帰の有意なし。弱証拠として明記）
-  + oracle 16/16 byte-exact。
+  + oracle 21/21 byte-exact（+SJIS/EUC-JP E2E 4 件 + 変換表再生成一致）。
 - 機械オラクル: `tests/test_compact.c`（free 後アクセスの ASan heap-use-after-free
   検出。walk 版開発中に tpl_map 開放番地法の走査バグを即検出した実績つき）＋
   フラグ OFF のゼロコピー不変条件テスト。
@@ -81,8 +87,8 @@ min **1.40ms** / median **1.66ms** / p90 1.96ms。
 | ゲート | 現行値 |
 |---|---|
 | WPT tree-construction（`tests/wpt-tree-construction`、WPT master `5b6a1e6`） | **1922/1922 (100.0%)**、skip 12 = `#script-on` のみ（fragment 196 件は `--fragment CTX` で実行済） |
-| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,926 checks / 0 failures** ×2（script 実行配線 + HANDLE GC 機械証明 + 入力 compaction オラクル込み） |
-| 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **16/16**（+2 = script 実行 ON/OFF 双方向 `oracle/script.html`） |
+| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,986 checks / 0 failures** ×2（script 実行配線 + HANDLE GC 機械証明 + 入力 compaction + 文字コード層 60 checks オラクル込み） |
+| 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **21/21**（+4 = Shift_JIS/EUC-JP E2E、+1 = 変換表再生成一致） |
 | golden（`tests/run_golden.sh`） | 1/1 |
 | GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | 51 checks PASS（X 不在環境の proxi、GUI 実機は未検証と明記） |
 | 拡張 smoke（`tests/ext_smoke.py`） | **12 checks**（console.log 凍結 v1 含む） |

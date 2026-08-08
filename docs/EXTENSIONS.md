@@ -201,7 +201,7 @@ WPT 100%・RSS 台帳を侵蝕しない = 各段で BENCH 再測定を台帳記�
   解消。`akl_native_register`/`akl_global_set`/`akl_mkobject`/`akl_prop_set` 族・
   AKL_OK_OBJ + AKL_OK_NATIVE、self 伝播・1024 insn 固定課金・`akl_native_throw` の
   明白失敗規約・nursery 一時ルート保護・登録は VM 停止中限定の構造拒否、
-  全て run_tests 双子 623,811 checks + LSan + fuzz で機械固定）。console.log（§3-A）
+  全て run_tests 双子 623,986 checks + LSan + fuzz で機械固定）。console.log（§3-A）
   が通過実例。E2/E3 本体（page.readText/injectStyle・ページイベント意味論）は
   未実装のままであり、意味論を §3 へ凍結追記してから実装する規則は変わらない。
 - E3 の DOM 書込は v0.4 配列 DOM 直結（ARCHITECTURE v0.4b / §7.1）の設計確定後に

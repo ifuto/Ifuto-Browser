@@ -87,7 +87,7 @@
   **heap 1MB 絞りの GC flood**（50k iter ≈6MB ≈ cap 6 倍 throughput: 成功 ≡ GC 複数回
   発火かつ get コールバック内確保・mcall 戻り値ハンドルの rooting が正しい）。
   両者とも ASan+UBSan+LSan 常時の双子バイナリで検査。
-- E2E byte-exact オラクル `oracle/script.html`（`tools/chk_oracle.sh` 16 件目系）:
+- E2E byte-exact オラクル `oracle/script.html`（`tools/chk_oracle.sh` 16-17 件目系。現行 21 件）:
   mutation が描画に出る（script.out）／`IF_SCRIPT=0` で出ない（script.killed）双方向。
 - `tests/test_html.c` slim-DOM オラクル: **script は本文ごと残る／template は従来通り剃る**
   （法則「画面描画に関係ないものは DOM しない」の補足: script は v0.3 で「描画に無関係」

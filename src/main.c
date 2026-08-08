@@ -15,6 +15,7 @@
 #include "chrome.h"
 #include "ext.h"
 #include "net.h"
+#include "charset.h" /* v0.3 A1: Shift_JIS/EUC-JP → UTF-8（docs/CHARSET.md） */
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -31,13 +32,13 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
 }
 
-static IfStr read_all(IfArena *a, const char *path) {
+static IfStr read_all(IfArena *a, const char *path, IfStr *out_ctype) {
     /* http:// はネットワーク取得（v0.3）。以後の pipeline はファイル入力と同一 */
     if (strncmp(path, "http://", 7) == 0) {
         IfStr body;
         u32 status = 0;
         const char *err = NULL;
-        if (!if_http_get(a, path, &body, &status, &err)) {
+        if (!if_http_get_ex(a, path, &body, &status, out_ctype, &err)) {
             fprintf(stderr, "ifuto: cannot fetch %s: %s\n", path, err);
             exit(1);
         }
@@ -84,6 +85,20 @@ static IfStr read_all(IfArena *a, const char *path) {
     if (ferror(f)) { fprintf(stderr, "ifuto: read error on %s\n", path); exit(1); }
     if (f != stdin) fclose(f);
     return if_str((const char *)buf, (u32)n);
+}
+
+/* v0.3 A1（docs/CHARSET.md）: HTML 経路の入力を UTF-8 へ正規化する単一関門。
+ * 判定は HTTP charset > UTF-8 BOM > meta prescan(4096B) > UTF-8 既定。
+ * MD は UTF-8 凍結（生テキスト保持が正本仕様）なので本関門を通さない。
+ * UTF-8 確定時は BOM 剥がしだけの恒等切片 = ゼロコピー不変条件を守る。 */
+static IfStr to_utf8_html(IfArena *a, IfStr ctype, IfStr input) {
+    bool bom = false;
+    IfEnc enc = if_charset_sniff(ctype, input, &bom);
+    if (enc == IF_ENC_UTF8) {
+        if (bom && input.n >= 3) { input.p += 3; input.n -= 3; }
+        return input;
+    }
+    return if_charset_decode(a, input, enc);
 }
 
 static void usage(FILE *f) {
@@ -171,7 +186,10 @@ int main(int argc, char **argv) {
     double t0 = now_ms();
     IfArena a;
     if_arena_init(&a, 1 << 23) /* ブロック数半減で THP 同期コンパクション stall 削減（paired +2.6ms。reserved +~7MB と引き換え、BENCH 台帳） */; /* CLI: 4MB ブロック→THP 直取り（マイナーフォールト税の構造除去。GUI/テストは従来のまま） */
-    IfStr input = read_all(&a, path);
+    IfStr ctype = if_str(NULL, 0);
+    IfStr input = read_all(&a, path, &ctype);
+    bool md_doc = force_md || if_path_is_md(path);
+    if (!md_doc) input = to_utf8_html(&a, ctype, input);
 
     double t1 = now_ms();
     /* v0.2: Markdown（+GFM 表/脚注。表示テキストは MD 以上の情報密度を持つ方針）
@@ -184,7 +202,7 @@ int main(int argc, char **argv) {
             return 2;
         }
         dom = if_parse_html_fragment(&a, input, frag_ctx);
-    } else if (force_md || if_path_is_md(path)) {
+    } else if (md_doc) {
         /* v0.3: md は DOM 直構築を先に試す（HTML 往復を消す高速経路）。
          * dump-tokens / wptdom は「HTML 段」の観測点なので従来どおり 2 段で。
          * taint 観測時は従来経路へフォールバック（正しさは本パーサに集約） */

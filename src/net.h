@@ -39,6 +39,7 @@ typedef struct {
     u64  content_length; /* UINT64_MAX = 未指定 */
     bool chunked;        /* Transfer-Encoding: chunked */
     IfStr location;      /* Location 値（無ければ p=NULL） */
+    IfStr content_type;  /* Content-Type 値（無ければ p=NULL。charset 判定の第 1 候補） */
 } IfHttpHead;
 
 /* "\r\n\r\n"（宽容 "\n\n"）までをヘッダとして状態行と
@@ -57,5 +58,10 @@ bool if_http_dechunk(IfArena *a, const u8 *p, u64 n, IfStr *out);
  * "too large"/"bad response"/"truncated"/"redirect loop"）。 */
 bool if_http_get(IfArena *a, const char *url, IfStr *out_body, u32 *out_status,
                  const char **err);
+
+/* if_http_get + 最終応答の Content-Type 値（out_content_type に buf 内参照。
+ * 不要なら NULL を渡す。charset 判定用に v0.3 で導入） */
+bool if_http_get_ex(IfArena *a, const char *url, IfStr *out_body, u32 *out_status,
+                    IfStr *out_content_type, const char **err);
 
 #endif

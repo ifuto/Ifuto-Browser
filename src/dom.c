@@ -243,6 +243,26 @@ static void dump_node(const IfNode *n, FILE *out, int depth) {
         fputs("\"\n", out);
         return;
     }
+    /* v0.3 修正: DOCTYPE / COMMENT / PI は union 側車（dtype/text）を読む。
+     * 従来は非 TEXT を一律 tag_name(p) の %s 表示に落としていて、DOCTYPE 等が
+     * ポインタ値を C 文字列として読むゴミ表示になっていた（ELEMENT はタグ名が
+     * 静的 NUL 終端表由来の契約で救われていた。md オラクルのみの凍結で未晒）。
+     * 本修正は観測面のみ：木・レイアウト・描画には無関係（--dump-dom 限定）。 */
+    if (n->kind == IF_NODE_DOCTYPE) {
+        const IfDoctype *dt = n->u.dtype;
+        if (dt && dt->has_name) fprintf(out, "<!DOCTYPE %.*s>\n", (int)dt->name.n, dt->name.p);
+        else fputs("<!DOCTYPE >\n", out);
+        return;
+    }
+    if (n->kind == IF_NODE_COMMENT) {
+        if (n->n_attrs) { /* PI: <?target data?>（target は attrs[0].name。insert 規約） */
+            fprintf(out, "<?%.*s %.*s?>\n", (int)n->attrs[0].name.n, n->attrs[0].name.p,
+                    (int)n->u.text.n, n->u.text.p);
+        } else {
+            fprintf(out, "<!-- %.*s -->\n", (int)n->u.text.n, n->u.text.p);
+        }
+        return;
+    }
     fprintf(out, "<%s", n->u.tag_name.p ? n->u.tag_name.p : "?");
     for (u32 i = 0; i < n->n_attrs; i++) {
         fprintf(out, " %.*s=\"%.*s\"",

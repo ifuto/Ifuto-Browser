@@ -45,7 +45,7 @@
 |---|---|---|
 | コールドスタート | **1.55ms**（fork/exec→初描画） | Chrome **0.70s**（11 種中最速）〜 Firefox 1.93s(8)。別測定 Safari 0.6s / Edge 0.9s(9) |
 | セッション復元 50 タブ | **0.11ms**（遅延ロード込み） | —（公開値なし。秒級の実感値が一般的） |
-| バイナリ/インストール | **443.9KB 単一ファイル**（453,512 B。JIT なし自作 JS エンジン + `<script>` 実行含む） | Firefox **55MB**、Opera 70MB、Brave 85MB、Chrome 90MB、Edge 95MB(10) |
+| バイナリ/インストール | **490.9KB 単一ファイル**（502,664 B。JIT なし自作 JS エンジン + `<script>` 実行 + SJIS/EUC-JP 文字コード変換表込み） | Firefox **55MB**、Opera 70MB、Brave 85MB、Chrome 90MB、Edge 95MB(10) |
 
 ## 4. 負けている領域（正直に列挙する）
 
@@ -53,7 +53,7 @@
 |---|---|---|
 | Speedometer 3.1（Web アプリ応答性） | Chrome 42.7 / Safari 41.9 / Edge 40.8 / Firefox 35.7(11)。M4 で Chrome 52.35 が過去最高(11) | **測定不能**（`<script>` akl 実行 + 最小 DOM バインド v1 は 2026-08-08 に接続済だが、frameworks・イベント・querySelector 等の全面 API が前提のため） |
 | WPT tree-construction 適合 | 3 大エンジンはほぼ全通過（引用の wpt.fyi 系統） | **100.0%（1,922/1,922、fragment 196 件含む。skip は script-on 12 のみ）** — 2026-08-08 到達 |
-| JS 実行 / 画像・動画 / HTTP 通信 / GPU 合成 / セキュリティサンドボックス | 全保有 | **未実装または限定**（軽量法則による意図的範囲外） |
+| JS 実行 / 画像・動画 / HTTPS(TLS) / GPU 合成 / セキュリティサンドボックス | 全保有 | **未実装または限定**（軽量法則による意図的範囲外。JS・HTTP/1.1・Shift_JIS/EUC-JP 文字コードは実装済、TLS は S/A 完遂プログラムで自作段階実装中） |
 
 ## 5. 構造分析（なぜこうなるか）
 

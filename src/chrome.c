@@ -6,6 +6,7 @@
 #include "css.h"
 #include "md.h"
 #include "net.h"
+#include "charset.h" /* v0.3 A1: Shift_JIS/EUC-JP → UTF-8（docs/CHARSET.md） */
 #include "script.h" /* v0.3: <script> akl 実行（style 適用前。正本 docs/SCRIPTING.md） */
 #include "ifuto_pages.h"
 #include "ext.h" /* 拡張 E1（chrome_init 走査結線） */
@@ -175,6 +176,7 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
     IfArena src; if_arena_init(&src, 1 << 18); /* 遅延確保: 内部ページでは 1B も確保されない */
     bool external = false;
     IfStr input;
+    IfStr ctype = if_str(NULL, 0); /* HTTP Content-Type（charset 判定第 1 候補） */
     bool is_http = strncmp(path, "http://", 7) == 0;
     /* ifuto:// 内部ページ（普通のブラウザの settings/history 相当）はローカル情報を
      * HTML として生成して通常 DOM 経路に乗せる（多層防御 = 共通パーサに統一） */
@@ -185,7 +187,7 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
              * ネットワーク失敗のみロード失敗（input.p = NULL） */
             const char *err = NULL;
             u32 status = 0;
-            if (!if_http_get(&src, path, &input, &status, &err))
+            if (!if_http_get_ex(&src, path, &input, &status, &ctype, &err))
                 input = if_str(NULL, 0);
             external = true;
         } else {
@@ -218,6 +220,19 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
      * 2 段経路が同じ結論へ至る = 多層防御不変。GUI は flags=0（full attrs 保持）:
      * リンク収集・将来の #id アンカー参照が属性を読む。CLI の SLIM_ATTRS は
      * 線形レンダ専用の剃りで GUI には適用しない） */
+    /* v0.3 A1（docs/CHARSET.md）: HTML 経路の外部入力は UTF-8 へ正規化してから
+     * 単一パーサへ（多層防御不変）。MD は UTF-8 凍結で対象外。内部ページ（generated
+     * UTF-8）も external=false で通さない。復号は src arena へ = 取り込み時複製の
+     * 入力としてそのまま載り、parse 後に src ごと即破棄される（寿命構造不変）。 */
+    if (external && !if_path_is_md(path)) {
+        bool bom = false;
+        IfEnc enc = if_charset_sniff(ctype, input, &bom);
+        if (enc == IF_ENC_UTF8) {
+            if (bom && input.n >= 3) { input.p += 3; input.n -= 3; }
+        } else {
+            input = if_charset_decode(&src, input, enc);
+        }
+    }
     /* v0.3 本丸（入力 compaction・取り込み時複製）: 一時入力 arena からの
      * ゼロコピー借用を全誕生点で arena 複製に切替える（parse 時にデータは
      * cache-hot = walk 型 compact の cold sweep を構造消去。台帳: dom.h） */
