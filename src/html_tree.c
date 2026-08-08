@@ -71,6 +71,14 @@ static IfNode *new_node(IfTB *b, IfNodeKind kind) {
     return n;
 }
 
+/* 入力 compaction の誕生点複製（flag off = ゼロコピー従来値のまま。台帳: dom.h） */
+static IfStr cpt_slice(IfTB *b, IfStr s) {
+    if (!if_dom_copy_strings || !s.n) return s;
+    u8 *cp = (u8 *)if_arena_alloc(b->arena, s.n);
+    memcpy(cp, s.p, s.n);
+    return if_str((const char *)cp, s.n);
+}
+
 static void append_child(IfNode *parent, IfNode *child) {
     child->parent = parent;
     if (!parent->first_child) parent->first_child = child;
@@ -332,7 +340,7 @@ static void append_text(IfTB *b, IfStr text) {
         return;
     }
     IfNode *n = new_node(b, IF_NODE_TEXT);
-    n->u.text = text;
+    n->u.text = cpt_slice(b, text);
     if (pl.before) insert_child_before(pl.parent, n, pl.before);
     else append_child(pl.parent, n);
 }
@@ -1639,7 +1647,7 @@ static void pi_target_save(IfTB *b, IfNode *n, IfStr target) {
     if (!target.n) return; /* 空 target は旧挙動どおり通常 comment として serialize */
     IfAttr *at = (IfAttr *)if_arena_alloc(b->arena, sizeof(IfAttr));
     if (!at) return; /* OOM 時は target なし PI（通常 comment として見える）に劣化 */
-    at->name = target;
+    at->name = cpt_slice(b, target);
     at->value = if_str(NULL, 0);
     n->attrs = at;
     n->n_attrs = 1;
@@ -1648,7 +1656,7 @@ static void pi_target_save(IfTB *b, IfNode *n, IfStr target) {
 static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok) {
     if (under_slim(b)) return;
     IfNode *n = new_node(b, IF_NODE_COMMENT);
-    n->u.text = tok->text;
+    n->u.text = cpt_slice(b, tok->text);
     if (tok->is_pi) pi_target_save(b, n, tok->pi_target);
     append_child(parent, n);
 }
@@ -1657,7 +1665,7 @@ static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok) {
 static void insert_comment_placed(IfTB *b, const IfTok *tok) {
     if (under_slim(b)) return;
     IfNode *n = new_node(b, IF_NODE_COMMENT);
-    n->u.text = tok->text;
+    n->u.text = cpt_slice(b, tok->text);
     if (tok->is_pi) pi_target_save(b, n, tok->pi_target);
     append_placed(b, n);
 }
@@ -1808,9 +1816,9 @@ static void step_initial(IfTB *b, IfTok tok) {
             b->seen_doctype = true;
             IfNode *d = new_node(b, IF_NODE_DOCTYPE);
             d->u.dtype = (IfDoctype *)if_arena_calloc(b->arena, sizeof(IfDoctype));
-            d->u.dtype->name = tok.text;      d->u.dtype->has_name = tok.dt_has_name;
-            d->u.dtype->pub = tok.dt_pub;     d->u.dtype->has_pub = tok.dt_has_pub;
-            d->u.dtype->sys = tok.dt_sys;     d->u.dtype->has_sys = tok.dt_has_sys;
+            d->u.dtype->name = cpt_slice(b, tok.text);   d->u.dtype->has_name = tok.dt_has_name;
+            d->u.dtype->pub = cpt_slice(b, tok.dt_pub);  d->u.dtype->has_pub = tok.dt_has_pub;
+            d->u.dtype->sys = cpt_slice(b, tok.dt_sys);  d->u.dtype->has_sys = tok.dt_has_sys;
             append_child(b->dom->root, d);
         } else {
             b->dom->n_errors++; /* 複数 doctype は無視 */

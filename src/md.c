@@ -97,6 +97,11 @@ typedef struct {
     u8 slim_attrs;        /* IF_MD_F_SLIM_ATTRS: 保持属性を A[href]/IMG[alt] に限定 */
     /* node slab: 生成は直列 bump（ノード単位の arena 呼出を slab refill に畳む） */
     IfNode *nslab, *nslab_end;
+    /* 入力 compaction（if_dom_copy_strings。台帳: dom.h）: 入力バッファ範囲。
+     * 設定されている間、入力内ポインタは mo_persistent=false（=借用せず複製）。
+     * arena 内バッファは従来通り借用可（寿命が DOM 側に一致しているため） */
+    const char *in_p;
+    u32 in_n;
     /* parent override（B slice 専用）: stub 直下への attach 時のみ ch->parent を
      * 実 body に直書きする（誕生時点で正しい値 → 接合後の parent 修繕ウォークは
      * 構造不要。深い子への誤適用は anchor 一致条件で除外）。非 B では両方 NULL */
@@ -130,6 +135,9 @@ static void mo_range(Mo *m, const char *p, u32 n) {
 }
 
 static bool mo_persistent(const Mo *m, const char *p) {
+    /* 入力 compaction: GUI の一時入力 arena はタブ寿命より短い → 入力内は借用不可 */
+    if (if_dom_copy_strings && p && m->in_p && p >= m->in_p && p <= m->in_p + m->in_n)
+        return false;
     for (int i = 0; i < m->n_rng; i++) {
         const char *s = m->rng_p[i];
         if (p >= s && p <= s + m->rng_n[i]) return true; /* p==end は n=0 借用用 */
@@ -1397,6 +1405,7 @@ static bool if_md_parse_fast_serial_f(IfArena *a, IfStr in, IfDom **out_dom, u8 
     m.a = a;
     m.is_dom = true;
     m.slim_attrs = (u8)(flags & IF_MD_F_SLIM_ATTRS);
+    m.in_p = in.p; m.in_n = in.n; /* 入力 compaction 借用禁止レンジ（dom.h 台帳） */
     IfDom *dom = (IfDom *)if_arena_calloc(a, sizeof(IfDom));
     dom->arena = a;
     dom->n_nodes = 1;
@@ -1561,6 +1570,7 @@ static void *md_slice_run(void *arg) {
     mb.a = j->a;
     mb.is_dom = true;
     mb.slim_attrs = j->slim_attrs;
+    mb.in_p = j->full_p; mb.in_n = j->full_n; /* 入力 compaction 借用禁止レンジ */
     mb.dom = j->dom;
     mb.stk[0] = j->html;
     mb.stk[1] = j->stub;
@@ -1601,6 +1611,7 @@ bool if_md_parse_fast_f(IfArena *a, IfStr in, IfDom **out_dom, u8 flags) {
                 m.a = a;
                 m.is_dom = true;
                 m.slim_attrs = slim;
+                m.in_p = in.p; m.in_n = in.n; /* 入力 compaction 借用禁止レンジ */
                 IfDom *dom = (IfDom *)if_arena_calloc(a, sizeof(IfDom));
                 dom->arena = a;
                 dom->n_nodes = 1;

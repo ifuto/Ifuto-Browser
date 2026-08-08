@@ -39,6 +39,34 @@
 median 123.10ms。環境アイドル直後のコールド初回のみ帯外（145–167ms 実測、従来同様の
 ウォーム要因で 2 回目以降に収束）。帯の定義と運用は git log の方針確立コミットを参照）。
 
+### 入力 compaction（v0.3 本丸・GUI 専用。2026-08-08 実測台帳）
+
+**採用設計: 取り込み時複製（copy-on-ingest）**。GUI ロード時 `if_dom_copy_strings`
+（dom.h 台帳）を立て、DOM が保持する入力切片を誕生点（text/comment/attr/doctype/
+md 借用判定）で arena 複製 → 一時入力 arena を parse 後即破棄。
+
+事前計測（スクラッチ調査器、凍結判定規則つき）: live slice = 入力の 54–56%、
+dead = 44–46%（16MB md と同等 HTML で一致）。判定規則「中間（30–70%）→ GUI 限定
+実装」に従い GUI のみ配線。CLI はフラグ不変の既定側（不変条件）。
+
+walk 型代替案（parse 後に DOM 全走査で差替）は**実測棄却**: cold sweep が 16MB で
+**+62ms** を要し法則「速度全体」に反する。ingest 版は cache-hot 複製で以下。
+
+| 指標（GUI `--shot`・16MB md・interleaved A/B n=5） | prev | ingest 版 | Δ |
+|---|---|---|---|
+| VmHWM（poll と ru_maxrss の一致確認済） | 609,288 KB | 605,876 KB | **−3,412 KB** |
+| wall（median。帯ノイズ内、上限 ~+25ms） | 485.0ms | 506.6ms | +21.6ms（有意でない弱証拠。walk 版 +62ms からは改善） |
+
+- 理論 dead 7.0MB に対し実現 −3.4MB の乖離理由（正直記載）: 小切片複製の arena
+  アライン損と、peak 位相が grid build 側にあること。50 ロード済みタブ換算で
+  **約 −170MB** が本意の効用（省メモリ法則 = truth が多タブで効く領域）。
+- CLI ミッション経路は 1 行も変更されていないことを固定: flag OFF の A/B 7 対
+  （嵐帯 ±10ms 中、中央差 −4.2ms、符号 3:4 = 回帰の有意なし。弱証拠として明記）
+  + oracle 16/16 byte-exact。
+- 機械オラクル: `tests/test_compact.c`（free 後アクセスの ASan heap-use-after-free
+  検出。walk 版開発中に tpl_map 開放番地法の走査バグを即検出した実績つき）＋
+  フラグ OFF のゼロコピー不変条件テスト。
+
 ### 2MB IDM（n=5、騒音帯）
 
 total median **17.44ms**（同日 n=5 再計測 16.0–19.4）。parse 8.0 / layout 7.0 / render 2.4ms、
@@ -53,7 +81,7 @@ min **1.40ms** / median **1.66ms** / p90 1.96ms。
 | ゲート | 現行値 |
 |---|---|
 | WPT tree-construction（`tests/wpt-tree-construction`、WPT master `5b6a1e6`） | **1922/1922 (100.0%)**、skip 12 = `#script-on` のみ（fragment 196 件は `--fragment CTX` で実行済） |
-| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,897 checks / 0 failures** ×2（script 実行配線 + HANDLE GC 発火機械証明込み） |
+| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,926 checks / 0 failures** ×2（script 実行配線 + HANDLE GC 機械証明 + 入力 compaction オラクル込み） |
 | 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **16/16**（+2 = script 実行 ON/OFF 双方向 `oracle/script.html`） |
 | golden（`tests/run_golden.sh`） | 1/1 |
 | GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | 51 checks PASS（X 不在環境の proxi、GUI 実機は未検証と明記） |

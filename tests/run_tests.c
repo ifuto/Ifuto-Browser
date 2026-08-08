@@ -16,6 +16,7 @@ void test_uichrome(void);
 void test_ifuto_pages(void);
 void test_akl(void);
 void test_script(void);
+void test_compact(void);
 void test_md(void);
 void test_md_slice_oracle(void);
 void test_raster(void);
@@ -42,6 +43,8 @@ int main(void) {
     RUN(test_akl);
     fprintf(stderr, "[script]\n");
     RUN(test_script);
+    fprintf(stderr, "[compact]\n");
+    RUN(test_compact);
     fprintf(stderr, "[md]\n");
     RUN(test_md);
     RUN(test_md_slice_oracle);

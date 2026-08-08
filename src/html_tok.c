@@ -482,6 +482,13 @@ static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
                 cap = (u32)(acap < 0xFFFFFFFFu ? acap : 0xFFFFFFFFu);
             }
         }
+        /* 入力 compaction（GUI 専用 if_dom_copy_strings。台帳: dom.h）:
+         * aname/aval は無参照時に入力切片（if_resolved のゼロコピー分岐）なので
+         * 誕生点で arena へ複製する。tok->arena == 文書 arena（html_tree が保証） */
+        if (if_dom_copy_strings) {
+            if (aname.n) { u8 *cp = (u8 *)if_arena_alloc(t->arena, aname.n); memcpy(cp, aname.p, aname.n); aname.p = (const char *)cp; }
+            if (aval.n)  { u8 *cp = (u8 *)if_arena_alloc(t->arena, aval.n);  memcpy(cp, aval.p, aval.n);  aval.p  = (const char *)cp; }
+        }
         attrs[n_attrs].name = aname;
         attrs[n_attrs].value = aval;
         n_attrs++;

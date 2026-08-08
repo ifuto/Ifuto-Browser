@@ -168,6 +168,12 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
     IfArena *doc = (IfArena *)malloc(sizeof(IfArena));
     if (!doc) if_fatal("oom: doc arena");
     if_arena_init(doc, 1 << 18);
+    /* v0.3 本丸（入力 compaction）: 外部入力は一時 arena src に退避し、parse 後に
+     * live 切片だけを doc へ差替複製して src を即破棄する（実測 ROI: 入力の dead
+     * ~44-46% がタブ寿命から剥がれる。16MB 文書で ~7MB/タブ。CLI は短命プロセスで
+     * 効果ゼロのため対象外 = ミッション計測経路は不変） */
+    IfArena src; if_arena_init(&src, 1 << 18); /* 遅延確保: 内部ページでは 1B も確保されない */
+    bool external = false;
     IfStr input;
     bool is_http = strncmp(path, "http://", 7) == 0;
     /* ifuto:// 内部ページ（普通のブラウザの settings/history 相当）はローカル情報を
@@ -179,25 +185,30 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
              * ネットワーク失敗のみロード失敗（input.p = NULL） */
             const char *err = NULL;
             u32 status = 0;
-            if (!if_http_get(doc, path, &input, &status, &err))
+            if (!if_http_get(&src, path, &input, &status, &err))
                 input = if_str(NULL, 0);
+            external = true;
         } else {
-            input = c->fs.read_file(doc, path, c->fs.ctx);
+            input = c->fs.read_file(&src, path, c->fs.ctx);
+            external = true;
         }
     }
     /* read_file 失敗の判定: 空ファイルは合法、失敗は ctx 別の手段が必要 →
      * ファイルサイズ 0 との区別は stat のみ存在で担保する（内部ページは stat 評価を飛ばす） */
     else if (!input.p) {
+        if_arena_destroy(&src);
         if_arena_destroy(doc);
         free(doc);
         return false;
     }
     if (!input.p) { /* fetch/read の NULL 失敗をここで一元判定 */
+        if_arena_destroy(&src);
         if_arena_destroy(doc);
         free(doc);
         return false;
     }
     if (input.n == 0 && !is_http && strncmp(path, "ifuto://", 8) != 0 && !c->fs.exists(path, c->fs.ctx)) {
+        if_arena_destroy(&src);
         if_arena_destroy(doc);
         free(doc);
         return false;
@@ -207,11 +218,15 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
      * 2 段経路が同じ結論へ至る = 多層防御不変。GUI は flags=0（full attrs 保持）:
      * リンク収集・将来の #id アンカー参照が属性を読む。CLI の SLIM_ATTRS は
      * 線形レンダ専用の剃りで GUI には適用しない） */
+    /* v0.3 本丸（入力 compaction・取り込み時複製）: 一時入力 arena からの
+     * ゼロコピー借用を全誕生点で arena 複製に切替える（parse 時にデータは
+     * cache-hot = walk 型 compact の cold sweep を構造消去。台帳: dom.h） */
+    if (external) if_dom_copy_strings = true;
     if (if_path_is_md(path)) {
         if (getenv("IFUTO_MD_SLOW") ||
             !if_md_parse_fast_f(doc, input, &t->dom, 0)) {
             IfStr md_html;
-            if_md_to_html(doc, input, &md_html);
+            if_md_to_html(&src, input, &md_html); /* src 内: 切片複製後にまとめて破棄 */
             input = md_html;
             if_dom_slim = true;
             t->dom = if_parse_html(doc, input);
@@ -219,6 +234,11 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
     } else {
         if_dom_slim = true; /* 実ブラウズ法則: 画面描画に関係ないものは DOM しない */
         t->dom = if_parse_html(doc, input);
+    }
+    if (external) {
+        if_dom_copy_strings = false;
+        if_arena_destroy(&src); /* DOM は入力を一切参照しない（test_compact.c が
+                                 * free 後アクセスを ASan で機械証明） */
     }
     /* v0.3: <script> akl 実行（本家順序: style 適用前。DOM 変更が style/layout に
      * 反映される。script RT は if_script_run 内で必ず破棄 → doc arena より先に

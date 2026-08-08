@@ -212,6 +212,9 @@ IfNode *if_dom_title_set(IfArena *a, IfDom *d, IfStr t) {
     return ttl;
 }
 
+/* v0.3 本丸フラグ（dom.h 契約）。GUI ロード中のみ true（chrome.c が設定/復元） */
+bool if_dom_copy_strings = false;
+
 /* 深さはツリービルダが IF_MAX_STACK_DEPTH に制限するため再帰は安全（スタック枯渇不能） */
 IfStr if_dom_text_content(IfArena *a, const IfNode *n) {
     if (!n) return if_str(NULL, 0);

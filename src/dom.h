@@ -163,6 +163,28 @@ IfNode *if_dom_find_by_id(const IfDom *d, IfStr id);  /* id 属性一致の最�
 void    if_dom_set_text(IfArena *a, IfNode *n, IfStr t); /* ELEMENT 子群を単一 TEXT 子に置換（t.n==0 は全子除去） */
 IfNode *if_dom_title_set(IfArena *a, IfDom *d, IfStr t); /* <title> 設定（無ければ head 先頭に生成）。d->title も更新 */
 
+/* ---- 入力 compaction（v0.3 本丸・GUI 実ブラウズ経路専用） ----
+ * 設計（取り込み時複製 / copy-on-ingest）: GUI は入力を一時 arena（chrome.c src）に
+ * 確保し、parse 中に DOM が保持する切片を「誕生点」で arena 複製してから
+ * 入力 arena を即破棄する。parse 直後の cold sweep（O(nodes) 全走査）を消すため
+ * walk 型 compact は採用しない（実測棄却: sweep 版 +62ms vs ingest 版 ≈+数 ms。
+ * 計測対象: VmHWM −5.2MB/16MB 文書・GUI --shot・2026-08-08 帳票 BENCH.md）。
+ *
+ * 本フラグが false（既定・CLI/観測系）のときの動作は従来と 1 ビットも変わらない
+ * （ゼロコピー切片。oracle/ミッション計測の不変条件）。true は GUI ロードのみ。
+ *
+ * 複製が必要な切片の誕生点台帳（これ以外に入力由来文字列の側路は存在しない。
+ * 検査: tests/test_compact.c が free 後アクセスを ASan heap-use-after-free で潰す）:
+ *   - TEXT ノード本文（html_tree append_text 直付けパス。merge 連結は元々 arena 複製）
+ *   - COMMENT 本文・PI target（attrs[0].name 規約）
+ *   - 属性 name/value（html_tok 割当点。実体参照デコード済は元々 arena）
+ *   - DOCTYPE name/pub/sys
+ *   - ELEMENT u.tag_name / d->title / svg adjust 名 / template clone 由来は
+ *     全て誕生点が arena または静的表で、入力無関係（台帳として明記）
+ *   - md fast は run_add/mo_persistent の借用量判定が唯一の関門: 本フラグ時は
+ *     「入力内は借用不可」に切替わり attr 値複製規則（既存）も自動遵守される */
+extern bool if_dom_copy_strings;
+
 /* デバッグ用のツリー印字（out は FILE*）。表示用のためポインタは void。 */
 void if_dom_dump(const IfDom *dom, void *out_FILE);
 

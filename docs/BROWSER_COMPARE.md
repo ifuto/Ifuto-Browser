@@ -15,11 +15,11 @@
 
 | 指標 | ifuto（実測・median） | 大手ブラウザ（引用・機材は数倍強い） |
 |---|---|---|
-| 全工程 total | **145.2ms**（142.5–146.1, n=5） | — |
-| parse | 56.5ms → **3.4ms/MB ≈ 297MB/s** | Chrome「Parse HTML」**約 7ms/MB ≈ 152MB/s**（DevTools 計測、MacBook 級）(1)(2) |
-| layout + style | 67.3ms（style は lazy 化で 0.0ms） | peterbe 119KB 文書: style 43ms + layout 386ms（parse 94ms の 4.6 倍が style+layout に溶ける実例）(3) |
-| render | 21.0ms | — |
-| 全工程律速 | **8.7ms/MB ≈ 115MB/s** | parse だけで 6–7ms/MB。style/layout/paint を加えた全工程は **推定** 0.5–2s 級（パターン(3)の比率を当てた推定。実測公開値なし） |
+| 全工程 total | **123.10ms**（warm 帯 120.1–123.7, n=7） | — |
+| parse | 55.0ms → **3.3ms/MB ≈ 304MB/s** | Chrome「Parse HTML」**約 7ms/MB ≈ 152MB/s**（DevTools 計測、MacBook 級）(1)(2) |
+| layout + style | 52.6ms（style は lazy 化で 0.0ms） | peterbe 119KB 文書: style 43ms + layout 386ms（parse 94ms の 4.6 倍が style+layout に溶ける実例）(3) |
+| render | 15.5ms | — |
+| 全工程律速 | **7.4ms/MB ≈ 136MB/s** | parse だけで 6–7ms/MB。style/layout/paint を加えた全工程は **推定** 0.5–2s 級（パターン(3)の比率を当てた推定。実測公開値なし） |
 
 根拠と注意:
 - Chrome の「parse 6–7ms/MB」はネイティブ Blink が強い CPU で出す値。**ifuto は数倍弱い
@@ -28,7 +28,7 @@
   示すとおりで、ここに ifuto の「lazy computed style（style 段 0ms）」が効いている。
 - 現実の巨大文書の証左: 7MB の HTML を DOM 挿入したケースで Chrome/Edge が
   out-of-memory になる報告（2018、Stack Overflow）(4)。ifuto はその 2.4 倍の文書を
-  145ms/233MB で完走する。
+  123ms/225MB で完走する。
 
 ## 2. メモリ
 
@@ -36,7 +36,7 @@
 |---|---|---|
 | アイドル常駐 RSS | **1.43MB**（空タブ UI） | Chrome **380–612MB**、Firefox **310–727MB**(5)(6)(7) |
 | 未ロード 50 タブのメタ | **14.7KB ≈ 294B/タブ** | Chrome アイドル 1 タブ **約 80MB**（Site Isolation の生レンダラ 50–90MB が下限）(5) |
-| 16.7MB 文書 全工程 peak RSS | **233.3MB**（入力の 13.9 倍） | 1.6M ノード級 DOM は **推定** 0.5–1.5GB 級（Blink/V8 の実測プロキシに基づく推定。公開実測なし） |
+| 16.7MB 文書 全工程 peak RSS | **225.1MB**（入力の 13.5 倍） | 1.6M ノード級 DOM は **推定** 0.5–1.5GB 級（Blink/V8 の実測プロキシに基づく推定。公開実測なし） |
 | 50 タブ時 | （上記メタ 14.7KB + 遅延ロード） | Chrome **約 6.5GB** / Firefox **約 3.8GB**(6)、別系統測定では Chrome 14.4GB・Firefox 8.8GB(7) |
 
 ## 3. 起動・サイズ
@@ -45,14 +45,14 @@
 |---|---|---|
 | コールドスタート | **1.55ms**（fork/exec→初描画） | Chrome **0.70s**（11 種中最速）〜 Firefox 1.93s(8)。別測定 Safari 0.6s / Edge 0.9s(9) |
 | セッション復元 50 タブ | **0.11ms**（遅延ロード込み） | —（公開値なし。秒級の実感値が一般的） |
-| バイナリ/インストール | **301.8KB 単一ファイル** | Firefox **55MB**、Opera 70MB、Brave 85MB、Chrome 90MB、Edge 95MB(10) |
+| バイナリ/インストール | **443.9KB 単一ファイル**（453,512 B。JIT なし自作 JS エンジン + `<script>` 実行含む） | Firefox **55MB**、Opera 70MB、Brave 85MB、Chrome 90MB、Edge 95MB(10) |
 
 ## 4. 負けている領域（正直に列挙する）
 
 | 領域 | 大手ブラウザ | ifuto |
 |---|---|---|
-| Speedometer 3.1（Web アプリ応答性） | Chrome 42.7 / Safari 41.9 / Edge 40.8 / Firefox 35.7(11)。M4 で Chrome 52.35 が過去最高(11) | **測定不能**（Web プラットフォーム未実装。akl JS エンジンは v0.0 で DOM 未接続） |
-| WPT tree-construction 適合 | 3 大エンジンはほぼ全通過（引用の wpt.fyi 系統） | **88.1%（1,521/1,726）** — 追い上げ中の領域 |
+| Speedometer 3.1（Web アプリ応答性） | Chrome 42.7 / Safari 41.9 / Edge 40.8 / Firefox 35.7(11)。M4 で Chrome 52.35 が過去最高(11) | **測定不能**（`<script>` akl 実行 + 最小 DOM バインド v1 は 2026-08-08 に接続済だが、frameworks・イベント・querySelector 等の全面 API が前提のため） |
+| WPT tree-construction 適合 | 3 大エンジンはほぼ全通過（引用の wpt.fyi 系統） | **100.0%（1,922/1,922、fragment 196 件含む。skip は script-on 12 のみ）** — 2026-08-08 到達 |
 | JS 実行 / 画像・動画 / HTTP 通信 / GPU 合成 / セキュリティサンドボックス | 全保有 | **未実装または限定**（軽量法則による意図的範囲外） |
 
 ## 5. 構造分析（なぜこうなるか）
