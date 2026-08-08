@@ -17,6 +17,37 @@ const char *if_ext_dir(void) { return g_ext_dir; }
 #define IF_EXT_PATH_CAP (IF_STORE_DIR_CAP + 384)
 #define IF_EXT_EFFECT_CAP 960
 
+/* console.log（全拡張 RT に常設の組込。凍結仕様 v1: docs/EXTENSIONS.md §3-A）:
+ *  - 可変引数 0..n を ToString して単一空白で連結、960 文字で切詰。
+ *  - 1 行 `[ext:<name>:console] <連結>` を report stream へ（\n/\r は空白に畳み
+ *    [ext] 1 行不変条件を維持）。perm 宣言に非依存（デバッグ面は常設）。
+ *  - console 自体は他 OBJ と同じく prop 再代入可能（効果は自 RT 内の log 面が
+ *    消えるだけで隣接拡張・本体に非影響。seal 機構は将来台帳）。 */
+typedef struct { FILE *rp; const char *name; } IfExtConsoleCtx;
+static AklVal ext_console_log(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self;
+    IfExtConsoleCtx *cc = (IfExtConsoleCtx *)udata;
+    char buf[IF_EXT_EFFECT_CAP + 1];
+    size_t n = 0;
+    for (int i = 0; i < argc; i++) {
+        AklVal sv = akl_tostring(rt, argv[i]); /* 直後に as_str コピー（pin 規約遵守） */
+        if (akl_error(rt)[0]) return akl_mkundefined(); /* budget 枯渇: native_err 連動済 */
+        u32 ln = 0;
+        const char *b = akl_as_str(rt, sv, &ln);
+        if (!b) { akl_native_throw(rt, "console.log: tostring failed"); return akl_mkundefined(); }
+        if (i && n < IF_EXT_EFFECT_CAP) buf[n++] = ' ';
+        u32 room = IF_EXT_EFFECT_CAP - (u32)n;
+        u32 cn = ln < room ? ln : room;
+        memcpy(buf + n, b, cn);
+        n += cn;
+        if (n >= IF_EXT_EFFECT_CAP) break;
+    }
+    buf[n] = 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] == '\n' || buf[i] == '\r') buf[i] = ' ';
+    fprintf(cc->rp, "[ext:%.48s:console] %s\n", cc->name ? cc->name : "?", buf);
+    return akl_mkundefined();
+}
+
 static void ext_report_fail(FILE *rp, const char *name, const char *why) {
     /* 1 行不変条件: 理由文字列の最初の \n で打ち切る（akl_error は複数行になりうる） */
     if (name && name[0]) fprintf(rp, "[ext] %s FAILED: %.128s\n", name, why);
@@ -55,6 +86,18 @@ static bool ext_run_one(struct IfChrome *c, FILE *rp, const char *dirpath,
      * 拡張が自身の制限を緩める経路は設計しない）。insn は akl_new の既定 10M */
     AklRT *rt = akl_new();
     if (!rt) { ext_report_fail(rp, mf.name, "akl_new failed"); return false; }
+    /* console オブジェクト組込（VM 停止中 = akl_eval 前。登録失敗は拡張 FAILED に倒す） */
+    IfExtConsoleCtx ccx = { rp, mf.name };
+    AklVal console = akl_mkobject(rt);
+    bool cok = akl_is_object(rt, console) &&
+               akl_prop_set(rt, console, "log", akl_mknative(rt, ext_console_log, &ccx)) &&
+               akl_global_set(rt, "console", console);
+    if (!cok) {
+        const char *e = akl_error(rt);
+        ext_report_fail(rp, mf.name, e && e[0] ? e : "console bootstrap failed");
+        akl_free(rt);
+        return false;
+    }
     AklVal out;
     bool ok = akl_eval(rt, csrc, &out);
     if (!ok) {

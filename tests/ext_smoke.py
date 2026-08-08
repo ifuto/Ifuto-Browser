@@ -50,6 +50,8 @@ with tempfile.TemporaryDirectory(prefix="ifuto_ext_") as tmp:
     mkext(extdir, "badcap", "name: badcap\nversion: 0.1\nentry: main.js\npermissions: net\n", '"x"')
     mkext(extdir, "broken", "name: broken\nentry: main.js\n", '"x"')          # version 欠落
     mkext(extdir, "noentry", "name: noentry\nversion: 1\nentry: ghost.js\npermissions: log\n", None)
+    mkext(extdir, "chatty", "name: chatty\nversion: 2\nentry: main.js\n",
+          'console.log("hello", 42, true, {a:1}); console.log(); "done"')
 
     # (A) 5 拡張混合: 各行が期待どおり
     r = run(["--ext", extdir, "--shot", os.path.join(tmp, "a.ppm"), PAGE])
@@ -58,11 +60,17 @@ with tempfile.TemporaryDirectory(prefix="ifuto_ext_") as tmp:
     want = [
         "[ext] badcap FAILED: manifest: line 4: unknown permission \"net\"",
         "[ext] broken FAILED: manifest: required key missing (version )",
+        "[ext] chatty v2 loaded (perm: none)",
         "[ext] hello v0.1 loaded (perm: status)",
         "[ext] killer FAILED: instruction budget exhausted",
         "[ext] noentry FAILED: entry unreadable",
     ]
     chk("[ext] golden lines (sorted, one per ext)", lines == want, "| got: %r" % lines)
+    # console.log（凍結 v1: ToString 連結・1 行化・perm 非依存の常設面）
+    clines = [l for l in err.splitlines() if l.startswith("[ext:chatty:console]")]
+    chk("console.log ToString line", "[ext:chatty:console] hello 42 true [object Object]" in clines,
+        "| got: %r" % clines)
+    chk("console.log zero-arg line", "[ext:chatty:console] " in clines, "| got: %r" % clines)
     chk("browser continues after ext failures (rc=0)", r.returncode == 0, "rc=%d" % r.returncode)
 
     # (B) status 効果は raster に可視（PPM 差分が bottom 帯行のみ = toast 表面化の機構証明）

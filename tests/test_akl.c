@@ -48,6 +48,15 @@ static void want_str(const char *src, const char *want) {
     if (!ok) fprintf(stderr, "  wrong string [%s]: got '%.*s' want '%s'\n",
                      src, s ? (int)ln : 0, s ? s : "", want);
 }
+static void want_undef(const char *src) {
+    AklVal v;
+    if (!akl_eval(g_rt, src, &v)) {
+        fprintf(stderr, "  eval failed [%s]: %s\n", src, akl_error(g_rt));
+        CHECK(0);
+        return;
+    }
+    CHECK(akl_is_undefined(v));
+}
 /* needle != NULL ならエラー文言に含まれることも検査（budget 系の原因特定を誤魔化さない） */
 static void want_err(const char *src, const char *needle) {
     if (akl_eval(g_rt, src, NULL)) {
@@ -555,6 +564,183 @@ static void t_cojit(void) {
     akl_free(off);
 }
 
+/* ============================== オブジェクト + ネイティブ登録層 ============================== */
+
+static void t_objects(void) {
+    want_num("var o = {a:1, b:2}; o.a + o.b", 3);
+    want_num("var o = {}; o.x = 7; o.x", 7);
+    want_num("var o = {}; o.x = 7", 7);               /* 代入式の値は右辺 */
+    want_undef("var o = {a:1}; o.missing");           /* 未定義 prop → undefined */
+    want_num("var o = {p:{q:41}}; o.p.q + 1", 42);    /* ネスト + PGET 連鎖 */
+    want_num("var o = {\"k\":9}; o.k", 9);            /* 文字列キー */
+    want_num("var o = {a:5,}; o.a", 5);               /* trailing comma */
+    want_num("({a:2}).a * 21", 42);                   /* 括弧 primary の連鎖 */
+    want_num("var o = {}; o.a = 1; o.b = 2; o.a + o.b", 3);
+    want_num("function g(){ return 3; } var o = {}; o.f = g; o.f()", 3); /* メソッド: bytecode 関数（this 未導入、self は渡らない） */
+    want_num("var o = {}; o.x = 1; var p = o; p.x + 9", 10);             /* 参照の共有 */
+    want_str("typeof ({})", "object");
+    want_str("typeof ({a:1})", "object");
+    want_str("\"\" + {a:1}", "[object Object]");
+    want_bool("var a = {}; var b = a; a === b", true);
+    want_bool("var a = {}; var b = {}; a === b", false);  /* identity（同形でも別物） */
+    want_bool("var a = {}; var b = a; a !== b", false);
+    /* 明白失敗系（黙った誤答を作らない） */
+    want_err("var o = 5; o.x = 1", "TypeError");       /* 非 object store */
+    want_err("var o = 5; o.x", "TypeError");           /* 非 object load */
+    want_err("var o = {}; o.f()", "not a function");   /* 無い/非関数メソッド */
+    want_err("var o = {a}; o", NULL);                  /* shorthand 非対応（期待 ':'） */
+    want_err("var o = {a:1, b}", NULL);
+    want_err("{a:1}", NULL);                           /* 文頭 {} は object literal と解釈しない（JS 同様の曖昧性解決） */
+    /* prop 数天井 64（1 obj あたり）: 65 個目で明白に失敗 */
+    {
+        char src[4200];
+        int n = snprintf(src, sizeof src, "var o = {}; ");
+        for (int i = 0; i <= 64; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = 0; ", i);
+        want_err(src, "property budget");
+        src[0] = 0;
+        n = snprintf(src, sizeof src, "var o = {}; ");
+        for (int i = 0; i < 64; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = %d; ", i, i);
+        n += snprintf(src + n, sizeof src - (size_t)n, "o.k63");
+        want_num(src, 63);                             /* 64 個ちょうどは成功 */
+    }
+}
+
+/* ---- ネイティブ登録層 ---- */
+static AklVal g_ho_expect;
+static int g_reg_rejected;
+
+static AklVal n_add2(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (argc != 2) return akl_mkundefined(); /* argc 規約: 過不足は undefined（err にしない） */
+    double a, b;
+    if (!akl_as_num(argv[0], &a) || !akl_as_num(argv[1], &b)) {
+        akl_native_throw(rt, "add2 expects numbers");
+        return akl_mkundefined();
+    }
+    return akl_mknum(a + b);
+}
+static AklVal n_is_self(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)rt; (void)argc; (void)argv;
+    AklVal *want = (AklVal *)udata;
+    return akl_mkbool(self == *want);
+}
+static AklVal n_getn(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)argc; (void)argv; (void)udata;
+    return akl_prop_get(rt, self, "n"); /* native 内 prop_get（既存 intern ヒット経路） */
+}
+static AklVal n_get_unknown(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)argc; (void)argv; (void)udata;
+    /* 実行中の新規 intern を強制する（nursery 保護経路の実証。無保護なら GC で dangling に成り得た） */
+    return akl_prop_get(rt, self, "never_seen_prop_xyzzy_0");
+}
+static AklVal n_boom(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)argc; (void)argv; (void)udata;
+    akl_native_throw(rt, "catastrophic failure");
+    return akl_mkundefined();
+}
+/* n 個の一時文字列（各 70,000B）を unpinned で作って合計 len を返す。
+ * 8 個 → 560KB > GC 初期閾値 512KB なので途中で GC 発火。nursery 保護なしなら
+ * 作った文字列が sweep され読み出しで破壊される（ASAN が裏取りする経路）。 */
+static AklVal n_temps(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (argc != 1) return akl_mkundefined();
+    double nd;
+    if (!akl_as_num(argv[0], &nd)) { akl_native_throw(rt, "temps expects a number"); return akl_mkundefined(); }
+    int n = (int)nd;
+    char *buf = (char *)malloc(70001);
+    if (!buf) { akl_native_throw(rt, "oom: temps"); return akl_mkundefined(); }
+    memset(buf, 'q', 70000);
+    double total = 0;
+    for (int i = 0; i < n; i++) {
+        AklVal sv = akl_mkstring(rt, buf, 70000);
+        uint32_t ln = 0;
+        const char *b = akl_as_str(rt, sv, &ln);
+        if (b) total += (double)ln;
+    }
+    free(buf);
+    return akl_mknum(total);
+}
+static AklVal n_reg_inside(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)argc; (void)argv; (void)udata;
+    if (akl_native_register(rt, "late_fn", n_add2, NULL)) {
+        akl_native_throw(rt, "register during eval must be rejected");
+        return akl_mkundefined();
+    }
+    g_reg_rejected = 1;
+    return akl_mknum(7);
+}
+
+/* akl_tostring（host プリミティブ）: native 内で引数を JS ToString して返す。
+ * console.log 等が組み立てられることを公開面越しに機械検証する。 */
+static AklVal n_tostr(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (argc != 1) return akl_mkundefined();
+    AklVal sv = akl_tostring(rt, argv[0]);
+    if (akl_error(rt)[0]) return akl_mkundefined();
+    return sv; /* 即返却: caller（VM）が push で直ちに根付かせるため生存規約を満たす */
+}
+
+static void t_native(void) {
+    CHECK(akl_native_register(g_rt, "add2", n_add2, NULL));
+    want_num("add2(20, 22)", 42);
+    want_num("add2(add2(1,2), add2(3,4))", 10);
+    want_undef("add2(1)");                            /* argc 規約（err ではなく undefined） */
+    want_err("add2(1, \"x\")", "add2 expects numbers"); /* native_throw は明白な失敗 */
+    want_undef("add2()");                            /* argc 規約: 0 個でも undefined */
+    /* self 伝播: メソッド呼出はレシーバ、通常呼出は undefined */
+    AklVal ho = akl_mkobject(g_rt);
+    CHECK(akl_is_object(g_rt, ho));
+    CHECK(akl_prop_set(g_rt, ho, "n", akl_mknum(41)));
+    g_ho_expect = ho;
+    CHECK(akl_prop_set(g_rt, ho, "isMe", akl_mknative(g_rt, n_is_self, &g_ho_expect)));
+    CHECK(akl_prop_set(g_rt, ho, "getn", akl_mknative(g_rt, n_getn, NULL)));
+    CHECK(akl_prop_set(g_rt, ho, "getUnknown", akl_mknative(g_rt, n_get_unknown, NULL)));
+    CHECK(akl_global_set(g_rt, "ho", ho));
+    want_bool("ho.isMe()", true);
+    want_bool("var f = ho.isMe; f()", false);         /* 関数値経由の通常呼出は self=undefined */
+    want_num("ho.getn() + 1", 42);
+    want_undef("ho.getUnknown()");                    /* 実行中新規 intern も安全（nury 保護） */
+    want_num("var o = {}; o.x = ho.getn(); o.x + 1", 42); /* native 値をスクリプト obj へ */
+    CHECK(akl_native_register(g_rt, "boom", n_boom, NULL));
+    want_err("boom()", "catastrophic failure");
+    /* プログラム的な temp budget: 8 個は成功（GC 発火帯）・9 個目で明白に失敗 */
+    AklVal tfn = akl_mknative(g_rt, n_temps, NULL);
+    CHECK(akl_global_set(g_rt, "temps", tfn));
+    want_num("temps(8)", 8.0 * 70000.0);
+    want_err("temps(9)", "temp budget");
+    /* 登録拒否（native コールバック内からの登録は構造的に拒否） */
+    g_reg_rejected = 0;
+    CHECK(akl_global_set(g_rt, "reginside", akl_mknative(g_rt, n_reg_inside, NULL)));
+    want_num("reginside()", 7);
+    CHECK(g_reg_rejected == 1);
+    want_err("late_fn(1,2)", NULL);                   /* 拒否されたので束縛は存在しない */
+    /* budget 課金: native 1 呼出は AKL_NATIVE_COST(1024) 命令相当。500 では明白に枯渇 */
+    {
+        AklRT *b = akl_new();
+        CHECK(b != NULL);
+        if (b) {
+            akl_set_insn_budget(b, 500);
+            CHECK(akl_native_register(b, "add2", n_add2, NULL));
+            CHECK(!akl_eval(b, "add2(1,2)", NULL));
+            CHECK(strstr(akl_error(b), "budget") != NULL);
+            akl_free(b);
+        }
+    }
+    /* host 側 const グローバルはスクリプトから上書きできない（明白に失敗） */
+    want_err("ho = 1", "const");
+    /* akl_tostring: 全型の JS ToString（DOM バインド/console 前提プリミティブ） */
+    CHECK(akl_global_set(g_rt, "tostr", akl_mknative(g_rt, n_tostr, NULL)));
+    want_str("tostr(42)", "42");
+    want_str("tostr(1.5)", "1.5");
+    want_str("tostr(true)", "true");
+    want_str("tostr(undefined)", "undefined");
+    want_str("tostr(null)", "null");
+    want_str("tostr(\"s\")", "s");
+    want_str("tostr({a:1})", "[object Object]");
+    want_str("tostr(tostr)", "function");                /* NATIVE も JS 同様 function */
+    want_str("tostr(40) + 2", "402");                  /* 文字列 + 数値の連結保存 */
+}
+
 void test_akl(void) {
     g_rt = akl_new();
     CHECK(g_rt != NULL);
@@ -572,6 +758,8 @@ void test_akl(void) {
     test_akl_modmagic();
     t_exceptions();
     t_cojit();
+    t_objects();
+    t_native();
     akl_free(g_rt);
     g_rt = NULL;
 }

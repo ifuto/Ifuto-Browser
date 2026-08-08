@@ -1495,8 +1495,10 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
         lay2->n_lines = sa.lay->n_lines + sb.lay->n_lines;
         u32 nd = sa.lay->n_deco + sb.lay->n_deco;
         IfDeco *darr = (IfDeco *)if_arena_alloc(arena, (u64)(nd ? nd : 1) * sizeof(IfDeco));
-        memcpy(darr, sa.lay->deco, (u64)sa.lay->n_deco * sizeof(IfDeco));
-        memcpy(darr + sa.lay->n_deco, sb.lay->deco, (u64)sb.lay->n_deco * sizeof(IfDeco));
+        /* n==0 では src が未確保 NULL になり得る → memcpy(NULL,0) は厳密 UB（nonnull 制約）。
+         * 0 件コピー自体を呼ばない構造にして UBSan runtime note を消す（byte-exact 不変） */
+        if (sa.lay->n_deco) memcpy(darr, sa.lay->deco, (u64)sa.lay->n_deco * sizeof(IfDeco));
+        if (sb.lay->n_deco) memcpy(darr + sa.lay->n_deco, sb.lay->deco, (u64)sb.lay->n_deco * sizeof(IfDeco));
         lay2->deco = darr;
         lay2->n_deco = nd;
         lay2->cap_deco = nd;
@@ -1506,7 +1508,7 @@ static IfLayout *build_impl(IfArena *arena, IfDom *dom, i32 width_cells, u8 line
          * 線形 CLI では span 未収集（n_spans==0）のため内側ループは常に空 */
         u32 nlk = sa.lay->n_links + sb.lay->n_links;
         IfLink *lk = (IfLink *)if_arena_alloc(arena, (u64)(nlk ? nlk : 1) * sizeof(IfLink));
-        memcpy(lk, sa.lay->links, (u64)sa.lay->n_links * sizeof(IfLink));
+        if (sa.lay->n_links) memcpy(lk, sa.lay->links, (u64)sa.lay->n_links * sizeof(IfLink)); /* deco 同型の UB ガード */
         for (u32 i = 0; i < sb.lay->n_links; i++) {
             lk[sa.lay->n_links + i] = sb.lay->links[i];
             lk[sa.lay->n_links + i].n = sa.lay->n_links + i + 1;

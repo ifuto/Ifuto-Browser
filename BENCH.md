@@ -16,29 +16,31 @@
 - 起動速度は ` /bin/true` 経路での最小/中央値に subprocess wall time を使う
   （`/usr/bin/time` 非存在、bash 組込の `time` のみ）。
 
-## 現行スナップショット（2026-08-07 計測・`build/ifuto` 433,032B）
+## 現行スナップショット（2026-08-08 計測・`build/ifuto` 441,224B）
+
+（前回 433,032B から +8,192B: akl ネイティブ登録層 + オブジェクトモデル +
+console.log。16MB パイプライン非実行コードのため pipeline 性能への影響なし。
+akl 単体ベンチ差分は末尾「akl エンジン差分」節参照）
 
 ### 16MB IDM パイプライン（`--no-ansi --stats`、n=7、騒音帯）
 
 | 段 | median | 範囲 |
 |---|---|---|
 | read | 0.02ms | 0.01–0.02 |
-| parse | 56.5ms | 50.0–77.0（並列 2-slice 経路） |
+| parse | 55.0ms | 53.3–72.1（並列 2-slice 経路） |
 | style | 0.00ms | lazy（行スイープ） |
-| layout | 66.1ms | 50.5–81.0（2-way 並列） |
-| render | 15.3ms | 15.1–19.8（単純先行） |
-| **total** | **144.5ms** | 115.8–164.3 |
-| peak RSS | 225,124 KB | ±0.4MB |
+| layout | 52.6ms | 51.1–61.6（2-way 並列） |
+| render | 15.5ms | 15.4–16.7（単純先行） |
+| **total** | **122.97ms** | 120.2–149.2 |
+| peak RSS | 225,180 KB | ±0.4MB |
 
-静寂帯の total median は **116ms** 帯（同日後半ラン）。**ミッション
-「騒音帯でも 16MB total ≤150ms」は継続達成中**（164.3ms の単発騒音振れは
-計測上の外れ値として除外せず全数報告。帯の定義と運用は git log の方針確立
-コミットを参照）。
+**ミッション「騒音帯でも 16MB total ≤150ms」は継続達成中**（n=7 全 run ≤150ms、
+median 122.97ms。帯の定義と運用は git log の方針確立コミットを参照）。
 
 ### 2MB IDM（n=5、騒音帯）
 
-total median **17.5ms**（15.9–18.1）。parse 7.2 / layout 7.9 / render 2.4ms、
-peak RSS 35,700 KB、nodes=206,290。
+total median **17.53ms**（17.2–22.3）。parse 8.0 / layout 7.0 / render 2.4ms、
+peak RSS 35,596 KB、nodes=206,290。
 
 ### CLI 起動（tiny HTML render 300 連プロセス wall）
 
@@ -49,11 +51,12 @@ min **1.40ms** / median **1.66ms** / p90 1.96ms。
 | ゲート | 現行値 |
 |---|---|
 | WPT tree-construction（`tests/wpt-tree-construction`、WPT master `5b6a1e6`） | **1922/1922 (100.0%)**、skip 12 = `#script-on` のみ（fragment 196 件は `--fragment CTX` で実行済） |
-| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,749 checks / 0 failures** ×2 |
+| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,811 checks / 0 failures** ×2 |
 | 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **14/14** |
 | golden（`tests/run_golden.sh`） | 1/1 |
 | GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | 51 checks PASS（X 不在環境の proxi、GUI 実機は未検証と明記） |
-| 拡張 smoke（`tests/ext_smoke.py`） | 10 checks |
+| 拡張 smoke（`tests/ext_smoke.py`） | **12 checks**（console.log 凍結 v1 含む） |
+| akl CLI smoke（`tests/akl_cli_smoke.py`） | 14 checks |
 | fuzz（`make fuzz`、500 回×5 標的: html/akl/net/store/ext） | 0 crash |
 | 警告 | 全ターゲット（REL/ASAN/tests）で**ゼロ** |
 
@@ -101,6 +104,23 @@ arena 16MB、-O3、POPULATE_WRITE 一括化、-march=native、style 2-way 並列
 7. `make build/ifuto-asan`（警告ゼロ）→ 主要経路の ASAN+LSan 走査
 8. `make fuzz`（500 iters × 5 標的）
 9. commit → push → `ifuto-backup.bundle` 更新（リモート整合確認後のみ）
+
+## akl エンジン差分（2026-08-08: native 登録層 + オブジェクトモデルの導入）
+
+`bench_akl` A/B（c757246 ビルド vs 本ビルド、paired interleaved 7 対、computed-goto、median-of-medians）:
+
+| workload | before | after | 差 | 判定 |
+|---|---|---|---|---|
+| fib(22) recursive | 1.474ms | 1.502ms | +1.9% | 6/7（弱証拠） |
+| arith loop 100k | 1.658ms | 1.672ms | +0.8% | 6/7（弱証拠） |
+
+機序記録（採否の根拠）: 初回インライン実装では arith +5.4% / fib +1.7%（7/7 有意）
+の退行。native 呼出機構の機械語がホットループの I$/レイアウトを汚す形（2026-07-31
+例外 cold 分離事件と同型）と同定し、`akl_vm_native_call` を `__attribute__((noinline,
+cold))` 隔離＋ CALL の `is_objv` 二重評価を kind 一本化で上表まで復元。残差は
+CALL 命令の native 判定 1 分岐（fib は CALL ホットのため現れ、arith は騒音域）。
+機能追加の必然コストとして採用・台帳記録。バイトコード列差分はゼロ（新 opcode は
+既存構文からは出ない。verify の else-if 鎖に 2 分岐追加のみ=compile 時微増）。
 
 ## 計測工学の教訓（再発防止・現在有効）
 

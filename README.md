@@ -19,7 +19,7 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 
 | 指標 | v0.1 (CLI) | 現在（v0.3-dev, GUI + ストア込み） |
 |---|---|---|
-| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **422.9 KB**（433,032 B。旧天井 240 KB を akl 拡張機構統合（+106.6 KB）で更新済。ldd = vdso/libm/libc/ld のみ） |
+| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **430.9 KB**（441,224 B。akl 拡張機構（+106.6 KB）＋ネイティブ登録層/オブジェクト（+8.2 KB）統合。ldd = vdso/libm/libc/ld のみ） |
 | コールドスタート | 1.1 ms（spawn 込み） | **min 1.40 ms / median 1.66 ms**（CLI tiny render 300 連、2026-08-07 実測） |
 | 空タブ UI 常駐 RSS | — | **1.43 MB**（天井 4 MB） |
 | アンロード済み 50 タブ メタ | — | **14.7 KB**（天井 2 MB） |
@@ -32,7 +32,7 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 
 ```sh
 make            # build/ifuto（リリース: -O2 LTO stripped。GUI 統合済み単一バイナリ）
-make test       # 単体テスト 623,749 checks ×2 dispatch（ASan+UBSan+LSan 常時）
+make test       # 単体テスト 623,811 checks ×2 dispatch（ASan+UBSan+LSan 常時）
 make guismoke   # GUI を X なしで検証（--shot ラスタ + 画素検査）
 make golden     # 描画の厳密 diff テスト
 make fuzz       # mutation fuzz + ASan

@@ -1,8 +1,8 @@
 # AKL_COMPAT.md — Aklus(akl) JS 言語カバレッジ（測定記録の唯一の正）
 
 **質問への直接の回答: いいえ。akl は「V8 等にある発展的な JS をすべて」実行できません。**
-3800 行で全部できるわけがない、という読みは正しい。akl は **意図的に切ったサブセット**
-であり、下表は `build/akl` での実測（2026-08-01、全ケース実走査。推定ゼロ）である。
+akl は **意図的に切ったサブセット**であり、下表は `build/akl` での実測
+（2026-08-08 再採、全ケース実走査。推定ゼロ）である。
 
 **規則**: 未対応構文は **必ず SyntaxError/ReferenceError 等で明白に落ちる**
 （「静かに違う答えを返す」状態を最悪のバグと定義する。2026-08-01 に `--i`/`++i` が
@@ -33,6 +33,16 @@
 | 強制変換 | `"5"+3` / `"5"*2` | `"53"` / `10` |
 | 行/ブロックコメント | — | OK |
 | budget fail-stop（命令/深さ/ヒープ） | `while (1) {}` | `instruction budget exhausted`（CLI 既定 500M ops ≒ 本機 1.3s で死亡） |
+| オブジェクトリテラル `{k:v}`（IDENT/KW/STR キー、ネスト、trailing comma） | `var o={a:1,b:2}; o.a+o.b` | `3` |
+| プロパティアクセス `.prop`（連鎖） | `var o={p:{q:41}}; o.p.q+1` | `42` |
+| 代入 `o.x = v`（文としての値は右辺） | `var o={}; o.x=40; o.x+2` | `42` |
+| メソッド呼出 `o.f()`（self は native のみ受ける。「this」は言語に非導入） | `function g(){return 3;} var o={}; o.f=g; o.f()` | `3` |
+| 未定義プロパティ参照 | `({a:1}).missing` | `undefined` |
+| 参照共有（obj は参照セマンティクス） | `var o={q:2}; var p=o; p.q=9; o.q` | `9` |
+| identity 等価（`===`/`==` とも obj は同一 idx のみ等しい） | `var a={}; var b={}; a===b` | `false` |
+| オブジェクトの ToString / typeof | `""+{a:1}` / `typeof {a:1}` | `[object Object]` / `object` |
+| ホストネイティブ関数（`akl_native_register` 族、1024 insn 課金、self 伝播） | docs/EXTENSIONS.md §3-A の console.log が通過実例 | `hello 42 true [object Object]` |
+| ホストネイティブ失敗規約（`akl_native_throw`） | — | eval は明白に失敗（黙った undefined を作らない） |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
 `-1/0 = -Infinity`、`NaN !== NaN`（IEEE 754/JIS X 3010 相当の double 厳密）、
@@ -42,9 +52,12 @@
 
 | 構文 | 実測エラー |
 |---|---|
-| 配列リテラル `[1,2,3]` / 要素アクセス | SyntaxError |
-| オブジェクトリテラル `{a:1}` | SyntaxError |
-| プロパティアクセス `s.length` / メソッド `Math.floor` | SyntaxError |
+| 配列リテラル `[1,2,3]` / 要素アクセス `o["k"]`・`a[i]` | SyntaxError（lex 拒否） |
+| ブラケットプロパティアクセス `o["k"]` | SyntaxError（`.` のみ） |
+| `this`・メソッド shorthand・computed key・shorthand `{a}` | SyntaxError（`o.f()` の self は native 専用で `this` バインドは渡らない） |
+| 文字列プロパティ `s.length`（および数値/bool のプロパティ） | `TypeError: property access on non-object value`（暗黙ボックス化はしない） |
+| `Math.floor` 等の標準組込オブジェクト | `ReferenceError: Math is not defined`（ホスト登録のみ存在） |
+| 文頭 `{` の曖昧性 | ブロック文が無いので object literal として読み、`{a:1}` 単文は `expected ';'` で明白に失敗（JS とは別解釈、いずれも拒否） |
 | 関数式・IIFE・アロー関数 | SyntaxError |
 | **クロージャ捕捉**（ネスト関数から外スコープの局所変数） | `ReferenceError: n is not defined` |
 | 三項演算子 `?:`、do-while、switch、for-in/for-of | SyntaxError |
@@ -56,7 +69,7 @@
 
 ## ロードマップ（優先度順。完了時にこの表へ実測で追記する）
 
-1. オブジェクト/配列リテラル + プロパティアクセス（ブラウザ DOM 結合の前提）
+1. ✅ オブジェクトリテラル + プロパティアクセス（2026-08-08 実測で上表へ。配列とブラケットは次）
 2. 関数式 + クロージャ捕捉（環境 record の導入）
 3. 三項演算子・switch・do-while・`++`/`--`・複合代入
 4. ビット演算/シフト（double→int32 変換規則含む）

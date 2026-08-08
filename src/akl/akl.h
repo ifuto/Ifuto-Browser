@@ -67,6 +67,46 @@ AklVal akl_mknull(void);
 AklVal akl_mkundefined(void);
 AklVal akl_mkstring(AklRT *rt, const char *s, uint32_t len);
 
+/* ---- ネイティブ登録層 + オブジェクト（v0.3 前倒し: ブラウザ DOM 結合の前提基盤） ----
+ * ホスト C 関数を akl 関数値としてスクリプトに露出する層。設計不変条件:
+ *  - native 呼出は固定コスト（AKL_NATIVE_COST 命令相当）を insn budget から課金。
+ *    native 実時間は budget が裁けないため、重い処理は宿主側で別途制限する責任。
+ *  - native が akl_mkstring 等で作った一時値は nursery（上限 AKL_NURY_CAP 件）で
+ *    GC から保護される。native 1 呼出で作る unpinned 値はその範囲に収める規約。
+ *  - 失敗の規約は「明白に失敗」: akl_native_throw で例外相当に落とす。
+ *    黙って undefined を返すでも落とすでもない第三の状態を作らない。
+ *  - 登録系 API（register/global_set/mkobject/mknative/prop_set）は VM 停止中
+ *    （akl_eval の外）でのみ有効。native コールバック内からの登録は拒否（err 設定）。
+ * self: 通常呼出 `f()` は undefined、`o.f()` メソッド呼出はレシーバ o。
+ * （バイトコード関数に this セマンティクスは未導入 — 言語に this は無い。native のみ
+ *  self を受ける。BROWSERS 側 document.getElementById 等の前提） */
+typedef AklVal (*AklNativeFn)(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata);
+
+/* name をグローバル const として native 関数値に束縛。失敗時 false（err 設定）。 */
+bool akl_native_register(AklRT *rt, const char *name, AklNativeFn fn, void *udata);
+/* name をグローバル const として値 v に束縛（既出名は上書き。document/page 等の
+ * ホストオブジェクト供給口）。失敗時 false。 */
+bool akl_global_set(AklRT *rt, const char *name, AklVal v);
+/* ホスト側オブジェクト/ネイティブ関数値の生成。生成直後は未ルートなので即座に
+ * global_set/prop_set で束縛すること（akl_mkstring と同一のライフサイクル規約）。 */
+AklVal akl_mkobject(AklRT *rt);
+AklVal akl_mknative(AklRT *rt, AklNativeFn fn, void *udata);
+/* obj（akl_mkobject 由来）のプロパティ操作。prop 数は 1 オブジェクト 64 まで。 */
+bool akl_prop_set(AklRT *rt, AklVal obj, const char *name, AklVal v);
+AklVal akl_prop_get(AklRT *rt, AklVal obj, const char *name); /* 無ければ undefined */
+bool akl_is_object(AklRT *rt, AklVal v);
+/* native コールバック内から例外相当を起こす: err を msg に設定し、VM に
+ * 「この eval は失敗」を通知する。呼んだ側は直ちに AKL_VAL_UNDEF 相当を返すこと。 */
+void akl_native_throw(AklRT *rt, const char *msg);
+
+/* JS ToString（ホスト側プリミティブ。console.log / 将来の DOM バインドが使う）。
+ * 全型で文字列値を返す（失敗は budget 枯渇のみ: undefined + err 設定、
+ * VM 実行中なら native_err 連動で eval も失敗に倒れる）。
+ * 規約: 戻り値はルートに積まない（nursery 浪費で任意可変引数処理を殺さないため）。
+ * VM 実行中の呼出側は「直後に akl_as_str でコピーするか即座に束縛する」こと
+ * （コピー前に他の確保を挟むと GC で失われ得る — akl_mkstring の pin 規約とは意図的に別）。 */
+AklVal akl_tostring(AklRT *rt, AklVal v);
+
 
 /* 組込側責任の上限引上げ（0 は据置）。既定値はブラウザ製品値（台帳の睩殺防止）。
  * クロスエンジン比較ベンチのように「打ち切りなしで収束する同一ソース」を

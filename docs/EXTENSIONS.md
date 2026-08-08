@@ -90,11 +90,31 @@ $IFUTO_HOME/ext/<name>/
 | E1 | `status` | 最終式文の値（String 必須）を起動時トーストとして 1 度表示（chrome 共通通知流路） | 自前 chrome 状態のみ |
 | E2 | `page.readText` | （未実装・意味論未定） | — |
 | E3 | `page.injectStyle` | （未実装・意味論未定） | — |
+| 常設 | **`console.log(...)`（perm 宣言不要）** | 全引数を JS ToString して単一空白連結、改行/CR は空白化して 1 行 `[ext:<name>:console] <連結>`（≤960B 切詰）を report stream へ | report stderr のみ |
 
-- **ネットワーク権限は設計上存在しない**。akl には IO プリミティブ自体が無く、
-  E1 はホスト関数を一切結線しないため、評価中に syscall へ到達する機構が無い。
-  カーネル層 seccomp（IF_SB_AKL 系・現行は akl 単体ランナーに適用済み、
-  chrome 適用は v0.4 台帳）はこの「不在」の上に乗る第二層として将来も機能する。
+### §3-A. console.log 凍結仕様 v1（2026-08-08 shipped）
+
+- **由来**: これは E1 でも perm でもない。**すべての拡張評価 RT に常設されるデバッグ面**。
+  akl のネイティブ登録層（2026-08-08、本ターン shipped: `akl_native_register` 族・
+  AKL_OK_OBJ オブジェクトモデル、`docs/AKL_COMPAT.md` 実測表参照）の最初の通過実例。
+- **契約**:
+  - バインド: 評価開始前（VM 停止中）にグローバル `console` を const 束縛。
+    登録失敗は当該拡張の FAILED で明白に終わる（黙って評価しない）。
+  - `console.log(a, b, ...)`: 各引数を `akl_tostring`（内部 ToString と同一規則）で
+    文字列化し、半角空白 1 個で連結。0 引数は空行。
+  - 出力は 1 行不変条件: `\n`/`\r` は空白に畳く。960 文字で切詰（E1 効果と同上限）。
+  - **perm 宣言に非依存**（console はデバッグ面であって権限効果ではない）。
+    宣言 perm の効果（status/log）とは別系列の行なので grep 視認のため
+    `[ext:<name>:console]` の接頭詞を使う。
+  - `console` オブジェクト自体の prop は現行 seal していない: 拡張が
+    `console.log = 1` 等で書き換えられる。効果はその拡張 RT 内部の log 面が
+    消えるだけで、本体・他拡張・chrome 状態には到達しない（隔離で無害化済）。
+    seal 機構（host 組込 OBJ の prop 固定）は必要になった時点で台帳追加する。
+- **効果範囲**: stderr のみ。ページ DOM・chrome 状態・ストア・ネットには一切触れない。
+  akl ネイティブの課金は 1 呼出 1024 insn（`AKL_NATIVE_COST`）として budget から引く。
+
+- **ネットワーク権限は設計上存在しない**。socket 生成に到るプリミティブを
+  ホスト側に結線しない（console.log のような安全な writing 面のみ）。
 - 宣言 perm とバインド表の **双方向一致** は manifest 解析で機械検査
   （未知宣言 = FAILED、複数宣言 = FAILED。黙って欠落させない）。
 
@@ -177,8 +197,12 @@ WPT 100%・RSS 台帳を侵蝕しない = 各段で BENCH 再測定を台帳記�
 - 拡張同士の通信・モジュール import は未定義（設計しない = 攻撃面にしない）。
 - ストア正面の socket 全面禁止により「拡張の自動更新」はできない
   （配布はユーザが curl 等で取得 → ローカルコピー。信頼判断もユーザにある）。
-- **ホスト関数を呼べる API（E2 以降の構想形）は、akl に native 登録層を
-  新設するところから始まる独立エンジン課題**である。層の設計（関数値・
-  budget 課金・GC 整合）と機械オラクルが先に要る。E2/E3 はその上にのみ置く。
+- **akl ネイティブ登録層は 2026-08-08 に shipped 済**（E2/E3 の唯一の前提課題が
+  解消。`akl_native_register`/`akl_global_set`/`akl_mkobject`/`akl_prop_set` 族・
+  AKL_OK_OBJ + AKL_OK_NATIVE、self 伝播・1024 insn 固定課金・`akl_native_throw` の
+  明白失敗規約・nursery 一時ルート保護・登録は VM 停止中限定の構造拒否、
+  全て run_tests 双子 623,811 checks + LSan + fuzz で機械固定）。console.log（§3-A）
+  が通過実例。E2/E3 本体（page.readText/injectStyle・ページイベント意味論）は
+  未実装のままであり、意味論を §3 へ凍結追記してから実装する規則は変わらない。
 - E3 の DOM 書込は v0.4 配列 DOM 直結（ARCHITECTURE v0.4b / §7.1）の設計確定後に
   再査定する。それ以前に書込 API を約束しない。
