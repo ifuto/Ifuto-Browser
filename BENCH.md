@@ -16,7 +16,18 @@
 - 起動速度は ` /bin/true` 経路での最小/中央値に subprocess wall time を使う
   （`/usr/bin/time` 非存在、bash 組込の `time` のみ）。
 
-## 現行スナップショット（2026-08-08 計測・`build/ifuto` 502,664B）
+## 現行スナップショット（2026-08-08 計測・`build/ifuto` 514,952B）
+
+直前差分（v0.4→v0.3 統合: 三項演算子・switch・do-while・前置/後置 `++`/`--`・
+複合代入 `+= -= *= /= %=`・ビット演算/シフト `& | ^ ~ << >> >>>`）: +12,288B
+（502,664B→514,952B）。**16MB IDM パイプライン計測は構造的に不変のため再計測なし**:
+新規言語機能は `src/akl/akl.c` のコードサイズのみを増やし、`<script>` を含まない
+文書では `IfDom.has_script` 観測スイッチにより script 実行経路自体が走査ゼロ
+（既存の script 実行配線追加時と同一の構造的ゼロ影響。本 corpus は script 0 件を
+grep 確認済）。`make test` 624,056 checks（AKL_COMPAT.md 実測表の新規行を含む）
+×2 dispatch + `make golden` + `make guismoke`（51 checks）+ `make conformance`
+（1922/1922 = 100.0%）+ `make fuzz`（5 ターゲット計 4,500+ iters、0 crash）は
+全て緑（本コミットで再確認済み）。
 
 直前差分（A1 文字コード層, docs/CHARSET.md）: SJIS/EUC-JP 変換表 +49,152B。
 md ミッション経路は関門外（`if (!md_doc)` ゲート）のまま、A1 後の n=7 再計測は

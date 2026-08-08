@@ -6,7 +6,10 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 
 **規則**: 未対応構文は **必ず SyntaxError/ReferenceError 等で明白に落ちる**
 （「静かに違う答えを返す」状態を最悪のバグと定義する。2026-08-01 に `--i`/`++i` が
-二重 unary として黙って誤答する経路を同定・lex 拒否に修正し回帰テスト化）。
+二重 unary として黙って誤答する経路を同定し、一旦 lex 拒否で封じた上で回帰テスト化。
+2026-08-08 の v0.4→v0.3 統合で正式な前置/後置 `++`/`--` として実装し直し、
+「対象は識別子・プロパティのみ、それ以外は明白な SyntaxError」という不変条件を
+保ったまま昇格した）。
 
 ## 動く（実測 OK）
 
@@ -43,16 +46,27 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | オブジェクトの ToString / typeof | `""+{a:1}` / `typeof {a:1}` | `[object Object]` / `object` |
 | ホストネイティブ関数（`akl_native_register` 族、1024 insn 課金、self 伝播） | docs/EXTENSIONS.md §3-A の console.log が通過実例 | `hello 42 true [object Object]` |
 | ホストネイティブ失敗規約（`akl_native_throw`） | — | eval は明白に失敗（黙った undefined を作らない） |
+| 前置/後置 `++`/`--`（識別子・プロパティ双方。v0.4 統合） | `var i=5; i++` / `var o={x:5}; --o.x` | `5`（i は 6 に）/ `4` |
+| 複合代入 `+= -= *= /= %=`（識別子は `x=x op y` に脱糖、既存融合命令をそのまま利用。プロパティは obj を 1 度だけ評価） | `var o={x:10}; o.x+=5; o.x` | `15` |
+| 三項演算子 `?:`（右結合ネスト・両枝が代入式まで許容） | `1>2 ? 1 : 2` | `2` |
+| ビット演算 `& \| ^ ~`（ToInt32 準拠） | `6 & 3` | `2` |
+| シフト `<< >> >>>`（シフト量は `&31`、`>>>` は ToUint32） | `-1 >>> 28` | `15` |
+| `do`-`while`（本体は最低 1 回実行） | `var n=0; do{n=n+1;}while(0); n` | `1` |
+| `switch`/`case`/`default`（`===` 判別・フォールスルー・`default` の任意位置） | `switch(2){case 1:1;case 2:2;case 3:3+9;break;}` | `12` |
+| switch 内 `continue` の外側ループへの透過（`break` は switch 自身のみを抜ける） | `for(...){switch(i){case 3:continue;default:acc+=i;}}` | JS 同様に continue は switch を素通り |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
 `-1/0 = -Infinity`、`NaN !== NaN`（IEEE 754/JIS X 3010 相当の double 厳密）、
 剰余は JS 規格の fmod 系（被除数符号）。
+ビット演算/シフトの ToInt32/ToUint32 も固定: `NaN|0 === 0`、`Infinity|0 === 0`、
+`4294967296|0 === 0`（2^32 は 0 に畳む）、`2147483648|0 === -2147483648`（2^31 帯の折返し）、
+`-1>>>0 === 4294967295`（ToUint32 域は int32 タグを超えるため double 化）。
 
 ## 動かない（実測で明白に失敗する。未対応一覧）
 
 | 構文 | 実測エラー |
 |---|---|
-| 配列リテラル `[1,2,3]` / 要素アクセス `o["k"]`・`a[i]` | SyntaxError（lex 拒否） |
+| 配列リテラル `[1,2,3]` / 要素アクセス `o["k"]`・`a[i]` | SyntaxError（lex 拒否。v0.4b 前の次課題） |
 | ブラケットプロパティアクセス `o["k"]` | SyntaxError（`.` のみ） |
 | `this`・メソッド shorthand・computed key・shorthand `{a}` | SyntaxError（`o.f()` の self は native 専用で `this` バインドは渡らない） |
 | 文字列プロパティ `s.length`（および数値/bool のプロパティ） | `TypeError: property access on non-object value`（暗黙ボックス化はしない） |
@@ -60,19 +74,21 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | 文頭 `{` の曖昧性 | ブロック文が無いので object literal として読み、`{a:1}` 単文は `expected ';'` で明白に失敗（JS とは別解釈、いずれも拒否） |
 | 関数式・IIFE・アロー関数 | SyntaxError |
 | **クロージャ捕捉**（ネスト関数から外スコープの局所変数） | `ReferenceError: n is not defined` |
-| 三項演算子 `?:`、do-while、switch、for-in/for-of | SyntaxError |
-| `++` `--`・複合代入 `+=` 等 | SyntaxError（黙った誤答はない。lex で拒否） |
-| ビット演算 `& \| ^ ~ << >>`、`**` | SyntaxError |
+| for-in / for-of | SyntaxError |
+| `&= \|= ^= <<= >>= >>>=`（複合代入はビット演算/シフトまで拡張していない。明示的非対応） | SyntaxError |
+| `**`（べき乗演算子） | SyntaxError |
+| リテラル以外への後置 `++`/`--`（数値/文字列/呼出式そのものなど） | `expected ';'` または `invalid increment/decrement target`（対象は識別子・プロパティのみ） |
 | class・async/await・generator・template literal・BigInt | SyntaxError |
 | `new`・`?.`・`??`・regex literal・spread・destructuring | SyntaxError |
 | `void`・カンマ演算子・`instanceof`・`delete`・`in` | SyntaxError |
 
 ## ロードマップ（優先度順。完了時にこの表へ実測で追記する）
 
-1. ✅ オブジェクトリテラル + プロパティアクセス（2026-08-08 実測で上表へ。配列とブラケットは次）
-2. 関数式 + クロージャ捕捉（環境 record の導入）
-3. 三項演算子・switch・do-while・`++`/`--`・複合代入
-4. ビット演算/シフト（double→int32 変換規則含む）
+1. ✅ オブジェクトリテラル + プロパティアクセス（2026-08-08 実測で上表へ）
+2. ✅ 三項演算子・switch・do-while・`++`/`--`・複合代入（2026-08-08、v0.4→v0.3 統合。上表参照）
+3. ✅ ビット演算/シフト（double→int32/uint32 変換規則含む。2026-08-08、上表参照）
+4. 配列リテラル + ブラケットアクセス（`[1,2,3]`、`a[i]`、`o["k"]`、`.length`）— 次
+5. 関数式 + クロージャ捕捉（環境 record の導入）— 実装リスク最大（upvalue 機構を要する）
 
 ## V8 との位置づけ
 

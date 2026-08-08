@@ -8,7 +8,9 @@ Markdown 表示（`.md` 自動検出）+
 **slim-DOM**（画面描画に関係ない template 配下は DOM に構築しない。実ブラウズ経路で既定）+
 **`<script>` akl 実行**（v0.3: 文書順・style 適用前・失敗は script 単位で隔離して描画継続。
 `document.title`/`getElementById`/`textContent` 等の最小 DOM バインド + `console.log`。
-JIT は恒久禁止の自作インタプリタ。凍結正本: docs/SCRIPTING.md）+
+JIT は恒久禁止の自作インタプリタ。**2026-08-08: 旧 v0.4 計画（三項演算子・switch・
+do-while・前置/後置 `++`/`--`・複合代入 `+= -= *= /= %=`・ビット演算/シフト
+`& | ^ ~ << >> >>>`）を v0.3 へ統合実装（AKL_COMPAT.md 実測表）**。凍結正本: docs/SCRIPTING.md）+
 **文字コード変換**（v0.3: Shift_JIS 系 / EUC-JP → UTF-8 正規化。HTTP charset > BOM >
 meta prescan > UTF-8 既定。変換表は python codec 生成の再生成一致オラクル凍結、
 波ダッシュ 6 件は cp932 採用と明記。凍結正本: docs/CHARSET.md）+
@@ -25,7 +27,7 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 
 | 指標 | v0.1 (CLI) | 現在（v0.3-dev, GUI + ストア込み） |
 |---|---|---|
-| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **490.9 KB**（502,664 B。akl 拡張機構＋ネイティブ層/オブジェクト＋`<script>` 実行配線＋文字コード変換表（SJIS/EUC-JP、+49.2 KB）統合。ldd = vdso/libm/libc/ld のみ） |
+| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **503.1 KB**（514,952 B。akl 拡張機構＋ネイティブ層/オブジェクト＋`<script>` 実行配線＋文字コード変換表（SJIS/EUC-JP、+49.2 KB）＋v0.4→v0.3 統合の言語機能（三項/switch/do-while/++--/複合代入/ビット演算・シフト、+12.3 KB）統合。ldd = vdso/libm/libc/ld のみ） |
 | コールドスタート | 1.1 ms（spawn 込み） | **min 1.40 ms / median 1.66 ms**（CLI tiny render 300 連、2026-08-07 実測） |
 | 空タブ UI 常駐 RSS | — | **1.43 MB**（天井 4 MB） |
 | アンロード済み 50 タブ メタ | — | **14.7 KB**（天井 2 MB） |

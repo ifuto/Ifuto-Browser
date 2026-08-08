@@ -172,6 +172,8 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_PLOAD,               /* name u32 : pop obj → push obj[name]（無ければ undefined） */
     OP_PSTORE,              /* name u32 : pop val, pop obj → obj[name]=val, push val（代入式の値） */
     OP_MCALL,               /* argc u8 | name u32 : stk[..-argc-1]=obj メソッド呼出（native は self=obj） */
+    /* v0.4 統合: ビット演算/シフト（imm なし。ToInt32/ToUint32 は VM 側ヘルパで JS 準拠） */
+    OP_BAND, OP_BOR, OP_BXOR, OP_BNOT, OP_SHL, OP_SHR, OP_USHR,
     OP_HALT,
     OP_COUNT
 };
@@ -182,6 +184,9 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
 enum { AKL_TE_TRY = 0, AKL_TE_FIN = 1 };
 #define AKL_PC_NONE 0xFFFFFFFFu
 #define AKL_SLOT_NONE 0xFFFFFFFFu
+/* v0.4: 後置プロパティ ++/-- 専用の予約 intern id。akl_intern は実オブジェクト表
+ * index（< AKL_MAX_OBJECTS）しか返さないため、ユーザ識別子と衝突しない。 */
+#define AKL_TEMP_SLOT_NAME 0xFFFFFFFFu
 typedef struct {
     AklVal pending;
     u32 frame;       /* 属する呼出し深さ（main=0, 1回目の callee=1, ...） */
@@ -543,20 +548,27 @@ typedef struct {
 
 enum { KW_VAR, KW_LET, KW_CONST, KW_FUNCTION, KW_RETURN, KW_IF, KW_ELSE, KW_WHILE,
        KW_FOR, KW_BREAK, KW_CONTINUE, KW_TRUE, KW_FALSE, KW_NULL, KW_UNDEFINED, KW_TYPEOF,
-       KW_THROW, KW_TRY, KW_CATCH, KW_FINALLY,
+       KW_THROW, KW_TRY, KW_CATCH, KW_FINALLY, KW_DO, KW_SWITCH, KW_CASE, KW_DEFAULT,
        KW_N };
 static const char *const AKL_KWS[KW_N] = {
     "var", "let", "const", "function", "return", "if", "else", "while",
     "for", "break", "continue", "true", "false", "null", "undefined", "typeof",
-    "throw", "try", "catch", "finally"
+    "throw", "try", "catch", "finally", "do", "switch", "case", "default"
 };
 
+/* v0.3→v0.4 統合（三項・ビット演算・シフト・++/--・複合代入・switch/do-while）で追加した
+ * 記号。longest-match は AKL_PUNCTS の並び順に依存しない（lex_next 参照）ため、
+ * 3 文字演算子（>>>）を混在させても安全。 */
 enum { P_LP, P_RP, P_LC, P_RC, P_SEMI, P_COMMA, P_ASSIGN, P_PLUS, P_MINUS, P_STAR,
        P_SLASH, P_PCT, P_BANG, P_LT, P_LE, P_GT, P_GE, P_EQEQ, P_NEQ, P_SEQ, P_SNE,
-       P_ANDAND, P_OROR, P_DOT, P_COLON, P_N };
+       P_ANDAND, P_OROR, P_DOT, P_COLON, P_QUESTION,
+       P_PLUSPLUS, P_MINUSMINUS, P_PLUSEQ, P_MINUSEQ, P_STAREQ, P_SLASHEQ, P_PCTEQ,
+       P_AMP, P_PIPE, P_CARET, P_TILDE, P_SHL, P_SHR, P_USHR, P_N };
 static const char *const AKL_PUNCTS[P_N] = {
     "(", ")", "{", "}", ";", ",", "=", "+", "-", "*", "/", "%", "!", "<", "<=", ">", ">=",
-    "==", "!=", "===", "!==", "&&", "||", ".", ":"
+    "==", "!=", "===", "!==", "&&", "||", ".", ":", "?",
+    "++", "--", "+=", "-=", "*=", "/=", "%=",
+    "&", "|", "^", "~", "<<", ">>", ">>>"
 };
 
 static bool lex_eof(Lex *lx) { return lx->pos >= lx->n; }
@@ -761,13 +773,10 @@ static int lex_next(Lex *lx) {
         lx->kind = TK_IDENT; lx->str_p = lx->s + st; lx->str_len = ln;
         return 0;
     }
-    /* ++ / -- は未対応。通すと二重 unary（+ (+x) / - (-x)）に落ちて「静かに
-     * 間違った答え」を返す（実測: var i=5; --i; i → 5、本来は 4）。
-     * 規則「未対応は構文エラーで明白に落ちる」に従い、隣接は lex で拒否する。
-     * JS 側も a--b は SyntaxError なので互換方向でも安全側。
-     * 空白ありの 1 - -2 は従来通り 3 に評価される（分離は失われない）。 */
-    if ((c == '+' && lex_at(lx, 1) == '+') || (c == '-' && lex_at(lx, 1) == '-'))
-        return -1;
+    /* ++ / -- は v0.4 統合で正式トークン化（P_PLUSPLUS/P_MINUSMINUS）。パーサ側が
+     * 適用対象を N_IDENT/N_PGET に限定し、それ以外は「invalid increment/decrement
+     * target」で明白に拒否する（静かな誤答は作らない）。空白ありの 1 - -2 は依然
+     * 2 個の別トークン（'-' が隣接しない）として 3 に評価される。 */
     /* punct 複数文字（最長一致。テーブル順序に依存しない: "==" が "===" を潰さない） */
     int best = -1; u32 bestl = 0;
     for (int k = 0; k < P_N; k++) {
@@ -799,9 +808,14 @@ enum {
     N_EXPRSTMT, N_IF, N_WHILE, N_FOR, N_BLOCK, N_RET, N_BREAK, N_CONTINUE, N_PROG,
     N_THROW, N_TRY,
     N_PGET,     /* a=obj node, b=name STR obj idx */
-    N_PSET,     /* a=obj node, b=val node, c=name STR obj idx */
+    N_PSET,     /* a=obj node, b=val node, c=name STR obj idx, op=0(単純代入)/OP_ADD 等(複合代入) */
     N_MCALL,    /* a=obj node, b=args first(list), c=argc, d=name STR obj idx */
     N_OBJLIT,   /* a=names first(list), b=values first(list), c=count */
+    N_TERNARY,  /* a=cond, b=then, c=else（v0.4: 三項演算子） */
+    N_INCDEC,   /* a=target(N_IDENT/N_PGET), op=OP_ADD(++)/OP_SUB(--), flags=0前置/1後置（v0.4） */
+    N_DOWHILE,  /* a=cond, b=body（v0.4: do-while） */
+    N_SWITCH,   /* a=discriminant, b=interleave[test0,body0,test1,body1,...]の先頭 index,
+                 * c=clause 数, d=default 節の index（0..c-1）または N_NONE（v0.4） */
     N_NONE = 0xFFFFFFFFu
 };
 
@@ -967,6 +981,20 @@ static u32 p_postfix(P *p, u32 base) {
             }
         } else break;
     }
+    if (p_is_punct(p, P_PLUSPLUS) || p_is_punct(p, P_MINUSMINUS)) {
+        /* 後置 ++/--（v0.4）。対象は N_IDENT/N_PGET のみ（LeftHandSideExpression 近似）。
+         * それ以外は「invalid increment/decrement target」で明白に拒否する。 */
+        u8 bk = p->nodes[base].kind;
+        if (bk != N_IDENT && bk != N_PGET) { p->fail = "invalid increment/decrement target"; return N_NONE; }
+        u8 dir = p_is_punct(p, P_PLUSPLUS) ? OP_ADD : OP_SUB;
+        if (lex_next(&p->lx) < 0) { p->fail = "lex error"; return N_NONE; }
+        u32 ni = p_node(p, N_INCDEC);
+        if (ni == N_NONE) return N_NONE;
+        p->nodes[ni].op = dir;
+        p->nodes[ni].a = base;
+        p->nodes[ni].flags = 1; /* postfix */
+        return ni;
+    }
     return base;
 }
 
@@ -1080,9 +1108,27 @@ static u32 p_unary(P *p) {
     if (++p->depth > AKL_PARSE_DEPTH) { p->depth--; p->fail = "parse depth exhausted"; return N_NONE; }
     u8 uop = 0;
     if (p_eat_punct(p, P_BANG)) uop = OP_NOT;
+    else if (p_eat_punct(p, P_TILDE)) uop = OP_BNOT;
     else if (p_eat_punct(p, P_MINUS)) uop = OP_NEG;
     else if (p_eat_punct(p, P_PLUS)) uop = OP_POS;
     else if (p_is_kw(p, KW_TYPEOF)) { if (lex_next(&p->lx) < 0) p->fail = "lex error"; uop = OP_TYPEOF; }
+    else if (p_is_punct(p, P_PLUSPLUS) || p_is_punct(p, P_MINUSMINUS)) {
+        /* 前置 ++/--（v0.4）。対象は N_IDENT/N_PGET のみ。 */
+        u8 dir = p_is_punct(p, P_PLUSPLUS) ? OP_ADD : OP_SUB;
+        if (lex_next(&p->lx) < 0) { p->fail = "lex error"; p->depth--; return N_NONE; }
+        u32 target = p_unary(p);
+        if (target == N_NONE) { p->depth--; return N_NONE; }
+        u8 tk = p->nodes[target].kind;
+        if (tk != N_IDENT && tk != N_PGET) {
+            p->fail = "invalid increment/decrement target";
+            p->depth--;
+            return N_NONE;
+        }
+        u32 ni = p_node(p, N_INCDEC);
+        if (ni != N_NONE) { p->nodes[ni].op = dir; p->nodes[ni].a = target; p->nodes[ni].flags = 0; }
+        p->depth--;
+        return ni;
+    }
     u32 ni;
     if (!uop) ni = p_primary(p);
     else if (p->fail) ni = N_NONE;
@@ -1163,43 +1209,159 @@ static u32 p_add(P *p) {
     }
     return lhs;
 }
-static u32 p_rel(P *p)   { return p_bin_rhs(p, P_LT, p_add); }
+/* JS 精度の優先順位（低いものから高いもの、v0.4 で挿入）:
+ * assign(=,+=..) < ternary(?:) < || < && < | < ^ < & < ==等 < 比較 < shift < + - < * / % < unary */
+static u32 p_shift(P *p) {
+    u32 lhs = p_add(p);
+    if (lhs == N_NONE) return N_NONE;
+    while (p_is_punct(p, P_SHL) || p_is_punct(p, P_SHR) || p_is_punct(p, P_USHR)) {
+        u8 pk = p->lx.pk;
+        lex_next(&p->lx);
+        u32 rhs = p_add(p);
+        if (rhs == N_NONE) return N_NONE;
+        u32 ni = p_node(p, N_BIN);
+        if (ni == N_NONE) return N_NONE;
+        p->nodes[ni].op = pk == P_SHL ? OP_SHL : pk == P_SHR ? OP_SHR : OP_USHR;
+        p->nodes[ni].a = lhs;
+        p->nodes[ni].b = rhs;
+        lhs = ni;
+    }
+    return lhs;
+}
+static u32 p_rel(P *p)   { return p_bin_rhs(p, P_LT, p_shift); }
 static u32 p_eq(P *p)    { return p_bin_rhs(p, P_EQEQ, p_rel); }
+static u32 p_bitand(P *p) {
+    u32 lhs = p_eq(p);
+    if (lhs == N_NONE) return N_NONE;
+    while (p_is_punct(p, P_AMP)) {
+        lex_next(&p->lx);
+        u32 rhs = p_eq(p);
+        if (rhs == N_NONE) return N_NONE;
+        u32 ni = p_node(p, N_BIN);
+        if (ni == N_NONE) return N_NONE;
+        p->nodes[ni].op = OP_BAND;
+        p->nodes[ni].a = lhs;
+        p->nodes[ni].b = rhs;
+        lhs = ni;
+    }
+    return lhs;
+}
+static u32 p_bitxor(P *p) {
+    u32 lhs = p_bitand(p);
+    if (lhs == N_NONE) return N_NONE;
+    while (p_is_punct(p, P_CARET)) {
+        lex_next(&p->lx);
+        u32 rhs = p_bitand(p);
+        if (rhs == N_NONE) return N_NONE;
+        u32 ni = p_node(p, N_BIN);
+        if (ni == N_NONE) return N_NONE;
+        p->nodes[ni].op = OP_BXOR;
+        p->nodes[ni].a = lhs;
+        p->nodes[ni].b = rhs;
+        lhs = ni;
+    }
+    return lhs;
+}
+static u32 p_bitor(P *p) {
+    u32 lhs = p_bitxor(p);
+    if (lhs == N_NONE) return N_NONE;
+    while (p_is_punct(p, P_PIPE)) {
+        lex_next(&p->lx);
+        u32 rhs = p_bitxor(p);
+        if (rhs == N_NONE) return N_NONE;
+        u32 ni = p_node(p, N_BIN);
+        if (ni == N_NONE) return N_NONE;
+        p->nodes[ni].op = OP_BOR;
+        p->nodes[ni].a = lhs;
+        p->nodes[ni].b = rhs;
+        lhs = ni;
+    }
+    return lhs;
+}
 
 static u32 p_logical_or(P *p);
+static u32 p_expr(P *p);
+
+/* 三項演算子（v0.4）。then/else は ConditionalExpression の spec 通り p_expr
+ * （代入式レベル）まで許す＝ネスト三項と代入式のどちらも両枝で受理し、else 側を
+ * p_expr で再帰することで `a?b:c?d:e` が a?b:(c?d:e) の右結合になる。 */
+static u32 p_ternary(P *p) {
+    u32 c = p_logical_or(p);
+    if (c == N_NONE) return N_NONE;
+    if (p_eat_punct(p, P_QUESTION)) {
+        u32 t = p_expr(p);
+        if (t == N_NONE) return N_NONE;
+        if (!p_expect_punct(p, P_COLON, "expected ':' in conditional expression")) return N_NONE;
+        u32 e = p_expr(p);
+        if (e == N_NONE) return N_NONE;
+        u32 ni = p_node(p, N_TERNARY);
+        if (ni == N_NONE) return N_NONE;
+        p->nodes[ni].a = c;
+        p->nodes[ni].b = t;
+        p->nodes[ni].c = e;
+        return ni;
+    }
+    return c;
+}
 
 static u32 p_expr(P *p) {
-    u32 lhs = p_logical_or(p);
+    u32 lhs = p_ternary(p);
     if (lhs == N_NONE) return N_NONE;
-    if (p_is_punct(p, P_ASSIGN)) {
+    bool plain = p_is_punct(p, P_ASSIGN);
+    bool compound = p_is_punct(p, P_PLUSEQ) || p_is_punct(p, P_MINUSEQ) || p_is_punct(p, P_STAREQ) ||
+                    p_is_punct(p, P_SLASHEQ) || p_is_punct(p, P_PCTEQ);
+    if (plain || compound) {
         u8 lk = p->nodes[lhs].kind;
         if (lk != N_IDENT && lk != N_PGET) { p->fail = "invalid assignment target"; return N_NONE; }
+        u8 pk = p->lx.pk;
+        u8 cop = pk == P_PLUSEQ ? OP_ADD : pk == P_MINUSEQ ? OP_SUB : pk == P_STAREQ ? OP_MUL :
+                 pk == P_SLASHEQ ? OP_DIV : pk == P_PCTEQ ? OP_MOD : 0;
         lex_next(&p->lx);
         u32 rhs = p_expr(p);
         if (rhs == N_NONE) return N_NONE;
         if (lk == N_PGET) {
+            /* プロパティ代入: obj は 1 度しか評価しない（cg_expr(N_PSET) が DUP で単評価を保証）。
+             * 複合代入は n->op に演算子を積んで codegen 側で read-modify-write に展開する。 */
             u32 ni = p_node(p, N_PSET);
             if (ni == N_NONE) return N_NONE;
             p->nodes[ni].a = p->nodes[lhs].a; /* obj node */
-            p->nodes[ni].b = rhs;           /* val node */
+            p->nodes[ni].b = rhs;             /* val node */
             p->nodes[ni].c = p->nodes[lhs].b; /* name STR idx */
+            p->nodes[ni].op = compound ? cop : 0;
             return ni;
         }
+        if (plain) {
+            u32 ni = p_node(p, N_ASSIGN);
+            if (ni == N_NONE) return N_NONE;
+            p->nodes[ni].a = p->nodes[lhs].a; /* name idx */
+            p->nodes[ni].b = rhs;
+            return ni;
+        }
+        /* 識別子の複合代入は `x = x op y` に脱糖する（cg_expr/cg_stmt の既存融合
+         * （LINC/GINC/加減乗算 CI 系）がそのまま適用され、二重実装を避けられる）。 */
+        u32 idcopy = p_node(p, N_IDENT);
+        if (idcopy == N_NONE) return N_NONE;
+        p->nodes[idcopy].a = p->nodes[lhs].a;
+        u32 binn = p_node(p, N_BIN);
+        if (binn == N_NONE) return N_NONE;
+        p->nodes[binn].op = cop;
+        p->nodes[binn].a = idcopy;
+        p->nodes[binn].b = rhs;
         u32 ni = p_node(p, N_ASSIGN);
         if (ni == N_NONE) return N_NONE;
-        p->nodes[ni].a = p->nodes[lhs].a; /* name idx */
-        p->nodes[ni].b = rhs;
+        p->nodes[ni].a = p->nodes[lhs].a;
+        p->nodes[ni].b = binn;
         return ni;
     }
     return lhs;
 }
 
 static u32 p_logical_and(P *p) {
-    u32 lhs = p_eq(p);
+    u32 lhs = p_bitor(p);
     if (lhs == N_NONE) return N_NONE;
     while (p_is_punct(p, P_ANDAND)) {
         lex_next(&p->lx);
-        u32 rhs = p_eq(p);
+        u32 rhs = p_bitor(p);
         if (rhs == N_NONE) return N_NONE;
         u32 ni = p_node(p, N_BIN);
         if (ni == N_NONE) return N_NONE;
@@ -1379,6 +1541,78 @@ static u32 p_stmt(P *p) {
         if (ni != N_NONE) { p->nodes[ni].a = c; p->nodes[ni].b = body; }
         goto out;
     }
+    if (p_is_kw(p, KW_DO)) {
+        /* do-while（v0.4）: 条件は本体の後。continue は本体後の条件再評価点へ */
+        lex_next(&p->lx);
+        u32 body = p_stmt(p);
+        if (body == N_NONE) goto out;
+        if (!p_is_kw(p, KW_WHILE)) { p->fail = "expected 'while' after do body"; goto out; }
+        lex_next(&p->lx);
+        if (!p_expect_punct(p, P_LP, "expected '('")) goto out;
+        u32 c = p_expr(p);
+        if (c == N_NONE || !p_expect_punct(p, P_RP, "expected ')'")) goto out;
+        p_eat_punct(p, P_SEMI); /* do-while 末尾の ';' は ASI 対象。あれば消費、無くても許容 */
+        ni = p_node(p, N_DOWHILE);
+        if (ni != N_NONE) { p->nodes[ni].a = c; p->nodes[ni].b = body; }
+        goto out;
+    }
+    if (p_is_kw(p, KW_SWITCH)) {
+        /* switch（v0.4）。case は厳密等価（===）で順に照合、フォールスルーは
+         * 節本体をソース順にそのまま並べることで無償で得る（break のみ end へ分岐）。 */
+        lex_next(&p->lx);
+        if (!p_expect_punct(p, P_LP, "expected '('")) goto out;
+        u32 disc = p_expr(p);
+        if (disc == N_NONE || !p_expect_punct(p, P_RP, "expected ')'")) goto out;
+        if (!p_expect_punct(p, P_LC, "expected '{' after switch")) goto out;
+        U32Vec pairs = { NULL, 0, 0 };
+        u32 default_idx = N_NONE, clause_count = 0;
+        while (!p_is_punct(p, P_RC) && p->lx.kind != TK_EOF) {
+            u32 test = N_NONE;
+            bool is_default;
+            if (p_is_kw(p, KW_CASE)) {
+                lex_next(&p->lx);
+                test = p_expr(p);
+                if (test == N_NONE) { free(pairs.v); goto out; }
+                is_default = false;
+            } else if (p_is_kw(p, KW_DEFAULT)) {
+                lex_next(&p->lx);
+                if (default_idx != N_NONE) { p->fail = "multiple default clauses in switch"; free(pairs.v); goto out; }
+                is_default = true;
+            } else { p->fail = "expected 'case' or 'default'"; free(pairs.v); goto out; }
+            if (!p_expect_punct(p, P_COLON, "expected ':'")) { free(pairs.v); goto out; }
+            if (clause_count >= 250) { p->fail = "too many switch cases"; free(pairs.v); goto out; }
+            U32Vec stmts = { NULL, 0, 0 };
+            while (!p_is_punct(p, P_RC) && !p_is_kw(p, KW_CASE) && !p_is_kw(p, KW_DEFAULT) && p->lx.kind != TK_EOF) {
+                u32 s = p_stmt(p);
+                if (s == N_NONE || p_scratch(p, &stmts, s) < 0) { free(stmts.v); free(pairs.v); goto out; }
+            }
+            u32 bfirst = p_list_commit(p, &stmts);
+            u32 bcnt = stmts.n;
+            free(stmts.v);
+            if (bcnt && bfirst == N_NONE) { free(pairs.v); goto out; }
+            u32 bn = p_node(p, N_BLOCK);
+            if (bn == N_NONE) { free(pairs.v); goto out; }
+            p->nodes[bn].a = bfirst;
+            p->nodes[bn].c = bcnt;
+            if (p_scratch(p, &pairs, test) < 0 || p_scratch(p, &pairs, bn) < 0) { free(pairs.v); goto out; }
+            if (is_default) default_idx = clause_count;
+            clause_count++;
+        }
+        if (!p_expect_punct(p, P_RC, "expected '}'")) { free(pairs.v); goto out; }
+        {
+            u32 pf = p_list_commit(p, &pairs);
+            free(pairs.v);
+            if (clause_count && pf == N_NONE) { if (!p->fail) p->fail = "oom: switch"; goto out; }
+            ni = p_node(p, N_SWITCH);
+            if (ni != N_NONE) {
+                p->nodes[ni].a = disc;
+                p->nodes[ni].b = pf;
+                p->nodes[ni].c = clause_count;
+                p->nodes[ni].d = default_idx;
+            }
+        }
+        goto out;
+    }
     if (p_is_kw(p, KW_FOR)) {
         lex_next(&p->lx);
         if (!p_expect_punct(p, P_LP, "expected '('")) goto out;
@@ -1486,6 +1720,7 @@ typedef struct {
     u32 in_func_depth;     /* 0=main */
     /* loop の break/continue パッチ連鎖（pos のリストを逆方向リンク: buf[pos]=prev head） */
     u32 brk_head[64], cont_head[64], cont_kind[64]; u32 n_loops;
+    u8 loop_is_switch[64]; /* v0.4: switch は break の対象だが continue には透過（JS 仕様） */
     u16 try_depth;              /* lex 上の try 領域の深さ（catch 本体含む） */
     u8 try_at_loop[64];         /* 各 loop 開設時の try_depth（try 越境 brk/cont の検出用） */
     bool fail;
@@ -1781,6 +2016,17 @@ static u32 cg_cond_jmpf(Cg *cg, u32 ni) {
     return cg_jmp_op(cg, OP_JMPF);
 }
 
+/* v0.4: 後置プロパティ ++/-- 専用の一時 local（関数ごとに 1 枠を使い回す）。
+ * 安全性の根拠: 使用区間は「LSTORE T ... LLOAD T」で完結する固定シーケンスに
+ * 限られ、その間に他のユーザ式コード生成を挟まない。入れ子式（例: 将来の配列で
+ * `a[i++]++` 相当）でも、内側の使用は cg_expr(objnode) の再帰内で開始〜完了して
+ * から外側がこの枠を使い始めるため、同時使用（競合）は構造的に発生しない。 */
+static i32 cg_temp_slot(Cg *cg) {
+    i32 at = cg_local_find(cg, AKL_TEMP_SLOT_NAME);
+    if (at >= 0) return at;
+    return cg_local_add(cg, AKL_TEMP_SLOT_NAME, 0);
+}
+
 static void cg_expr(Cg *cg, u32 ni) {
     if (cg->fail) return;
     AklNode *n = &cg->p->nodes[ni];
@@ -1911,11 +2157,89 @@ static void cg_expr(Cg *cg, u32 ni) {
         cg_u32(cg, n->b);
         break;
     case N_PSET:
+        if (n->op == 0) {
+            /* 単純代入: obj は 1 度だけ評価（PSTORE が obj/val を直接消費） */
+            cg_expr(cg, n->a);
+            cg_expr(cg, n->b);
+            cg_op(cg, OP_PSTORE);
+            cg_u32(cg, n->c);
+            break;
+        }
+        /* 複合代入（v0.4）: obj.prop OP= val。obj は 1 度だけ評価する必要があるため
+         * DUP で複製してから PLOAD/PSTORE の対を踏む（obj が任意の式＝副作用を
+         * 持ち得るため、二重評価は構造的に禁止しなければならない）。
+         *   [obj] -DUP-> [obj,obj] -PLOAD-> [obj,old] -val-> [obj,old,val]
+         *   -OP-> [obj,result] -PSTORE-> [result] */
         cg_expr(cg, n->a);
+        cg_op(cg, OP_DUP);
+        cg_op(cg, OP_PLOAD);
+        cg_u32(cg, n->c);
         cg_expr(cg, n->b);
+        cg_op(cg, n->op);
         cg_op(cg, OP_PSTORE);
         cg_u32(cg, n->c);
         break;
+    case N_TERNARY: {
+        u32 s_else = cg_cond_jmpf(cg, n->a);
+        cg_expr(cg, n->b);
+        u32 s_end = cg_jmp_op(cg, OP_JMP);
+        cg_patch_u32(cg, s_else, cg_target_here(cg));
+        cg_expr(cg, n->c);
+        cg_patch_u32(cg, s_end, cg_target_here(cg));
+        break;
+    }
+    case N_INCDEC: {
+        AklNode *t = &cg->p->nodes[n->a];
+        if (t->kind == N_IDENT) {
+            /* 識別子: cg_load/cg_store が local/global を共に吸収する対称性を利用。
+             * store 系は「pop して格納するだけ（push し直さない）」ため、
+             * 前置は DUP 後の片方を store（残りが新値）、後置は old を先に確保して
+             * from new を store した後、old を再ロードする。 */
+            cg_load(cg, t->a);
+            cg_op(cg, OP_POS); /* ToNumber（文字列 "5"++ 等も数値化。project 規約: 暗黙変換は明示関数を通す） */
+            if (n->flags == 0) {
+                /* 前置: [oldnum] -ADDCI-> [newval] -DUP-> [newval,newval] -store-> [newval] */
+                cg_op(cg, n->op == OP_ADD ? OP_ADDCI : OP_SUBCI);
+                cg_u32(cg, 1);
+                cg_op(cg, OP_DUP);
+                cg_store(cg, t->a, 0, false);
+            } else {
+                /* 後置: [oldnum] -DUP-> [oldnum,oldnum] -ADDCI-> [oldnum,newval] -store-> [oldnum] */
+                cg_op(cg, OP_DUP);
+                cg_op(cg, n->op == OP_ADD ? OP_ADDCI : OP_SUBCI);
+                cg_u32(cg, 1);
+                cg_store(cg, t->a, 0, false);
+            }
+        } else { /* N_PGET: obj.prop++ / --obj.prop */
+            cg_expr(cg, t->a);   /* obj は 1 度だけ評価 */
+            cg_op(cg, OP_DUP);
+            cg_op(cg, OP_PLOAD);
+            cg_u32(cg, t->b);
+            cg_op(cg, OP_POS);
+            if (n->flags == 0) {
+                /* 前置: [obj,oldnum] -ADDCI-> [obj,newval] -PSTORE-> [newval] */
+                cg_op(cg, n->op == OP_ADD ? OP_ADDCI : OP_SUBCI);
+                cg_u32(cg, 1);
+                cg_op(cg, OP_PSTORE);
+                cg_u32(cg, t->b);
+            } else {
+                /* 後置: old を一時 local T に退避してから新値を格納し、最後に T を戻す。
+                 * スタックのみでは [obj,old] から「obj の直下に old を残したまま
+                 * top を new に差し替えて PSTORE する」配置が作れない（3 項の並べ替えに
+                 * SWAP 相当が要る）ため、正しさのために 1 枠の一時 local を使う。 */
+                i32 tslot = cg_temp_slot(cg);
+                if (tslot < 0) { cg->fail = true; break; }
+                cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)tslot); /* [obj] , T=oldnum */
+                cg_op(cg, OP_LLOAD);  cg_u32(cg, (u32)tslot); /* [obj,oldnum] */
+                cg_op(cg, n->op == OP_ADD ? OP_ADDCI : OP_SUBCI);
+                cg_u32(cg, 1);                                  /* [obj,newval] */
+                cg_op(cg, OP_PSTORE); cg_u32(cg, t->b);          /* [newval] */
+                cg_op(cg, OP_POP);                               /* [] */
+                cg_op(cg, OP_LLOAD);  cg_u32(cg, (u32)tslot);    /* [oldnum] 最終値 */
+            }
+        }
+        break;
+    }
     case N_MCALL: {
         cg_expr(cg, n->a);
         for (u32 i = 0; i < n->c; i++) cg_expr(cg, cg->p->list[n->b + i]);
@@ -2128,6 +2452,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
         u32 li = cg->n_loops++;
         cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = cond;
+        cg->loop_is_switch[li] = 0;
         cg_stmt(cg, n->b);
         cg_op(cg, OP_JMP); cg_u32(cg, cond);
         u32 end = cg_target_here(cg);
@@ -2141,6 +2466,82 @@ static void cg_stmt(Cg *cg, u32 ni) {
             u32 nxt2; memcpy(&nxt2, &cg->rt->code[s3], 4);
             cg_patch_u32(cg, s3, (u32)cg->cont_kind[li]);
             s3 = nxt2;
+        }
+        cg->n_loops--;
+        break;
+    }
+    case N_DOWHILE: {
+        /* do { body } while (cond): continue は cond 再評価点へ（while と対称）。
+         * 意味保持: body; cond; (真なら body へ戻る)。break/continue の連鎖 patch は
+         * N_WHILE と同一手順（コード重複より「同一の証明済み手順を複製」を選ぶ:
+         * ここは 15 行未満で、共通化すると N_WHILE 側の可読性が却って落ちる）。 */
+        if (cg->n_loops >= 64) { akl_errf(cg->rt, "loop nesting budget exhausted"); cg->fail = true; break; }
+        u32 li = cg->n_loops++;
+        cg->try_at_loop[li] = (u8)cg->try_depth;
+        cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE;
+        cg->loop_is_switch[li] = 0;
+        u32 body_top = cg_target_here(cg);
+        cg_stmt(cg, n->b);
+        u32 cond_addr = cg_target_here(cg);
+        cg->cont_kind[li] = cond_addr;
+        u32 s_end = cg_cond_jmpf(cg, n->a);
+        cg_op(cg, OP_JMP); cg_u32(cg, body_top);
+        u32 end = cg_target_here(cg);
+        cg_patch_u32(cg, s_end, end);
+        for (u32 s2 = cg->brk_head[li]; s2 != N_NONE;) {
+            u32 nxt; memcpy(&nxt, &cg->rt->code[s2], 4);
+            cg_patch_u32(cg, s2, end);
+            s2 = nxt;
+        }
+        for (u32 s3 = cg->cont_head[li]; s3 != N_NONE;) {
+            u32 nxt2; memcpy(&nxt2, &cg->rt->code[s3], 4);
+            cg_patch_u32(cg, s3, (u32)cg->cont_kind[li]);
+            s3 = nxt2;
+        }
+        cg->n_loops--;
+        break;
+    }
+    case N_SWITCH: {
+        /* strict-eq (===) 順次照合。フォールスルーは節本体をソース順に並べる
+         * だけで得る（各節間に無条件 JMP を挿まない）。break のみ end へ。
+         * continue はこのフレームに一切 attach しない（loop_is_switch=1 が
+         * N_CONTINUE 側の探索で読み飛ばす）。 */
+        if (cg->n_loops >= 64) { akl_errf(cg->rt, "loop nesting budget exhausted"); cg->fail = true; break; }
+        if (n->c > 250) { akl_errf(cg->rt, "internal: switch clause overflow"); cg->fail = true; break; }
+        cg_expr(cg, n->a); /* discriminant を 1 度だけ評価 */
+        if (cg->fail) break;
+        u32 li = cg->n_loops++;
+        cg->try_at_loop[li] = (u8)cg->try_depth;
+        cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE;
+        cg->loop_is_switch[li] = 1;
+        u32 body_sites[250] = { 0 };
+        for (u32 i = 0; i < n->c; i++) {
+            if (i == n->d) continue; /* default 節は等価照合の対象外（後段で fallback 先として使う） */
+            u32 test_ni = cg->p->list[n->b + 2 * i];
+            cg_op(cg, OP_DUP);
+            cg_expr(cg, test_ni);
+            if (cg->fail) break;
+            cg_op(cg, OP_SEQ);
+            u32 skip = cg_jmp_op(cg, OP_JMPF);
+            cg_op(cg, OP_POP);                     /* 一致: 判別値を捨てて本体へ */
+            body_sites[i] = cg_jmp_op(cg, OP_JMP);
+            cg_patch_u32(cg, skip, cg_target_here(cg));
+        }
+        cg_op(cg, OP_POP);                         /* 不一致: 判別値を捨てて default/end へ */
+        u32 fallback_site = cg_jmp_op(cg, OP_JMP);
+        for (u32 i = 0; i < n->c && !cg->fail; i++) {
+            u32 body_ni = cg->p->list[n->b + 2 * i + 1];
+            u32 addr = cg_target_here(cg);
+            if (i == n->d) cg_patch_u32(cg, fallback_site, addr);
+            else cg_patch_u32(cg, body_sites[i], addr);
+            cg_stmt(cg, body_ni);
+        }
+        u32 end = cg_target_here(cg);
+        if (n->d == N_NONE) cg_patch_u32(cg, fallback_site, end);
+        for (u32 s2 = cg->brk_head[li]; s2 != N_NONE;) {
+            u32 nxt; memcpy(&nxt, &cg->rt->code[s2], 4);
+            cg_patch_u32(cg, s2, end);
+            s2 = nxt;
         }
         cg->n_loops--;
         break;
@@ -2202,6 +2603,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
             u32 li = cg->n_loops++;
             cg->try_at_loop[li] = (u8)cg->try_depth;
             cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE;
+            cg->loop_is_switch[li] = 0;
             cg_stmt(cg, n->d);
             u32 step_addr = cg_target_here(cg);
             cg->cont_kind[li] = step_addr;
@@ -2234,6 +2636,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
         u32 li = cg->n_loops++;
         cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE; /* step addr 後決め */
+        cg->loop_is_switch[li] = 0;
         cg_stmt(cg, n->d);
         u32 step_addr = cg_target_here(cg);
         cg->cont_kind[li] = step_addr;
@@ -2270,20 +2673,25 @@ static void cg_stmt(Cg *cg, u32 ni) {
             cg->brk_head[li] = site;
         }
         break;
-    case N_CONTINUE:
-        if (!cg->n_loops) { akl_errf(cg->rt, "continue outside loop"); cg->fail = true; break; }
-        if ((u32)cg->try_depth != cg->try_at_loop[cg->n_loops - 1]) {
+    case N_CONTINUE: {
+        /* switch は continue に透過（JS 仕様）: 直近の「ループ」フレームまで飛び越す。
+         * loop_is_switch はループの内側でのみ push/pop されるため、ここで見つかる
+         * 最初の非 switch フレームが構造的に唯一の正しい対象。 */
+        i32 li = -1;
+        for (i32 k = (i32)cg->n_loops - 1; k >= 0; k--) {
+            if (!cg->loop_is_switch[k]) { li = k; break; }
+        }
+        if (li < 0) { akl_errf(cg->rt, "continue outside loop"); cg->fail = true; break; }
+        if ((u32)cg->try_depth != cg->try_at_loop[li]) {
             akl_errf(cg->rt, "continue across try boundary is unsupported in v0.1");
             cg->fail = true; break;
         }
-        {
-            u32 site = cg_jmp_op(cg, OP_JMP);
-            u32 li = cg->n_loops - 1;
-            u32 prev = cg->cont_head[li];
-            memcpy(&cg->rt->code[site], &prev, 4);
-            cg->cont_head[li] = site;
-        }
+        u32 site = cg_jmp_op(cg, OP_JMP);
+        u32 prev = cg->cont_head[li];
+        memcpy(&cg->rt->code[site], &prev, 4);
+        cg->cont_head[li] = site;
         break;
+    }
     case N_THROW:
         cg_expr(cg, n->a);
         cg_op(cg, OP_THROW);
@@ -2956,6 +3364,21 @@ static double akl_to_number(AklRT *rt, AklVal v) {
     return akl_canon(0.0 / 0.0);
 }
 
+/* ToInt32 / ToUint32（ECMA-262 7.1.6/7.1.7 準拠。v0.4 ビット演算/シフト用）。
+ * NaN/±Infinity は 0（modulo が未定義になる領域を明示的に潰す）。 */
+static u32 akl_to_uint32_bits(double d) {
+    if (isnan(d) || isinf(d)) return 0;
+    double pos = d < 0 ? -floor(-d) : floor(d); /* ToInteger（0 方向丸め相当） */
+    /* fmod は負の被除数で負を返し得るため、非負化してから 2^32 で畳む */
+    double m = fmod(pos, 4294967296.0);
+    if (m < 0) m += 4294967296.0;
+    return (u32)m;
+}
+static i32 akl_to_int32(double d) {
+    u32 u = akl_to_uint32_bits(d);
+    return (i32)u; /* u32→i32 の実装定義変換は 2 の補数前提（本プロジェクトの対象環境で妥当。ARCHITECTURE 台帳） */
+}
+
 /* 二項演算の被演算子ペアをまとめて数値化する。pop 済みの値は GC ルート外なので、
  * 片方の flatten が起こす GC で他方の obj が掃かれる（index 再利用まで含む）のを
  * 防ぐため、両方を nursery にピンしてから変換する。 */
@@ -3592,6 +4015,8 @@ static bool vm_exec(AklRT *rt, u32 entry) {
         [OP_LOOPINC_GV] = &&l_LOOPINC_GV, [OP_LOOPINC_LV] = &&l_LOOPINC_LV,
         [OP_OBJNEW] = &&l_OBJNEW, [OP_PLOAD] = &&l_PLOAD,
         [OP_PSTORE] = &&l_PSTORE, [OP_MCALL] = &&l_MCALL,
+        [OP_BAND] = &&l_BAND, [OP_BOR] = &&l_BOR, [OP_BXOR] = &&l_BXOR, [OP_BNOT] = &&l_BNOT,
+        [OP_SHL] = &&l_SHL, [OP_SHR] = &&l_SHR, [OP_USHR] = &&l_USHR,
         [OP_HALT] = &&l_HALT,
     };
 #define AKL_NEXT() do { if (dead) { free(frames); return false; } AKL_BUDGET(); goto *akl_jt[*pc++]; } while (0)
@@ -3728,6 +4153,58 @@ static bool vm_exec(AklRT *rt, u32 entry) {
         AKL_NEXT();
     }
     AKL_L(POS): { AklVal v = AKL_POP(); rt->gc_sp = sp; AKL_PUSH(akl_num(akl_canon(akl_to_number(rt, v)))); AKL_NEXT(); }
+    AKL_L(BNOT): {
+        AklVal v = AKL_POP();
+        rt->gc_sp = sp;
+        i32 i2 = akl_to_int32(akl_to_number(rt, v));
+        AKL_PUSH(AKL_MK_INT(~i2));
+        AKL_NEXT();
+    }
+#define AKL_BITOP(EXPR) { \
+        AklVal vb = AKL_POP(), va = AKL_POP(); \
+        rt->gc_sp = sp; \
+        double da_, db_; \
+        akl_to_number2(rt, va, vb, &da_, &db_); \
+        i32 a_ = akl_to_int32(da_), b_ = akl_to_int32(db_); \
+        AKL_PUSH(AKL_MK_INT((i32)(EXPR))); \
+        AKL_NEXT(); }
+    AKL_L(BAND): AKL_BITOP(a_ & b_);
+    AKL_L(BOR):  AKL_BITOP(a_ | b_);
+    AKL_L(BXOR): AKL_BITOP(a_ ^ b_);
+#undef AKL_BITOP
+    AKL_L(SHL): {
+        AklVal vb = AKL_POP(), va = AKL_POP();
+        rt->gc_sp = sp;
+        double da_, db_;
+        akl_to_number2(rt, va, vb, &da_, &db_);
+        i32 a_ = akl_to_int32(da_);
+        u32 sh_ = akl_to_uint32_bits(db_) & 31u;
+        AKL_PUSH(AKL_MK_INT((i32)((u32)a_ << sh_)));
+        AKL_NEXT();
+    }
+    AKL_L(SHR): {
+        AklVal vb = AKL_POP(), va = AKL_POP();
+        rt->gc_sp = sp;
+        double da_, db_;
+        akl_to_number2(rt, va, vb, &da_, &db_);
+        i32 a_ = akl_to_int32(da_);
+        u32 sh_ = akl_to_uint32_bits(db_) & 31u;
+        AKL_PUSH(AKL_MK_INT(a_ >> sh_)); /* i32 の算術右シフト（符号拡張。実装定義だが GCC/Clang は算術） */
+        AKL_NEXT();
+    }
+    AKL_L(USHR): {
+        AklVal vb = AKL_POP(), va = AKL_POP();
+        rt->gc_sp = sp;
+        double da_, db_;
+        akl_to_number2(rt, va, vb, &da_, &db_);
+        u32 a_ = akl_to_uint32_bits(da_);
+        u32 sh_ = akl_to_uint32_bits(db_) & 31u;
+        u32 r_ = a_ >> sh_;
+        /* 結果は ToUint32 域（2^31 以上もあり得る）なので int32 タグに収まらない値は double 化 */
+        if (r_ <= 2147483647u) { AKL_PUSH(AKL_MK_INT((i32)r_)); }
+        else { AKL_PUSH(akl_num((double)r_)); }
+        AKL_NEXT();
+    }
     AKL_L(TYPEOF): {
         AklVal v = AKL_POP();
         const char *s;

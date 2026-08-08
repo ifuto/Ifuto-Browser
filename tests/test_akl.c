@@ -117,12 +117,13 @@ static void t_vars_assign(void) {
     want_err("const c = 1; c = 2;", "const");
     want_err("var 1x;", NULL);
     want_err("const z;", "initializer");
-    /* ++/-- は未対応。黙って二重 unary に落とすと「静かに間違った答え」になる
-     * （実測: var i=5; --i; i が 5 を返していた。本来は 4）ので lex で明白に拒否 */
-    want_err("var i = 5; --i; i", NULL);
-    want_err("var i = 1; ++i; i", NULL);
-    want_err("var i = 9; i--; i", NULL);
-    want_err("var i = 9; i++; i", NULL);
+    /* ++/-- は v0.4 統合で実装済み（AKL_COMPAT.md 実測表を更新）。
+     * 旧 v0.0/v0.3 は lex で拒否していた（黙った二重 unary 誤答対策）が、
+     * 正式なインクリメント/デクリメントとして実装したことで表を昇格した。 */
+    want_num("var i = 5; --i; i", 4);
+    want_num("var i = 1; ++i; i", 2);
+    want_num("var i = 9; i--; i", 8);
+    want_num("var i = 9; i++; i", 10);
     want_num("1 - -2", 3);           /* 空白分離の二重 unary は生き続ける */
     want_num("- -3", 3);
     want_num("5 + +2", 7);
@@ -397,6 +398,129 @@ static void test_akl_modmagic(void) {
     want_num("2147483647 % 1", 0);
     want_num("-7 % 3", -1);
     want_num("7 % -3", 1);
+}
+
+/* ---- v0.4 統合: 三項・ビット演算/シフト・++/--・複合代入・switch/do-while。
+ * ロードマップ（AKL_COMPAT.md）優先度 2〜4 の一括実装。ゼロコピーの脱糖
+ * （x op= y → x = x op y）が既存の融合命令を素通しすることも確認する。 */
+static void t_v04_control_ops(void) {
+    /* 独立 RT で走らせる: g_rt は他の全 t_* 関数と共有され、コンパイル由来オブジェクトは
+     * pin_mark で eval ごとに永続化される（ARCHITECTURE の設計）。この関数だけで
+     * ~90 個の eval() を追加すると共有 g_rt の 100,000 obj 天井の残り margin を
+     * 消費し、離れた既存 GC churn テスト（gs/gn/gkeep 系）を巻き添えで落とす
+     * （実測で確認済み）。テスト自体の独立性を保つのが正しい修正であり、
+     * 「共有グローバル可変状態」を追加で汚さない（t_native の入れ子 fresh-rt と同型）。 */
+    AklRT *saved = g_rt;
+    g_rt = akl_new();
+    CHECK(g_rt != NULL);
+    if (!g_rt) { g_rt = saved; return; }
+    /* 前置/後置 ++/--: 値と副作用の両方を確認（JS では ToNumber(old) を返す） */
+    want_num("var i = 5; var r = i++; r * 100 + i", 506);       /* r=5, i=6 */
+    want_num("var i = 5; var r = ++i; r * 100 + i", 606);       /* r=6, i=6 */
+    want_num("var i = 5; var r = i--; r * 100 + i", 504);
+    want_num("var i = 5; var r = --i; r * 100 + i", 404);
+    want_num("var s = '5'; var r = s++; r * 100 + s", 506);     /* 文字列は暗黙で数値化 */
+    want_num("function f(){ var i = 10; i++; return i; } f()", 11); /* 関数ローカル slot */
+    want_num("var g = 1; function f(){ g++; return g; } f() * 10 + g", 22); /* グローバルへの副作用 */
+    want_err("5++;", "expected ';'"); /* 数値リテラルは postfix 連鎖に入らない（p_primary が
+     * NUM に対して p_postfix を呼ばない）ため「invalid increment target」ではなく
+     * 「expected ';'」で拒否される。文言は JS と異なるが失敗自体は正しい（誠実な別解釈） */
+    want_err("++5;", "invalid increment");
+    want_err("(1+2)++;", "invalid increment");
+
+    /* プロパティ ++/--: obj は 1 度だけ評価する（副作用二重化の検出） */
+    want_num("var o = {x: 5}; var r = o.x++; r * 100 + o.x", 506);
+    want_num("var o = {x: 5}; var r = ++o.x; r * 100 + o.x", 606);
+    want_num("var o = {x: 5}; var r = o.x--; r * 100 + o.x", 504);
+    want_num("var o = {x: 5}; var r = --o.x; r * 100 + o.x", 404);
+    want_num(
+        "var calls = 0; var box = {v: 1};"
+        "function get() { calls = calls + 1; return box; }"
+        "get().v++;"
+        "calls * 1000 + box.v", 1002); /* get() は 1 回だけ呼ばれる（obj 単評価の証明。calls=1, box.v=1→2） */
+    want_num(
+        "var calls = 0; var box = {v: 1};"
+        "function get() { calls = calls + 1; return box; }"
+        "++get().v;"
+        "calls * 1000 + box.v", 1002);
+
+    /* 複合代入: 識別子（脱糖が既存融合を素通しする）とプロパティ（単評価） */
+    want_num("var x = 10; x += 5; x", 15);
+    want_num("var x = 10; x -= 3; x", 7);
+    want_num("var x = 10; x *= 4; x", 40);
+    want_num("var x = 10; x /= 4; x", 2.5);
+    want_num("var x = 10; x %= 3; x", 1);
+    want_str("var s = 'a'; s += 'b'; s", "ab");
+    want_err("const c = 1; c += 1;", "const");
+    want_num("var o = {x: 10}; o.x += 5; o.x", 15);
+    want_num("var o = {x: 10}; o.x -= 3; o.x", 7);
+    want_num("var o = {x: 10}; o.x *= 4; o.x", 40);
+    want_num("var o = {x: 10}; o.x %= 3; o.x", 1);
+    want_num(
+        "var calls = 0; var box = {v: 3};"
+        "function get() { calls = calls + 1; return box; }"
+        "get().v += 4;"
+        "calls * 1000 + box.v", 1007);
+
+    /* 三項演算子: ネスト（右結合）と両枝の代入式受理 */
+    want_num("1 > 2 ? 10 : 20", 20);
+    want_num("1 < 2 ? 10 : 20", 10);
+    want_num("var a = 1; var r = a > 0 ? a > 5 ? 1 : 2 : 3; r", 2);         /* ネスト（右結合） */
+    want_num("var a = 0; var b = 0; var r = (a=1) ? (b=2) : (b=3); r*10+a*100+b", 122);
+
+    /* ビット演算/シフト（ToInt32/ToUint32、double→int32 変換規則） */
+    want_num("6 & 3", 2);
+    want_num("6 | 1", 7);
+    want_num("6 ^ 1", 7);
+    want_num("~0", -1);
+    want_num("~5", -6);
+    want_num("1 << 4", 16);
+    want_num("-8 >> 1", -4);          /* 算術右シフト（符号維持） */
+    want_num("-1 >>> 28", 15);        /* 論理右シフト（符号なし） */
+    want_num("-1 >>> 0", 4294967295.0); /* ToUint32 域は int32 タグを超えて double 化 */
+    want_num("1 << 32", 1);           /* シフト量は & 31（ECMA-262 7.1.10） */
+    want_num("NaN | 0", 0);
+    want_num("Infinity | 0", 0);
+    want_num("(-Infinity) | 0", 0);
+    want_num("4294967296 | 0", 0);    /* 2^32 は ToInt32 で 0 */
+    want_num("2147483648 | 0", -2147483648.0); /* 2^31 は最小 int32 に折り返す */
+    want_num("3.9 | 0", 3);           /* ToInteger は 0 方向丸め（floor ではない） */
+    want_num("-3.9 | 0", -3);
+
+    /* do-while: 条件が最初から偽でも本体は最低 1 回実行される（while との違い） */
+    want_num("var n = 0; do { n = n + 1; } while (0); n", 1);
+    want_num("var n = 0; do { n = n + 1; } while (n < 5); n", 5);
+    want_num("var n = 0; do { n = n + 1; if (n == 3) break; } while (n < 10); n", 3);
+    want_num("var n = 0, s = 0; do { n = n + 1; if (n % 2 == 0) continue; s = s + n; } while (n < 5); s", 9); /* 1+3+5 */
+
+    /* switch: フォールスルー・default の途中配置・break・空 switch・多重一致なし */
+    want_num("var r; switch (2) { case 1: r=1; break; case 2: r=2; case 3: r=r+3; break; default: r=9; } r", 5);
+    want_num("var r=0; switch (99) { case 1: r=1; break; default: r=100; case 2: r=r+2; break; } r", 102);
+    want_num("var r=0; switch (1) { case 1: r=1; default: r=r+100; case 2: r=r+2; } r", 103); /* default 経由後も後続へ通過 */
+    want_num("var r=0; switch (5) { } r = 1; r", 1); /* 空 switch は無害 */
+    want_num("var r=0; switch ('a') { case 'a': r=1; break; case 'b': r=2; } r", 1); /* 判別は strict eq */
+    want_num("var r=0; switch (1) { case '1': r=1; break; default: r=2; } r", 2);    /* === なので型不一致は default */
+    want_err("switch(1){ default: 1; default: 2; }", "default");
+
+    /* continue は switch を透過して外側ループへ、break は switch自身を抜けるだけ */
+    want_num(
+        "var acc = 0;"
+        "for (var i = 0; i < 5; i = i + 1) {"
+        "  switch (i) { case 3: continue; default: acc = acc + i; }"
+        "}"
+        "acc", 7); /* 0+1+2+4（3 は continue でスキップ） */
+    want_num(
+        "var acc = 0;"
+        "for (var i = 0; i < 5; i = i + 1) {"
+        "  switch (i) { case 3: break; default: acc = acc + i; }"
+        "  acc = acc + 100;"
+        "}"
+        "acc", 507); /* switch の break はループを止めない（100 の加算は毎周実行、case3 は自身の加算だけ抜く） */
+    want_err("switch(1){ case 1: continue; }", "continue outside loop");
+    want_err("break;", "break outside loop");
+    want_err("continue;", "continue outside loop");
+    akl_free(g_rt);
+    g_rt = saved;
 }
 
 /* ---- JS 例外（throw/try/catch/finally）。JS 規則の要点:
@@ -870,6 +994,7 @@ void test_akl(void) {
     t_arith();
     t_vars_assign();
     t_control();
+    t_v04_control_ops();
     t_functions();
     t_strings();
     t_equality_logic();
