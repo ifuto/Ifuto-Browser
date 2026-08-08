@@ -6,6 +6,7 @@
 #include "css.h"
 #include "md.h"
 #include "net.h"
+#include "script.h" /* v0.3: <script> akl 実行（style 適用前。正本 docs/SCRIPTING.md） */
 #include "ifuto_pages.h"
 #include "ext.h" /* 拡張 E1（chrome_init 走査結線） */
 #include <stdio.h>
@@ -219,6 +220,10 @@ static bool tab_load(IfChrome *c, IfTab *t, const char *path, i32 width) {
         if_dom_slim = true; /* 実ブラウズ法則: 画面描画に関係ないものは DOM しない */
         t->dom = if_parse_html(doc, input);
     }
+    /* v0.3: <script> akl 実行（本家順序: style 適用前。DOM 変更が style/layout に
+     * 反映される。script RT は if_script_run 内で必ず破棄 → doc arena より先に
+     * 死ぬ = HANDLE ptr 規約の構造保証。失敗は script 単位で隔離・描画継続） */
+    if_script_run(doc, t->dom, stderr);
     if_style_apply(doc, t->dom);
     if (t->doc) if_arena_destroy(t->doc);
     free(t->doc);

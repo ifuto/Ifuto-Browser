@@ -90,7 +90,14 @@ static bool under_slim(IfTB *b) {
         if (b->stack[i - 1]->flags & IF_NF_SLIM) return true;
     return false;
 }
-static bool slim_root_tag(u16 t) { return t == IF_TAG_SCRIPT || t == IF_TAG_TEMPLATE; }
+static bool slim_root_tag(u16 t) {
+    /* template のみ。script は v0.3 で akl 実行配線（src/script.c）したため DOM 保持に
+     * 変更: slim が消してよいのは『描画に現れない』だけでは不足で『実行もしない』
+     * 対象に限る、が法則『画面描画に関係ないものは DOM しない』の補足として凍結。
+     * script ノード自体はレンダラが従来から正しく無視する（実測: 非 slim 経路で
+     * script 内容が一切描画されないことを確認済・2026-08-08）。 */
+    return t == IF_TAG_TEMPLATE;
+}
 
 /* ファイル前半のユーティリティで参照される下方定義の前方宣言群 */
 static IfNode *top(IfTB *b);
@@ -209,6 +216,7 @@ static void pop(IfTB *b) { if (b->depth) b->depth--; }
 static IfNode *make_element(IfTB *b, const IfTok *tok) {
     IfNode *n = new_node(b, IF_NODE_ELEMENT);
     n->tag = tok->tag;
+    if (tok->tag == IF_TAG_SCRIPT) b->dom->has_script = 1; /* script 実行配線の走査スイッチ */
     if (tok->tag == IF_TAG_UNKNOWN) {
         char *lc = (char *)if_arena_alloc(b->arena, (u64)tok->tag_raw.n + 1);
         for (u32 i = 0; i < tok->tag_raw.n; i++) lc[i] = (char)if_ascii_lower((u8)tok->tag_raw.p[i]);

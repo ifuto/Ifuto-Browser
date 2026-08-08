@@ -7,6 +7,7 @@
 #include "arena.h"
 #include "dom.h"
 #include "md.h"
+#include "script.h" /* v0.3: <script> akl 実行（正本 docs/SCRIPTING.md） */
 #include "css.h"
 #include "layout.h"
 #include "render.h"
@@ -234,6 +235,17 @@ int main(int argc, char **argv) {
     }
 
     double arena_after_parse = (double)if_arena_reserved(&a);
+
+    /* v0.3: <script> akl 実行（凍結正本: docs/SCRIPTING.md）。
+     * dump 系モード（wptdom/tokens/dom）は上流で return 済み = 文字列観測系オラクル不変。
+     * 本家順序に従い style 適用前（DOM 変更が style/layout/render へ反映される）。
+     * 計測は既存 5 段を汚さない独立枠（script 実行時のみ stats に追加行）。
+     * script RT は if_script_run 内で必ず破棄される → DOM arena 解体より先死ぬ
+     * （HANDLE ptr 規約の構造保証。akl/akl.h の AklHandleVTab 注記参照）。 */
+    double tscr0 = now_ms();
+    IfScriptReport srep = if_script_run(&a, dom, stderr);
+    double script_ms = now_ms() - tscr0;
+
     /* lazy style: md fast-DOM × CLI 行スイープでは style 全面走査を消し、
      * layout の DFS 訪問時に必要箇所だけ解決する（解決値は if_style_apply と同値。
      * 詳細は css.h の IfStyleLazy 注釈。--no-style / dump / GUI は従来経路） */
@@ -244,6 +256,9 @@ int main(int argc, char **argv) {
     }
     double t3 = now_ms();
     double arena_after_style = (double)if_arena_reserved(&a);
+    /* style 段の正直な帰属: script 実行（style 適用前の本家順序）を差引く。
+     * script 非含有文書は has_script 早期リターンで script_ms≈0 = 既存計測不変 */
+    double style_ms = (t3 - t2) - script_ms;
 
     /* devtools 観測点: style 適用直後の computed style を全要素ダンプして終了
      * （layout 以降へは進まない。style_lazy は M_RENDER 専用なので本経路は常に
@@ -292,12 +307,15 @@ int main(int argc, char **argv) {
                 if (sscanf(line, "VmHWM: %llu kB", (unsigned long long *)&vwhwm_kb) == 1) break;
             fclose(st);
         }
+        if (srep.n_run)
+            fprintf(stderr, "ifuto stats: scripts=%u errors=%u skipped=%u script_ms=%.2f\n",
+                    srep.n_run, srep.n_errors, srep.n_skipped, script_ms);
         fprintf(stderr,
             "ifuto stats: read=%.2fms parse=%.2fms style=%.2fms layout=%.2fms render=%.2fms total=%.2fms\n"
             "  nodes=%u parse_errors=%u grid=%dx%d links=%u peak_rss_kb=%llu\n"
             "  render_split: grid=%.2fms emit=%.2fms\n"
             "  arena_kb: parse=%.1f style=%.1f layout=%.1f render=%.1f\n",
-            t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0,
+            t1 - t0, t2 - t1, style_ms, t4 - t3, t5 - t4, t5 - t0,
             dom->n_nodes, dom->n_errors, mx, my, lay->n_links,
             (unsigned long long)vwhwm_kb,
             acc_grid, acc_emit,

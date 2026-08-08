@@ -16,11 +16,12 @@
 - 起動速度は ` /bin/true` 経路での最小/中央値に subprocess wall time を使う
   （`/usr/bin/time` 非存在、bash 組込の `time` のみ）。
 
-## 現行スナップショット（2026-08-08 計測・`build/ifuto` 441,224B）
+## 現行スナップショット（2026-08-08 計測・`build/ifuto` 453,512B）
 
-（前回 433,032B から +8,192B: akl ネイティブ登録層 + オブジェクトモデル +
-console.log。16MB パイプライン非実行コードのため pipeline 性能への影響なし。
-akl 単体ベンチ差分は末尾「akl エンジン差分」節参照）
+（前回 441,224B から +12,288B: `<script>` akl 実行配線（src/script.c）+ DOM
+最小変更面 + AklHandleVTab。**script 実行配線の pipeline 影響は構造的ゼロ** =
+`IfDom.has_script` parse 観測スイッチで script 非含有文書は走査自体を行わない
+（本 corpus は script 0 件を grep 確認済。median は 122.97→123.10ms で帯内一致）。
 
 ### 16MB IDM パイプライン（`--no-ansi --stats`、n=7、騒音帯）
 
@@ -31,15 +32,16 @@ akl 単体ベンチ差分は末尾「akl エンジン差分」節参照）
 | style | 0.00ms | lazy（行スイープ） |
 | layout | 52.6ms | 51.1–61.6（2-way 並列） |
 | render | 15.5ms | 15.4–16.7（単純先行） |
-| **total** | **122.97ms** | 120.2–149.2 |
-| peak RSS | 225,180 KB | ±0.4MB |
+| **total** | **123.10ms** | warm 帯 120.1–123.7（同日 n=7 再計測） |
+| peak RSS | 225,096 KB | ±0.4MB |
 
-**ミッション「騒音帯でも 16MB total ≤150ms」は継続達成中**（n=7 全 run ≤150ms、
-median 122.97ms。帯の定義と運用は git log の方針確立コミットを参照）。
+**ミッション「騒音帯でも 16MB total ≤150ms」は継続達成中**（warm 帯全 run ≤150ms、
+median 123.10ms。環境アイドル直後のコールド初回のみ帯外（145–167ms 実測、従来同様の
+ウォーム要因で 2 回目以降に収束）。帯の定義と運用は git log の方針確立コミットを参照）。
 
 ### 2MB IDM（n=5、騒音帯）
 
-total median **17.53ms**（17.2–22.3）。parse 8.0 / layout 7.0 / render 2.4ms、
+total median **17.44ms**（同日 n=5 再計測 16.0–19.4）。parse 8.0 / layout 7.0 / render 2.4ms、
 peak RSS 35,596 KB、nodes=206,290。
 
 ### CLI 起動（tiny HTML render 300 連プロセス wall）
@@ -51,7 +53,7 @@ min **1.40ms** / median **1.66ms** / p90 1.96ms。
 | ゲート | 現行値 |
 |---|---|
 | WPT tree-construction（`tests/wpt-tree-construction`、WPT master `5b6a1e6`） | **1922/1922 (100.0%)**、skip 12 = `#script-on` のみ（fragment 196 件は `--fragment CTX` で実行済） |
-| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,811 checks / 0 failures** ×2 |
+| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,863 checks / 0 failures** ×2（+52 = `tests/test_script.c` script 実行配線オラクル） |
 | 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **14/14** |
 | golden（`tests/run_golden.sh`） | 1/1 |
 | GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | 51 checks PASS（X 不在環境の proxi、GUI 実機は未検証と明記） |

@@ -54,8 +54,9 @@
 | 入力 CR/CRLF → LF 正規化なし | `\r` 含む入力でツリー差異の可能性 | v0.2 継続（入力前処理に正規化層） |
 | isindex/body↔head 移動等の非推奨・特殊規則 | 全合格（isindex.dat 4/4 含む全件） | 解消 |
 | フォント: CLI は SGR 属性（太字/斜体/下線/打消）、GUI は自前ピクセルフォント + 太字の横オフセット重ね + 斜体の oblique shear（fb.c）。等幅 | 真ベクターフォント/AA なし | ソフトラスタ品質の段階改善（要検証設計） |
-| GUI: 生 X11 プロトコル単一 UI（Xlib/XCB 不リンク、TUI は廃止）、自前 5x7+16x16 フォント（かな全量・CJK 第 5 陣まで 103 kanji）、タブ/omnibox/status・リンククリック・hover・セッション永続化（原子書込・遅延復元）・`--shot` 決定ラスタ検証（51 checks）。ldd は vdso/libm/libc/ld のみ | 台帳（続課題）: 漢字第 6 陣以降の補完、anchor 遷移、`make jsdiff`、斜体傾斜 | CJK フォント段階投入・akl DOM バインド（v0.4） |
-| slim-DOM（法則「画面描画に関係ないものは DOM しない」）: script/template 配下を DOM 非構築。**style は cascade が本文を読むので剃らない**。構築状態機械は完全実行、root は marker 残置 | 剃りバイト分はゼロコピー入力 arena がタブ寿命で保持するため現状はノードヘッダ+走査回避に限定（BENCH.md 実測） | 入力 compaction（v0.3 本丸）、slim 変異 fuzz、attrs 側の tokenizer 層剃り |
+| GUI: 生 X11 プロトコル単一 UI（Xlib/XCB 不リンク、TUI は廃止）、自前 5x7+16x16 フォント（かな全量・CJK 第 5 陣まで 103 kanji）、タブ/omnibox/status・リンククリック・hover・セッション永続化（原子書込・遅延復元）・`--shot` 決定ラスタ検証（51 checks）。ldd は vdso/libm/libc/ld のみ | 台帳（続課題）: 漢字第 6 陣以降の補完、anchor 遷移、斜体傾斜 | CJK フォント段階投入・akl DOM バインド拡張（v0.4） |
+| `<script>` akl 実行（v0.3。src/script.c、正本 docs/SCRIPTING.md）: 文書順・1 頁 1 AklRT・style 適用前・失敗は script 単位で隔離。最小 DOM バインド（`document.title`/`body`/`documentElement`/`getElementById`、要素 `.textContent`/`.id`/`.tagName`）は `AklHandleVTab`（ptr=DOM arena 所有・script RT 先に破棄の構造証明）。`has_script` parse 観測スイッチで非含有文書は走査ゼロ | 外部 src 取得・module・イベント・querySelector は v1 非対象（明白スキップ/拒否で数える） | DOM バインド拡張（v0.4）、src 取得（net.c と連結） |
+| slim-DOM（法則「画面描画に関係ないものは DOM しない」）: **template 配下**を DOM 非構築（script は v0.3 で実行対象のため本文ごと残す = 法則の正しい適用。renderer は従来機構で script subtree を描画しない）。**style は cascade が本文を読むので剃らない**。構築状態機械は完全実行、root は marker 残置 | 剃りバイト分はゼロコピー入力 arena がタブ寿命で保持するため現状はノードヘッダ+走査回避に限定（BENCH.md 実測） | 入力 compaction（v0.3 本丸）、slim 変異 fuzz、attrs 側の tokenizer 層剃り |
 | レンダ grid は viewport 窓のみ materialize（`IfGrid.y_off`、GUI/CLI 共用ビルダ） | 窓再構築はスクロール/リサイズ/タブ切替ごとに O(boxes) クリップ走査 | 差分ペイント（v0.3 候補） |
 | Markdown 表示: `.md` は md.c が多層防御つき HTML に変換して共通パイプラインへ（生 HTML 素通し禁止） | MD の入れ子深度上限で飽和（quote 8 / list 16） | MD 全構文網羅（v0.3 継続） |
 | 画像・メディアはプレースホルダ | 実デコードなし | v0.3 |

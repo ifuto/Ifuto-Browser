@@ -172,7 +172,7 @@ void test_html(void) {
             "<!doctype html><title>KeepMe</title><p>alpha</p>"
             "<script>var x = 'script-body-vanish';</script>"
             "<style>.keep { color: red }</style>"
-            "<template><div>t-body-vanish</div></template>"
+            "<template><div>tplbody-vanish</div></template>"
             "<p>omega <b>bold-stays</b></p>";
         u32 full_nodes;
         { /* full との差分測定 */
@@ -194,9 +194,11 @@ void test_html(void) {
         CHECK(sl_tree_tag_exists(d, d->root, IF_TAG_SCRIPT)); /* root は marker として残る */
         CHECK(sl_tree_tag_exists(d, d->root, IF_TAG_TEMPLATE));
         CHECK(sl_tree_text_has(d, d->root, "alpha") && sl_tree_text_has(d, d->root, "bold-stays"));
-        /* script の本文・template の子孫は DOM に存在しない（content 辺も探索済み） */
-        CHECK(!sl_tree_text_has(d, d->root, "script-body-vanish"));
-        CHECK(!sl_tree_text_has(d, d->root, "t-body-vanish"));
+        /* v0.3 凍結（docs/SCRIPTING.md）: script は実行対象になったため slim でも
+         * ノードと本文を残す（renderer は従来機構で script subtree を描画しない）。
+         * template の子孫は従来通り DOM に存在しない（content 辺も探索済み）。 */
+        CHECK(sl_tree_text_has(d, d->root, "script-body-vanish"));
+        CHECK(!sl_tree_text_has(d, d->root, "tplbody-vanish"));
         CHECK(sl_tree_text_has(d, d->root, ".keep"));         /* style 本文は残す設計 */
         CHECK(!sl_tree_tag_exists(d, d->root, IF_TAG_DIV));   /* template 下 div 無し */
         /* ノード数は full より厳密に少ない（剃りの証跡を数値で） */

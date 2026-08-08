@@ -85,7 +85,7 @@ static bool akl_numv(AklVal v, double *out) {
 
 /* ============================== ヒープオブジェクト ============================== */
 
-enum { AKL_OK_STR = 1, AKL_OK_FUNC = 2, AKL_OK_ROPE = 3, AKL_OK_NATIVE = 4, AKL_OK_OBJ = 5 };
+enum { AKL_OK_STR = 1, AKL_OK_FUNC = 2, AKL_OK_ROPE = 3, AKL_OK_NATIVE = 4, AKL_OK_OBJ = 5, AKL_OK_HANDLE = 6 };
 /* ROPE: code_off=左 obj idx, name=右 obj idx, n_params=深さ(最大4096), len=全長。
  * 不変条件: 子の index は親より小さい必要は「ない」（free-list 再利用で逆転し得る）。
  * よって GC の伝播は添字順に依らない明示ワークリストで行う。文字列は不変。
@@ -112,6 +112,7 @@ typedef struct {
     union {
         struct { AklNativeFn fn; void *udata; } nat;   /* NATIVE */
         struct { AklProp *props; u32 n, cap; } po;     /* OBJ */
+        struct { const AklHandleVTab *vt; void *ptr; } hd; /* HANDLE（C 側所有。GC 非管理） */
     } u;
 } AklObj; /* 48B（NATIVE/OBJ 追加で 32B から +16B。objs は live 数比例確保のため定常影響は live 数に限定。ARCH 台帳記録） */
 
@@ -3034,6 +3035,12 @@ static u32 akl_to_string(AklRT *rt, AklVal v) {
         if (o->kind == AKL_OK_STR || o->kind == AKL_OK_ROPE) return akl_get_obj(v); /* ROPE は文字列そのもの。flatten は読み出し時に遅延 */
         if (o->kind == AKL_OK_FUNC || o->kind == AKL_OK_NATIVE) return akl_mkstr(rt, (const u8 *)"function", 8);
         if (o->kind == AKL_OK_OBJ) return akl_mkstr(rt, (const u8 *)"[object Object]", 15);
+        if (o->kind == AKL_OK_HANDLE) {
+            char hbuf[64];
+            int hn_ = snprintf(hbuf, sizeof hbuf, "[object %s]",
+                               o->u.hd.vt && o->u.hd.vt->tag ? o->u.hd.vt->tag : "Handle");
+            return akl_mkstr(rt, (const u8 *)hbuf, (u32)hn_);
+        }
     }
     return akl_mkstr(rt, (const u8 *)"[unknown]", 9);
 }
@@ -3732,7 +3739,7 @@ static bool vm_exec(AklRT *rt, u32 entry) {
         else if (akl_is_objv(v)) {
             u8 ok_ = rt->objs[akl_get_obj(v)].kind;
             s = (ok_ == AKL_OK_STR || ok_ == AKL_OK_ROPE) ? "string"
-              : ok_ == AKL_OK_OBJ ? "object"
+              : (ok_ == AKL_OK_OBJ || ok_ == AKL_OK_HANDLE) ? "object"
               : "function"; /* FUNC / NATIVE */
         }
         else s = "undefined";
@@ -3897,6 +3904,23 @@ static bool vm_exec(AklRT *rt, u32 entry) {
         u32 name;
         memcpy(&name, pc, 4); pc += 4;
         AklVal ov = AKL_POP();
+        if (akl_is_objv(ov) && rt->objs[akl_get_obj(ov)].kind == AKL_OK_HANDLE) {
+            AklObj *ho = &rt->objs[akl_get_obj(ov)];
+            u32 nl;
+            const u8 *nb = akl_str(rt, name, &nl);
+            if (!nb) { free(frames); return false; }
+            AklVal out = AKL_VAL_UNDEF;
+            if (ho->u.hd.vt && ho->u.hd.vt->get) {
+                rt->gc_sp = sp + 1; /* pop 後でも ov は stk[sp] に残存値として mark されるよう同期 */
+                u32 nur0 = rt->n_nury;
+                bool ok_h = ho->u.hd.vt->get(rt, ho->u.hd.ptr, (const char *)nb, nl, &out);
+                if (rt->native_err) { free(frames); return false; }
+                rt->n_nury = nur0; /* out は直後 PUSH で根付く（間に GC 契機なし） */
+                if (!ok_h) out = AKL_VAL_UNDEF;
+            }
+            AKL_PUSH(out);
+            AKL_NEXT();
+        }
         if (!akl_is_objv(ov) || rt->objs[akl_get_obj(ov)].kind != AKL_OK_OBJ) {
             akl_errf(rt, "TypeError: property access on non-object value");
             free(frames); return false;
@@ -3911,6 +3935,24 @@ static bool vm_exec(AklRT *rt, u32 entry) {
         memcpy(&name, pc, 4); pc += 4;
         AklVal v = AKL_POP();
         AklVal ov = AKL_POP();
+        if (akl_is_objv(ov) && rt->objs[akl_get_obj(ov)].kind == AKL_OK_HANDLE) {
+            AklObj *ho = &rt->objs[akl_get_obj(ov)];
+            u32 nl;
+            const u8 *nb = akl_str(rt, name, &nl);
+            if (!nb) { free(frames); return false; }
+            if (!ho->u.hd.vt || !ho->u.hd.vt->set) {
+                akl_errf(rt, "TypeError: property store on handle without setter");
+                free(frames); return false;
+            }
+            rt->gc_sp = sp + 2; /* pop 済み ov/v も stk 残存値として mark（set 内 GC 発火対策） */
+            u32 nur0 = rt->n_nury;
+            bool ok_h = ho->u.hd.vt->set(rt, ho->u.hd.ptr, (const char *)nb, nl, v);
+            if (rt->native_err) { free(frames); return false; }
+            rt->n_nury = nur0;
+            if (!ok_h) { akl_errf(rt, "TypeError: property store rejected"); free(frames); return false; }
+            AKL_PUSH(v); /* 代入式の値は右辺（JS 同様） */
+            AKL_NEXT();
+        }
         if (!akl_is_objv(ov) || rt->objs[akl_get_obj(ov)].kind != AKL_OK_OBJ) {
             akl_errf(rt, "TypeError: property store on non-object value");
             free(frames); return false;
@@ -3925,6 +3967,25 @@ static bool vm_exec(AklRT *rt, u32 entry) {
         memcpy(&name, pc, 4); pc += 4;
         if (argc > 250 || sp < base + argc + 1) { akl_errf(rt, "stack underflow: mcall"); free(frames); return false; }
         AklVal ov = stk[sp - argc - 1];
+        if (akl_is_objv(ov) && rt->objs[akl_get_obj(ov)].kind == AKL_OK_HANDLE) {
+            AklObj *ho = &rt->objs[akl_get_obj(ov)];
+            u32 nl;
+            const u8 *nb = akl_str(rt, name, &nl);
+            if (!nb) { free(frames); return false; }
+            if (!ho->u.hd.vt || !ho->u.hd.vt->call) { akl_errf(rt, "TypeError: not a function"); free(frames); return false; }
+            if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
+            budget -= AKL_NATIVE_COST;
+            rt->gc_sp = sp; /* argv/ov は stk 上 = mark 済み */
+            u32 nur0 = rt->n_nury;
+            AklVal out = AKL_VAL_UNDEF;
+            bool ok_h = ho->u.hd.vt->call(rt, ho->u.hd.ptr, (const char *)nb, nl, (int)argc, stk + sp - argc, &out);
+            if (rt->native_err) { free(frames); return false; }
+            rt->n_nury = nur0;
+            if (!ok_h) { akl_errf(rt, "TypeError: not a function"); free(frames); return false; }
+            sp -= argc;
+            stk[sp - 1] = out; /* obj スロットを結果で潰す */
+            AKL_NEXT();
+        }
         AklVal fv = AKL_VAL_UNDEF;
         if (akl_is_objv(ov)) {
             AklObj *o = &rt->objs[akl_get_obj(ov)];
@@ -4910,6 +4971,33 @@ AklVal akl_mknative(AklRT *rt, AklNativeFn fn, void *udata) {
     o->u.nat.fn = fn;
     o->u.nat.udata = udata;
     return AKL_MK_OBJ(oi);
+}
+
+/* HANDLE はメソッド戻り値として「実行中生成」が本筋のため mknative とは規約が違う:
+ * VM 実行中も生成可（mkstring 同型の nursery 一時保護＋直後に束縛/返却の規約）。
+ * ホスト側オブジェクト構築（document 等）は通常通り eval 前（VM 停止中）に行う。 */
+AklVal akl_mkhandle(AklRT *rt, const AklHandleVTab *vt, void *ptr) {
+    if (!rt || !vt) { if (rt) akl_errf(rt, "bad handle vtab"); return AKL_VAL_UNDEF; }
+    u32 oi = akl_obj_new(rt);
+    if (oi == UINT32_MAX) { if (rt->gc_live) rt->native_err = true; return AKL_VAL_UNDEF; }
+    AklObj *o = &rt->objs[oi];
+    o->kind = AKL_OK_HANDLE;
+    o->u.hd.vt = vt;
+    o->u.hd.ptr = ptr;
+    if (rt->gc_live) {
+        if (rt->n_nury >= AKL_NURY_CAP) {
+            akl_errf(rt, "native temp budget exhausted");
+            rt->native_err = true;
+            return AKL_VAL_UNDEF;
+        }
+        rt->nury[rt->n_nury++] = oi;
+    }
+    return AKL_MK_OBJ(oi);
+}
+
+bool akl_is_handle(AklRT *rt, AklVal v) {
+    return rt && akl_is_objv(v) && akl_get_obj(v) < rt->n_objs &&
+           rt->objs[akl_get_obj(v)].kind == AKL_OK_HANDLE;
 }
 
 /* globals への const 束縛（register/global_set の共通内部）。同名は上書き。

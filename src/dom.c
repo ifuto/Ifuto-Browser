@@ -146,6 +146,72 @@ static void text_write_dfs(const IfNode *n, u8 *buf, u64 *w) {
     }
 }
 
+/* ---- script 実行専用の最小 DOM 変更面（dom.h 契約） ---- */
+
+static IfNode *dom_find_rec(IfNode *n, u16 tag, IfStr id, bool by_id) {
+    for (IfNode *c = n; c; c = c->next_sibling) {
+        if (c->kind == IF_NODE_ELEMENT) {
+            if (by_id) {
+                IfStr v = if_dom_attr(c, "id");
+                if (v.p && v.n == id.n && (id.n == 0 || memcmp(v.p, id.p, id.n) == 0)) return c;
+            } else if (c->tag == tag) return c;
+        }
+        IfNode *r = c->first_child ? dom_find_rec(c->first_child, tag, id, by_id) : NULL;
+        if (r) return r;
+    }
+    return NULL;
+}
+IfNode *if_dom_find_tag_dfs(const IfDom *d, u16 tag) {
+    return (d && d->root) ? dom_find_rec(d->root, tag, if_str(NULL, 0), false) : NULL;
+}
+IfNode *if_dom_find_by_id(const IfDom *d, IfStr id) {
+    return (d && d->root) ? dom_find_rec(d->root, 0, id, true) : NULL;
+}
+
+static IfNode *dom_new_node(IfArena *a, IfNodeKind kind) {
+    IfNode *n = (IfNode *)if_arena_alloc(a, sizeof(IfNode));
+    memset(n, 0, sizeof *n);
+    n->kind = kind;
+    return n;
+}
+
+/* text は akl ヒープ等の一時寿命を想定 → dom arena へ必ずコピーして保持する。 */
+void if_dom_set_text(IfArena *a, IfNode *n, IfStr t) {
+    if (!a || !n || n->kind != IF_NODE_ELEMENT) return;
+    n->first_child = NULL;
+    n->last_child = NULL;
+    if (!t.n || !t.p) return;
+    IfNode *tn = dom_new_node(a, IF_NODE_TEXT);
+    u8 *cp = (u8 *)if_arena_alloc(a, t.n);
+    memcpy(cp, t.p, t.n);
+    tn->u.text = if_str((const char *)cp, t.n);
+    tn->parent = n;
+    n->first_child = tn;
+    n->last_child = tn;
+}
+
+IfNode *if_dom_title_set(IfArena *a, IfDom *d, IfStr t) {
+    if (!a || !d) return NULL;
+    IfNode *ttl = if_dom_find_tag_dfs(d, IF_TAG_TITLE);
+    if (!ttl) {
+        IfNode *head = if_dom_find_tag_dfs(d, IF_TAG_HEAD);
+        if (!head) return NULL; /* html/tree 構造上 head 必須（保証はパーサ） */
+        ttl = dom_new_node(a, IF_NODE_ELEMENT);
+        ttl->tag = IF_TAG_TITLE;
+        ttl->ns = IF_NS_HTML;
+        ttl->u.tag_name = if_str(if_tag_name(IF_TAG_TITLE), (u32)strlen(if_tag_name(IF_TAG_TITLE))); /* 静的表参照（寿命無限） */
+        ttl->parent = head;
+        ttl->next_sibling = head->first_child;
+        head->first_child = ttl;
+        if (!head->last_child) head->last_child = ttl;
+    }
+    if_dom_set_text(a, ttl, t);
+    /* d->title の保持規約はパーサ由来（trim 済み arena ビュー）と揃える */
+    IfNode *fresh = if_dom_find_tag_dfs(d, IF_TAG_TITLE);
+    d->title = fresh ? if_str_trim(if_dom_text_content(a, fresh)) : if_str(NULL, 0);
+    return ttl;
+}
+
 /* 深さはツリービルダが IF_MAX_STACK_DEPTH に制限するため再帰は安全（スタック枯渇不能） */
 IfStr if_dom_text_content(IfArena *a, const IfNode *n) {
     if (!n) return if_str(NULL, 0);

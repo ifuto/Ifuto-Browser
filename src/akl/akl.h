@@ -107,6 +107,23 @@ void akl_native_throw(AklRT *rt, const char *msg);
  * （コピー前に他の確保を挟むと GC で失われ得る — akl_mkstring の pin 規約とは意図的に別）。 */
 AklVal akl_tostring(AklRT *rt, AklVal v);
 
+/* ---- ホストハンドル（DOM バインド向け不透明参照。AKL_OK_HANDLE） ----
+ * C 側オブジェクトを vtab 経由で akl に露出する値型。ptr は GC 非管理:
+ * ライフサイクル規約は「ptr はハンドル値が死ぬ RT より長く生きること」を呼出側が組織する
+ * （ブラウザでは script RT は DOM arena 解体より先に破棄＝構造保証。akl は ptr を
+ * 参照・解放・比較しない。所有は完全にホスト側）。 */
+typedef struct AklHandleVTab {
+    const char *tag; /* tostring/診断用（"[object TAG]"。NULL なら "Handle"） */
+    /* unknown prop は false を返す → akl 側は undefined を返す（set は TypeError） */
+    bool (*get)(AklRT *rt, void *ptr, const char *name, uint32_t len, AklVal *out);
+    bool (*set)(AklRT *rt, void *ptr, const char *name, uint32_t len, AklVal v);
+    /* メソッドディスパッチ。未定義名は false → "TypeError: not a function"。NULL 可 */
+    bool (*call)(AklRT *rt, void *ptr, const char *name, uint32_t len,
+                 int argc, const AklVal *argv, AklVal *out);
+} AklHandleVTab;
+AklVal akl_mkhandle(AklRT *rt, const AklHandleVTab *vt, void *ptr); /* pin 規約は mkobject 同様 */
+bool akl_is_handle(AklRT *rt, AklVal v);
+
 
 /* 組込側責任の上限引上げ（0 は据置）。既定値はブラウザ製品値（台帳の睩殺防止）。
  * クロスエンジン比較ベンチのように「打ち切りなしで収束する同一ソース」を

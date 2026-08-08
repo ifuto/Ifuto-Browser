@@ -76,8 +76,9 @@ typedef struct IfDoctype {
 #define IF_NF_TXTCLS_MASK     0x06
 
 /* 法則「画面描画に関係ないものは DOM しない」の実装スイッチ（dom.c）。
- * true のとき script / template 配下の子孫・本文を DOM に構築しない
- * （tree 構築の状態機械は完全に回す: stack 規則不変。適合性 Track B は
+ * true のとき template 配下の子孫・本文を DOM に構築しない
+ * （script は v0.3 で実行対象になったため剃らない: slim_root_tag 参照。
+ * tree 構築の状態機械は完全に回す: stack 規則不変。適合性 Track B は
  * false=full DOM が既定。実ブラウズ経路 TUI/GUI は true）。
  * style は cascade が本文を読むため残す（描画に関係する）。 */
 extern bool if_dom_slim;
@@ -111,6 +112,8 @@ typedef struct {
     IfStr title;         /* <title> のテキスト（見つからなければ empty） */
     u8 has_selectedcontent; /* parse 中に <selectedcontent> を観測（post-pass clone の走査スイッチ） */
     u8 has_style;         /* <style> 要素を観測（author sheet 収集の走査スイッチ） */
+    u8 has_script;        /* HTML ns <script> 要素を観測（script 実行の走査スイッチ。
+                           * 0 なら走査自体を行わない = script 非含有文書はゼロコスト） */
     u8 md_ws_stripped;    /* md fast path: 純粋ブロック容器直下の ws-only TEXT を生成しなかった
                            * （layout は当該容器で兄弟相殺を旧 DOM 同値に補正する） */
     IfNode *md_body_mid;  /* md 2-slice パースの分割境界 = body 直下の「B 側先頭子」
@@ -151,6 +154,14 @@ static inline IfNode *if_node_first_elem_child(IfNode *n) {
 
 /* text ノードを UTF-8 のまま子孫から連結取得（dom.c）。arena に新規確保。 */
 IfStr if_dom_text_content(IfArena *a, const IfNode *n);
+
+/* ---- script 実行（v0.3, src/script.c）専用の最小 DOM 変更面。
+ * 木の操作は「子群を単一 TEXT に置換」「head 先頭への title 生成」のみに限定し、
+ * 削除/移動の一般 API は設けない（木の不変条件を狭く保つ。正本: docs/SCRIPTING.md）。 */
+IfNode *if_dom_find_tag_dfs(const IfDom *d, u16 tag); /* 文書順最初の ELEMENT（無ければ NULL） */
+IfNode *if_dom_find_by_id(const IfDom *d, IfStr id);  /* id 属性一致の最初の ELEMENT（値は case-sensitive、無ければ NULL） */
+void    if_dom_set_text(IfArena *a, IfNode *n, IfStr t); /* ELEMENT 子群を単一 TEXT 子に置換（t.n==0 は全子除去） */
+IfNode *if_dom_title_set(IfArena *a, IfDom *d, IfStr t); /* <title> 設定（無ければ head 先頭に生成）。d->title も更新 */
 
 /* デバッグ用のツリー印字（out は FILE*）。表示用のためポインタは void。 */
 void if_dom_dump(const IfDom *dom, void *out_FILE);
