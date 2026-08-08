@@ -136,7 +136,13 @@ IfX *x11_open(void) {
     struct sockaddr_un un;
     memset(&un, 0, sizeof un);
     un.sun_family = AF_UNIX;
-    snprintf(un.sun_path, sizeof un.sun_path, "%s", sockpath);
+    size_t sp = strlen(sockpath);
+    if (sp >= sizeof un.sun_path) { /* sun_path は典型的 108B。超過は接続不能として明示失敗 */
+        fprintf(stderr, "x11: socket path too long: %s\n", sockpath);
+        close(fd);
+        return NULL;
+    }
+    memcpy(un.sun_path, sockpath, sp + 1);
     if (connect(fd, (struct sockaddr *)&un, sizeof un) != 0) {
         fprintf(stderr, "x11: cannot connect to %s (%s)\n", sockpath, strerror(errno));
         close(fd);

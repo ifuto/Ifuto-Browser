@@ -124,6 +124,11 @@ typedef struct {
 /* 入力はドキュメント寿命中生存していること（ページ arena にコピーして呼ぶのが安全）。 */
 IfDom *if_parse_html(IfArena *arena, IfStr input);
 
+/* fragment 解析（WHATWG 13.4）。ctx は html5lib-tests の #document-fragment 値
+ * （"body" / "svg path" / "math mi" / "svg foreignObject" 形式）。生成される
+ * 文書は Document 直下に仮想 html root を持ち、fragment 結果はその子群。 */
+IfDom *if_parse_html_fragment(IfArena *arena, IfStr input, const char *ctx);
+
 const char *if_tag_name(u16 tag);                 /* canonical lowercase 名 or NULL */
 u16         if_tag_id(IfStr name);                /* 既知タグの ID、未知は IF_TAG_UNKNOWN */
 bool        if_tag_is_void(u16 tag);
@@ -156,5 +161,8 @@ bool if_dom_tag_table_sane(void); /* タグ表長さ整合性（テスト用） 
 /* html5lib-tests ツリー構築形式（"| indented"）での DOM シリアライズ。
  * tree-construction 採点ハーネス用。 */
 void if_dom_serialize_wpt(const IfDom *dom, void *out_FILE);
+
+/* fragment（#document-fragment）版: 仮想 html root の子群だけを出す */
+void if_dom_serialize_wpt_frag(const IfDom *dom, void *out_FILE);
 
 #endif

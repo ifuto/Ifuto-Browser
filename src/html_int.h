@@ -39,6 +39,9 @@ typedef struct {
     IfArena *arena;
     u16 raw_tag;       /* 0 以外: rawtext/RCDATA モード（その要素の終了タグまで TEXT として読む） */
     u8 raw_rcdata;     /* raw 内容で文字参照を解決する（title/textarea） */
+    u8 raw_frag;       /* fragment 直接 raw モード（13.4）: tokenizer は開始タグを
+                        * 1 個も放出していないので "appropriate end tag" は決して
+                        * 合致しない — 終端スキャンせず EOF までが 1 個の TEXT */
     u8 strip_lf;       /* raw 内容の先頭 LF を 1 つ捨てる（textarea の仕様） */
     u8 cdata_foreign;  /* tree builder が設定: 現在位置が foreign content（DATA text の
                         * U+0000 → U+FFFD 規則の切替。integration point 等は HTML 側） */

@@ -6,6 +6,7 @@ int g_if_test_checks = 0;
 void test_arena(void);
 void test_utf8(void);
 void test_html(void);
+void test_frag_parse(void);
 void test_css(void);
 void test_css_ruleset_oracle(void);
 void test_layout(void);
@@ -26,6 +27,7 @@ int main(void) {
     RUN(test_utf8);
     fprintf(stderr, "[html]\n");
     RUN(test_html);
+    RUN(test_frag_parse);
     fprintf(stderr, "[css]\n");
     RUN(test_css);
     RUN(test_css_ruleset_oracle);

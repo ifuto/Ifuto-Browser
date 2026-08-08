@@ -5,7 +5,9 @@
 # 注: raw.githubusercontent.com が届かない環境があるため gh api (raw accept) 経由で取る。
 set -eu
 
-SHA="0acb81f2619df3096926dcc5a9d234d668f5a38e"  # wpt master HEAD as of 2026-07-28
+SHA="5b6a1e61dbf639ebea0b7f19d9df0e313ae5d959"  # wpt master HEAD as of 2026-08-07。
+# 内容は前ピン 0acb81f と .dat 61 件全てバイト同一であることを sparse clone で機械照合済
+# （新規テスト追加無し。ピン前進は provenance 更新のみ）。
 BASE="repos/web-platform-tests/wpt/contents/html/syntax/parsing/resources"
 DEST="$(dirname "$0")/wpt-tree-construction"
 mkdir -p "$DEST"

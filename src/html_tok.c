@@ -275,10 +275,13 @@ static bool raw_at(const IfHtmlTok *t, u32 i, const char *lit, bool need_term) {
     return if_hws(t->src[after]) || t->src[after] == '/' || t->src[after] == '>';
 }
 
-/* script data のエスケープ状態機械（WHATWG 8.2.26-35）:
- *   DATA: '-->' ではない。'<!--' で ESC へ、'</script' 正常終端で終わる。
- *   ESC:  '-->' で DATA へ、'<script' 正常終端で DBL へ、'</script' 正常終端で終わる。
- *   DBL:  '</script' 正常終端で ESC へ（終端ではない）、'<script' 正常終端で DBL 継続。
+/* script data のエスケープ状態機械（WHATWG 8.2.26-35 の実用形）:
+ *   DATA: '<!--' で ESC へ、'</script' + 区切りで終端（開始タグ放出済みなので
+ *         appropriate end tag と合致する）。
+ *   ESC:  '-->' で DATA へ、'<script' + 区切りで DBL へ、'</script' + 区切りで終端
+ *         （fragment/raw_frag（開始タグ未放出）時は if_raw_token が本関数を
+ *           呼ばず EOF 走査にするので、ここに載るのは常に「appropriate 合致可」）。
+ *   DBL:  '</script' + 区切りで ESC へ（終端ではない）。
  * 戻り値は真の終了タグの '<' の位置。見つからなければ len。 */
 static u32 if_find_script_end(IfHtmlTok *t) {
     enum { S_DATA, S_ESC, S_DBL } st = S_DATA;
@@ -336,7 +339,10 @@ static IfTok if_raw_token(IfHtmlTok *t) {
         t->strip_lf = 0;
         if (t->pos < t->len && t->src[t->pos] == '\n') t->pos++;
     }
-    u32 end = (t->raw_tag == IF_TAG_SCRIPT) ? if_find_script_end(t) : if_find_raw_end(t);
+    /* raw_frag: 終端を探さず EOF まで（appropriate end tag 非合致、13.4） */
+    u32 end = t->raw_frag ? t->len
+                          : ((t->raw_tag == IF_TAG_SCRIPT) ? if_find_script_end(t)
+                                                           : if_find_raw_end(t));
     if (end > t->pos) {
         tok.kind = TOK_TEXT;
         /* RCDATA(title/textarea) は文字参照を解決する。rawtext(style/script) は生のまま。

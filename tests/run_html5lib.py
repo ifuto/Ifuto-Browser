@@ -8,8 +8,9 @@
 「空行 + #data」またはファイル末尾（テキスト内の空行曖昧性をこの先読みで避ける）。
 
 スキップ規則（分母から除外し、SKIP として計数）:
-  - #document-fragment あり → フラグメント解析は未実装
-  - #script-on あり → スクリプト有効 UA のみの期待のため
+  - #script-on あり → スクリプト有効 UA のみの期待のため（恒久スキップ）
+#document-fragment ありのテストは --fragment CTX で実行する（fragment 解析
+WHATWG 13.4 実装済）。
 比較: | indented 形式の完全一致（末尾改行だけ正規化）。
 """
 import os
@@ -58,6 +59,7 @@ def parse_dat(path):
             "data": data,
             "expected": "\n".join(doc_lines),
             "fragment": "#document-fragment" in t,
+            "ctx": " ".join(t.get("#document-fragment", [])).strip(),
             "script_on": "#script-on" in t,
         })
     return out
@@ -77,12 +79,16 @@ def main():
         fp = fs = ft = 0
         first_fail = None
         for t in tests:
-            if t["fragment"] or t["script_on"]:
+            if t["script_on"]:
                 skipped += 1
                 fs += 1
                 continue
             ft += 1
-            r = subprocess.run([binary, "--dump-wptdom", "-"], input=t["data"],
+            cmd = [binary, "--dump-wptdom"]
+            if t["fragment"]:
+                cmd += ["--fragment", t["ctx"]]
+            cmd += ["-"]
+            r = subprocess.run(cmd, input=t["data"],
                                capture_output=True, text=True, timeout=10)
             got = r.stdout.rstrip("\n")
             want = t["expected"].rstrip("\n")
@@ -111,7 +117,11 @@ def main():
         fn, (_, t) = worst[0]
         print(f"---- first failing test in {fn} ----")
         print("#data:", repr(t["data"][:200]))
-        r = subprocess.run([binary, "--dump-wptdom", "-"], input=t["data"],
+        cmd = [binary, "--dump-wptdom"]
+        if t["fragment"]:
+            cmd += ["--fragment", t["ctx"]]
+        cmd += ["-"]
+        r = subprocess.run(cmd, input=t["data"],
                            capture_output=True, text=True)
         print("-- got --")
         print(r.stdout[:600])

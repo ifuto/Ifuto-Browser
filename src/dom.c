@@ -335,3 +335,11 @@ void if_dom_serialize_wpt(const IfDom *dom, void *out_FILE) {
     if (!dom || !dom->root) return;
     ser_children(dom, dom->root, out, 0);
 }
+
+void if_dom_serialize_wpt_frag(const IfDom *dom, void *out_FILE) {
+    FILE *out = (FILE *)out_FILE;
+    if (!dom || !dom->root) return;
+    /* fragment の結果 = 仮想 html root（Document 直下の最初の要素）の子群 */
+    for (const IfNode *c = dom->root->first_child; c; c = c->next_sibling)
+        if (c->kind == IF_NODE_ELEMENT) { ser_children(dom, c, out, 0); return; }
+}

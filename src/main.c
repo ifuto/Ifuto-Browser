@@ -95,6 +95,7 @@ static void usage(FILE *f) {
           "  --dump-layout    print box tree\n"
           "  --dump-tokens    print HTML tokens\n"
           "  --dump-wptdom    print DOM in html5lib tree-construction format\n"
+          "  --fragment CTX   parse HTML fragment with context CTX (\"body\" / \"svg path\"...)\n"
           "  --dump-styles    print computed styles per element (devtools)\n"
           "  --gui            interactive GUI (single supported UI; TUI は廃止)\n"
           "  --shot OUT.ppm   headless full-page raster to PPM (GUI 検証経路)\n"
@@ -133,7 +134,7 @@ int main(int argc, char **argv) {
     i32 width = 100;
     int ansi = 1, do_style = 1, links = 0, stats = 0, force_md = 0;
     enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM, M_STYLES, M_GUI } mode = M_RENDER;
-    const char *path = NULL, *shot = NULL;
+    const char *path = NULL, *shot = NULL, *frag_ctx = NULL;
     bool legacy_ui = false;
 
     for (int i = 1; i < argc; i++) {
@@ -144,6 +145,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--dump-layout") == 0) mode = M_LAYOUT;
         else if (strcmp(argv[i], "--dump-tokens") == 0) mode = M_TOKENS;
         else if (strcmp(argv[i], "--dump-wptdom") == 0) mode = M_WPTDOM;
+        else if (strcmp(argv[i], "--fragment") == 0 && i + 1 < argc) frag_ctx = argv[++i];
         else if (strcmp(argv[i], "--dump-styles") == 0) mode = M_STYLES;
         else if (strcmp(argv[i], "--gui") == 0) mode = M_GUI;
         else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) shot = argv[++i];
@@ -174,7 +176,14 @@ int main(int argc, char **argv) {
     /* v0.2: Markdown（+GFM 表/脚注。表示テキストは MD 以上の情報密度を持つ方針）
      * は HTML に前段変換してから単一の WHATWG パーサへ（多層防御） */
     IfDom *dom = NULL;
-    if (force_md || if_path_is_md(path)) {
+    if (frag_ctx) {
+        /* fragment（innerHTML 相当）解析は観測モード専用（WHATWG 13.4） */
+        if (mode != M_WPTDOM && mode != M_DOM) {
+            fprintf(stderr, "ifuto: --fragment は --dump-wptdom / --dump-dom 専用\n");
+            return 2;
+        }
+        dom = if_parse_html_fragment(&a, input, frag_ctx);
+    } else if (force_md || if_path_is_md(path)) {
         /* v0.3: md は DOM 直構築を先に試す（HTML 往復を消す高速経路）。
          * dump-tokens / wptdom は「HTML 段」の観測点なので従来どおり 2 段で。
          * taint 観測時は従来経路へフォールバック（正しさは本パーサに集約） */
@@ -191,7 +200,8 @@ int main(int argc, char **argv) {
     double t2 = now_ms();
 
     if (mode == M_WPTDOM) {
-        if_dom_serialize_wpt(dom, stdout);
+        if (frag_ctx) if_dom_serialize_wpt_frag(dom, stdout);
+        else if_dom_serialize_wpt(dom, stdout);
         if_arena_destroy(&a);
         return 0;
     }

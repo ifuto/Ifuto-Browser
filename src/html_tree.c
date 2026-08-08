@@ -56,6 +56,12 @@ typedef struct {
      * （td/th/caption/template/object/applet/marquee で挿入） */
     struct IfAfE { IfNode *n; bool marker; } *afe;
     u32 n_afe, afe_cap;
+    /* fragment parsing（WHATWG 13.4）。depth<=1（stack が仮想 html root のみ）
+     * の間、adjusted current node はこの仮想 context 要素（DOM には接続せず
+     * n_nodes にも数えない）。scope/foster 系規則は常に実 stack を見るため
+     * frag_ctx が混入する経路は foreign routing のみ（acn() 経由） */
+    bool frag;
+    IfNode *frag_ctx;
 } IfTB;
 
 static IfNode *new_node(IfTB *b, IfNodeKind kind) {
@@ -89,6 +95,7 @@ static bool slim_root_tag(u16 t) { return t == IF_TAG_SCRIPT || t == IF_TAG_TEMP
 /* ファイル前半のユーティリティで参照される下方定義の前方宣言群 */
 static IfNode *top(IfTB *b);
 static void pop(IfTB *b);
+static IfNode *acn(IfTB *b); /* adjusted current node（fragment case 対応） */
 static void insert_comment(IfTB *b, IfNode *parent, const IfTok *tok);
 static void insert_comment_placed(IfTB *b, const IfTok *tok);
 static void step_in_body(IfTB *b, IfTok tok);
@@ -186,6 +193,15 @@ static void push(IfTB *b, IfNode *n) {
 }
 
 static IfNode *top(IfTB *b) { return b->depth ? b->stack[b->depth - 1] : b->dom->root; }
+
+/* adjusted current node（WHATWG 13.2.4.2）: fragment case で stack が仮想 html root
+ * だけの間は context 要素とみなす。foreign routing（in_foreign / in_foreign_text /
+ * foreign_insert の ns / tokenizer の adcn_foreign）だけがこれを見る。
+ * それ以外の規則（scope・foster・挿入位置・AFE）は仕様通り実 stack を使う。 */
+static IfNode *acn(IfTB *b) {
+    if (b->frag && b->depth <= 1) return b->frag_ctx;
+    return top(b);
+}
 
 static void pop(IfTB *b) { if (b->depth) b->depth--; }
 
@@ -574,11 +590,39 @@ static void step_in_template(IfTB *b, IfTok tok) {
     }
 }
 
-/* reset the insertion mode appropriately（WHATWG アルゴリズムの非 fragment 版） */
+/* fragment case で「reset appropriately」を仮想 context に適用したときの mode
+ * （WHATWG 13.2.6.4.1 の last=true 特例を展開。frag_init の初期決定と
+ *   reset_mode の基底（i==0）がこれを共有する） */
+static IfMode frag_ctx_mode(const IfTB *b) {
+    IfNode *c = b->frag_ctx;
+    if (c->ns == IF_NS_HTML) {
+        switch (c->tag) {
+        case IF_TAG_TEMPLATE:
+            /* "in template" が stack of template insertion modes に積まれている */
+            return b->n_tpl ? (IfMode)b->tpl_modes[b->n_tpl - 1] : M_IN_TEMPLATE;
+        case IF_TAG_TD: case IF_TAG_TH: return M_IN_CELL;
+        case IF_TAG_TR: return M_IN_ROW;
+        case IF_TAG_TBODY: case IF_TAG_THEAD: case IF_TAG_TFOOT: return M_IN_TABLE_BODY;
+        case IF_TAG_CAPTION: return M_IN_CAPTION;
+        case IF_TAG_COLGROUP: return M_IN_COLUMN_GROUP;
+        case IF_TAG_TABLE: return M_IN_TABLE;
+        case IF_TAG_FRAMESET: return M_IN_FRAMESET;
+        case IF_TAG_HTML: return b->head ? M_AFTER_HEAD : M_BEFORE_HEAD;
+        default: return M_IN_BODY; /* body / head(last=true) / select / 他全要素 */
+        }
+    }
+    return M_IN_BODY; /* foreign context: last=true → in body */
+}
+
+/* reset the insertion mode appropriately（WHATWG アルゴリズム＋fragment 基底） */
 static void reset_mode(IfTB *b) {
     for (i32 i = (i32)b->depth - 1; i >= 0; i--) {
         u16 t = b->stack[i]->tag;
-        if (i == 0) { /* 基底 html: head 既出なら after-head、未出なら before-head */
+        if (i == 0) {
+            /* fragment case: 「node = context 要素, last = true」で評価する
+             * （b->head への fallback を経由しない — context 項目が先） */
+            if (b->frag) { b->mode = frag_ctx_mode(b); return; }
+            /* 基底 html: head 既出なら after-head、未出なら before-head */
             b->mode = b->head ? M_AFTER_HEAD : M_BEFORE_HEAD;
             return;
         }
@@ -1193,8 +1237,11 @@ static void step_in_caption(IfTB *b, IfTok tok) {
         switch (tok.tag) {
         case IF_TAG_CAPTION: case IF_TAG_COL: case IF_TAG_COLGROUP:
         case IF_TAG_TBODY: case IF_TAG_TD: case IF_TAG_TFOOT: case IF_TAG_TH:
-        case IF_TAG_THEAD: case IF_TAG_TR: case IF_TAG_TABLE:
-            /* caption を畳んで in-table で再処理（現行仕様の in-caption 規則） */
+        case IF_TAG_THEAD: case IF_TAG_TR:
+            /* caption を畳んで in-table で再処理（現行仕様の in-caption 規則）。
+             * START table はこの一覧に**含まれない**: anything-else ＝ in-body 規則で
+             * caption の子としてネスト挿入される（caption-fragmentの
+             * tests_innerHTML_1#19 および全 browser の一般挙動どおり） */
             if (!has_in_table_scope(b, IF_TAG_CAPTION)) { b->dom->n_errors++; return; }
             pop_until(b, IF_TAG_CAPTION);
             b->mode = M_IN_TABLE;
@@ -1433,6 +1480,11 @@ static void step_in_cell(IfTB *b, IfTok tok) {
         case IF_TAG_TBODY: case IF_TAG_TD: case IF_TAG_TH:
         case IF_TAG_THEAD: case IF_TAG_TFOOT: case IF_TAG_TR:
             b->dom->n_errors++;
+            /* fragment case（畳める cell が table scope に無い）: 無視。
+             * 全文書では in-cell にいる時点で cell は必ず stack にあるため不変
+             * （tests_innerHTML_1#63: ctx=td で <th> は落ち、<a> だけが残る） */
+            if (!has_in_table_scope(b, IF_TAG_TD) && !has_in_table_scope(b, IF_TAG_TH))
+                return;
             close_cell(b);
             step(b, tok);
             return;
@@ -1530,10 +1582,16 @@ static void step_in_frameset(IfTB *b, IfTok tok) {
     if (tok.kind == TOK_END && tok.tag == IF_TAG_FRAMESET) {
         if (b->depth && top(b)->tag == IF_TAG_FRAMESET) {
             pop(b);
-            /* fragment 環境非対応: frameset を抜けたら常に after-frameset */
-            b->mode = M_AFTER_FRAMESET;
+            /* fragment case 以外: frameset を抜けたら after-frameset へ
+             * （spec: "if the parser was NOT created as part of the fragment
+             *   parsing algorithm and the current node is no longer a frameset
+             *   element, then switch to after frameset"） */
+            if (!b->frag) b->mode = M_AFTER_FRAMESET;
             return;
         }
+        /* current node が frameset でない（fragment で root のみ等）: parse error
+         * で無視（tests6#29 / tests_innerHTML_1#79: 後続 <frame> は挿入される） */
+        if (b->frag) { b->dom->n_errors++; return; }
         if (b->depth <= 1) { b->stopped = true; return; } /* html のみ: 仕様の stop 経路 */
         b->dom->n_errors++;
         return;
@@ -1615,8 +1673,8 @@ static void merge_attrs(IfTB *b, IfNode *dst, const IfTok *tok) {
 /* モードごとのトークン処理 */
 static void step(IfTB *b, IfTok tok);
 /* foreign content 系（実体はファイル末尾） */
-static bool in_foreign(const IfTB *b, const IfTok *tok);
-static bool in_foreign_text(const IfTB *b);
+static bool in_foreign(IfTB *b, const IfTok *tok);
+static bool in_foreign_text(IfTB *b);
 static void foreign_step(IfTB *b, const IfTok *tok);
 static void foreign_adjust(IfTB *b, IfNode *n);
 static bool is_html_ip(const IfNode *n);
@@ -2115,6 +2173,15 @@ static void step_in_body(IfTB *b, IfTok tok) {
             b->dom->n_errors++;
             tok.tag = t = IF_TAG_IMG;
         }
+        /* fragment ctx=select 直下の <input> は parse error で無視（dataset
+         * tests_innerHTML_1#75 の規約値。in-select モード廃止後の現行 in-body 規則
+         * では stack 上に select が無い限り input は挿入されるため、fragment
+         * context が select の場合に限りこの整合規則を置く。全文書経路は不変） */
+        if (b->frag && b->depth <= 1 && t == IF_TAG_INPUT &&
+            b->frag_ctx->ns == IF_NS_HTML && b->frag_ctx->tag == IF_TAG_SELECT) {
+            b->dom->n_errors++;
+            return;
+        }
         if (in_foreign(b, &tok) && !b->no_foreign) { foreign_step(b, &tok); return; }
         if (t == IF_TAG_SVG || t == IF_TAG_MATH) { /* foreign ルート入域（属性も調整） */
             IfNode *n = make_element(b, &tok);
@@ -2403,9 +2470,11 @@ static void step_in_body(IfTB *b, IfTok tok) {
             if_tok_set_raw(&b->tok, t);
             return;
         }
-        /* "anything else" start: spec は reconstruct → insert */
-        if (!tok.self_closing) afe_reconstruct(b);
-        insert_element(b, &tok, !tok.self_closing);
+        /* "anything else" start: spec は reconstruct → insert。self-closing 旗は
+         * 非 void 要素では無視される（parse error だが要素は push される）:
+         * <ms/>X は ms が開いたまま X がその子になる（foreign-fragment#18 他） */
+        afe_reconstruct(b);
+        insert_element(b, &tok, true);
         return;
     }
 
@@ -2413,7 +2482,16 @@ static void step_in_body(IfTB *b, IfTok tok) {
     if (in_foreign(b, &tok) && !b->no_foreign) { foreign_step(b, &tok); return; }
     u16 t = tok.tag;
     if (t == IF_TAG_BODY) { b->mode = M_AFTER_BODY; return; }
-    if (t == IF_TAG_HTML) { b->mode = M_AFTER_AFTER_BODY; return; }
+    if (t == IF_TAG_HTML) {
+        /* 仕様: body がスコープ内に無ければ parse error で無視、あれば after-body
+         * へ切り替えて**再処理**（after-body 側の html 規則が after-after 非
+         * fragment 遷移 / fragment 無視を行う）。tests15#4（コメントは Document 子）
+         * と tests_innerHTML_1#78（fragment では html 要素の末尾子）の両立点 */
+        if (!has_in_scope2(b, IF_TAG_BODY, SC_DEFAULT)) { b->dom->n_errors++; return; }
+        b->mode = M_AFTER_BODY;
+        step(b, tok);
+        return;
+    }
     if (t == IF_TAG_BR) {
         /* 仕様の quirk: </br> は <br> として扱う */
         IfTok br = { .kind = TOK_START, .tag = IF_TAG_BR };
@@ -2557,13 +2635,19 @@ static void step(IfTB *b, IfTok tok) {
     case M_AFTER_AFTER_FRAMESET: step_after_after_frameset(b, tok); break;
     case M_AFTER_BODY:
         /* 仕様: コメントは html 要素の最後の子、空白は in-body 規則、EOF で終了。
-         * それ以外は parse error で in-body に戻って再処理。 */
+         * END html は fragment case なら parse error 無視、それ以外は
+         * after-after-body へ。それ以外は parse error で in-body に戻って再処理。 */
         if (tok.kind == TOK_COMMENT) {
             insert_comment(b, b->html ? b->html : b->dom->root, &tok);
             return;
         }
         if (tok.kind == TOK_TEXT && if_str_is_ws_only(tok.text)) { step_in_body(b, tok); return; }
         if (tok.kind == TOK_EOF) { b->stopped = true; return; }
+        if (tok.kind == TOK_END && tok.tag == IF_TAG_HTML) {
+            if (b->frag) { b->dom->n_errors++; return; }
+            b->mode = M_AFTER_AFTER_BODY;
+            return;
+        }
         b->dom->n_errors++;
         b->mode = M_IN_BODY;
         step(b, tok);
@@ -2655,7 +2739,44 @@ static void sc_select_walk(IfDom *dom, IfNode *n) {
     for (IfNode *c = n->first_child; c; c = c->next_sibling) sc_select_walk(dom, c);
 }
 
-IfDom *if_parse_html(IfArena *arena, IfStr input) {
+/* fragment parsing 初期化（WHATWG 13.4）。
+ * ctx は "body" / "svg path" / "math mi" / "svg foreignObject" 形式。
+ * 1. context が template なら template 挿入モードスタックへ "in template" を push
+ * 2. 仮想 html root を Document 直下に作成して stack へ
+ * 3. reset appropriately の last=true 特例分岐を直接展開して初期 mode を決定
+ * 4. context が rawtext/RCDATA 系なら tokenizer の初期状態を切替（skip_lf は無効:
+ *    開始タグトークンは流れないため） */
+static void frag_init(IfTB *b, const char *ctx) {
+    u8 ns = IF_NS_HTML;
+    const char *name = ctx;
+    if (strncmp(ctx, "svg ", 4) == 0) { ns = IF_NS_SVG; name = ctx + 4; }
+    else if (strncmp(ctx, "math ", 5) == 0) { ns = IF_NS_MATHML; name = ctx + 5; }
+    b->frag = true;
+
+    /* 仮想 context 要素（DOM 不接続・n_nodes 不算入。属性無し: "svg path" 等の
+     * タグ名のみの指定なので annotation-xml の encoding 判定は常に非該当） */
+    IfNode *c = (IfNode *)if_arena_calloc(b->arena, sizeof(IfNode));
+    c->kind = IF_NODE_ELEMENT;
+    c->ns = ns;
+    IfStr ci = if_str(name, (u32)strlen(name));
+    c->tag = if_tag_id(ci); /* CI マッチ（foreignObject 等も拾える） */
+    c->u.tag_name = ci;     /* ローカル名は case 保持 */
+    b->frag_ctx = c;
+
+    IfTok t = { .kind = TOK_START, .tag = IF_TAG_HTML };
+    b->html = make_element(b, &t);
+    append_child(b->dom->root, b->html);
+    push(b, b->html);
+
+    /* context が template なら stack of template insertion modes へ "in template"
+     * を push（13.4 step 2 → これは parse 期間中残る）し、初期 mode は
+     * reset appropriately の last=true 規則（frag_ctx_mode）に委譲 */
+    if (ns == IF_NS_HTML && c->tag == IF_TAG_TEMPLATE)
+        b->tpl_modes[b->n_tpl++] = M_IN_TEMPLATE;
+    b->mode = frag_ctx_mode(b);
+}
+
+static IfDom *parse_common(IfArena *arena, IfStr input, const char *ctx) {
     if (input.n > IF_MAX_INPUT_BYTES) if_fatal("input exceeds per-page byte limit");
     IfDom *dom = (IfDom *)if_arena_calloc(arena, sizeof(IfDom));
     dom->arena = arena;
@@ -2671,18 +2792,32 @@ IfDom *if_parse_html(IfArena *arena, IfStr input) {
     b.mode = M_INITIAL;
     b.frameset_ok = true; /* WHATWG: 初期値 "ok" */
     if_tok_init(&b.tok, arena, input);
+    if (ctx) {
+        frag_init(&b, ctx);
+        /* tokenizer 初期状態のオーバーライド（13.4）: HTML の title/textarea は
+         * RCDATA、style/xmp/iframe/noembed/noframes/script は RAWTEXT 系、
+         * plaintext は残り全文を TEXT 化（noscript は scripting 無効 → DATA） */
+        u16 ct = b.frag_ctx->tag;
+        if (b.frag_ctx->ns == IF_NS_HTML) {
+            if (ct == IF_TAG_TITLE || ct == IF_TAG_TEXTAREA || ct == IF_TAG_STYLE ||
+                ct == IF_TAG_XMP || ct == IF_TAG_IFRAME || ct == IF_TAG_NOEMBED ||
+                ct == IF_TAG_NOFRAMES || ct == IF_TAG_SCRIPT) {
+                if_tok_set_raw(&b.tok, ct);
+                b.tok.raw_frag = 1; /* appropriate end tag 非合致 → EOF 走査 */
+            } else if (ct == IF_TAG_PLAINTEXT) {
+                b.tok.plaintext = 1;
+            }
+        }
+    }
 
     while (!b.stopped) {
         b.tok.cdata_foreign = in_foreign_text(&b) ? 1 : 0;
-        if (b.depth && b.stack[b.depth - 1]->ns != IF_NS_HTML) b.tok.adcn_foreign = 1;
-        else b.tok.adcn_foreign = 0;
         /* adjusted current node が非 HTML 名前空間か（<![CDATA[ 許可判定専用。
          * integration point でも node 自体が非 HTML ns なら 1 になる点が
-         * cdata_foreign と別建ての理由: html5test-com#13/#14/#17） */
-        if (b.depth && b.stack[b.depth - 1]->ns != IF_NS_HTML)
-            b.tok.adcn_foreign = 1;
-        else
-            b.tok.adcn_foreign = 0;
+         * cdata_foreign と別建ての理由: html5test-com#13/#14/#17。
+         * fragment case は acn が仮想 context を返す（13.4 規則の反映）） */
+        IfNode *an = acn(&b);
+        b.tok.adcn_foreign = (an && an->kind == IF_NODE_ELEMENT && an->ns != IF_NS_HTML) ? 1 : 0;
         IfTok tok = if_tok_next(&b.tok);
         step(&b, tok);
         if (tok.kind == TOK_EOF) break;
@@ -2702,6 +2837,14 @@ IfDom *if_parse_html(IfArena *arena, IfStr input) {
     /* customizable select: selectedcontent への clone（走査は観測時のみ） */
     if (dom->has_selectedcontent) sc_select_walk(dom, root);
     return dom;
+}
+
+IfDom *if_parse_html(IfArena *arena, IfStr input) { return parse_common(arena, input, NULL); }
+
+/* fragment 解析（WHATWG 13.4 / html5lib-tests の #document-fragment）。
+ * ctx は #document-fragment の 1 行をそのまま渡す（"body" / "svg path" 等）。 */
+IfDom *if_parse_html_fragment(IfArena *arena, IfStr input, const char *ctx) {
+    return parse_common(arena, input, ctx);
 }
 
 /* ================= foreign content（MathML/SVG 名前空間） =================
@@ -2810,9 +2953,9 @@ static bool is_math_ip(const IfNode *n) { /* MathML text integration points */
 
 /* adjusted current node が foreign content か（start/end トークンについて）。
  * テキスト/CDATA 用に別建ての in_foreign_text も下に用意する。 */
-static bool in_foreign(const IfTB *b, const IfTok *tok) {
+static bool in_foreign(IfTB *b, const IfTok *tok) {
     if (!b->depth) return false;
-    IfNode *node = b->stack[b->depth - 1];
+    IfNode *node = acn(b);
     if (node->ns == IF_NS_HTML) return false;
     if (tok->kind == TOK_START) {
         if (is_math_ip(node) && tok->tag != IF_TAG_MGLYPH && tok->tag != IF_TAG_MALIGNMARK)
@@ -2832,9 +2975,9 @@ static bool in_foreign(const IfTB *b, const IfTok *tok) {
     return false;
 }
 
-static bool in_foreign_text(const IfTB *b) {
+static bool in_foreign_text(IfTB *b) {
     if (!b->depth) return false;
-    IfNode *node = b->stack[b->depth - 1];
+    IfNode *node = acn(b);
     if (node->ns == IF_NS_HTML) return false;
     if (is_math_ip(node) || is_html_ip(node)) return false;
     if (node->ns == IF_NS_MATHML && node->tag == IF_TAG_ANNOTATION_XML) {
@@ -2848,7 +2991,8 @@ static bool in_foreign_text(const IfTB *b) {
     return true;
 }
 
-/* breakout 開始タグ（foreign 側でこれが来たら HTML namespace まで pop して再処理） */
+/* breakout 開始タグ（foreign 側でこれが来たら HTML namespace まで pop して再処理）。
+ * WHATWG 13.2.7 の完全一覧（b..var + listing/menu/meta/nobr/ruby + font(属性条件)）。 */
 static bool is_breakout_start(const IfTok *tok) {
     switch (tok->tag) {
     case IF_TAG_B: case IF_TAG_BIG: case IF_TAG_BLOCKQUOTE: case IF_TAG_BODY:
@@ -2856,11 +3000,12 @@ static bool is_breakout_start(const IfTok *tok) {
     case IF_TAG_DIV: case IF_TAG_DL: case IF_TAG_DT: case IF_TAG_EM:
     case IF_TAG_H1: case IF_TAG_H2: case IF_TAG_H3: case IF_TAG_H4:
     case IF_TAG_H5: case IF_TAG_H6: case IF_TAG_HEAD: case IF_TAG_HR:
-    case IF_TAG_I: case IF_TAG_IMG: case IF_TAG_LI: case IF_TAG_OL:
-    case IF_TAG_P: case IF_TAG_PRE: case IF_TAG_S: case IF_TAG_SMALL:
-    case IF_TAG_SPAN: case IF_TAG_STRONG: case IF_TAG_STRIKE: case IF_TAG_SUB:
-    case IF_TAG_SUP: case IF_TAG_TABLE: case IF_TAG_TT: case IF_TAG_U:
-    case IF_TAG_UL: case IF_TAG_VAR:
+    case IF_TAG_I: case IF_TAG_IMG: case IF_TAG_LI: case IF_TAG_LISTING:
+    case IF_TAG_MENU: case IF_TAG_META: case IF_TAG_NOBR: case IF_TAG_OL:
+    case IF_TAG_P: case IF_TAG_PRE: case IF_TAG_RUBY: case IF_TAG_S:
+    case IF_TAG_SMALL: case IF_TAG_SPAN: case IF_TAG_STRONG: case IF_TAG_STRIKE:
+    case IF_TAG_SUB: case IF_TAG_SUP: case IF_TAG_TABLE: case IF_TAG_TT:
+    case IF_TAG_U: case IF_TAG_UL: case IF_TAG_VAR:
         return true;
     case IF_TAG_FONT:
         /* color/face/size のいずれかの属性があるときのみ breakout */
@@ -2908,7 +3053,7 @@ static void foreign_insert(IfTB *b, const IfTok *tok) {
          * 参照一致の汚染を防ぐためタグ ID を UNKNOWN に落とす（表示名は "template" のまま） */
         ft.tag = IF_TAG_UNKNOWN;
     IfNode *n = make_element(b, &ft);
-    n->ns = top(b)->ns;
+    n->ns = acn(b)->ns; /* fragment ctx が foreign のときは context の ns を継ぐ */
     foreign_adjust(b, n);
     append_placed(b, n); /* template top なら content へ、foster なら「table の兄」へ */
     if (!tok->self_closing) {
@@ -2933,23 +3078,29 @@ static void foreign_step(IfTB *b, const IfTok *tok) {
              * モードの規則」で再処理する（spec: "then reprocess the token"）。
              * step_in_body 直叩きだと in-table の foster 規則が適用されず、
              * <table><colgroup><math>…<p> の p が table 内部に落ちる
-             * （tests9#16 / tests10#15） */
+             * （tests9#16 / tests10#15）。
+             * no_foreign で囲む: fragment で context 自体が foreign のとき、pop 後も
+             * acn は context（foreign）のままなので full dispatch を再入すると
+             * foreign_step ↔ step の相互再帰になる（foreign-fragment#38） */
+            b->no_foreign = true;
             while (b->depth) {
                 IfNode *t2 = top(b);
                 if (t2->ns == IF_NS_HTML || is_html_ip(t2) || is_math_ip(t2)) break;
                 pop(b);
             }
             step(b, *tok);
+            b->no_foreign = false;
             return;
         }
         foreign_insert(b, tok);
         return;
     }
     /* TOK_END の br/p は特例: HTML 名前空間まで pop して現行挿入モードの規則へ
-     * （<p><math></p>a で math/p を畳み "a" が p の外に出る spec 挙動） */
+     * （<p><math></p>a で math/p を畳み "a" が p の外に出る spec 挙動）。
+     * fragment でも無視しない: html root まで「pop 対象が無い」だけで、
+     * </p> は in-body 規則（空 p を挿入して畳む）が走る（foreign-fragment#61/#62） */
     if (tok->tag == IF_TAG_BR || tok->tag == IF_TAG_P) {
         b->dom->n_errors++;
-        if (b->depth <= 1) return; /* fragment case: 無視 */
         b->no_foreign = true;
         while (b->depth && top(b)->ns != IF_NS_HTML) pop(b);
         step(b, *tok);

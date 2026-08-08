@@ -1,3 +1,4 @@
+#define _GNU_SOURCE /* open_memstream（fragment シリアライズ オラクル） */
 #include "tests.h"
 #include "../src/dom.h"
 #include <string.h>
@@ -212,4 +213,94 @@ void test_html(void) {
     }
 
     if_arena_destroy(&a);
+}
+
+/* ---- fragment parsing（WHATWG 13.4）固定オラクル ----
+ * 既定値は tests/wpt-tree-construction 採点済みの本物ケースから機械抽出した bytes。
+ * 目的: python ハーネス非依存で fragment 経路の縮退を機械検出する。 */
+void test_frag_parse(void) {
+    static const struct { const char *ctx, *data, *want; } FRAG_CASES[] = {
+        /* foreign-fragment.dat#0: breakout（svg ctx で nobr は HTML へ） */
+        { "svg path", "<nobr>X",
+          "| <nobr>\n"
+          "|   \"X\"" },
+        /* foreign-fragment.dat#1: font color 属性付き breakout */
+        { "svg path", "<font color></font>X",
+          "| <font>\n"
+          "|   color=\"\"\n"
+          "| \"X\"" },
+        /* foreign-fragment.dat#18: math TIP + 非 void self-closing は push（<ms/>X） */
+        { "math ms", "<b></b><mglyph/><i></i><malignmark/><u></u><ms/>X",
+          "| <b>\n"
+          "| <math mglyph>\n"
+          "| <i>\n"
+          "| <math malignmark>\n"
+          "| <u>\n"
+          "| <ms>\n"
+          "|   \"X\"" },
+        /* foreign-fragment.dat#38: annotation-xml（encoding 無し）で div は breakout */
+        { "math annotation-xml", "<div></div>",
+          "| <div>" },
+        /* foreign-fragment.dat#47: breakout 後の入れ子は HTML 規則 */
+        { "svg svg", "<div><h1>X</h1></div>",
+          "| <div>\n"
+          "|   <h1>\n"
+          "|     \"X\"" },
+        /* tests4.dat#8: script ctx は EOF までが 1 TEXT（appropriate end tag 非合致） */
+        { "script", "<!-- inside </script> -->",
+          "| \"<!-- inside </script> -->\"" },
+        /* template.dat#108: template ctx（content + 初期 in-template モード） */
+        { "template", "<template><form><input name=\"q\"></form><div>second</div></template>",
+          "| <template>\n"
+          "|   content\n"
+          "|     <form>\n"
+          "|       <input>\n"
+          "|         name=\"q\"\n"
+          "|     <div>\n"
+          "|       \"second\"" },
+        /* tests6.dat#29: frameset ctx で stray </frameset> は無視され frame は挿入 */
+        { "frameset", "</frameset><frame>",
+          "| <frame>" },
+        /* tests_innerHTML_1.dat#19: caption ctx の table はネスト挿入 */
+        { "caption", "<table></table><tbody>",
+          "| <table>" },
+        /* tests_innerHTML_1.dat#63: td ctx で畳める cell 無しの <th> は落ちる */
+        { "td", "<th><a>",
+          "| <a>" },
+        /* tests_innerHTML_1.dat#75: select ctx 直下の <input> は抑止 */
+        { "select", "<input><option>",
+          "| <option>" },
+        /* tests_innerHTML_1.dat#78: </html> は in-body→after-body 規則でコメントは html 末子 */
+        { "html", "</html><!--abc-->",
+          "| <head>\n"
+          "| <body>\n"
+          "| <!-- abc -->" },
+    };
+    for (u32 i = 0; i < sizeof FRAG_CASES / sizeof FRAG_CASES[0]; i++) {
+        IfArena a; if_arena_init(&a, 1 << 16);
+        IfDom *d = if_parse_html_fragment(&a, if_str(FRAG_CASES[i].data,
+                                           (u32)strlen(FRAG_CASES[i].data)),
+                                          FRAG_CASES[i].ctx);
+        CHECK(d != NULL);
+        if (!d) { if_arena_destroy(&a); continue; }
+        char *bs = NULL; size_t ns = 0;
+        FILE *os = open_memstream(&bs, &ns);
+        CHECK(os != NULL);
+        if (!os) { if_arena_destroy(&a); continue; }
+        if_dom_serialize_wpt_frag(d, os);
+        fclose(os);
+        /* fragment 期待は「仮想 html root の子群」。実出力の末尾改行 1 個は
+         * ハーネス規約どおり落として比較（python 側の rstrip と同じ正規化） */
+        size_t got_n = ns;
+        while (got_n && bs[got_n - 1] == '\n') got_n--;
+        size_t want_n = strlen(FRAG_CASES[i].want);
+        if (!(got_n == want_n && memcmp(bs, FRAG_CASES[i].want, got_n) == 0)) {
+            fprintf(stderr, "--- frag case #%u (ctx=%s data=%.60s)\n", i,
+                    FRAG_CASES[i].ctx, FRAG_CASES[i].data);
+            fprintf(stderr, "got:\n%.*s\nwant:\n%s\n", (int)ns, bs, FRAG_CASES[i].want);
+            CHECK(0);
+        }
+        free(bs);
+        if_arena_destroy(&a);
+    }
 }

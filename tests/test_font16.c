@@ -25,7 +25,8 @@ void test_font16_lookup(void) {
     for (uint32_t cp = F16_BASE; cp < F16_BASE + F16_SPAN; cp++) {
         uint8_t s = F16_INDEX[cp - F16_BASE];
         if (s == F16_NONE) { CHECK(f16_lookup(cp) == NULL); continue; }
-        CHECK((int)s < N_GLYPHS);
+        /* slot は uint8_t で N_GLYPHS(>255) に型レベルで収まる（bounds CHECK は恒真
+         * のため警告になる）— 実効判定は下の f16_lookup 一致 CHECK が担う */
         CHECK(f16_lookup(cp) == F16_GLYPHS[s]);
     }
 
