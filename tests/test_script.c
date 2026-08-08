@@ -177,8 +177,32 @@ static void test_script_count_cap(void) {
     tscr_end(&t);
 }
 
+static void test_script_gc_churn(void) {
+    /* 敵対: ハンドル（elem/document の IfNode* 値）を生かしたまま akl GC を強制発火。
+     * GC 発火の機械証明: 300k iter × (ROPE+STR ≈123B) ≈ 37MB の garbage を
+     * 16MB 既定ヒープに流す → GC 不発火なら heap budget で eval 失敗する（成功 ≡
+     * GC 複数回発火 + globals ルート経由で handle オブジェクト生存 + IfNode* ptr
+     * （GC 非管理）が一貫有効）。insn≈3M < 既定 budget 10M、live は微小。 */
+    TScr t;
+    tscr_begin(&t, "<div id=a>X</div>"
+                   "<script>"
+                   "var d = document.getElementById('a');"
+                   "for (var i = 0; i < 300000; i = i + 1) { var g = 'garbage-garbage-garbage' + i; }"
+                   "d.textContent = 'post-gc';"
+                   "document.title = 'gc-ok';"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 7 && memcmp(txt.p, "post-gc", 7) == 0);
+    CHECK(t.dom->title.n == 5 && memcmp(t.dom->title.p, "gc-ok", 5) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
     test_script_mutation();
+    test_script_gc_churn();
     test_script_failure_isolation();
     test_script_skip_rules();
     test_script_kill_and_zero_cost();

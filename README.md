@@ -35,7 +35,7 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 
 ```sh
 make            # build/ifuto（リリース: -O2 LTO stripped。GUI 統合済み単一バイナリ）
-make test       # 単体テスト 623,863 checks ×2 dispatch（ASan+UBSan+LSan 常時）
+make test       # 単体テスト 623,897 checks ×2 dispatch（ASan+UBSan+LSan 常時）
 make guismoke   # GUI を X なしで検証（--shot ラスタ + 画素検査）
 make golden     # 描画の厳密 diff テスト
 make fuzz       # mutation fuzz + ASan

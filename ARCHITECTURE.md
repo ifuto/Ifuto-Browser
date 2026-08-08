@@ -130,7 +130,7 @@ layout がブロック完成ごとに消費する融合段にして DOM 素材�
   「ブロック局所バッファ」まで縮退可能。文書全体の保持が必要なのはリンク目次と
   並列 layout の中間点だけ → 保持は (tag, attrs 最小, テキスト範囲) の幽霊骨格でよい。
 - **byte-exact オラクルが命綱**: 融合しても最終発行ビットは現行と 1bit も変えない
-  （chk_oracle 14/14: forged/2MB/16MB × out/ansi/w40/w160/dom/links/styles + serial≡sliced の全一致を逐次検証）。
+  （chk_oracle 16/16: forged/2MB/16MB × out/ansi/w40/w160/dom/links/styles + serial≡sliced + script 実行 ON/OFF 双方向の全一致を逐次検証）。
 - **2 pass → 1 pass 化は段階投入**: まず fitdom の融合（DOM 再読 1 回消去）、
   ついで DOM 局所化。見積もり便益は DOM トラフィック消去で -25~35ms（推定・上限）。
 - 既判の不採用（再挑戦禁止）: POPULATE_WRITE 一括化・arena 16MB・-O3・style 2-way 並列。

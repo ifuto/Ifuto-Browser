@@ -28,5 +28,9 @@ chk 564f2ee9d421a88e34b7b8d69bbba058a4047d7ef3f67eb9064feb6fa77135f0 idm-2mb.dom
 chk 1186bf92885b8fe6281a537dd2a96e82efd455ecd79919b3f9ec2054920ab9c2 forged.styles "$BIN" --dump-styles "$F"
 # serial（IF_MD_PAR=0）≡ sliced（既定 2-slice 並列）の差分オラクル（expected は idm-2mb.out と同値への一致が機械意味）
 chk c092c35dcdcc1c1c17379748fb418c3d303ec65c2345152a54cee20fa0230116 idm-2mb.serial env IF_MD_PAR=0 "$BIN" --no-ansi "$M2"
+# script 実行配線の E2E byte-exact オラクル（v0.3。mutation が描画に出る / IF_SCRIPT=0 で出ない、の双方向）
+S=oracle/script.html
+chk 13655f7074599cfe39fcb756bd3f02b44b92125087f35286340ff957e2f5291b script.out    "$BIN" --no-ansi "$S"
+chk afb095effd08167731a4d3aa41924cd7bcdc9bd20ccf97847375a2b80ee4be5e script.killed env IF_SCRIPT=0 "$BIN" --no-ansi "$S"
 echo "oracle: ok=$ok ng=$ng"
 [ "$ng" -eq 0 ]

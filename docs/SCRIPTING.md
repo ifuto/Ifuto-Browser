@@ -12,6 +12,10 @@
   CLI の dump 系観測モード（`--dump-wptdom` / `--dump-tokens` / `--dump-dom`）は
   実行点より上流で return するため **script は走らない**（文字列観測オラクル不変）。
 - JIT は恒久禁止（akl 方針。バイトコードインタプリタのみ）。
+- **Markdown 文書では script は一切実行しない（2026-08-08 実測凍結）**: md は
+  インライン HTML をテキストとしてエスケープ保持する法則（生 HTML 素通し禁止）
+  により `<script>` 要素が DOM 上に構築されない（fast/2 段両経路で実測確認）。
+  よって md では `has_script` が立たず、収集・実行コストは構造的に発生しない。
 
 ## 2. スキップ規則（明白に数える: `IfScriptReport.n_skipped`）
 
@@ -75,7 +79,16 @@
 ## 8. テスト台帳
 
 - `tests/test_script.c`: DOM 変更の可視性・失敗隔離・スキップ規則・kill switch・
-  has_script ゼロコスト・svg 除外・console 行規約・128 打切り（全件 in-process オラクル）。
+  has_script ゼロコスト・svg 除外・console 行規約・128 打切り・
+  **GC churn E2E**（300k iter ≈37MB garbage を 16MB 既定ヒープに通す: GC 不発火なら
+  heap budget で eval 失敗するため、成功 ≡ GC 複数回発火＋handle 生存＋IfNode* 有効）。
+- `tests/test_akl.c` `t_handles`: AklHandleVTab の基本面凍結（typeof/tostring/
+  unknown→undefined/store rejected/not a function/native_throw/C 側実体共有 identity）と
+  **heap 1MB 絞りの GC flood**（50k iter ≈6MB ≈ cap 6 倍 throughput: 成功 ≡ GC 複数回
+  発火かつ get コールバック内確保・mcall 戻り値ハンドルの rooting が正しい）。
+  両者とも ASan+UBSan+LSan 常時の双子バイナリで検査。
+- E2E byte-exact オラクル `oracle/script.html`（`tools/chk_oracle.sh` 16 件目系）:
+  mutation が描画に出る（script.out）／`IF_SCRIPT=0` で出ない（script.killed）双方向。
 - `tests/test_html.c` slim-DOM オラクル: **script は本文ごと残る／template は従来通り剃る**
   （法則「画面描画に関係ないものは DOM しない」の補足: script は v0.3 で「描画に無関係」
   ではなくなった = 例外ではなく法則の正しい適用）。

@@ -741,6 +741,128 @@ static void t_native(void) {
     want_str("tostr(40) + 2", "402");                  /* 文字列 + 数値の連結保存 */
 }
 
+/* ---- AKL_OK_HANDLE（AklHandleVTab）の敵対検証（v0.3 DOM バインドの足場） ---- */
+typedef struct { int n; char tag[8]; } TBox;
+static const AklHandleVTab g_box_vt;
+static int g_hcalls;
+
+static bool h_get(AklRT *rt, void *ptr, const char *name, uint32_t len, AklVal *out) {
+    TBox *b = (TBox *)ptr;
+    if (len == 1 && name[0] == 'n') { *out = akl_mknum((double)b->n); return true; }
+    if (len == 4 && memcmp(name, "name", 4) == 0) {
+        /* VM 実行中の確保（nursery 規約経路）を必ず踏ませる */
+        *out = akl_mkstring(rt, b->tag, (uint32_t)strlen(b->tag));
+        return true;
+    }
+    return false; /* unknown prop → undefined（TypeError ではない） */
+}
+static bool h_set(AklRT *rt, void *ptr, const char *name, uint32_t len, AklVal v) {
+    (void)rt;
+    TBox *b = (TBox *)ptr;
+    if (len != 1 || name[0] != 'n') return false; /* → "property store rejected" */
+    double d;
+    if (!akl_as_num(v, &d)) return false;         /* 型違反も拒否で明白に */
+    b->n = (int)d;
+    return true;
+}
+static bool h_call(AklRT *rt, void *ptr, const char *name, uint32_t len,
+                   int argc, const AklVal *argv, AklVal *out) {
+    TBox *b = (TBox *)ptr;
+    if (len == 3 && memcmp(name, "add", 3) == 0) {
+        double d = 0;
+        if (argc != 1 || !akl_as_num(argv[0], &d)) {
+            akl_native_throw(rt, "add expects 1 number");
+            return true;
+        }
+        b->n += (int)d;
+        g_hcalls++;
+        *out = akl_mknum((double)b->n);
+        return true;
+    }
+    if (len == 4 && memcmp(name, "self", 4) == 0) {
+        /* gc_live 中のハンドル生成（メソッド戻り値の本筋経路 = nursery 一時保護） */
+        *out = akl_mkhandle(rt, &g_box_vt, b);
+        return true;
+    }
+    return false; /* 未知メソッド → "TypeError: not a function" */
+}
+static const AklHandleVTab g_box_vt = { "TBox", h_get, h_set, h_call };
+
+static void t_handles(void) {
+    TBox box; box.n = 10; memcpy(box.tag, "BoxTen", 7);
+    g_hcalls = 0;
+
+    /* 基本面: typeof / tostring / 未定義意味論の凍結 */
+    CHECK(akl_global_set(g_rt, "box", akl_mkhandle(g_rt, &g_box_vt, &box)));
+    CHECK(akl_is_handle(g_rt, akl_mkhandle(g_rt, &g_box_vt, &box)));
+    want_str("typeof box", "object");
+    want_str("'' + box", "[object TBox]");
+    want_num("box.n", 10);
+    want_str("box.name", "BoxTen");
+    want_undef("box.zzz");                       /* unknown get は undefined */
+    want_err("box.zzz = 1", "property store rejected");
+    want_err("box.n = 's'", "property store rejected"); /* 型違反も拒否 */
+    want_err("box.nosuch(1)", "not a function");
+    want_err("box.add()", "add expects 1 number");
+    want_num("box.n = 41; box.n + 1", 42);       /* set → C 側 mutates → get で見える */
+    CHECK(box.n == 41);
+    want_num("box.add(5)", 46);
+    CHECK(g_hcalls == 1);
+    want_num("var k2 = box.self(); k2.add(1); box.n", 47); /* self ハンドルの identity は C ptr 共有 */
+    /* ハンドルに対する !! / 等値の挙動（truthy object） */
+    want_bool("!box", false);
+    want_bool("box == box", true);
+    akl_eval(g_rt, "box = undefined", NULL);     /* 後続の他テストを汚さない掃除 */
+
+    /* GC churn: heap 1MB に絞った専用 RT で、mcall 戻り値・get 確保・garbage を
+     * 数千回まわして GC を強制発火させる（HANDLE オブジェクトの rooting 証明）。
+     * 期待値は Python 実算で凍結: Σ 11..3010 + 300000 = 4,831,500。 */
+    AklRT *rt3 = akl_new();
+    CHECK(rt3 != NULL);
+    if (!rt3) return;
+    akl_tune(rt3, 0, 1, 0); /* heap 1MB（insn budget は既定 10M のまま） */
+    g_hcalls = 0;
+    box.n = 10;
+    CHECK(akl_global_set(rt3, "box", akl_mkhandle(rt3, &g_box_vt, &box)));
+    AklVal v; double d = -1;
+    CHECK(akl_eval(rt3,
+        "var acc = 0;"
+        "for (var i = 0; i < 3000; i = i + 1) {"
+        "  var junk = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' + i;"
+        "  if (box.name == 'BoxTen') { acc = acc + 100; }"
+        "  acc = acc + box.add(1);"
+        "} acc",
+        &v) && akl_as_num(v, &d));
+    if (d != 4831500) fprintf(stderr, "  gc-churn acc: got %g want 4831500\n", d);
+    CHECK(d == 4831500);
+    CHECK(g_hcalls == 3000);
+    /* GC 発火の機械証明: 1MB cap に対し 50k iter × (ROPE+STR ≈120B) ≈ 6MB の
+     * garbage を流す。GC が全く発火しなければ heap budget で eval 失敗する =
+     * 成功かつ値が合うこと ≡ GC が複数回発火した上で rooting が正しかったこと。
+     * さらに box.name（get コールバック内確保）も毎回踏ませ、コールバック最中の
+     * 確保→GC の最悪窓を必ず通す。 */
+    CHECK(akl_eval(rt3, "1", NULL)); /* 前エラーの掃除 */
+    CHECK(akl_eval(rt3,
+        "var fl = 0;"
+        "for (var i = 0; i < 50000; i = i + 1) {"
+        "  var g = 'flood-flood-flood-flood-flood' + i;"
+        "  if (box.name == 'BoxTen') { fl = fl + 1; }"
+        "} fl",
+        &v) && akl_as_num(v, &d));
+    if (d != 50000) fprintf(stderr, "  gc-flood: got %g want 50000 (GC 未発火なら heap budget で潰れる)\n", d);
+    CHECK(d == 50000);
+    /* self() で作ったハンドルが GC 嵐を跨いで生存（globals root 経路） */
+    CHECK(akl_eval(rt3,
+        "var keep = box.self();"
+        "keep.n = 5;"
+        "for (var i = 0; i < 20000; i = i + 1) { var z = 'zzzzzzzzzzzzzzzz' + i; }"
+        "keep.add(2)",
+        &v) && akl_as_num(v, &d));
+    CHECK(d == 7);
+    CHECK(box.n == 7); /* C 側実体への書込が最終値として残る */
+    akl_free(rt3);
+}
+
 void test_akl(void) {
     g_rt = akl_new();
     CHECK(g_rt != NULL);
@@ -760,6 +882,7 @@ void test_akl(void) {
     t_cojit();
     t_objects();
     t_native();
+    t_handles();
     akl_free(g_rt);
     g_rt = NULL;
 }

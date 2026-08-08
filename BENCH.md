@@ -53,8 +53,8 @@ min **1.40ms** / median **1.66ms** / p90 1.96ms。
 | ゲート | 現行値 |
 |---|---|
 | WPT tree-construction（`tests/wpt-tree-construction`、WPT master `5b6a1e6`） | **1922/1922 (100.0%)**、skip 12 = `#script-on` のみ（fragment 196 件は `--fragment CTX` で実行済） |
-| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,863 checks / 0 failures** ×2（+52 = `tests/test_script.c` script 実行配線オラクル） |
-| 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **14/14** |
+| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,897 checks / 0 failures** ×2（script 実行配線 + HANDLE GC 発火機械証明込み） |
+| 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **16/16**（+2 = script 実行 ON/OFF 双方向 `oracle/script.html`） |
 | golden（`tests/run_golden.sh`） | 1/1 |
 | GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | 51 checks PASS（X 不在環境の proxi、GUI 実機は未検証と明記） |
 | 拡張 smoke（`tests/ext_smoke.py`） | **12 checks**（console.log 凍結 v1 含む） |
