@@ -214,6 +214,7 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_MAKEFS,              /* fidx u32 | srcslot u8 : [親][fn] → fn の env 先頭に親をバインド */
     OP_SUPERGET,            /* name u32 : 親クラス（関数 env の vals[0]）の name を push */
     OP_OBJSPREAD,           /* pop src → TOS の OBJ に全 props コピー（オブジェクト spread） */
+    OP_PSETDYN,             /* pop val, pop key, pop obj → obj[key]=val, push val（computed） */
     OP_MCALLN,              /* slot u32 | name u32 : argc = locals[slot] の動的 MCALL（メソッド spread） */
     OP_ARRREST,             /* pop start, pop arr → 新規配列 [start..n)（分割 rest） */
     OP_OBJREST,             /* pop src_obj → 新規 OBJ（全 props コピー。除外は PDEL で） */
@@ -746,6 +747,8 @@ enum { P_LP, P_RP, P_LC, P_RC, P_SEMI, P_COMMA, P_ASSIGN, P_PLUS, P_MINUS, P_STA
        P_SHLASS, P_SHRASS, P_USHRASS, P_ANDASS, P_ORASS, P_XORASS,
        /* v0.3 JS 全構文: 冪乗・オプショナルチェーン・ヌル合体・rest/spread・テンプレート */
        P_POW, P_POWASS, P_QMARKDOT, P_QQ, P_ELLIPSIS, P_BACKTICK,
+       /* v0.4: 論理代入 */
+       P_ANDANDASS, P_ORORASS, P_QQASS,
        P_N };
 static const char *const AKL_PUNCTS[P_N] = {
     "(", ")", "{", "}", ";", ",", "=", "+", "-", "*", "/", "%", "!", "<", "<=", ">", ">=",
@@ -754,7 +757,8 @@ static const char *const AKL_PUNCTS[P_N] = {
     "+=", "-=", "*=", "/=", "%=",
     "<<", ">>", ">>>", "&", "|", "^", "~",
     "<<=", ">>=", ">>>=", "&=", "|=", "^=",
-    "**", "**=", "?.", "??", "...", "`"
+    "**", "**=", "?.", "??", "...", "`",
+    "&&=", "||=", "?\?="
 };
 
 static bool lex_eof(Lex *lx) { return lx->pos >= lx->n; }
@@ -928,6 +932,22 @@ static int lex_template(Lex *lx) {
     return 0;
 }
 
+/* 数値リテラルの数字列を読み進める。_ は数字間の区切りとして許容（JS ES2021）。 */
+static bool lex_digits(Lex *lx) {
+    bool any = false;
+    for (;;) {
+        u8 c = lex_cur(lx);
+        if (c >= '0' && c <= '9') { lx->pos++; any = true; continue; }
+        if (c == '_') {
+            if (!any || lex_at(lx, 1) < '0' || lex_at(lx, 1) > '9') return false;
+            lx->pos++;
+            continue;
+        }
+        break;
+    }
+    return any;
+}
+
 static int lex_next(Lex *lx) {
     lex_skip_ws(lx);
     if (lex_eof(lx)) { lx->kind = TK_EOF; return 0; }
@@ -946,7 +966,12 @@ static int lex_next(Lex *lx) {
             if (hex_dig(lex_cur(lx)) < 0) return -1;
             double hv = 0;
             u32 guard = 0;
-            while (hex_dig(lex_cur(lx)) >= 0) {
+            while (hex_dig(lex_cur(lx)) >= 0 || lex_cur(lx) == '_') {
+                if (lex_cur(lx) == '_') {
+                    if (hex_dig(lex_at(lx, 1)) < 0) return -1;
+                    lx->pos++;
+                    continue;
+                }
                 hv = hv * 16 + (double)hex_dig(lex_cur(lx));
                 lx->pos++;
                 if (++guard > 16) return -1; /* 実効桁上限（巨大 16 進は拒否） */
@@ -957,7 +982,13 @@ static int lex_next(Lex *lx) {
             if (lex_cur(lx) != '0' && lex_cur(lx) != '1') return -1;
             double bv = 0;
             u32 guard = 0;
-            while (lex_cur(lx) == '0' || lex_cur(lx) == '1') {
+            while (lex_cur(lx) == '0' || lex_cur(lx) == '1' || lex_cur(lx) == '_') {
+                if (lex_cur(lx) == '_') {
+                    u8 nx = lex_at(lx, 1);
+                    if (nx != '0' && nx != '1') return -1;
+                    lx->pos++;
+                    continue;
+                }
                 bv = bv * 2 + (double)(lex_cur(lx) - '0');
                 lx->pos++;
                 if (++guard > 48) return -1; /* 2^48 まで double で正確 */
@@ -968,16 +999,34 @@ static int lex_next(Lex *lx) {
             if (lex_cur(lx) < '0' || lex_cur(lx) > '7') return -1;
             double ov = 0;
             u32 guard = 0;
-            while (lex_cur(lx) >= '0' && lex_cur(lx) <= '7') {
+            while ((lex_cur(lx) >= '0' && lex_cur(lx) <= '7') || lex_cur(lx) == '_') {
+                if (lex_cur(lx) == '_') {
+                    u8 nx = lex_at(lx, 1);
+                    if (nx < '0' || nx > '7') return -1;
+                    lx->pos++;
+                    continue;
+                }
                 ov = ov * 8 + (double)(lex_cur(lx) - '0');
                 lx->pos++;
                 if (++guard > 16) return -1; /* 8^16 = 2^48 まで正確 */
             }
             lx->num = ov;
         } else {
-            while (lex_cur(lx) >= '0' && lex_cur(lx) <= '9') {
-                v = v * 10 + (double)(lex_cur(lx) - '0');
-                lx->pos++;
+            {
+                u32 dpos0 = lx->pos;
+                if (!lex_digits(lx)) return -1;
+                lx->pos = dpos0;
+                while (lex_cur(lx) >= '0' && lex_cur(lx) <= '9') {
+                    v = v * 10 + (double)(lex_cur(lx) - '0');
+                    lx->pos++;
+                }
+                while (lex_cur(lx) == '_') { /* 区切りは数値計算では無視 */
+                    lx->pos++;
+                    while (lex_cur(lx) >= '0' && lex_cur(lx) <= '9') {
+                        v = v * 10 + (double)(lex_cur(lx) - '0');
+                        lx->pos++;
+                    }
+                }
             }
             if (lex_cur(lx) == '.') {
                 is_int = false;
@@ -1098,6 +1147,8 @@ enum {
     N_SWITCH,   /* a=disc node, b=case list first, c=count */
     N_CASE,     /* a=expr（N_NONE=default）, b=body stmt */
     N_FUNCEXPR, /* 関数式: N_FUNC と同形（d=body）。a=name idx（無名は UINT32_MAX） */
+    N_OBJKEY,   /* オブジェクト computed キー: a=キー式, b=値（N_OBJLIT の要素） */
+    N_LOGASSIGN,/* 論理代入: a=target, b=rhs, op=0(||=) 1(&&=) 2(??=) */
     N_REGEX,    /* 正規表現リテラル: a=pattern STR idx, b=flags（AKL_RX_F_*） */
     N_SUPER,    /* super: 疑似識別子（親クラスオブジェクト = SUPER_NAME ローカル） */
     N_SUPERGET, /* super.name: b=name STR idx */
@@ -1361,6 +1412,21 @@ static u32 p_postfix(P *p, u32 base) {
 /* オブジェクトリテラル: `{ k: v, ... }` 現在トークンは '{'（式文脈のみ到達。
  * 文頭 '{' は p_stmt のブロックが優先して消費＝JS と同一の曖昧性解決）。
  * key は IDENT/KW/STR。shorthand {a} / method shorthand / computed key は非対応（明白に拒否）。 */
+/* getter/setter の非公開プロパティ名（ソースに現れない NUL 入り）。PLOAD/PSTORE が
+ * 通常名に失敗したら "get:\x01name" / "set:\x01name" を探索して関数を呼ぶ。 */
+static u32 p_special_prop_name(P *p, const char *kind, u32 name) {
+    u32 kn = (u32)strlen(kind);
+    u32 nl = 0;
+    const u8 *np = akl_str(p->rt, name, &nl);
+    if (!np) return UINT32_MAX;
+    u8 buf[256];
+    if (kn + 1 + nl > sizeof buf) return UINT32_MAX;
+    memcpy(buf, kind, kn);
+    buf[kn] = 0x01;
+    memcpy(buf + kn + 1, np, nl);
+    return akl_intern(p->rt, buf, kn + 1 + nl, NULL);
+}
+
 static u32 p_lit_object(P *p) {
     if (!p_expect_punct(p, P_LC, "expected '{'")) return N_NONE;
     U32Vec ks = { NULL, 0, 0 }, vs = { NULL, 0, 0 };
@@ -1376,16 +1442,128 @@ static u32 p_lit_object(P *p) {
                 p->nodes[spn].a = s;
                 if (p_scratch(p, &ks, UINT32_MAX) < 0 || p_scratch(p, &vs, spn) < 0) goto fail;
                 if (p_eat_punct(p, P_COMMA)) {
-                    if (p_is_punct(p, P_RC)) break; /* trailing comma 許容 */
+                    if (p_is_punct(p, P_RC)) break;
                     continue;
                 }
                 break;
             }
-            if (lx->kind == TK_IDENT || lx->kind == TK_KW || lx->kind == TK_STR) {
+            if (p_is_punct(p, P_LBR)) { /* computed key: { [expr]: v } */
+                lex_next(&p->lx);
+                u32 ke = p_expr(p);
+                if (ke == N_NONE) goto fail;
+                if (!p_expect_punct(p, P_RBR, "expected ']'")) goto fail;
+                u32 okn = p_node(p, N_OBJKEY);
+                if (okn == N_NONE) goto fail;
+                p->nodes[okn].a = ke;
+                if (p_is_punct(p, P_LP)) { /* computed メソッドは非対応（明示） */
+                    p->fail = "computed method names are not supported";
+                    goto fail;
+                }
+                if (!p_expect_punct(p, P_COLON, "expected ':' in object literal")) goto fail;
+                u32 val = p_expr(p);
+                if (val == N_NONE) goto fail;
+                p->nodes[okn].b = val;
+                if (p_scratch(p, &ks, UINT32_MAX) < 0 || p_scratch(p, &vs, okn) < 0) goto fail;
+                if (p_eat_punct(p, P_COMMA)) {
+                    if (p_is_punct(p, P_RC)) break;
+                    continue;
+                }
+                break;
+            }
+            /* getter/setter 判定: 'get'/'set' + 名前 + '(' を先読み（Lex 全体退避） */
+            bool is_acc = false, is_get = false, is_set = false;
+            if (lx->kind == TK_IDENT && lx->str_len == 3 &&
+                (memcmp(lx->str_p, "get", 3) == 0 || memcmp(lx->str_p, "set", 3) == 0)) {
+                Lex saved = *lx;
+                lex_next(lx);
+                if (lx->kind == TK_IDENT) {
+                    Lex saved2 = *lx;
+                    lex_next(lx);
+                    if (lx->kind == TK_PUNCT && lx->pk == P_LP) {
+                        is_acc = true;
+                        is_get = memcmp(saved.str_p, "get", 3) == 0;
+                        *lx = saved2; /* 名前トークンで復元 */
+                    } else {
+                        *lx = saved;
+                    }
+                } else {
+                    *lx = saved;
+                }
+            }
+            if (is_acc) {
+                /* アクセサ: 現在トークンは名前（復元済み） */
+                if (lx->kind != TK_IDENT) { p->fail = "expected accessor name"; goto fail; }
                 key = p_intern(p, lx->str_p, lx->str_len);
                 if (key == UINT32_MAX) goto fail;
                 lex_next(lx);
-            } else { p->fail = "expected property key"; goto fail; }
+                if (!p_expect_punct(p, P_LP, "expected '('")) goto fail;
+                u32 pf = 0, pc2 = 0;
+                p_params(p, &pf, &pc2);
+                if (p->fail) goto fail;
+                if (is_set && pc2 > 1) { p->fail = "setter takes exactly one argument"; goto fail; }
+                if (!p_expect_punct(p, P_LC, "expected '{'")) goto fail;
+                p->super_ctx++;
+                u32 body = p_block_tail(p);
+                p->super_ctx--;
+                if (body == N_NONE) goto fail;
+                u32 cm = p_node(p, N_CLASSMETH);
+                if (cm == N_NONE) goto fail;
+                p->nodes[cm].a = key;
+                p->nodes[cm].b = pf;
+                p->nodes[cm].c = pc2;
+                p->nodes[cm].d = body;
+                p->nodes[cm].flags = is_get ? 4u : 8u;
+                u32 skey = p_special_prop_name(p, is_get ? "get" : "set", key);
+                if (skey == UINT32_MAX) goto fail;
+                if (p_scratch(p, &ks, skey) < 0 || p_scratch(p, &vs, cm) < 0) goto fail;
+                if (p_eat_punct(p, P_COMMA)) {
+                    if (p_is_punct(p, P_RC)) break;
+                    continue;
+                }
+                break;
+            }
+            /* 通常キー（IDENT / KW / STR） */
+            if (lx->kind != TK_IDENT && lx->kind != TK_KW && lx->kind != TK_STR) {
+                p->fail = "expected property key";
+                goto fail;
+            }
+            key = p_intern(p, lx->str_p, lx->str_len);
+            if (key == UINT32_MAX) goto fail;
+            lex_next(lx);
+            if (p_is_punct(p, P_LP)) { /* メソッド短縮: { m() {} } */
+                lex_next(&p->lx); /* '(' を消費 */
+                u32 pf = 0, pc2 = 0;
+                p_params(p, &pf, &pc2);
+                if (p->fail) goto fail;
+                if (!p_expect_punct(p, P_LC, "expected '{'")) goto fail;
+                p->super_ctx++;
+                u32 body = p_block_tail(p);
+                p->super_ctx--;
+                if (body == N_NONE) goto fail;
+                u32 cm = p_node(p, N_CLASSMETH);
+                if (cm == N_NONE) goto fail;
+                p->nodes[cm].a = key;
+                p->nodes[cm].b = pf;
+                p->nodes[cm].c = pc2;
+                p->nodes[cm].d = body;
+                if (p_scratch(p, &ks, key) < 0 || p_scratch(p, &vs, cm) < 0) goto fail;
+                if (p_eat_punct(p, P_COMMA)) {
+                    if (p_is_punct(p, P_RC)) break;
+                    continue;
+                }
+                break;
+            }
+            if (p_is_punct(p, P_COMMA) || p_is_punct(p, P_RC)) { /* ショートハンド {a} */
+                u32 val = p_node(p, N_IDENT);
+                if (val == N_NONE) goto fail;
+                p->nodes[val].a = key;
+                if (p_scratch(p, &ks, key) < 0 || p_scratch(p, &vs, val) < 0) goto fail;
+                if (p_eat_punct(p, P_COMMA)) {
+                    if (p_is_punct(p, P_RC)) break;
+                    continue;
+                }
+                break;
+            }
             if (!p_expect_punct(p, P_COLON, "expected ':' in object literal")) goto fail;
             u32 val = p_expr(p);
             if (val == N_NONE) goto fail;
@@ -2095,6 +2273,21 @@ static u32 p_expr(P *p) {
         p->nodes[ni].a = lhs; /* target node（N_IDENT | N_PGET | N_INDEX） */
         p->nodes[ni].b = rhs;
         p->nodes[ni].op = op;
+        return ni;
+    }
+    if (p_is_punct(p, P_ANDANDASS) || p_is_punct(p, P_ORORASS) || p_is_punct(p, P_QQASS)) {
+        /* 論理代入: a ||= b / a &&= b / a ??= b（短絡。式の値 = 新値 or 元値） */
+        u8 pk = p->lx.pk;
+        u8 lk = p->nodes[lhs].kind;
+        if (lk != N_IDENT && lk != N_PGET && lk != N_INDEX) { p->fail = "invalid assignment target"; return N_NONE; }
+        lex_next(&p->lx);
+        u32 rhs = p_expr(p);
+        if (rhs == N_NONE) return N_NONE;
+        u32 ni = p_node(p, N_LOGASSIGN);
+        if (ni == N_NONE) return N_NONE;
+        p->nodes[ni].a = lhs;
+        p->nodes[ni].b = rhs;
+        p->nodes[ni].op = (u8)(pk == P_ANDANDASS ? 1 : (pk == P_QQASS ? 2 : 0));
         return ni;
     }
     return lhs;
@@ -2902,6 +3095,9 @@ static void an_refs(P *p, u32 ni, U32Vec *out) {
     case N_BLOCK: if (n->a != N_NONE) for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->a + i], out); break;
     case N_TRY: an_refs(p, n->a, out); an_refs(p, n->c, out); an_refs(p, n->d, out); break;
     case N_OBJLIT: for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->b + i], out); break;
+    case N_OBJKEY: an_refs(p, n->a, out); an_refs(p, n->b, out); break;
+    case N_LOGASSIGN: an_refs(p, n->a, out); an_refs(p, n->b, out); break;
+    case N_SPREAD: an_refs(p, n->a, out); break;
     case N_SUPERMCALL:
         an_add(out, p->super_name);
         for (u32 i = 0; i < n->d; i++) an_refs(p, p->list[n->c + i], out);
@@ -2961,6 +3157,17 @@ static void an_decls(P *p, u32 ni, U32Vec *out) {
         break;
     case N_ARRLIT: case N_OBJLIT:
         for (u32 i = 0; i < n->c; i++) an_decls(p, p->list[n->b + i], out);
+        break;
+    case N_OBJKEY:
+        an_decls(p, n->a, out);
+        an_decls(p, n->b, out);
+        break;
+    case N_LOGASSIGN:
+        an_decls(p, n->a, out);
+        an_decls(p, n->b, out);
+        break;
+    case N_SPREAD:
+        an_decls(p, n->a, out);
         break;
     default: break;
     }
@@ -3040,6 +3247,17 @@ static void an_walk(P *p, u32 ni, u32 *anc, u32 anc_n) {
         return;
     case N_ARRLIT: case N_OBJLIT: /* a は list index（name 列）でノードでない */
         for (u32 i = 0; i < n->c; i++) an_walk(p, p->list[n->b + i], anc, anc_n);
+        return;
+    case N_OBJKEY:
+        an_walk(p, n->a, anc, anc_n);
+        an_walk(p, n->b, anc, anc_n);
+        return;
+    case N_LOGASSIGN:
+        an_walk(p, n->a, anc, anc_n);
+        an_walk(p, n->b, anc, anc_n);
+        return;
+    case N_SPREAD:
+        an_walk(p, n->a, anc, anc_n);
         return;
     case N_IF: case N_WHILE: case N_DOWHILE: case N_TERN:
         an_walk(p, n->a, anc, anc_n);
@@ -3146,6 +3364,17 @@ static void an_main_decls(P *p, u32 ni, U32Vec *out) {
         break;
     case N_ARRLIT: case N_OBJLIT: /* a は list index（name 列）でノードでない */
         for (u32 i = 0; i < n->c; i++) an_main_decls(p, p->list[n->b + i], out);
+        break;
+    case N_OBJKEY:
+        an_main_decls(p, n->a, out);
+        an_main_decls(p, n->b, out);
+        break;
+    case N_LOGASSIGN:
+        an_main_decls(p, n->a, out);
+        an_main_decls(p, n->b, out);
+        break;
+    case N_SPREAD:
+        an_main_decls(p, n->a, out);
         break;
     default: break;
     }
@@ -3790,6 +4019,26 @@ static void cg_expr(Cg *cg, u32 ni) {
                 cg_op(cg, OP_OBJSPREAD);
                 continue;
             }
+            if (ve < cg->p->n_nodes && cg->p->nodes[ve].kind == N_OBJKEY) {
+                /* computed: [obj] → DUP; val; key; PSETDYN; POP */
+                cg_op(cg, OP_DUP);
+                cg_expr(cg, cg->p->nodes[ve].b); /* 値 */
+                cg_expr(cg, cg->p->nodes[ve].a); /* キー式 */
+                cg_op(cg, OP_PSETDYN);
+                cg_op(cg, OP_POP);
+                if (cg->fail) return;
+                continue;
+            }
+            if (ve < cg->p->n_nodes && cg->p->nodes[ve].kind == N_CLASSMETH) {
+                /* メソッド短縮: cg_fn で関数を作って PSTORE */
+                cg_op(cg, OP_DUP);
+                cg_fn(cg, ve);
+                cg_op(cg, OP_PSTORE);
+                cg_u32(cg, cg->p->list[n->a + i]);
+                cg_op(cg, OP_POP);
+                if (cg->fail) return;
+                continue;
+            }
             cg_op(cg, OP_DUP);
             cg_expr(cg, ve);
             cg_op(cg, OP_PSTORE);
@@ -4004,6 +4253,93 @@ static void cg_expr(Cg *cg, u32 ni) {
         cg_op(cg, OP_POP); /* a を捨てる */
         cg_expr(cg, n->b);
         cg_patch_u32(cg, s_end, cg_target_here(cg));
+        break;
+    }
+    case N_LOGASSIGN: {
+        /* a ||= b / a &&= b / a ??= b（target は N_IDENT | N_PGET | N_INDEX）。
+         * 展開: LOAD a; DUP; 判定ジャンプ Lend; POP; rhs; DUP; store; Lend:
+         * 判定: ||= は JMPT（truthy なら a のまま end）、&&= は JMPF（falsy なら a のまま）、
+         *       ??= は DUP;NULL_T;EQ;JMPF（null でない = EQ false なら a のまま end。
+         *       null なら EQ true で続行 → b を代入）。
+         * JMPX は TOS を pop するため end には a のコピーが残る。代入経路は POP で
+         * a を捨て rhs → DUP → store → 式の値 = b。
+         * obj/index は一時ローカルに退避（評価 1 回・ゴミを残さない）。 */
+        AklNode *tn = &cg->p->nodes[n->a];
+        u8 mode = n->op;
+        if (tn->kind == N_IDENT) {
+            cg_load(cg, tn->a);
+            cg_op(cg, OP_DUP);
+            u32 s_end;
+            if (mode == 0) s_end = cg_jmp_op(cg, OP_JMPT);
+            else if (mode == 1) s_end = cg_jmp_op(cg, OP_JMPF);
+            else {
+                cg_op(cg, OP_NULL_T);
+                cg_op(cg, OP_EQ);
+                s_end = cg_jmp_op(cg, OP_JMPF);
+            }
+            cg_op(cg, OP_POP);
+            cg_expr(cg, n->b);
+            cg_op(cg, OP_DUP);
+            if (!cg->fail) cg_store(cg, tn->a, 0, false);
+            cg_patch_u32(cg, s_end, cg_target_here(cg));
+            break;
+        }
+        if (tn->kind == N_PGET) {
+            u32 on = tn->a;
+            u32 nm = tn->b;
+            i32 t = cg_local_add(cg, 0xFFFFFFFEu - (u32)cg->tmp_seq++, 0);
+            if (t < 0) break;
+            cg_expr(cg, on);
+            cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)t);
+            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
+            cg_op(cg, OP_PLOAD); cg_u32(cg, nm);
+            cg_op(cg, OP_DUP);
+            u32 s_end;
+            if (mode == 0) s_end = cg_jmp_op(cg, OP_JMPT);
+            else if (mode == 1) s_end = cg_jmp_op(cg, OP_JMPF);
+            else {
+                cg_op(cg, OP_NULL_T);
+                cg_op(cg, OP_EQ);
+                s_end = cg_jmp_op(cg, OP_JMPF);
+            }
+            cg_op(cg, OP_POP); /* 元値を捨てる */
+            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
+            cg_expr(cg, n->b);
+            cg_op(cg, OP_PSTORE); cg_u32(cg, nm); /* [obj, b] → PSTORE が b を push */
+            cg_patch_u32(cg, s_end, cg_target_here(cg));
+            break;
+        }
+        /* N_INDEX */
+        {
+            u32 on = tn->a;
+            u32 ix = tn->b;
+            i32 t = cg_local_add(cg, 0xFFFFFFFEu - (u32)cg->tmp_seq++, 0);
+            i32 u = cg_local_add(cg, 0xFFFFFFFEu - (u32)cg->tmp_seq++, 0);
+            if (t < 0 || u < 0) break;
+            cg_expr(cg, on);
+            cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)t);
+            cg_expr(cg, ix);
+            cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)u);
+            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
+            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)u);
+            cg_op(cg, OP_AGET);
+            cg_op(cg, OP_DUP);
+            u32 s_end;
+            if (mode == 0) s_end = cg_jmp_op(cg, OP_JMPT);
+            else if (mode == 1) s_end = cg_jmp_op(cg, OP_JMPF);
+            else {
+                cg_op(cg, OP_NULL_T);
+                cg_op(cg, OP_EQ);
+                s_end = cg_jmp_op(cg, OP_JMPF);
+            }
+            cg_op(cg, OP_POP); /* 元値を捨てる */
+            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
+            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)u);
+            cg_expr(cg, n->b);
+            cg_op(cg, OP_ASET); /* [obj, idx, b] → ASET が b を push */
+            cg_patch_u32(cg, s_end, cg_target_here(cg));
+            break;
+        }
         break;
     }
     case N_DELETE: {
@@ -5105,6 +5441,8 @@ static u32 akl_op_imm_len(u8 op) {
         return 4;
     case OP_MCALLN:
         return 8;   /* slot u32 | name u32 */
+    case OP_PSETDYN:
+        return 0;
     case OP_ELOAD: case OP_ESTORE:
         return 4;
     case OP_PDEL:
@@ -7561,7 +7899,7 @@ static bool jp_hex4(JsonP *p, u32 *out) {
     return true;
 }
 /* 文字列（"..." エスケープ込み。UTF-8 出力） */
-static bool jp_string(JsonP *p, u32 *out_idx) {
+static bool jp_string(JsonP *p, u32 *out_idx, bool do_intern) {
     if (p->pos >= p->n || p->s[p->pos] != '"') return false;
     p->pos++;
     u8 *buf = (u8 *)malloc(64);
@@ -7628,7 +7966,12 @@ static bool jp_string(JsonP *p, u32 *out_idx) {
         }
     }
     if (!ok) { free(buf); return false; }
-    u32 oi = akl_mkstr(p->rt, buf, bl);
+    /* キー（do_intern=true）は intern 済みで作る: akl_mkstr で uninterned な STR を
+     * 作ると、akl_intern の線形走査が「先頭優先」でそれを既存と誤認し、コンパイル時
+     * intern の STR と別の id になる（実測で .key が undefined に化ける）。 */
+    u32 oi;
+    if (do_intern) oi = akl_intern(p->rt, buf, bl, NULL);
+    else oi = akl_mkstr(p->rt, buf, bl);
     free(buf);
     if (oi == UINT32_MAX) return false;
     *out_idx = oi;
@@ -7676,7 +8019,7 @@ static AklVal jp_value(JsonP *p, u32 depth) {
         for (;;) {
             jp_ws(p);
             u32 ki;
-            if (!jp_string(p, &ki)) { akl_errf(p->rt, "SyntaxError: invalid json"); return AKL_VAL_UNDEF; }
+            if (!jp_string(p, &ki, true)) { akl_errf(p->rt, "SyntaxError: invalid json"); return AKL_VAL_UNDEF; }
             if (p->rt->n_nury < AKL_NURY_CAP) p->rt->nury[p->rt->n_nury++] = ki;
             /* キーは intern 必須（PLOAD は intern idx で照合する。未 intern のまま
              * prop_set すると名前不一致になり .k が undefined になる — 実測で特定） */
@@ -7732,7 +8075,7 @@ static AklVal jp_value(JsonP *p, u32 depth) {
     }
     if (c == '"') {
         u32 si;
-        if (!jp_string(p, &si)) { akl_errf(p->rt, "SyntaxError: invalid json"); return AKL_VAL_UNDEF; }
+        if (!jp_string(p, &si, false)) { akl_errf(p->rt, "SyntaxError: invalid json"); return AKL_VAL_UNDEF; }
         return AKL_MK_OBJ(si);
     }
     if (c == 't' && jp_lit(p, "true")) return AKL_VAL_TRUE;
@@ -8623,6 +8966,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_MAKEFS] = &&l_MAKEFS,
         [OP_SUPERGET] = &&l_SUPERGET,
         [OP_OBJSPREAD] = &&l_OBJSPREAD,
+        [OP_PSETDYN] = &&l_PSETDYN,
         [OP_MCALLN] = &&l_MCALLN,
         [OP_ARRREST] = &&l_ARRREST,
         [OP_OBJREST] = &&l_OBJREST,
@@ -9199,10 +9543,75 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 co = &rt->objs[akl_get_obj(pv)];
                 pi = obj_prop_find(co, name);
             }
-            AKL_PUSH(pi >= 0 ? co->u.po.props[pi].v : AKL_VAL_UNDEF);
-            AKL_NEXT();
+            if (pi >= 0) { AKL_PUSH(co->u.po.props[pi].v); AKL_NEXT(); }
         }
-        AKL_PUSH(pi >= 0 ? o->u.po.props[pi].v : AKL_VAL_UNDEF); /* 未定義 prop → undefined（JS 同様） */
+        if (pi >= 0) { AKL_PUSH(o->u.po.props[pi].v); AKL_NEXT(); }
+        /* getter 自動呼び出し: 通常 prop が無ければ "get:\x01name" を探して this=obj で呼ぶ */
+        if (o->kind == AKL_OK_OBJ) {
+            u32 nl2;
+            const u8 *nb2 = akl_str(rt, name, &nl2);
+            if (!nb2) { free(frames); return false; }
+            u8 gbuf[260];
+            if (nl2 + 5 <= sizeof gbuf) {
+                memcpy(gbuf, "get", 3);
+                gbuf[3] = 0x01;
+                memcpy(gbuf + 4, nb2, nl2);
+                rt->gc_sp = sp + 1; /* ov は stk[sp] に残存（GC ルート） */
+                u32 gname = akl_intern(rt, gbuf, 4 + nl2, NULL);
+                if (gname != UINT32_MAX) {
+                    i32 gi = obj_prop_find(o, gname);
+                    if (gi >= 0) {
+                        AklVal fn = o->u.po.props[gi].v;
+                        if (akl_is_objv(fn)) {
+                            AklObj *gfo = &rt->objs[akl_get_obj(fn)];
+                            if (gfo->kind == AKL_OK_NATIVE) {
+                                if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
+                                budget -= AKL_NATIVE_COST;
+                                u32 nur0 = rt->n_nury;
+                                AklVal gout;
+                                if (!akl_vm_native_call(rt, gfo, ov, 0, NULL, &gout)) { free(frames); return false; }
+                                rt->n_nury = nur0;
+                                AKL_PUSH(gout);
+                                AKL_NEXT();
+                            }
+                            if (gfo->kind == AKL_OK_FUNC) {
+                                u32 gfid = akl_get_obj(fn);
+                                u32 gfei = rt->objs[gfid].code_off;
+                                if (gfei >= rt->n_funcs) { akl_errf(rt, "internal: bad func ref"); free(frames); return false; }
+                                AklFuncEnt *gfe = &rt->funcs[gfei];
+                                if (nframes >= AKL_MAX_DEPTH) { akl_errf(rt, "call depth budget exhausted"); free(frames); return false; }
+                                u32 gnh = 1 + (gfe->n_env ? 1u : 0u) + (gfe->n_cap ? 1u : 0u);
+                                u32 gwin = sp; /* ov pop 済み。ここからフレーム */
+                                u32 gnloc = gfe->n_locals;
+                                AKL_GROW_TO(gwin + gnloc + 4);
+                                if (gnh > 1) {
+                                    rt->gc_sp = sp;
+                                    if (!akl_vm_frame_hidden(rt, stk, gwin, gnloc, gfe, ov,
+                                        gfo->env == UINT32_MAX ? AKL_VAL_UNDEF : AKL_MK_OBJ(gfo->env))) {
+                                        free(frames);
+                                        return false;
+                                    }
+                                } else {
+                                    stk[gwin] = ov;
+                                }
+                                for (u32 gi2 = gnh; gi2 < gnloc; gi2++) stk[gwin + gi2] = AKL_VAL_UNDEF;
+                                sp = gwin + gnloc;
+                                frames[nframes].ret_off = (u32)(pc - code);
+                                frames[nframes].base = base;
+                                frames[nframes].func = cur;
+                                frames[nframes].is_new = 0;
+                                nframes++;
+                                base = gwin;
+                                cur = gfei;
+                                pc = code + rt->funcs[cur].code_off;
+                                AKL_NEXT();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        AKL_PUSH(AKL_VAL_UNDEF); /* 未定義 prop → undefined（JS 同様） */
         AKL_NEXT();
     }
     AKL_L(PSTORE): {
@@ -9272,7 +9681,75 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             akl_errf(rt, "TypeError: property store on non-object value");
             free(frames); return false;
         }
-        if (!obj_prop_set(rt, &rt->objs[akl_get_obj(ov)], name, v)) { free(frames); return false; }
+        AklObj *so = &rt->objs[akl_get_obj(ov)];
+        if (so->kind == AKL_OK_OBJ) {
+            /* setter 自動呼び出し: 通常 prop に代入する前に "set:\x01name" を探す */
+            u32 nl3;
+            const u8 *nb3 = akl_str(rt, name, &nl3);
+            if (!nb3) { free(frames); return false; }
+            u8 sbuf[260];
+            if (nl3 + 5 <= sizeof sbuf) {
+                memcpy(sbuf, "set", 3);
+                sbuf[3] = 0x01;
+                memcpy(sbuf + 4, nb3, nl3);
+                rt->gc_sp = sp + 2; /* ov/v は stk 残存（GC ルート） */
+                u32 sname = akl_intern(rt, sbuf, 4 + nl3, NULL);
+                if (sname != UINT32_MAX) {
+                    i32 si = obj_prop_find(so, sname);
+                    if (si >= 0) {
+                        AklVal fn = so->u.po.props[si].v;
+                        if (akl_is_objv(fn)) {
+                            AklObj *sfo = &rt->objs[akl_get_obj(fn)];
+                            if (sfo->kind == AKL_OK_NATIVE) {
+                                if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
+                                budget -= AKL_NATIVE_COST;
+                                u32 nur0 = rt->n_nury;
+                                AklVal sout;
+                                if (!akl_vm_native_call(rt, sfo, ov, 1, &v, &sout)) { free(frames); return false; }
+                                rt->n_nury = nur0;
+                                AKL_PUSH(v); /* 代入式の値は右辺 */
+                                AKL_NEXT();
+                            }
+                            if (sfo->kind == AKL_OK_FUNC) {
+                                u32 sfid = akl_get_obj(fn);
+                                u32 sfei = rt->objs[sfid].code_off;
+                                if (sfei >= rt->n_funcs) { akl_errf(rt, "internal: bad func ref"); free(frames); return false; }
+                                AklFuncEnt *sfe = &rt->funcs[sfei];
+                                if (nframes >= AKL_MAX_DEPTH) { akl_errf(rt, "call depth budget exhausted"); free(frames); return false; }
+                                u32 snh = 1 + (sfe->n_env ? 1u : 0u) + (sfe->n_cap ? 1u : 0u);
+                                u32 swin = sp; /* ov/v pop 済み。フレームはここから */
+                                u32 snloc = sfe->n_locals;
+                                u32 snpar = sfe->n_params;
+                                AKL_GROW_TO(swin + snloc + 4);
+                                if (snh > 1) {
+                                    rt->gc_sp = sp;
+                                    if (!akl_vm_frame_hidden(rt, stk, swin, snloc, sfe, ov,
+                                        sfo->env == UINT32_MAX ? AKL_VAL_UNDEF : AKL_MK_OBJ(sfo->env))) {
+                                        free(frames);
+                                        return false;
+                                    }
+                                } else {
+                                    stk[swin] = ov;
+                                }
+                                if (snpar > 0) stk[swin + snh] = v; /* 第 1 引数 = 代入値 */
+                                for (u32 si2 = snh + (snpar > 0 ? 1u : 0u); si2 < snloc; si2++) stk[swin + si2] = AKL_VAL_UNDEF;
+                                sp = swin + snloc;
+                                frames[nframes].ret_off = (u32)(pc - code);
+                                frames[nframes].base = base;
+                                frames[nframes].func = cur;
+                                frames[nframes].is_new = 0;
+                                nframes++;
+                                base = swin;
+                                cur = sfei;
+                                pc = code + rt->funcs[cur].code_off;
+                                AKL_NEXT();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!obj_prop_set(rt, so, name, v)) { free(frames); return false; }
         AKL_PUSH(v); /* 代入式の値は右辺（JS 同様） */
         AKL_NEXT();
     }
@@ -10721,6 +11198,33 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AKL_NEXT();
     }
 
+    AKL_L(PSETDYN): {
+        /* スタック [obj, val, key]（key が TOS） */
+        AklVal kv = AKL_POP(); /* key */
+        AklVal vv = AKL_POP(); /* val */
+        AklVal av = AKL_POP(); /* obj */
+        if (!akl_is_objv(av) || rt->objs[akl_get_obj(av)].kind != AKL_OK_OBJ) {
+            akl_errf(rt, "TypeError: property store on non-object value");
+            free(frames);
+            return false;
+        }
+        u32 sidx = akl_to_string(rt, kv);
+        if (sidx == UINT32_MAX) { free(frames); return false; }
+        u32 sn;
+        const u8 *spn = akl_str(rt, sidx, &sn);
+        if (rt->err[0]) { free(frames); return false; }
+        u32 name = akl_intern(rt, spn, sn, NULL);
+        if (name == UINT32_MAX) { akl_errf(rt, "intern failed"); free(frames); return false; }
+        AklObj *ao = &rt->objs[akl_get_obj(av)];
+        if (ao->u.po.n >= AKL_OBJ_MAX_PROPS) {
+            akl_errf(rt, "object property limit exceeded");
+            free(frames);
+            return false;
+        }
+        if (!obj_prop_set(rt, ao, name, vv)) { free(frames); return false; }
+        AKL_PUSH(vv);
+        AKL_NEXT();
+    }
     AKL_L(OBJSPREAD): {
         /* pop src → TOS の OBJ に全 props コピー（{...src, k: v} の後勝ちを保証）。
          * src が OBJ 以外（undefined/null/primitive/ARR/STR）は無視（簡易近似。AKL_COMPAT）。 */
@@ -11149,6 +11653,7 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
             "MAKEFS",
             "SUPERGET",
             "OBJSPREAD",
+            "PSETDYN",
             "MCALLN",
             "ARRREST",
             "OBJREST",
@@ -11166,8 +11671,14 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
         }
     }
     bool vm_ok = vm_exec(rt, main_idx, NULL, 0, AKL_VAL_UNDEF, AKL_VAL_UNDEF, false);
-    rt->gc_live = false;
+    /* eval 終了時の残骸回収: 次回 eval の pin_mark が「実行時生成物まで」取り込んで
+     * 永久にスイープ対象外にする問題への対処。gc_sp=0（スタックは root にしない）で
+     * GC を発火し、ローカルで不要になった実行時オブジェクト（ROPE チェーン等）を
+     * 回収する。globals / last_val に残る値は正しく生存する。 */
     rt->gc_sp = 0;
+    rt->gc_live = true;
+    akl_gc(rt);
+    rt->gc_live = false;
     if (!vm_ok) return false;
 
     if (out) *out = rt->last_val;

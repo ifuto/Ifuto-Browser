@@ -70,6 +70,12 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | `String(x)` / `Number(x)` / `Boolean(x)`（呼び出し変換） | `String(42)` / `Number('3.5')` / `Boolean('x')` | `"42"` / `3.5` / `true` |
 | class フィールド宣言 `x = expr`（instance field。ctor 先頭で this.x に代入） | `class A { x = 1; } new A().x` | `1` |
 | 配列 `length` 代入（切り詰め / undefined 拡張） | `var a=[1,2,3]; a.length=1; a[1]` | `undefined` |
+| 論理代入 `\|\|=` `&&=` `??=`（短絡・式の値 = 新値 or 元値） | `var a=null; a \|\|= 5; a` | `5` |
+| 数値区切り `1_000_000` / `0xFF_FF` / `0b1010_0101` | `1_000_000` | `1000000` |
+| オブジェクトショートハンド `{a, b}` | `var a=1; var o={a}; o.a` | `1` |
+| computed キー `{[expr]: v}` | `var k='x'; var o={[k]:9}; o.x` | `9` |
+| メソッド短縮 `{ m() {} }`（this はメソッド呼び出し時に束縛） | `var o={m(){return 42;}}; o.m()` | `42` |
+| getter/setter `{ get x(){} }` / `{ set x(v){} }`（自動呼び出し・this 束縛） | `var o={_x:1, get x(){return this._x;}, set x(v){this._x=v*2;}}; o.x=5; o.x` | `10` |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
 `-1/0 = -Infinity`、`NaN !== NaN`（IEEE 754/JIS X 3010 相当の double 厳密）、
@@ -89,6 +95,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | `i` フラグの非 ASCII ケースフォールディング・`\\d`/`\\w` の非 ASCII 扱い | 非対応（ASCII のみ。`\\s` は Unicode 空白対応） |
 | RegExp 独自プロパティ（`re.x = 1`） | 代入は無視（lastIndex のみ更新可） |
 | 式文のオブジェクト分割代入 `({a} = o)` | 非対応（`var {a} = o` の宣言形式は対応済み。`(` で括るとオブジェクトリテラルと解釈され `expected ':'`） |
+| computed メソッド名 `{ [k]() {} }` | SyntaxError（computed キーは通常プロパティのみ） |
+| getter-only プロパティへの代入 | 通常プロパティとして新規作成（JS の strict エラー/非 strict 無視とは異なる近似。AKL_COMPAT 注記） |
 | `{...primitive}` のプリミティブ列挙 | 無視（undefined/null は JS 同様無視。number/string はコピーしない） |
 | `new String(x)` / `new Number(x)` / `new Boolean(x)` のラッパーオブジェクト | 空オブジェクトを返す（値は変換関数と同じ。length 等は undefined） |
 | `Object.getPrototypeOf` / `Object.defineProperty` / `Object.freeze` 等 | `TypeError: not a function` |
@@ -120,7 +128,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 13. ✅ オブジェクト spread・メソッド呼び出し spread・分割代入 rest（2026-08-09: OP_OBJSPREAD/OP_MCALLN/OP_ARRREST/OP_OBJREST を新設。4 点同期: enum/imm_len/jumptable/ハンドラ）
 14. ✅ Object/Array グローバル・String/Number/Boolean コンストラクタ（2026-08-09: keys/values/entries/assign/create/isArray + 呼び出し変換）
 15. ✅ class フィールド宣言・配列 length 代入（2026-08-09）
-16. async/await（コルーチン基盤の設計が必要）
+16. ✅ 論理代入・数値区切り・オブジェクト短縮/computed/メソッド/getter-setter（2026-08-09）
+17. async/await（コルーチン基盤の設計が必要）
 
 ## V8 との位置づけ
 

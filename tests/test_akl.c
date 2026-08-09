@@ -594,8 +594,8 @@ static void t_objects(void) {
     want_err("var o = 5; o.x = 1", "TypeError");       /* 非 object store */
     want_err("var o = 5; o.x", "TypeError");           /* 非 object load */
     want_err("var o = {}; o.f()", "not a function");   /* 無い/非関数メソッド */
-    want_err("var o = {a}; o", NULL);                  /* shorthand 非対応（期待 ':'） */
-    want_err("var o = {a:1, b}", NULL);
+    want_num("var o = {a}; o.a == undefined ? 1 : 0", 0); /* shorthand: a 未定義 → o.a は undefined */
+    want_num("var x = 9; var o = {a:1, b: x}; o.b", 9);  /* b: x は通常プロパティ */
     want_err("{a:1}", NULL);                           /* 文頭 {} は object literal と解釈しない（JS 同様の曖昧性解決） */
     /* prop 数天井 64（1 obj あたり）: 65 個目で明白に失敗 */
     {
@@ -884,6 +884,8 @@ static void t_v04_class_extends(void);
 static void t_v04_spread_rest(void);
 static void t_v04_builtins2(void);
 static void t_v04_fields_len(void);
+static void t_v04_logassign(void);
+static void t_v04_objlit_ext(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -933,6 +935,10 @@ void test_akl(void) {
     t_v04_spread_rest();
     fprintf(stderr, "  %-40s", "t_v04_builtins2");
     t_v04_builtins2();
+    fprintf(stderr, "  %-40s", "t_v04_logassign");
+    t_v04_logassign();
+    fprintf(stderr, "  %-40s", "t_v04_objlit_ext");
+    t_v04_objlit_ext();
     fprintf(stderr, "  %-40s", "t_v04_fields_len");
     t_v04_fields_len();
     akl_free(g_rt);
@@ -1584,4 +1590,66 @@ static void t_v04_fields_len(void) {
     want_num("var a = [1,2,3]; a.length = 1; a[1] == undefined ? 1 : 0", 1);
     want_num("var a = [1,2]; a.length = 5; a[4] == undefined ? 1 : 0", 1);
     want_num("var a = [1,2,3]; a.length = 2; a.push(9); a.length + a[2]", 12);
+}
+
+/* ================= v0.4: 論理代入・数値区切り ================= */
+static void t_v04_logassign(void) {
+    /* ||= */
+    want_num("var a = null; a ||= 5; a", 5);
+    want_num("var b = 0; b ||= 5; b", 5);
+    want_num("var cc2 = 3; cc2 ||= 5; cc2", 3);
+    want_str("var s = ''; s ||= 'x'; s", "x");
+    /* &&= */
+    want_num("var f = 1; f &&= 7; f", 7);
+    want_num("var g = 0; g &&= 7; g", 0);
+    /* ??= */
+    want_num("var d = null; d ?\?= 9; d", 9);
+    want_num("var e = 0; e ?\?= 9; e", 0);
+    want_num("var t = 4; t ?\?= 1; t", 4);
+    /* プロパティ/要素 */
+    want_num("var o = {}; o.x ||= 5; o.x", 5);
+    want_num("var o = {x: null}; o.x ?\?= 3; o.x", 3);
+    want_num("var o = {x: 3}; o.x ?\?= 9; o.x", 3);
+    want_num("var o = {x: 1}; o.x &&= 7; o.x", 7);
+    want_num("var arr = [0]; arr[0] ||= 9; arr[0]", 9);
+    want_num("var arr = [5]; arr[0] &&= 2; arr[0]", 2);
+    want_num("var o = {x: 1}; var k = 'x'; o[k] ||= 9; o.x", 1);
+    /* 短絡（右辺は評価されない） */
+    want_num("var cnt = 0; function f() { cnt++; return null; } var r = 1; r ||= f(); r + cnt", 1);
+    want_num("var cnt2 = 0; function g() { cnt2++; return 1; } var r2 = null; r2 ||= g(); r2 + cnt2", 2);
+    /* 関数内 */
+    want_num("function f() { var n = null; n ?\?= 5; return n; } f()", 5);
+    /* 数値区切り */
+    want_num("1_000_000", 1000000);
+    want_num("0xFF_FF", 65535);
+    want_num("0b1010_0101", 165);
+    want_num("0o77_77", 4095);
+    want_num("var n = 1_000; n + 1", 1001);
+}
+
+/* ================= v0.4: オブジェクトリテラル拡張 ================= */
+static void t_v04_objlit_ext(void) {
+    /* ショートハンド {a} */
+    want_num("var a = 1; var b = 2; var o = {a, b}; o.a + o.b", 3);
+    want_num("var x = 9; var o = {x}; o.x", 9);
+    /* computed key */
+    want_num("var k = 'x'; var o = {[k]: 9}; o.x", 9);
+    want_num("var k = 'a'; var v = 7; var o = {[k + 'b']: v}; o.ab", 7);
+    want_num("var o = {['m']: 5}; o.m", 5);
+    want_num("var i = 2; var o = {['x' + i]: 10}; o.x2", 10);
+    /* メソッド短縮 */
+    want_num("var o = { m() { return 42; } }; o.m()", 42);
+    want_num("var o = { m() { return this.x; }, x: 5 }; o.m()", 5);
+    want_num("var o = { a: 1, m() { return this.a + 1; } }; o.m()", 2);
+    want_num("var o = { m() { return 1; }, n() { return 2; } }; o.m() + o.n()", 3);
+    want_num("var o = { x: 10, m() { return this.x * 2; } }; o.m()", 20);
+    /* getter */
+    want_num("var o = { get x() { return 7; } }; o.x", 7);
+    want_num("var count = 0; var o = { get v() { count++; return count; } }; o.v + o.v", 3);
+    want_num("var o = { _x: 1, get x() { return this._x; } }; o.x", 1);
+    /* setter */
+    want_num("var o = { set s(v) { this._s = v; } }; o.s = 9; o._s", 9);
+    want_num("var o = { _x: 1, get x() { return this._x; }, set x(v) { this._x = v * 2; } }; o.x = 5; o.x", 10);
+    want_num("var o = { set s(v) { this._s = v + 1; }, get s() { return this._s; } }; o.s = 41; o.s", 42);
+    want_num("var o = { _v: 0, get v() { return this._v; }, set v(nv) { if (nv >= 0) this._v = nv; } }; o.v = 10; o.v = -5; o.v", 10);
 }
