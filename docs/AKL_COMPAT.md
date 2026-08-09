@@ -78,6 +78,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | getter/setter `{ get x(){} }` / `{ set x(v){} }`（自動呼び出し・this 束縛） | `var o={_x:1, get x(){return this._x;}, set x(v){this._x=v*2;}}; o.x=5; o.x` | `10` |
 | ラベル文 `label: stmt` + `break label` / `continue label`（非ループラベルの break は文終端へ） | `outer: for(...) { break outer; }` | OK |
 | `debugger` 文（no-op） | `debugger; 1+1` | `2` |
+| `arguments`（関数内の引数配列。length・超過引数込み） | `function f(){return arguments.length;} f(1,2,3)` | `3` |
 | 文頭 `{a:1}` の曖昧性 | ブロック文 + ラベル + 式文として解釈（JS 準拠） | `1` |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
@@ -89,6 +90,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | 構文 | 実測エラー |
 |---|---|
 | `with` 文・ラベルなしの非ループ break（`foo: { break; }` の無名 break） | SyntaxError / break outside loop（ラベル付きは対応） |
+| 関数外の `arguments` | ReferenceError（JS の module スコープでは undefined だが、簡易近似として明白にエラー） |
+| `var arguments = ...` によるシャドウ | 非対応（関数内の arguments は常に引数配列） |
 | `Math.floor` 等の標準組込オブジェクト | ✅ v0.3 で実装（Math 24 関数 + 定数 8 種） |
 | `super` のプロパティ取得（`super.x = 1`）・`super[name]` | SyntaxError（super.m() と super(...) のみ対応） |
 | async/await・generator・BigInt | SyntaxError |
@@ -133,7 +136,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 15. ✅ class フィールド宣言・配列 length 代入（2026-08-09）
 16. ✅ 論理代入・数値区切り・オブジェクト短縮/computed/メソッド/getter-setter（2026-08-09）
 17. ✅ ラベル break/continue・debugger・eval 間 last_val 残留修正（2026-08-09）
-18. async/await（コルーチン基盤の設計が必要）
+18. ✅ arguments（2026-08-09: AklFrame に argc 記録（16B→24B）。超過引数はローカル領域の後ろに逆順コピーで保護（順方向だと値が伝播するバグを実測で特定・修正））
+19. async/await（コルーチン基盤の設計が必要）
 
 ## V8 との位置づけ
 
