@@ -214,6 +214,7 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_MAKEFS,              /* fidx u32 | srcslot u8 : [親][fn] → fn の env 先頭に親をバインド */
     OP_SUPERGET,            /* name u32 : 親クラス（関数 env の vals[0]）の name を push */
     OP_OBJSPREAD,           /* pop src → TOS の OBJ に全 props コピー（オブジェクト spread） */
+    OP_ARGS,                /* imm なし : 現在関数の引数配列を push（arguments） */
     OP_PSETDYN,             /* pop val, pop key, pop obj → obj[key]=val, push val（computed） */
     OP_MCALLN,              /* slot u32 | name u32 : argc = locals[slot] の動的 MCALL（メソッド spread） */
     OP_ARRREST,             /* pop start, pop arr → 新規配列 [start..n)（分割 rest） */
@@ -1148,6 +1149,7 @@ enum {
     N_SWITCH,   /* a=disc node, b=case list first, c=count */
     N_CASE,     /* a=expr（N_NONE=default）, b=body stmt */
     N_FUNCEXPR, /* 関数式: N_FUNC と同形（d=body）。a=name idx（無名は UINT32_MAX） */
+    N_ARGS,     /* arguments: 現在関数の引数配列（関数本体のみ。main は実行時エラー） */
     N_LABEL,    /* ラベル文: a=ラベル名 idx, b=本体文, flags bit0=本体がループ */
     N_OBJKEY,   /* オブジェクト computed キー: a=キー式, b=値（N_OBJLIT の要素） */
     N_LOGASSIGN,/* 論理代入: a=target, b=rhs, op=0(||=) 1(&&=) 2(??=) */
@@ -1184,6 +1186,7 @@ typedef struct {
     const char *fail;                    /* 構文エラーの原因（短い固定文） */
     char fail_buf[128];                  /* 詳細メッセージ用（regex 等） */
     u32 super_ctx;                       /* class メソッド body のパース中 > 0（super 許可） */
+    u32 fn_body;                         /* 関数本体のパース中 > 0（arguments 識別子の解決） */
     u32 super_name;                      /* 親クラス保持ローカルの疑似名（intern id） */
     u32 super_prop;                      /* クラスオブジェクトの親参照プロパティ名（intern id） */
 } P;
@@ -1505,7 +1508,9 @@ static u32 p_lit_object(P *p) {
                 if (is_set && pc2 > 1) { p->fail = "setter takes exactly one argument"; goto fail; }
                 if (!p_expect_punct(p, P_LC, "expected '{'")) goto fail;
                 p->super_ctx++;
+                p->fn_body++;
                 u32 body = p_block_tail(p);
+                p->fn_body--;
                 p->super_ctx--;
                 if (body == N_NONE) goto fail;
                 u32 cm = p_node(p, N_CLASSMETH);
@@ -1539,7 +1544,9 @@ static u32 p_lit_object(P *p) {
                 if (p->fail) goto fail;
                 if (!p_expect_punct(p, P_LC, "expected '{'")) goto fail;
                 p->super_ctx++;
+                p->fn_body++;
                 u32 body = p_block_tail(p);
+                p->fn_body--;
                 p->super_ctx--;
                 if (body == N_NONE) goto fail;
                 u32 cm = p_node(p, N_CLASSMETH);
@@ -1741,6 +1748,15 @@ static u32 p_primary(P *p) {
     if (p_is_kw(p, KW_NULL))  { lex_next(lx); p->depth--; return p_node(p, N_NULL); }
     if (p_is_kw(p, KW_UNDEFINED)) { lex_next(lx); p->depth--; return p_node(p, N_UNDEF); }
     if (lx->kind == TK_IDENT) {
+        if (p->fn_body && lx->str_len == 9 && memcmp(lx->str_p, "arguments", 9) == 0) {
+            /* 関数本体の arguments は引数配列（ローカル宣言で上書きされると通常変数に
+             * なるが、ここでは簡易近似として常に引数配列 — AKL_COMPAT に明記） */
+            lex_next(lx);
+            u32 ni = p_node(p, N_ARGS);
+            if (ni != N_NONE) ni = p_postfix(p, ni);
+            p->depth--;
+            return ni;
+        }
         u32 idx = p_intern(p, lx->str_p, lx->str_len);
         u32 ni = idx == UINT32_MAX ? N_NONE : p_node(p, N_IDENT);
         if (ni != N_NONE) p->nodes[ni].a = idx;
@@ -1813,7 +1829,9 @@ static u32 p_primary(P *p) {
         p_params(p, &pf, &pc2);
         if (p->fail) { p->depth--; return N_NONE; }
         if (!p_expect_punct(p, P_LC, "expected '{'")) { p->depth--; return N_NONE; }
+        p->fn_body++;
         u32 body = p_block_tail(p);
+        p->fn_body--;
         if (body == N_NONE) { p->depth--; return N_NONE; }
         u32 ni = p_node(p, N_FUNCEXPR);
         if (ni == N_NONE) { p->depth--; return N_NONE; }
@@ -2667,7 +2685,9 @@ static u32 p_stmt(P *p) {
             if (p->fail) { free(mb.v); goto out; }
             if (!p_expect_punct(p, P_LC, "expected '{'")) { free(mb.v); goto out; }
             if (parent != N_NONE) p->super_ctx++;
+            p->fn_body++;
             u32 body = p_block_tail(p);
+            p->fn_body--;
             if (parent != N_NONE) p->super_ctx--;
             if (body == N_NONE) { free(mb.v); goto out; }
             u32 cm = p_node(p, N_CLASSMETH);
@@ -2779,7 +2799,9 @@ static u32 p_stmt(P *p) {
         p_params(p, &pf, &pc2);
         if (p->fail) goto out;
         if (!p_expect_punct(p, P_LC, "expected '{'")) goto out;
+        p->fn_body++;
         u32 body = p_block_tail(p);
+        p->fn_body--;
         if (body == N_NONE) goto out;
         ni = p_node(p, N_FUNC);
         if (ni == N_NONE) goto out;
@@ -3930,6 +3952,7 @@ static void cg_expr(Cg *cg, u32 ni) {
         }
         break;
     case N_STR:   cg_op(cg, OP_CONST_STR); cg_u32(cg, n->a); break;
+    case N_ARGS:  cg_op(cg, OP_ARGS); break;
     case N_REGEX: cg_op(cg, OP_NEWREGEX); cg_u32(cg, n->a); cg_u32(cg, n->b); break;
     case N_SUPERGET: /* super.name → 親クラス（関数 env の vals[0]）の name */
         cg_op(cg, OP_SUPERGET);
@@ -8766,7 +8789,7 @@ static bool akl_builtins_install(AklRT *rt) {
 
 /* ============================== VM ============================== */
 
-typedef struct { u32 ret_off; u32 base; u32 func; u8 is_new; } AklFrame; /* 16B（new 呼び出しの this 復元用） */
+typedef struct { u32 ret_off; u32 base; u32 func; u32 argc; u8 is_new; } AklFrame; /* 24B（arguments 用に argc 記録） */
 
 /* ---- JS 例外: cold 経路の out-of-line 化 ----
  * 例外機構はホット数値ループでは「存在しない」ため、そのコードを dispatch
@@ -9001,6 +9024,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
     /* MCALL/MCALLN 共通化のための共有引数（goto をまたぐため関数先頭で確保） */
     i32 mcall_argc = 0;
     u32 mcall_name = 0;
+    u32 entry_argc = 0; /* エントリフレームの argc（arguments 用。frames に入らないため） */
 
 /* stk を top 要素数まで収容できるよう倍々で拡張（rt->stk と共有。AKL_STK_MAX で fail-fast） */
 #define AKL_GROW_TO(top) do { \
@@ -9048,8 +9072,14 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             stk[0] = init_this;
         }
         u32 keep = init_argc < fe0->n_params ? init_argc : fe0->n_params;
+        entry_argc = init_argc;
+        if (init_argc > fe0->n_params) { /* 超過引数をローカル領域の後ろに保護 */
+            u32 extra = init_argc - fe0->n_params;
+            AKL_GROW_TO(nl + extra + 4);
+            for (u32 i = 0; i < extra; i++) stk[nl + i] = init_args[fe0->n_params + i];
+        }
         for (u32 i = 0; i < keep; i++) stk[nh + i] = init_args[i];
-        sp = nl;
+        sp = nl + (init_argc > fe0->n_params ? init_argc - fe0->n_params : 0);
     }
 /* 規則: マクロ内で AKL_NEXT を使わない（switch 側では do-while(0) がマクロ内 break を
  * 攫って case 貫通事故になる。裸ブロックにし NEXT は必ず呼び出し側の case 末で行う） */
@@ -9116,6 +9146,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_MAKEFS] = &&l_MAKEFS,
         [OP_SUPERGET] = &&l_SUPERGET,
         [OP_OBJSPREAD] = &&l_OBJSPREAD,
+        [OP_ARGS] = &&l_ARGS,
         [OP_PSETDYN] = &&l_PSETDYN,
         [OP_MCALLN] = &&l_MCALLN,
         [OP_ARRREST] = &&l_ARRREST,
@@ -9394,11 +9425,17 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             stk[win] = AKL_VAL_UNDEF; /* this */
         }
         u32 keep = argc < npar ? argc : npar;
+        u32 extra = (u32)argc > npar ? (u32)argc - npar : 0;
+        if (extra) { /* 超過引数をローカル領域の後ろに先に保護（undefined 埋めで破壊されない） */
+            AKL_GROW_TO(win + nloc + extra + 4);
+            for (u32 i = extra; i-- > 0;) stk[win + nloc + i] = stk[win + nh + npar + i];
+        }
         for (u32 i = nh + keep; i < nloc; i++) stk[win + i] = AKL_VAL_UNDEF;
-        sp = win + nloc;
+        sp = win + nloc + extra;
         frames[nframes].ret_off = (u32)(pc - code);
         frames[nframes].base = base;
         frames[nframes].func = cur;
+        frames[nframes].argc = (u32)argc;
         frames[nframes].is_new = 0;
         nframes++;
         base = win;
@@ -9464,11 +9501,17 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             stk[win] = thisv;
         }
         u32 keep = argc < npar ? argc : npar;
+        u32 extra = (u32)argc > npar ? (u32)argc - npar : 0;
+        if (extra) { /* 超過引数をローカル領域の後ろに先に保護（undefined 埋めで破壊されない） */
+            AKL_GROW_TO(win + nloc + extra + 4);
+            for (u32 i = extra; i-- > 0;) stk[win + nloc + i] = stk[win + nh + npar + i];
+        }
         for (u32 i = nh + keep; i < nloc; i++) stk[win + i] = AKL_VAL_UNDEF;
-        sp = win + nloc;
+        sp = win + nloc + extra;
         frames[nframes].ret_off = (u32)(pc - code);
         frames[nframes].base = base;
         frames[nframes].func = cur;
+        frames[nframes].argc = (u32)argc;
         frames[nframes].is_new = 0;
         nframes++;
         base = win;
@@ -9749,6 +9792,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                                 frames[nframes].ret_off = (u32)(pc - code);
                                 frames[nframes].base = base;
                                 frames[nframes].func = cur;
+                                frames[nframes].argc = 0;
                                 frames[nframes].is_new = 0;
                                 nframes++;
                                 base = gwin;
@@ -9887,6 +9931,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                                 frames[nframes].ret_off = (u32)(pc - code);
                                 frames[nframes].base = base;
                                 frames[nframes].func = cur;
+                                frames[nframes].argc = 1;
                                 frames[nframes].is_new = 0;
                                 nframes++;
                                 base = swin;
@@ -10039,11 +10084,17 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 stk[win] = ov; /* this = レシーバ */
             }
             u32 keep = argc < npar ? argc : npar;
+            u32 extra = (u32)argc > npar ? (u32)argc - npar : 0;
+            if (extra) {
+                AKL_GROW_TO(win + nloc + extra + 4);
+                for (u32 i = extra; i-- > 0;) stk[win + nloc + i] = stk[win + nh + npar + i];
+            }
             for (u32 i = nh + keep; i < nloc; i++) stk[win + i] = AKL_VAL_UNDEF;
-            sp = win + nloc;
+            sp = win + nloc + extra;
             frames[nframes].ret_off = (u32)(pc - code);
             frames[nframes].base = base;
             frames[nframes].func = cur;
+            frames[nframes].argc = (u32)argc;
             frames[nframes].is_new = 0;
             nframes++;
             base = win;
@@ -11237,11 +11288,17 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             stk[win] = AKL_VAL_UNDEF;
         }
         u32 keep = argc < npar ? argc : npar;
+        u32 extra = (u32)argc > npar ? (u32)argc - npar : 0;
+        if (extra) { /* 超過引数をローカル領域の後ろに先に保護（undefined 埋めで破壊されない） */
+            AKL_GROW_TO(win + nloc + extra + 4);
+            for (u32 i = extra; i-- > 0;) stk[win + nloc + i] = stk[win + nh + npar + i];
+        }
         for (u32 i = nh + keep; i < nloc; i++) stk[win + i] = AKL_VAL_UNDEF;
-        sp = win + nloc;
+        sp = win + nloc + extra;
         frames[nframes].ret_off = (u32)(pc - code);
         frames[nframes].base = base;
         frames[nframes].func = cur;
+        frames[nframes].argc = (u32)argc;
         frames[nframes].is_new = 0;
         nframes++;
         base = win;
@@ -11335,11 +11392,17 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         }
         rt->n_nury = nur0;
         u32 keep = argc < npar ? argc : npar;
+        u32 extra = (u32)argc > npar ? (u32)argc - npar : 0;
+        if (extra) {
+            AKL_GROW_TO(win + nloc + extra + 4);
+            for (u32 i = extra; i-- > 0;) stk[win + nloc + i] = stk[win + nh + npar + i];
+        }
         for (u32 i = nh + keep; i < nloc; i++) stk[win + i] = AKL_VAL_UNDEF;
-        sp = win + nloc;
+        sp = win + nloc + extra;
         frames[nframes].ret_off = (u32)(pc - code);
         frames[nframes].base = base;
         frames[nframes].func = cur;
+        frames[nframes].argc = (u32)argc;
         frames[nframes].is_new = 1;
         nframes++;
         base = win;
@@ -11373,6 +11436,30 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         }
         if (!obj_prop_set(rt, ao, name, vv)) { free(frames); return false; }
         AKL_PUSH(vv);
+        AKL_NEXT();
+    }
+    AKL_L(ARGS): {
+        /* 現在関数の引数配列を生成。パラメータは base+nh+i、超過引数は
+         * base+nloc+(i-npar)（フレーム生成でローカル領域の後ろに保護済み）。
+         * エントリ関数（nframes==0）は entry_argc を使う。 */
+        u32 argc = nframes ? frames[nframes - 1].argc : entry_argc;
+        AklFuncEnt *cfe = &rt->funcs[cur];
+        u32 nh = 1 + (cfe->n_env ? 1u : 0u) + (cfe->n_cap ? 1u : 0u);
+        u32 npar = cfe->n_params;
+        u32 nloc = cfe->n_locals;
+        rt->gc_sp = sp;
+        u32 oi = akl_obj_new(rt);
+        if (oi == UINT32_MAX) { free(frames); return false; }
+        rt->objs[oi].kind = AKL_OK_ARR;
+        if (argc > 0) {
+            if (!akl_arr_grow(rt, &rt->objs[oi], argc)) { free(frames); return false; }
+            for (u32 i = 0; i < argc; i++) {
+                if (i < npar) rt->objs[oi].u.arr.v[i] = stk[base + nh + i];
+                else rt->objs[oi].u.arr.v[i] = stk[base + nloc + (i - npar)];
+            }
+        }
+        rt->objs[oi].u.arr.n = argc;
+        AKL_PUSH(AKL_MK_OBJ(oi));
         AKL_NEXT();
     }
     AKL_L(OBJSPREAD): {
@@ -11804,6 +11891,7 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
             "MAKEFS",
             "SUPERGET",
             "OBJSPREAD",
+            "ARGS",
             "PSETDYN",
             "MCALLN",
             "ARRREST",

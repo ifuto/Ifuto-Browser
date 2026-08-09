@@ -887,6 +887,7 @@ static void t_v04_fields_len(void);
 static void t_v04_logassign(void);
 static void t_v04_objlit_ext(void);
 static void t_v04_labels(void);
+static void t_v04_arguments(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -944,6 +945,8 @@ void test_akl(void) {
     t_v04_fields_len();
     fprintf(stderr, "  %-40s", "t_v04_labels");
     t_v04_labels();
+    fprintf(stderr, "  %-40s", "t_v04_arguments");
+    t_v04_arguments();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1677,4 +1680,23 @@ static void t_v04_labels(void) {
     /* エラー */
     want_err("break missing;", "label");
     want_err("var i = 0; foo: { continue foo; }", "continue");
+}
+
+/* ================= v0.4: arguments ================= */
+static void t_v04_arguments(void) {
+    want_num("function f() { return arguments.length; } f(1, 2, 3)", 3);
+    want_num("function f() { return arguments[0] + arguments[1]; } f(3, 4)", 7);
+    want_str("function f() { return arguments[2]; } f('a', 'b', 'c')", "c");
+    want_num("function f() { var s = 0; for (var i = 0; i < arguments.length; i++) s += arguments[i]; return s; } f(1, 2, 3, 4)", 10);
+    want_num("function f() { return arguments.length; } f()", 0);
+    want_num("function f(a, b) { return arguments.length + a + b; } f(1, 2, 3, 4)", 7);
+    want_num("var o = { m: function() { return arguments[0]; } }; o.m(7)", 7);
+    want_num("function f() { var g = function() { return arguments.length; }; return g(5, 6); } f()", 2);
+    want_num("class C { m() { return arguments[1]; } } new C().m(1, 9)", 9);
+    want_num("function f() { return arguments.length; } f(1, 2, 3, 4, 5, 6, 7, 8)", 8);
+    want_num("function f() { var a = arguments; return a[0] * 10 + a.length; } f(4, 5, 6)", 43);
+    /* 関数外の arguments は ReferenceError（簡易近似。AKL_COMPAT に明記） */
+    want_err("arguments", "arguments");
+    /* 高階コールバック内 */
+    want_num("[1, 2, 3].map(function() { return arguments.length; })[0]", 3);
 }
