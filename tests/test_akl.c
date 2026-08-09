@@ -879,6 +879,7 @@ static void t_v03_json(void);
 static void t_v03_hof(void);
 static void t_v03_syntax2(void);
 static void t_v03_syntax3(void);
+static void t_v04_regex(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -920,6 +921,8 @@ void test_akl(void) {
     t_v03_syntax2();
     fprintf(stderr, "  %-40s", "t_v03_syntax3");
     t_v03_syntax3();
+    fprintf(stderr, "  %-40s", "t_v04_regex");
+    t_v04_regex();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1355,4 +1358,99 @@ static void t_v03_syntax3(void) {
     want_str("class Person { constructor(n) { this.name = n; } greet() { return 'hi ' + this.name; } } var p = new Person('taro'); p.greet()", "hi taro");
     want_num("class I { constructor(v) { this.v = v; } get() { return this.v; } } var i1 = new I(10); var i2 = new I(20); i1.get() + i2.get()", 30);
     want_num("class E { constructor() { this.list = []; } push(x) { this.list.push(x); return this; } sum() { var s = 0; for (var i = 0; i < this.list.length; i++) { s += this.list[i]; } return s; } } var e = new E(); e.push(1).push(2).push(3).sum()", 6);
+}
+
+/* ================= v0.4: 正規表現 ================= */
+static void t_v04_regex(void) {
+    /* リテラルと基本メソッド */
+    want_bool("/abc/.test('xxabcxx')", true);
+    want_bool("/abc/.test('xxab')", false);
+    want_bool("/a/i.test('ABC')", true);
+    want_str("'hello'.match(/l+/)[0]", "ll");
+    want_num("'hello'.match(/l+/).length", 1);
+    want_str("'12-34'.match(/(\\d+)-(\\d+)/)[2]", "34");
+    want_str("'12-34'.match(/(\\d+)-(\\d+)/)[1]", "12");
+    want_str("'a1b2'.match(/[0-9]+/g).join('-')", "1-2");
+    want_num("'aaa bbb aaa'.match(/a/g).length", 6);
+    want_num("'aaa bbb'.match(/x/) == null ? 1 : 0", 1);
+    want_num("'aaa'.match(/x/g) == null ? 1 : 0", 1);
+    /* replace: 正規表現 / 関数 / $ 展開 */
+    want_str("'aaa bbb'.replace(/a/g, 'X')", "XXX bbb");
+    want_str("'aaa'.replace(/a/, 'X')", "Xaa");
+    want_str("'abc'.replace(/(b)/, '[$1]')", "a[b]c");
+    want_str("'abc'.replace(/(a)(b)/, '$2$1')", "bac");
+    want_str("'ab'.replace(/a/, function(m){ return m.toUpperCase(); })", "Ab");
+    want_str("'a1b2'.replace(/[0-9]/g, function(m){ return '(' + m + ')'; })", "a(1)b(2)");
+    want_str("'hello'.replace(/l/g, 'L$&')", "heLlLlo");
+    want_str("'abc'.replace('b', '$&$&')", "abbc");
+    want_str("'x'.replace(/x/, '$`-$&-$\\'')", "-x-");
+    want_str("'aaa'.replace(/a/g, '')", "");
+    want_str("'  x  '.replace(/^\\s+|\\s+$/g, '!')", "!x!");
+    /* split: 正規表現（キャプチャ含む）/ 空マッチ */
+    want_num("'a,b,c'.split(/,/).length", 3);
+    want_str("'a,b,c'.split(/,/)[1]", "b");
+    want_num("'a1b22c'.split(/(\\d+)/).length", 5);
+    want_str("'a1b22c'.split(/(\\d+)/)[2]", "b");
+    want_num("'ab'.split(/x*/).length", 1);
+    want_str("'ab'.split(/x*/)[0]", "ab");
+    want_num("'a,b,'.split(/,/).length", 3);
+    /* search */
+    want_num("'hello'.search(/l+/)", 2);
+    want_num("'hello'.search(/z/)", -1);
+    /* RegExp コンストラクタ */
+    want_bool("new RegExp('ab', 'i').test('AB')", true);
+    want_bool("RegExp('ab').test('ab')", true);
+    want_bool("RegExp(/a/g).global", true);
+    want_str("new RegExp('a+b').source", "a+b");
+    /* プロパティ */
+    want_str("/abc/gi.flags", "gi");
+    want_str("/a+b/.source", "a+b");
+    want_str("/x/i.toString()", "/x/i");
+    want_bool("/a/g.global", true);
+    want_bool("/a/i.ignoreCase", true);
+    want_bool("/a/m.multiline", true);
+    want_bool("/a/g.dotAll", false);
+    /* exec / lastIndex */
+    want_str("/(\\d+)/.exec('x123y')[1]", "123");
+    want_num("var r = /a/g; r.exec('banana'); r.lastIndex", 2);
+    want_str("var r = /a/g; r.exec('banana'); r.exec('banana')[0]", "a");
+    want_num("var r = /a/g; r.exec('bbbb') == null ? 1 : 0", 1);
+    want_num("var r = /a/g; r.test('aab'); r.lastIndex", 1);
+    want_num("var r = /a/; r.lastIndex = 3; r.exec('aaa') == null ? 1 : 0", 1);
+    /* アンカー・量詞・クラス・グループ */
+    want_bool("/^abc$/.test('abc')", true);
+    want_bool("/^abc$/.test('xabc')", false);
+    want_bool("/colou?r/.test('color')", true);
+    want_bool("/colou?r/.test('colour')", true);
+    want_bool("/\\d{2,4}/.test('a12345b')", true);
+    want_bool("/[a-c]+/.test('cab')", true);
+    want_bool("/(ab)+c/.test('ababc')", true);
+    want_bool("/^\\w+@[a-z]+\\.(com|org)$/i.test('User@Example.COM')", true);
+    want_bool("/\\bword\\b/.test('a word!')", true);
+    want_bool("/^$/m.test('\\n')", true);
+    /* 非貪欲 */
+    want_str("'axxbayyb'.match(/a.*?b/)[0]", "axxb");
+    want_str("'axxbayyb'.match(/a.*b/)[0]", "axxbayyb");
+    /* エラー（非対応構文は明白に失敗） */
+    want_err("/(?=a)/", "invalid regexp");
+    want_err("/(?<n>a)/", "invalid regexp");
+    want_err("/\\1/", "invalid regexp");
+    want_err("/a{1001}/", "invalid regexp");
+    want_err("new RegExp('a', 'x')", "SyntaxError");
+    want_err("new RegExp('a', 'ii')", "SyntaxError");
+    want_err("/[z-a]/", "invalid regexp");
+    /* ステップ制限（指数的バックトラックは有界） */
+    want_err("var s = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; s.replace(/(a+)+b/, 'x')", "RangeError");
+    /* ブラウザ系実用パターン */
+    want_str("'color:#ff8800;'.match(/#[0-9a-fA-F]+/)[0]", "#ff8800");
+    want_str("'width=100px'.match(/[0-9]+/)[0]", "100");
+    want_bool("'2026-08-09'.match(/^\\d{4}-\\d{2}-\\d{2}$/) != null", true);
+    want_str("'user@example.com'.replace(/^(.+)@(.+)$/, '$2.$1')", "example.com.user");
+    /* UTF-8 */
+    want_bool("/あ+/.test('あああ')", true);
+    want_str("'xあy'.match(/あ/)[0]", "あ");
+    /* match の引数変換（文字列 → RegExp） */
+    want_str("'hello'.match('l+')[0]", "ll");
+    want_num("'hello'.search('l')", 2);
+    want_num("'a,b'.split('a').length", 2);
 }

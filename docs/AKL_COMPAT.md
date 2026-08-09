@@ -43,6 +43,17 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | オブジェクトの ToString / typeof | `""+{a:1}` / `typeof {a:1}` | `[object Object]` / `object` |
 | ホストネイティブ関数（`akl_native_register` 族、1024 insn 課金、self 伝播） | docs/EXTENSIONS.md §3-A の console.log が通過実例 | `hello 42 true [object Object]` |
 | ホストネイティブ失敗規約（`akl_native_throw`） | — | eval は明白に失敗（黙った undefined を作らない） |
+| 正規表現リテラル `/pat/flags`（i g m s u y） | `/^\\d+-(\\d+)$/.exec('12-34')[1]` | `34` |
+| `RegExp(pat, flags)` / `new RegExp(pat, flags)`（RE の複製含む） | `new RegExp('ab','i').test('AB')` | `true` |
+| `re.test` / `re.exec`（g/y で lastIndex 更新） | `var r=/a/g; r.exec('banana'); r.lastIndex` | `2` |
+| `re.source` / `re.flags` / `re.global` / `re.ignoreCase` / `re.multiline` / `re.lastIndex` | `/a/gi.flags` | `gi` |
+| `String.match`（g: 全マッチ配列 / 非 g: キャプチャ配列、無しは null） | `'12-34'.match(/(\\d+)-(\\d+)/)[2]` | `34` |
+| `String.replace`（RE/文字列、関数 replacer、`$&` `` $` `` `$'` `$1..$99`） | `'abc'.replace(/(b)/,'[$1]')` | `a[b]c` |
+| `String.split`（RE: キャプチャ含む。文字列: 従来通り） | `'a1b22c'.split(/(\\d+)/).length` | `5` |
+| `String.search` | `'hello'.search(/l+/)` | `2` |
+| 正規表現構文: 文字クラス・量詞（非貪欲含む）・グループ・選択・アンカー・`\\d \\w \\s \\b` 等 | — | OK（実測 112 ケースの単体テスト + t_v04_regex） |
+| UTF-8 パターン・対象（コードポイント単位） | `/あ+/.test('あああ')` | `true` |
+| ステップ上限（指数バックトラックの有界化: 500 万ステップ） | `'aaa...'(30個).replace(/(a+)+b/,'x')` | `RangeError` で明白に失敗 |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
 `-1/0 = -Infinity`、`NaN !== NaN`（IEEE 754/JIS X 3010 相当の double 厳密）、
@@ -56,7 +67,11 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | `Math.floor` 等の標準組込オブジェクト | ✅ v0.3 で実装（Math 24 関数 + 定数 8 種） |
 | class の `extends`・`super` | SyntaxError（extends は v0.4 台帳。super は未対応） |
 | async/await・generator・BigInt | SyntaxError |
-| regex literal `/.../`・`RegExp` | SyntaxError（v0.4 台帳） |
+| 正規表現の先読み/後読み `(?=..)` `(?!..)` `(?<=..)`・名前付きキャプチャ `(?<n>..)`・バックリファレンス `\\1` | SyntaxError（コンパイル時） |
+| 文字クラス内の非 ASCII 文字・範囲（`[あ-ん]` 等）・`\\u{...}` | SyntaxError（コンパイル時） |
+| `match`/`exec` 結果の `index`/`input` プロパティ | undefined（配列要素のみ。AKL_OK_ARR は名前付きプロパティ非対応） |
+| `i` フラグの非 ASCII ケースフォールディング・`\\d`/`\\w` の非 ASCII 扱い | 非対応（ASCII のみ。`\\s` は Unicode 空白対応） |
+| RegExp 独自プロパティ（`re.x = 1`） | 代入は無視（lastIndex のみ更新可） |
 | オブジェクト spread `{...obj}` | SyntaxError（配列 spread は対応済み） |
 | メソッド呼び出しの spread `o.m(...a)` | SyntaxError（関数呼び出しの spread は対応済み） |
 | 分割代入の rest パターン `[a, ...rest]` | SyntaxError（基本分割代入は対応済み） |
@@ -64,7 +79,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | ~~高階関数 `[1,2].map(f)` / `forEach` / `filter`~~ | ✅ v0.3: `map`/`filter`/`forEach`/`some`/`every`/`find`/`findIndex`/`reduce`（VM 再入 akl_call 経由。コールバック fn(elem, idx, arr)、reduce は fn(acc, elem, idx, arr)） |
 | `String()` / `Number()` コンストラクタ・`Object.keys` 等 | ReferenceError |
 | `s.length` の代入・配列の `length` 代入 | 無視（length は読み取り専用） |
-| 文字列メソッドの一部（`match`/`search`/`padStart`/`localeCompare` 等） | `TypeError: not a function` |
+| 文字列メソッドの一部（`padStart`/`padEnd`/`localeCompare`/`charAt` 越え等） | `TypeError: not a function` |
 | `JSON` の第 2 引数（replacer/reviver） | 無視（第 1 引数のみ処理） |
 
 ## ロードマップ（優先度順。完了時にこの表へ実測で追記する）
@@ -79,7 +94,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 8. ✅ 演算子群 `**`/`void`/カンマ/`in`/`delete`/`?.`/`??`/`instanceof`（2026-08-08）
 9. ✅ テンプレートリテラル・for-in/for-of・デフォルト引数（2026-08-08）
 10. ✅ 分割代入・配列/呼び出し spread・`new`・`class`（2026-08-08。VM 再入とフレーム is_new）
-11. class extends/super・RegExp・async/await（優先度順）
+11. ✅ 正規表現（2026-08-09: リテラル/RegExp グローバル/test/exec/match/search/replace/split。エンジンは別ファイル akl_regex.c、バックトラッキング VM + ステップ有界化）
+12. class extends/super・async/await（優先度順）
 
 ## V8 との位置づけ
 

@@ -28,6 +28,7 @@
  */
 #include "../common.h"
 #include "akl.h"
+#include "akl_regex.h"
 #include <string.h>
 #include <stdlib.h>
 #include <sys/random.h>
@@ -89,7 +90,7 @@ static bool akl_numv(AklVal v, double *out) {
 /* ============================== ヒープオブジェクト ============================== */
 
 enum { AKL_OK_STR = 1, AKL_OK_FUNC = 2, AKL_OK_ROPE = 3, AKL_OK_NATIVE = 4, AKL_OK_OBJ = 5, AKL_OK_HANDLE = 6,
-       AKL_OK_ARR = 7, AKL_OK_ENV = 8 };
+       AKL_OK_ARR = 7, AKL_OK_ENV = 8, AKL_OK_REGEX = 9 };
 /* ROPE: code_off=左 obj idx, name=右 obj idx, n_params=深さ(最大4096), len=全長。
  * 不変条件: 子の index は親より小さい必要は「ない」（free-list 再利用で逆転し得る）。
  * よって GC の伝播は添字順に依らない明示ワークリストで行う。文字列は不変。
@@ -125,6 +126,7 @@ typedef struct {
         struct { const AklHandleVTab *vt; void *ptr; } hd; /* HANDLE（C 側所有。GC 非管理） */
         struct { AklVal *v; u32 n, cap; } arr;         /* ARR */
         struct { AklVal *vals; u32 n; u32 parent; } env; /* ENV */
+        struct { AklRex *rx; u32 flags; i32 last_index; } rex; /* REGEX（16B） */
     } u;
 } AklObj; /* 56B（v0.3: ARR/ENV/FUNC.env 追加で 48B から +8B。ARCH 台帳記録） */
 
@@ -207,6 +209,7 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_IDEL,                /* pop idx, pop obj → obj[idx] を削除 → push true（配列は undefined 化） */
     OP_INSTANCEOF,          /* pop obj, pop f → push (obj は f のインスタンスか) */
     OP_NEW,                 /* argc u8 : new 呼び出し（this=新 OBJ、戻りが obj でなければ this） */
+    OP_NEWREGEX,            /* pat STR idx u32 | flags u32 : RegExp オブジェクト生成 */
     OP_HALT,
     OP_COUNT
 };
@@ -217,8 +220,9 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
 enum { AKL_TE_TRY = 0, AKL_TE_FIN = 1 };
 #define AKL_PC_NONE 0xFFFFFFFFu
 #define AKL_SLOT_NONE 0xFFFFFFFFu
-#define AKL_STR_METH_N 18u    /* v0.3 組込: 文字列メソッド数 */
+#define AKL_STR_METH_N 20u    /* v0.3 組込: 文字列メソッド数（v0.4: match/search 追加） */
 #define AKL_ARR_METH_N 20u    /* v0.3 組込: 配列メソッド数（v0.4: 高階 8 種追加） */
+#define AKL_REGEX_METH_N 3u    /* v0.4: 正規表現メソッド数（test/exec/toString） */
 
 typedef struct {
     AklVal pending;
@@ -275,6 +279,7 @@ struct AklRT {
     /* v0.3 組込: 文字列/配列メソッドの NATIVE キャッシュ（akl_new で生成。PLOAD が返す） */
     AklVal str_meth_vals[AKL_STR_METH_N];
     AklVal arr_meth_vals[AKL_ARR_METH_N];
+    AklVal regex_meth_vals[AKL_REGEX_METH_N];
     char err[256];
     bool native_err;    /* native が akl_native_throw した（VM はこれを見て eval を失敗に） */
     /* 定数除数の剰余を magic-multiply に強度削減する直写メモ（8 エントリ）。
@@ -440,6 +445,10 @@ static u32 akl_gc(AklRT *rt) {
         if (o->kind == AKL_OK_ENV && o->u.env.vals) {
             rt->heap_bytes -= (u64)o->u.env.n * sizeof(AklVal);
             free(o->u.env.vals);
+        }
+        if (o->kind == AKL_OK_REGEX && o->u.rex.rx) {
+            akl_rex_free(o->u.rex.rx);
+            rt->heap_bytes -= o->len; /* len = コンパイル済みサイズ概算 */
         }
         o->kind = 0; o->bytes = NULL; o->len = 0; o->code_off = 0; o->name = 0;
         o->env = UINT32_MAX;
@@ -1052,6 +1061,7 @@ enum {
     N_SWITCH,   /* a=disc node, b=case list first, c=count */
     N_CASE,     /* a=expr（N_NONE=default）, b=body stmt */
     N_FUNCEXPR, /* 関数式: N_FUNC と同形（d=body）。a=name idx（無名は UINT32_MAX） */
+    N_REGEX,    /* 正規表現リテラル: a=pattern STR idx, b=flags（AKL_RX_F_*） */
     N_NONE = 0xFFFFFFFFu
 };
 
@@ -1078,6 +1088,7 @@ typedef struct {
     AklFnInfo main_fi;                   /* main 擬似関数の捕捉情報 */
     u32 depth;
     const char *fail;                    /* 構文エラーの原因（短い固定文） */
+    char fail_buf[128];                  /* 詳細メッセージ用（regex 等） */
 } P;
 
 static u32 p_node(P *p, u8 kind) {
@@ -1173,6 +1184,7 @@ static u32 p_expr(P *p);
 static u32 p_expr_comma(P *p);
 static u32 p_new_callee(P *p);
 static u32 p_primary(P *p);
+static u32 p_regex_literal(P *p);
 static u32 p_params(P *p, u32 *first, u32 *cnt);
 static u32 p_block_tail(P *p);
 
@@ -1392,6 +1404,71 @@ static u32 p_new_callee(P *p) {
     return base;
 }
 
+/* 正規表現リテラル /pat/flags をスキャンして N_REGEX ノードを生成する。
+ * 呼び出し時、p->lx は TK_PUNCT/P_SLASH を保持し、lx->pos は '/' の直後を指す。 */
+static u32 p_regex_literal(P *p) {
+    Lex *lx = &p->lx;
+    u32 st = lx->pos - 1; /* '/' の位置 */
+    u32 pos = st + 1;
+    bool in_cls = false;
+    for (;;) {
+        if (pos >= lx->n) { p->fail = "unterminated regexp literal"; return N_NONE; }
+        u8 c = lx->s[pos];
+        if (c == '\n' || c == '\r') { p->fail = "unterminated regexp literal"; return N_NONE; }
+        if (c == '\\') {
+            if (pos + 1 >= lx->n || lx->s[pos + 1] == '\n' || lx->s[pos + 1] == '\r') {
+                p->fail = "unterminated regexp literal";
+                return N_NONE;
+            }
+            pos += 2;
+            continue;
+        }
+        if (c == '[') in_cls = true;
+        else if (c == ']') in_cls = false;
+        else if (c == '/' && !in_cls) break;
+        pos++;
+    }
+    u32 pat_st = st + 1;
+    u32 pat_len = pos - pat_st;
+    u32 pos2 = pos + 1;
+    u32 flags = 0;
+    while (pos2 < lx->n) {
+        u8 c = lx->s[pos2];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) break;
+        u32 bit;
+        switch (c) {
+        case 'i': bit = AKL_RX_F_IGNORE; break;
+        case 'g': bit = AKL_RX_F_GLOBAL; break;
+        case 'm': bit = AKL_RX_F_MULTI; break;
+        case 's': bit = AKL_RX_F_DOTALL; break;
+        case 'y': bit = AKL_RX_F_STICKY; break;
+        case 'u': bit = AKL_RX_F_UNICODE; break;
+        default: p->fail = "invalid regexp flag"; return N_NONE;
+        }
+        if (flags & bit) { p->fail = "duplicate regexp flag"; return N_NONE; }
+        flags |= bit;
+        pos2++;
+    }
+    /* パターンをコンパイル検証（実行時にも再コンパイルされる） */
+    char rerr[96];
+    AklRex *rx = akl_rex_compile(lx->s + pat_st, pat_len, flags, rerr, sizeof rerr);
+    if (!rx) {
+        snprintf(p->fail_buf, sizeof p->fail_buf, "%s", rerr);
+        p->fail = p->fail_buf;
+        return N_NONE;
+    }
+    akl_rex_free(rx);
+    u32 idx = p_intern(p, lx->s + pat_st, pat_len);
+    if (idx == UINT32_MAX) return N_NONE;
+    u32 ni = p_node(p, N_REGEX);
+    if (ni == N_NONE) return N_NONE;
+    p->nodes[ni].a = idx;
+    p->nodes[ni].b = flags;
+    lx->pos = pos2;
+    lex_next(lx);
+    return ni;
+}
+
 static u32 p_primary(P *p) {
     if (p->fail) return N_NONE;
     if (++p->depth > AKL_PARSE_DEPTH) { p->depth--; p->fail = "parse depth exhausted"; return N_NONE; }
@@ -1445,6 +1522,12 @@ static u32 p_primary(P *p) {
     }
     if (p_is_punct(p, P_LC)) { /* オブジェクトリテラル（式文脈のみ。文頭は p_stmt のブロック優先） */
         u32 ni = p_lit_object(p);
+        if (ni != N_NONE) ni = p_postfix(p, ni);
+        p->depth--;
+        return ni;
+    }
+    if (p_is_punct(p, P_SLASH)) { /* 正規表現リテラル（式の開始位置のみ。除算は p_expr 側で処理） */
+        u32 ni = p_regex_literal(p);
         if (ni != N_NONE) ni = p_postfix(p, ni);
         p->depth--;
         return ni;
@@ -3307,6 +3390,7 @@ static void cg_expr(Cg *cg, u32 ni) {
         }
         break;
     case N_STR:   cg_op(cg, OP_CONST_STR); cg_u32(cg, n->a); break;
+    case N_REGEX: cg_op(cg, OP_NEWREGEX); cg_u32(cg, n->a); cg_u32(cg, n->b); break;
     case N_BOOL:  cg_op(cg, n->a ? OP_TRUE_T : OP_FALSE_T); break;
     case N_NULL:  cg_op(cg, OP_NULL_T); break;
     case N_UNDEF: cg_op(cg, OP_UNDEF_T); break;
@@ -4696,6 +4780,8 @@ static u32 akl_op_imm_len(u8 op) {
     case OP_CALL:
     case OP_NEW:
         return 1;
+    case OP_NEWREGEX:
+        return 8;
     case OP_PLOAD: case OP_PSTORE:
         return 4;
     case OP_MCALL:
@@ -5622,6 +5708,8 @@ static double akl_to_integer(AklRT *rt, AklVal v) {
     return (isnan(d) || isinf(d)) ? d : trunc(d);
 }
 
+static bool akl_arr_grow(AklRT *rt, AklObj *o, u32 need); /* 定義は配列メソッド節（前方参照） */
+
 static i32 akl_self_str(AklRT *rt, AklVal self) {
     if (!akl_is_objv(self)) return -1;
     u32 oi = akl_get_obj(self);
@@ -5880,6 +5968,49 @@ static AklVal akl_m_str_split(AklRT *rt, AklVal self, int argc, const AklVal *ar
         rt->heap_bytes += sizeof(AklVal);
         return AKL_MK_OBJ(oi);
     }
+    if (akl_is_objv(argv[0]) && rt->objs[akl_get_obj(argv[0])].kind == AKL_OK_REGEX) {
+        /* 正規表現分割（キャプチャを含める。空マッチはスキップ） */
+        AklObj *ro = &rt->objs[akl_get_obj(argv[0])];
+        AklRex *rx = ro->u.rex.rx;
+        u32 ncap = akl_rex_ncap(rx);
+        if (ncap > 32) ncap = 32;
+        u32 cap_beg[33], cap_end[33];
+        bool lim = false;
+        u32 oi = akl_obj_new(rt);
+        if (oi == UINT32_MAX) return akl_mkundefined();
+        rt->objs[oi].kind = AKL_OK_ARR;
+        u32 pos = 0;
+        u32 cnt = 0;
+        bool any = false;
+        for (;;) {
+            if (pos >= ln) break;
+            bool m = akl_rex_match(rx, bp, ln, pos, cap_beg, cap_end, ncap, &lim);
+            if (lim) { akl_errf(rt, "RangeError: regexp execution limit exceeded"); akl_native_throw(rt, rt->err); rt->objs[oi].kind = 0; return akl_mkundefined(); }
+            if (!m) break;
+            if (cap_beg[0] == cap_end[0]) { /* 空マッチは区切りにしない（位置のみ進める） */
+                pos = cap_beg[0] + 1;
+                continue;
+            }
+            any = true;
+            u32 e0 = pos, e1 = cap_beg[0];
+            if (!akl_arr_grow(rt, &rt->objs[oi], cnt + 1 + ncap)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
+            rt->objs[oi].u.arr.v[cnt++] = akl_mkstring(rt, (const char *)(bp + e0), e1 - e0);
+            for (u32 k = 1; k <= ncap; k++) {
+                if (cap_beg[k] == UINT32_MAX) rt->objs[oi].u.arr.v[cnt++] = akl_mkundefined();
+                else rt->objs[oi].u.arr.v[cnt++] = akl_mkstring(rt, (const char *)(bp + cap_beg[k]), cap_end[k] - cap_beg[k]);
+            }
+            pos = cap_end[0];
+        }
+        if (any) {
+            if (!akl_arr_grow(rt, &rt->objs[oi], cnt + 1)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
+            rt->objs[oi].u.arr.v[cnt++] = akl_mkstring(rt, (const char *)(bp + pos), ln - pos);
+        } else {
+            if (!akl_arr_grow(rt, &rt->objs[oi], cnt + 1)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
+            rt->objs[oi].u.arr.v[cnt++] = akl_mkstring(rt, (const char *)bp, ln);
+        }
+        rt->objs[oi].u.arr.n = cnt;
+        return AKL_MK_OBJ(oi);
+    }
     u32 sep = akl_to_string(rt, argv[0]);
     if (sep == UINT32_MAX) return akl_mkundefined();
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = sep;
@@ -6035,43 +6166,139 @@ static AklVal akl_m_str_replace(AklRT *rt, AklVal self, int argc, const AklVal *
     i32 si = akl_self_str(rt, self);
     if (si < 0) return akl_native_typeerr(rt, "TypeError: not a string");
     if (argc < 1) return akl_native_typeerr(rt, "TypeError: replace requires search string");
-    u32 sidx = akl_to_string(rt, argv[0]);
-    if (sidx == UINT32_MAX) return akl_mkundefined();
-    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = sidx;
-    u32 ridx = akl_to_string(rt, argc > 1 ? argv[1] : akl_mkundefined());
-    if (ridx == UINT32_MAX) return akl_mkundefined();
-    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ridx;
-    u32 hn, sn, rn;
-    const u8 *hp = akl_str(rt, (u32)si, &hn);
+    u32 ln;
+    const u8 *bp = akl_str(rt, (u32)si, &ln);
     if (rt->err[0]) return akl_mkundefined();
-    const u8 *sp2 = akl_str(rt, sidx, &sn);
-    if (rt->err[0]) return akl_mkundefined();
-    const u8 *rp = akl_str(rt, ridx, &rn);
-    if (rt->err[0]) return akl_mkundefined();
-    u64 total;
-    u32 hit = UINT32_MAX;
-    if (sn == 0) {
-        total = (u64)hn + rn;
-        hit = 0;
-    } else {
-        for (u32 i = 0; i + sn <= hn; i++) {
-            if (memcmp(hp + i, sp2, sn) == 0) { hit = i; break; }
+    bool is_regex = akl_is_objv(argv[0]) && rt->objs[akl_get_obj(argv[0])].kind == AKL_OK_REGEX;
+    bool fn_repl = argc > 1 && akl_is_objv(argv[1]) &&
+                   (rt->objs[akl_get_obj(argv[1])].kind == AKL_OK_FUNC ||
+                    rt->objs[akl_get_obj(argv[1])].kind == AKL_OK_NATIVE);
+    bool global = is_regex && (rt->objs[akl_get_obj(argv[0])].u.rex.flags & AKL_RX_F_GLOBAL);
+    u32 self_idx = (u32)si;
+    u8 *out = NULL;
+    u32 out_len = 0, out_cap = 0;
+    bool oom = false;
+#define RX_OUT_APPEND(p, n) do { \
+        u32 rxn = (u32)(n); \
+        if (rxn) { \
+            if ((u64)out_len + rxn > out_cap) { \
+                u32 nc = out_cap ? out_cap * 2 : 64; \
+                while (nc < out_len + rxn) nc *= 2; \
+                if ((u64)nc > (u64)rt->heap_mb << 20) { oom = true; break; } \
+                u8 *nb = (u8 *)realloc(out, nc ? nc : 1); \
+                if (!nb) { oom = true; break; } \
+                out = nb; out_cap = nc; \
+            } \
+            memcpy(out + out_len, (p), rxn); out_len += rxn; \
+        } \
+    } while (0)
+    u32 search_from = 0;
+    u32 prev_end = 0;
+    bool any = false;
+    u32 cap_beg[33], cap_end[33];
+    for (;;) {
+        u32 ncap = 0;
+        bool m = false;
+        bool lim = false;
+        if (is_regex) {
+            AklObj *ro = &rt->objs[akl_get_obj(argv[0])];
+            ncap = akl_rex_ncap(ro->u.rex.rx);
+            if (ncap > 32) ncap = 32;
+            m = akl_rex_match(ro->u.rex.rx, bp, ln, search_from, cap_beg, cap_end, ncap, &lim);
+            if (lim) { free(out); akl_errf(rt, "RangeError: regexp execution limit exceeded"); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+        } else {
+            u32 sidx = akl_to_string(rt, argv[0]);
+            if (sidx == UINT32_MAX) { free(out); return akl_mkundefined(); }
+            u32 sn;
+            const u8 *sp = akl_str(rt, sidx, &sn);
+            if (rt->err[0]) { free(out); return akl_mkundefined(); }
+            if (sn == 0) { m = true; cap_beg[0] = search_from; cap_end[0] = search_from; }
+            else {
+                for (u32 i = search_from; i + sn <= ln; i++) {
+                    if (memcmp(bp + i, sp, sn) == 0) { m = true; cap_beg[0] = i; cap_end[0] = i + sn; break; }
+                }
+            }
         }
-        total = (u64)hn - (hit == UINT32_MAX ? 0 : sn) + rn;
+        if (!m) break;
+        any = true;
+        RX_OUT_APPEND(bp + prev_end, cap_beg[0] - prev_end);
+        if (oom) break;
+        if (fn_repl) {
+            /* replacer(match, p1..pn, offset, string) */
+            AklVal args[36];
+            u32 na = 0;
+            u32 nur0 = rt->n_nury;
+            args[na++] = akl_mkstring(rt, (const char *)(bp + cap_beg[0]), cap_end[0] - cap_beg[0]);
+            if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_get_obj(args[na - 1]);
+            for (u32 k = 1; k <= ncap; k++) {
+                if (cap_beg[k] == UINT32_MAX) args[na++] = akl_mkundefined();
+                else {
+                    args[na++] = akl_mkstring(rt, (const char *)(bp + cap_beg[k]), cap_end[k] - cap_beg[k]);
+                    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_get_obj(args[na - 1]);
+                }
+            }
+            args[na++] = akl_mknum((double)cap_beg[0]);
+            args[na++] = AKL_MK_OBJ(self_idx);
+            if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = self_idx;
+            AklVal rv = AKL_VAL_UNDEF;
+            if (!akl_call(rt, argv[1], (int)na, args, &rv)) { free(out); return akl_mkundefined(); }
+            rt->n_nury = nur0;
+            u32 ridx = akl_to_string(rt, rv);
+            if (ridx == UINT32_MAX) { free(out); return akl_mkundefined(); }
+            u32 rn;
+            const u8 *rp = akl_str(rt, ridx, &rn);
+            if (rt->err[0]) { free(out); return akl_mkundefined(); }
+            RX_OUT_APPEND(rp, rn);
+        } else {
+            /* 文字列 replacer（$ 展開: $$ $& $` $' $1..$99） */
+            u32 ridx = akl_to_string(rt, argc > 1 ? argv[1] : akl_mkundefined());
+            if (ridx == UINT32_MAX) { free(out); return akl_mkundefined(); }
+            u32 rn;
+            const u8 *rp = akl_str(rt, ridx, &rn);
+            if (rt->err[0]) { free(out); return akl_mkundefined(); }
+            for (u32 i = 0; i < rn; i++) {
+                if (oom) break;
+                if (rp[i] != '$' || i + 1 >= rn) { RX_OUT_APPEND(rp + i, 1); continue; }
+                u8 c = rp[i + 1];
+                if (c == '$') { RX_OUT_APPEND((const u8 *)"$", 1); i++; }
+                else if (c == '&') { RX_OUT_APPEND(bp + cap_beg[0], cap_end[0] - cap_beg[0]); i++; }
+                else if (c == '`') { RX_OUT_APPEND(bp, cap_beg[0]); i++; }
+                else if (c == '\'') { RX_OUT_APPEND(bp + cap_end[0], ln - cap_end[0]); i++; }
+                else if (c >= '1' && c <= '9') {
+                    u32 g = (u32)(c - '0');
+                    u32 used = 1;
+                    if (i + 2 < rn && rp[i + 2] >= '0' && rp[i + 2] <= '9') {
+                        u32 g2 = g * 10 + (u32)(rp[i + 2] - '0');
+                        if (g2 >= 1 && g2 <= ncap) { g = g2; used = 2; }
+                    }
+                    if (g >= 1 && g <= ncap && cap_beg[g] != UINT32_MAX) {
+                        RX_OUT_APPEND(bp + cap_beg[g], cap_end[g] - cap_beg[g]);
+                        i += used;
+                    } else {
+                        RX_OUT_APPEND((const u8 *)"$", 1);
+                    }
+                } else {
+                    RX_OUT_APPEND((const u8 *)"$", 1);
+                }
+            }
+        }
+        if (oom) break;
+        prev_end = cap_end[0];
+        search_from = (cap_end[0] == cap_beg[0]) ? cap_beg[0] + 1 : cap_end[0];
+        if (!global) break;
+        if (search_from > ln) break;
     }
-    if (hit == UINT32_MAX) return akl_mkstring(rt, (const char *)hp, hn);
-    if (total > (u64)rt->heap_mb << 20) { akl_errf(rt, "heap bytes budget exhausted"); return akl_mkundefined(); }
-    u8 *buf = (u8 *)malloc(total ? total : 1);
-    if (!buf) { akl_errf(rt, "oom: replace"); return akl_mkundefined(); }
-    u32 w = 0;
-    memcpy(buf + w, hp, hit); w += hit;
-    memcpy(buf + w, rp, rn); w += rn;
-    memcpy(buf + w, hp + hit + sn, hn - hit - sn); w += hn - hit - sn;
-    u32 oi = akl_mkstr(rt, buf, w);
-    free(buf);
+    if (oom) { free(out); akl_errf(rt, "heap bytes budget exhausted"); return akl_mkundefined(); }
+    if (!any) { free(out); return akl_mkstring(rt, (const char *)bp, ln); }
+    RX_OUT_APPEND(bp + prev_end, ln - prev_end);
+    if (oom) { free(out); akl_errf(rt, "heap bytes budget exhausted"); return akl_mkundefined(); }
+    u32 oi = akl_mkstr(rt, out, out_len);
+    free(out);
     if (oi == UINT32_MAX) return akl_mkundefined();
     return AKL_MK_OBJ(oi);
+#undef RX_OUT_APPEND
 }
+
 static AklVal akl_m_str_repeat(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     (void)udata;
     i32 si = akl_self_str(rt, self);
@@ -6094,6 +6321,284 @@ static AklVal akl_m_str_repeat(AklRT *rt, AklVal self, int argc, const AklVal *a
     return AKL_MK_OBJ(oi);
 }
 
+
+/* ================= RegExp（正規表現） ================= */
+
+/* REGEX オブジェクト生成（rx は所有権移転）。heap_bytes に概算課金（GC の
+ * free で o->len を減算）。 */
+static AklVal akl_regex_make(AklRT *rt, AklRex *rx, u32 flags) {
+    u32 pl = 0;
+    akl_rex_pat(rx, &pl);
+    u64 sz = 128 + (u64)pl * 24; /* 命令 24B × 概算 */
+    if (rt->heap_bytes + sz > (u64)rt->heap_mb << 20) {
+        akl_rex_free(rx);
+        akl_errf(rt, "heap bytes budget exhausted");
+        return akl_mkundefined();
+    }
+    u32 oi = akl_obj_new(rt);
+    if (oi == UINT32_MAX) { akl_rex_free(rx); return akl_mkundefined(); }
+    AklObj *o = &rt->objs[oi];
+    o->kind = AKL_OK_REGEX;
+    o->u.rex.rx = rx;
+    o->u.rex.flags = flags;
+    o->u.rex.last_index = 0;
+    o->len = (u32)(sz > UINT32_MAX ? UINT32_MAX : sz);
+    rt->heap_bytes += o->len;
+    return AKL_MK_OBJ(oi);
+}
+
+/* マッチ試行共通部。成功時 true で cap 配列を埋める。g/y フラグ時 lastIndex を更新 */
+static bool akl_regex_try(AklRT *rt, AklObj *o, const u8 *sp, u32 sl,
+                          u32 *cap_beg, u32 *cap_end, u32 ncap) {
+    AklRex *rx = o->u.rex.rx;
+    bool lim = false;
+    i32 last = o->u.rex.last_index;
+    if (last < 0) last = 0;
+    bool m = akl_rex_match(rx, sp, sl, (u32)last, cap_beg, cap_end, ncap, &lim);
+    if (lim) {
+        akl_errf(rt, "RangeError: regexp execution limit exceeded"); akl_native_throw(rt, rt->err);
+        return false;
+    }
+    if (m && (o->u.rex.flags & (AKL_RX_F_GLOBAL | AKL_RX_F_STICKY))) {
+        o->u.rex.last_index = (i32)cap_end[0];
+    }
+    return m;
+}
+
+/* exec の配列組み立て（cap 配列から） */
+static AklVal akl_regex_result_arr(AklRT *rt, const u8 *bp, u32 *cap_beg, u32 *cap_end, u32 ncap) {
+    u32 oi = akl_obj_new(rt);
+    if (oi == UINT32_MAX) return akl_mkundefined();
+    rt->objs[oi].kind = AKL_OK_ARR;
+    u32 n = ncap + 1;
+    if (!akl_arr_grow(rt, &rt->objs[oi], n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
+    for (u32 k = 0; k <= ncap; k++) {
+        if (cap_beg[k] == UINT32_MAX) rt->objs[oi].u.arr.v[k] = akl_mkundefined();
+        else rt->objs[oi].u.arr.v[k] = akl_mkstring(rt, (const char *)(bp + cap_beg[k]), cap_end[k] - cap_beg[k]);
+    }
+    rt->objs[oi].u.arr.n = n;
+    return AKL_MK_OBJ(oi);
+}
+
+static AklVal akl_m_regex_exec(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)udata;
+    if (!akl_is_objv(self)) return akl_native_typeerr(rt, "TypeError: not a RegExp");
+    AklObj *o = &rt->objs[akl_get_obj(self)];
+    if (o->kind != AKL_OK_REGEX) return akl_native_typeerr(rt, "TypeError: not a RegExp");
+    u32 sidx = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
+    if (sidx == UINT32_MAX) return akl_mkundefined();
+    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = sidx;
+    u32 sl;
+    const u8 *sp = akl_str(rt, sidx, &sl);
+    if (rt->err[0]) return akl_mkundefined();
+    u32 ncap = akl_rex_ncap(o->u.rex.rx);
+    if (ncap > 32) ncap = 32;
+    u32 cap_beg[33], cap_end[33];
+    bool m = akl_regex_try(rt, o, sp, sl, cap_beg, cap_end, ncap);
+    if (rt->err[0]) return akl_mkundefined();
+    if (!m) return AKL_VAL_NULL;
+    return akl_regex_result_arr(rt, sp, cap_beg, cap_end, ncap);
+}
+
+static AklVal akl_m_regex_test(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)udata;
+    if (!akl_is_objv(self)) return akl_native_typeerr(rt, "TypeError: not a RegExp");
+    AklObj *o = &rt->objs[akl_get_obj(self)];
+    if (o->kind != AKL_OK_REGEX) return akl_native_typeerr(rt, "TypeError: not a RegExp");
+    u32 sidx = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
+    if (sidx == UINT32_MAX) return akl_mkundefined();
+    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = sidx;
+    u32 sl;
+    const u8 *sp = akl_str(rt, sidx, &sl);
+    if (rt->err[0]) return akl_mkundefined();
+    u32 ncap = akl_rex_ncap(o->u.rex.rx);
+    if (ncap > 32) ncap = 32;
+    u32 cap_beg[33], cap_end[33];
+    bool m = akl_regex_try(rt, o, sp, sl, cap_beg, cap_end, ncap);
+    if (rt->err[0]) return akl_mkundefined();
+    return akl_mkbool(m);
+}
+
+static AklVal akl_m_regex_toString(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)udata; (void)argc; (void)argv;
+    if (!akl_is_objv(self)) return akl_native_typeerr(rt, "TypeError: not a RegExp");
+    AklObj *o = &rt->objs[akl_get_obj(self)];
+    if (o->kind != AKL_OK_REGEX) return akl_native_typeerr(rt, "TypeError: not a RegExp");
+    u32 pl = 0;
+    const u8 *pp = akl_rex_pat(o->u.rex.rx, &pl);
+    char flags[8];
+    u32 fw = 0;
+    u32 f = o->u.rex.flags;
+    if (f & AKL_RX_F_GLOBAL) flags[fw++] = 'g';
+    if (f & AKL_RX_F_IGNORE) flags[fw++] = 'i';
+    if (f & AKL_RX_F_MULTI) flags[fw++] = 'm';
+    if (f & AKL_RX_F_DOTALL) flags[fw++] = 's';
+    if (f & AKL_RX_F_UNICODE) flags[fw++] = 'u';
+    if (f & AKL_RX_F_STICKY) flags[fw++] = 'y';
+    flags[fw] = 0;
+    u64 total = (u64)pl + 2 + fw;
+    if (total > (u64)rt->heap_mb << 20) { akl_errf(rt, "heap bytes budget exhausted"); return akl_mkundefined(); }
+    u8 *buf = (u8 *)malloc(total ? total : 1);
+    if (!buf) { akl_errf(rt, "oom: regexp toString"); return akl_mkundefined(); }
+    u32 w = 0;
+    buf[w++] = '/';
+    memcpy(buf + w, pp, pl); w += pl;
+    buf[w++] = '/';
+    memcpy(buf + w, flags, fw); w += fw;
+    u32 oi = akl_mkstr(rt, buf, w);
+    free(buf);
+    if (oi == UINT32_MAX) return akl_mkundefined();
+    return AKL_MK_OBJ(oi);
+}
+
+static const AklMethEntry AKL_REGEX_METHODS[AKL_REGEX_METH_N] = {
+    {"test", akl_m_regex_test}, {"exec", akl_m_regex_exec},
+    {"toString", akl_m_regex_toString}
+};
+
+/* グローバル RegExp コンストラクタ（new でも呼び出しでも同じ） */
+static AklVal akl_m_regexp_ctor(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)udata; (void)self;
+    u32 flags = 0;
+    bool have_flags = false;
+    if (argc > 1 && !akl_is_undefined(argv[1])) {
+        u32 fidx = akl_to_string(rt, argv[1]);
+        if (fidx == UINT32_MAX) return akl_mkundefined();
+        u32 fl;
+        const u8 *fp = akl_str(rt, fidx, &fl);
+        if (rt->err[0]) return akl_mkundefined();
+        for (u32 i = 0; i < fl; i++) {
+            u32 bit;
+            switch (fp[i]) {
+            case 'i': bit = AKL_RX_F_IGNORE; break;
+            case 'g': bit = AKL_RX_F_GLOBAL; break;
+            case 'm': bit = AKL_RX_F_MULTI; break;
+            case 's': bit = AKL_RX_F_DOTALL; break;
+            case 'u': bit = AKL_RX_F_UNICODE; break;
+            case 'y': bit = AKL_RX_F_STICKY; break;
+            default: return akl_native_typeerr(rt, "SyntaxError: invalid regexp flags");
+            }
+            if (flags & bit) return akl_native_typeerr(rt, "SyntaxError: duplicate regexp flag");
+            flags |= bit;
+        }
+        have_flags = true;
+    }
+    const u8 *pp = NULL;
+    u32 pn = 0;
+    if (argc > 0 && akl_is_objv(argv[0]) && rt->objs[akl_get_obj(argv[0])].kind == AKL_OK_REGEX) {
+        AklObj *ro = &rt->objs[akl_get_obj(argv[0])];
+        if (!have_flags) {
+            /* RegExp オブジェクトの複製 */
+            u32 sl = 0;
+            const u8 *sr = akl_rex_pat(ro->u.rex.rx, &sl);
+            char rerr[96];
+            AklRex *rx = akl_rex_compile(sr, sl, ro->u.rex.flags, rerr, sizeof rerr);
+            if (!rx) { akl_errf(rt, "SyntaxError: %s", rerr); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+            return akl_regex_make(rt, rx, ro->u.rex.flags);
+        }
+        pp = akl_rex_pat(ro->u.rex.rx, &pn);
+    } else {
+        u32 sidx = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
+        if (sidx == UINT32_MAX) return akl_mkundefined();
+        pp = akl_str(rt, sidx, &pn);
+        if (rt->err[0]) return akl_mkundefined();
+    }
+    char rerr[96];
+    AklRex *rx = akl_rex_compile(pp, pn, flags, rerr, sizeof rerr);
+    if (!rx) { akl_errf(rt, "SyntaxError: %s", rerr); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    return akl_regex_make(rt, rx, flags);
+}
+
+/* String.prototype.match（正規表現。g フラグで全マッチ配列、非 g でキャプチャ配列。
+ * マッチなしは null。index/input プロパティは非対応（AKL_COMPAT に明記）） */
+static AklVal akl_m_str_match(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)udata;
+    i32 si = akl_self_str(rt, self);
+    if (si < 0) return akl_native_typeerr(rt, "TypeError: not a string");
+    u32 ln;
+    const u8 *bp = akl_str(rt, (u32)si, &ln);
+    if (rt->err[0]) return akl_mkundefined();
+    AklRex *rx = NULL;
+    u32 rflags = 0;
+    bool own = false;
+    if (argc > 0 && akl_is_objv(argv[0]) && rt->objs[akl_get_obj(argv[0])].kind == AKL_OK_REGEX) {
+        AklObj *ro = &rt->objs[akl_get_obj(argv[0])];
+        rx = ro->u.rex.rx;
+        rflags = ro->u.rex.flags;
+    } else {
+        u32 sidx = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
+        if (sidx == UINT32_MAX) return akl_mkundefined();
+        u32 sn;
+        const u8 *sp = akl_str(rt, sidx, &sn);
+        if (rt->err[0]) return akl_mkundefined();
+        char rerr[96];
+        rx = akl_rex_compile(sp, sn, 0, rerr, sizeof rerr);
+        if (!rx) { akl_errf(rt, "SyntaxError: %s", rerr); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+        own = true;
+    }
+    u32 cap_beg[33], cap_end[33];
+    bool lim = false;
+    if (rflags & AKL_RX_F_GLOBAL) {
+        u32 oi = akl_obj_new(rt);
+        if (oi == UINT32_MAX) { if (own) akl_rex_free(rx); return akl_mkundefined(); }
+        rt->objs[oi].kind = AKL_OK_ARR;
+        u32 pos = 0;
+        u32 cnt = 0;
+        for (;;) {
+            bool m = akl_rex_match(rx, bp, ln, pos, cap_beg, cap_end, 0, &lim);
+            if (lim) { akl_errf(rt, "RangeError: regexp execution limit exceeded"); akl_native_throw(rt, rt->err); if (own) akl_rex_free(rx); rt->objs[oi].kind = 0; return akl_mkundefined(); }
+            if (!m) break;
+            if (!akl_arr_grow(rt, &rt->objs[oi], cnt + 1)) { if (own) akl_rex_free(rx); rt->objs[oi].kind = 0; return akl_mkundefined(); }
+            rt->objs[oi].u.arr.v[cnt++] = akl_mkstring(rt, (const char *)(bp + cap_beg[0]), cap_end[0] - cap_beg[0]);
+            pos = (cap_end[0] == pos) ? cap_end[0] + 1 : cap_end[0];
+            if (pos > ln) break;
+        }
+        rt->objs[oi].u.arr.n = cnt;
+        if (own) akl_rex_free(rx);
+        if (cnt == 0) return AKL_VAL_NULL;
+        return AKL_MK_OBJ(oi);
+    }
+    u32 ncap = akl_rex_ncap(rx);
+    if (ncap > 32) ncap = 32;
+    bool m = akl_rex_match(rx, bp, ln, 0, cap_beg, cap_end, ncap, &lim);
+    if (own) akl_rex_free(rx);
+    if (lim) { akl_errf(rt, "RangeError: regexp execution limit exceeded"); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    if (!m) return AKL_VAL_NULL;
+    return akl_regex_result_arr(rt, bp, cap_beg, cap_end, ncap);
+}
+
+/* String.prototype.search: 最初のマッチ位置。無ければ -1 */
+static AklVal akl_m_str_search(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)udata;
+    i32 si = akl_self_str(rt, self);
+    if (si < 0) return akl_native_typeerr(rt, "TypeError: not a string");
+    u32 ln;
+    const u8 *bp = akl_str(rt, (u32)si, &ln);
+    if (rt->err[0]) return akl_mkundefined();
+    AklRex *rx = NULL;
+    bool own = false;
+    if (argc > 0 && akl_is_objv(argv[0]) && rt->objs[akl_get_obj(argv[0])].kind == AKL_OK_REGEX) {
+        AklObj *ro = &rt->objs[akl_get_obj(argv[0])];
+        rx = ro->u.rex.rx;
+    } else {
+        u32 sidx = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
+        if (sidx == UINT32_MAX) return akl_mkundefined();
+        u32 sn;
+        const u8 *sp = akl_str(rt, sidx, &sn);
+        if (rt->err[0]) return akl_mkundefined();
+        char rerr[96];
+        rx = akl_rex_compile(sp, sn, 0, rerr, sizeof rerr);
+        if (!rx) { akl_errf(rt, "SyntaxError: %s", rerr); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+        own = true;
+    }
+    u32 cap_beg[2], cap_end[2];
+    bool lim = false;
+    bool m = akl_rex_match(rx, bp, ln, 0, cap_beg, cap_end, 0, &lim);
+    if (own) akl_rex_free(rx);
+    if (lim) { akl_errf(rt, "RangeError: regexp execution limit exceeded"); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    return akl_mknum(m ? (double)cap_beg[0] : -1.0);
+}
+
 static const AklMethEntry AKL_STR_METHODS[AKL_STR_METH_N] = {
     {"charAt", akl_m_str_charAt}, {"charCodeAt", akl_m_str_charCodeAt},
     {"codePointAt", akl_m_str_codePointAt}, {"indexOf", akl_m_str_indexOf},
@@ -6103,7 +6608,8 @@ static const AklMethEntry AKL_STR_METHODS[AKL_STR_METH_N] = {
     {"trim", akl_m_str_trim}, {"split", akl_m_str_split},
     {"concat", akl_m_str_concat}, {"includes", akl_m_str_includes},
     {"startsWith", akl_m_str_startsWith}, {"endsWith", akl_m_str_endsWith},
-    {"replace", akl_m_str_replace}, {"repeat", akl_m_str_repeat}
+    {"replace", akl_m_str_replace}, {"repeat", akl_m_str_repeat},
+    {"match", akl_m_str_match}, {"search", akl_m_str_search}
 };
 
 
@@ -7220,6 +7726,16 @@ static bool akl_builtins_install(AklRT *rt) {
         }
         if (!akl_global_set(rt, "JSON", jv)) return false;
     }
+    /* RegExp グローバル（new でも呼び出しでもオブジェクトを返す） */
+    {
+        char *buf = (char *)malloc(7);
+        if (!buf) { akl_errf(rt, "oom: builtins"); return false; }
+        memcpy(buf, "RegExp", 6);
+        buf[6] = 0;
+        bool ok = akl_native_register(rt, buf, akl_m_regexp_ctor, NULL);
+        free(buf);
+        if (!ok) return false;
+    }
     struct { u32 name; AklNativeFn f; } g[] = {
         {n_parseInt, akl_m_parseInt}, {n_parseFloat, akl_m_parseFloat},
         {n_isNaN, akl_m_isNaN}, {n_isFinite, akl_m_isFinite}
@@ -7244,6 +7760,10 @@ static bool akl_builtins_install(AklRT *rt) {
     for (u32 i = 0; i < AKL_ARR_METH_N; i++) {
         rt->arr_meth_vals[i] = akl_mknative(rt, AKL_ARR_METHODS[i].fn, NULL);
         if (akl_is_undefined(rt->arr_meth_vals[i])) return false;
+    }
+    for (u32 i = 0; i < AKL_REGEX_METH_N; i++) {
+        rt->regex_meth_vals[i] = akl_mknative(rt, AKL_REGEX_METHODS[i].fn, NULL);
+        if (akl_is_undefined(rt->regex_meth_vals[i])) return false;
     }
     return true;
 }
@@ -7593,6 +8113,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_ARRSPREADC] = &&l_ARRSPREADC, [OP_CALLN] = &&l_CALLN,
         [OP_PDEL] = &&l_PDEL, [OP_IDEL] = &&l_IDEL, [OP_INSTANCEOF] = &&l_INSTANCEOF,
         [OP_NEW] = &&l_NEW,
+        [OP_NEWREGEX] = &&l_NEWREGEX,
         [OP_HALT] = &&l_HALT,
     };
 #define AKL_NEXT() do { if (dead) { free(frames); return false; } AKL_BUDGET(); goto *akl_jt[*pc++]; } while (0)
@@ -7994,6 +8515,51 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 AKL_PUSH(AKL_VAL_UNDEF);
                 AKL_NEXT();
             }
+            if (oo->kind == AKL_OK_REGEX) {
+                u32 nl;
+                const u8 *nb = akl_str(rt, name, &nl);
+                if (!nb) { free(frames); return false; }
+                AklRex *rx = oo->u.rex.rx;
+                u32 rf = oo->u.rex.flags;
+                AklVal out = AKL_VAL_UNDEF;
+                if (nl == 6 && memcmp(nb, "source", 6) == 0) {
+                    u32 pl = 0;
+                    const u8 *pp = akl_rex_pat(rx, &pl);
+                    out = akl_mkstring(rt, (const char *)pp, pl);
+                } else if (nl == 5 && memcmp(nb, "flags", 5) == 0) {
+                    char fb[8];
+                    u32 fw = 0;
+                    if (rf & AKL_RX_F_GLOBAL) fb[fw++] = 'g';
+                    if (rf & AKL_RX_F_IGNORE) fb[fw++] = 'i';
+                    if (rf & AKL_RX_F_MULTI) fb[fw++] = 'm';
+                    if (rf & AKL_RX_F_DOTALL) fb[fw++] = 's';
+                    if (rf & AKL_RX_F_UNICODE) fb[fw++] = 'u';
+                    if (rf & AKL_RX_F_STICKY) fb[fw++] = 'y';
+                    out = akl_mkstring(rt, fb, fw);
+                } else if (nl == 6 && memcmp(nb, "global", 6) == 0) {
+                    out = akl_mkbool((rf & AKL_RX_F_GLOBAL) != 0);
+                } else if (nl == 10 && memcmp(nb, "ignoreCase", 10) == 0) {
+                    out = akl_mkbool((rf & AKL_RX_F_IGNORE) != 0);
+                } else if (nl == 9 && memcmp(nb, "multiline", 9) == 0) {
+                    out = akl_mkbool((rf & AKL_RX_F_MULTI) != 0);
+                } else if (nl == 6 && memcmp(nb, "dotAll", 6) == 0) {
+                    out = akl_mkbool((rf & AKL_RX_F_DOTALL) != 0);
+                } else if (nl == 6 && memcmp(nb, "sticky", 6) == 0) {
+                    out = akl_mkbool((rf & AKL_RX_F_STICKY) != 0);
+                } else if (nl == 7 && memcmp(nb, "unicode", 7) == 0) {
+                    out = akl_mkbool((rf & AKL_RX_F_UNICODE) != 0);
+                } else if (nl == 9 && memcmp(nb, "lastIndex", 9) == 0) {
+                    out = AKL_MK_INT(oo->u.rex.last_index);
+                } else {
+                    u32 hit_r = UINT32_MAX;
+                    for (u32 i = 0; i < AKL_REGEX_METH_N; i++)
+                        if (strlen(AKL_REGEX_METHODS[i].name) == nl &&
+                            memcmp(AKL_REGEX_METHODS[i].name, nb, nl) == 0) { hit_r = i; break; }
+                    if (hit_r != UINT32_MAX) { AKL_PUSH(rt->regex_meth_vals[hit_r]); AKL_NEXT(); }
+                }
+                AKL_PUSH(out);
+                AKL_NEXT();
+            }
         }
         if (!akl_is_objv(ov) || rt->objs[akl_get_obj(ov)].kind != AKL_OK_OBJ) {
             akl_errf(rt, "TypeError: property access on non-object value");
@@ -8026,6 +8592,22 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             if (!ok_h) { akl_errf(rt, "TypeError: property store rejected"); free(frames); return false; }
             AKL_PUSH(v); /* 代入式の値は右辺（JS 同様） */
             AKL_NEXT();
+        }
+        if (akl_is_objv(ov)) {
+            AklObj *oo = &rt->objs[akl_get_obj(ov)];
+            if (oo->kind == AKL_OK_REGEX) {
+                u32 nl;
+                const u8 *nb = akl_str(rt, name, &nl);
+                if (!nb) { free(frames); return false; }
+                if (nl == 9 && memcmp(nb, "lastIndex", 9) == 0) {
+                    double d = akl_to_integer(rt, v);
+                    if (rt->err[0]) { free(frames); return false; }
+                    oo->u.rex.last_index = (i32)d;
+                }
+                /* その他のプロパティ代入は静かに無視（独自プロパティ非対応。AKL_COMPAT） */
+                AKL_PUSH(v);
+                AKL_NEXT();
+            }
         }
         if (!akl_is_objv(ov) || rt->objs[akl_get_obj(ov)].kind != AKL_OK_OBJ) {
             akl_errf(rt, "TypeError: property store on non-object value");
@@ -8068,6 +8650,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 tbl = AKL_STR_METHODS; tn = AKL_STR_METH_N;
             } else if (oo->kind == AKL_OK_ARR) {
                 tbl = AKL_ARR_METHODS; tn = AKL_ARR_METH_N;
+            } else if (oo->kind == AKL_OK_REGEX) {
+                tbl = AKL_REGEX_METHODS; tn = AKL_REGEX_METH_N;
             }
             if (tbl) {
                 u32 nl;
@@ -9355,7 +9939,9 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             if (!akl_vm_native_call(rt, fo, AKL_MK_OBJ(oi), argc, stk + sp - argc, &r)) { free(frames); return false; }
             rt->n_nury = nur0;
             sp -= argc;
-            stk[sp - 1] = AKL_MK_OBJ(oi);
+            /* native コンストラクタ: 戻りがオブジェクトならそれを返す（JS 仕様）。
+             * プリミティブなら this（新 OBJ）を返す。 */
+            stk[sp - 1] = akl_is_objv(r) ? r : AKL_MK_OBJ(oi);
             AKL_NEXT();
         }
         if (fo->kind != AKL_OK_FUNC) { akl_errf(rt, "TypeError: not a constructor"); free(frames); return false; }
@@ -9424,6 +10010,25 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
 
     AKL_L(NOP): { AKL_NEXT(); } /* CoJIT 埋め。通常到達不能、到達しても透過 */
 
+    AKL_L(NEWREGEX): {
+        u32 pat_idx;
+        memcpy(&pat_idx, pc, 4); pc += 4;
+        u32 rflags;
+        memcpy(&rflags, pc, 4); pc += 4;
+        u32 pn;
+        const u8 *pp = akl_str(rt, pat_idx, &pn);
+        if (!pp) { free(frames); return false; }
+        if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
+        budget -= AKL_NATIVE_COST;
+        char rerr[96];
+        AklRex *rx = akl_rex_compile(pp, pn, rflags, rerr, sizeof rerr);
+        if (!rx) { akl_errf(rt, "SyntaxError: %s", rerr); akl_native_throw(rt, rt->err); free(frames); return false; }
+        AklVal rv = akl_regex_make(rt, rx, rflags);
+        if (rt->err[0]) { free(frames); return false; }
+        AKL_PUSH(rv);
+        AKL_NEXT();
+    }
+
     AKL_L(HALT): {
         if (rt->n_tries) { /* 防御層: main 正常終了で try が残るのは内部不整合 */
             akl_errf(rt, "internal: try/frame skew at halt"); free(frames); return false; }
@@ -9490,6 +10095,7 @@ void akl_free(AklRT *rt) {
         if (rt->objs[i].kind == AKL_OK_OBJ) free(rt->objs[i].u.po.props);
         if (rt->objs[i].kind == AKL_OK_ARR) free(rt->objs[i].u.arr.v);
         if (rt->objs[i].kind == AKL_OK_ENV) free(rt->objs[i].u.env.vals);
+        if (rt->objs[i].kind == AKL_OK_REGEX) akl_rex_free(rt->objs[i].u.rex.rx);
     }
     free(rt->objs);
     free(rt->free_objs);
