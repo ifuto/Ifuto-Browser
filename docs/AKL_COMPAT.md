@@ -59,6 +59,10 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | 3 段以上の継承チェーン・`super` の多重呼び出し | `class C extends B extends A ... new C().m()` | OK |
 | static メソッドの継承（`__super` チェーン解決） | `class A { static s(){return 7;} } class B extends A { } B.s()` | `7` |
 | 派生クラスの合成コンストラクタ（extends 時は super() を自動呼び出し） | `class B extends A { } new B().n` | 親が初期化した `n` |
+| オブジェクト spread `{...a, k: v}`（後勝ち・複数 spread 可） | `{...{x:1}, ...{y:2}, z:3}` | `{x:1, y:2, z:3}` |
+| メソッド呼び出し spread `o.m(...args)`（通常引数と混在可） | `o.f(10, ...[2, 3])` | `5` |
+| 配列 rest `[a, b, ...rest] = arr` | `[1,2,3,4]` から | `a=1, b=2, rest=[3,4]` |
+| オブジェクト rest `var {a, ...rest} = o`（取り出したキーを除外） | `var {b, ...rest} = o` | `rest` は b 以外 |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
 `-1/0 = -Infinity`、`NaN !== NaN`（IEEE 754/JIS X 3010 相当の double 厳密）、
@@ -77,9 +81,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | `match`/`exec` 結果の `index`/`input` プロパティ | undefined（配列要素のみ。AKL_OK_ARR は名前付きプロパティ非対応） |
 | `i` フラグの非 ASCII ケースフォールディング・`\\d`/`\\w` の非 ASCII 扱い | 非対応（ASCII のみ。`\\s` は Unicode 空白対応） |
 | RegExp 独自プロパティ（`re.x = 1`） | 代入は無視（lastIndex のみ更新可） |
-| オブジェクト spread `{...obj}` | SyntaxError（配列 spread は対応済み） |
-| メソッド呼び出しの spread `o.m(...a)` | SyntaxError（関数呼び出しの spread は対応済み） |
-| 分割代入の rest パターン `[a, ...rest]` | SyntaxError（基本分割代入は対応済み） |
+| 式文のオブジェクト分割代入 `({a} = o)` | 非対応（`var {a} = o` の宣言形式は対応済み。`(` で括るとオブジェクトリテラルと解釈され `expected ':'`） |
+| `{...primitive}` のプリミティブ列挙 | 無視（undefined/null は JS 同様無視。number/string はコピーしない） |
 | `String()` / `Number()` コンストラクタ・`Object.keys` 等 | ReferenceError |
 | ~~高階関数 `[1,2].map(f)` / `forEach` / `filter`~~ | ✅ v0.3: `map`/`filter`/`forEach`/`some`/`every`/`find`/`findIndex`/`reduce`（VM 再入 akl_call 経由。コールバック fn(elem, idx, arr)、reduce は fn(acc, elem, idx, arr)） |
 | `String()` / `Number()` コンストラクタ・`Object.keys` 等 | ReferenceError |
@@ -101,7 +104,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 10. ✅ 分割代入・配列/呼び出し spread・`new`・`class`（2026-08-08。VM 再入とフレーム is_new）
 11. ✅ 正規表現（2026-08-09: リテラル/RegExp グローバル/test/exec/match/search/replace/split。エンジンは別ファイル akl_regex.c、バックトラッキング VM + ステップ有界化）
 12. ✅ class extends / super（2026-08-09: OP_MAKEFS で親クラスを関数 env にバインド、OP_SUPERGET/OP_CALLT で解決。継承コピーは __super チェーンを親→子順に。合成 ctor は extends 時 super() 自動呼び出し）
-13. async/await（コルーチン基盤の設計が必要）
+13. ✅ オブジェクト spread・メソッド呼び出し spread・分割代入 rest（2026-08-09: OP_OBJSPREAD/OP_MCALLN/OP_ARRREST/OP_OBJREST を新設。4 点同期: enum/imm_len/jumptable/ハンドラ）
+14. async/await（コルーチン基盤の設計が必要）
 
 ## V8 との位置づけ
 

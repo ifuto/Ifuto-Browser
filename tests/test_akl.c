@@ -881,6 +881,7 @@ static void t_v03_syntax2(void);
 static void t_v03_syntax3(void);
 static void t_v04_regex(void);
 static void t_v04_class_extends(void);
+static void t_v04_spread_rest(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -926,6 +927,8 @@ void test_akl(void) {
     t_v04_regex();
     fprintf(stderr, "  %-40s", "t_v04_class_extends");
     t_v04_class_extends();
+    fprintf(stderr, "  %-40s", "t_v04_spread_rest");
+    t_v04_spread_rest();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1485,4 +1488,33 @@ static void t_v04_class_extends(void) {
     /* エラー: super はクラス外で使えない */
     want_err("super.m()", "super");
     want_err("class A { m() { return 1; } } class B { m() { return super.m(); } } new B().m()", "super");
+}
+
+/* ================= v0.4: オブジェクト spread / メソッド spread / 分割 rest ================= */
+static void t_v04_spread_rest(void) {
+    /* オブジェクト spread */
+    want_num("var a = {x: 1, y: 2}; var b = {...a}; b.x + b.y", 3);
+    want_num("var a = {x: 1}; var b = {...a, x: 9, z: 3}; b.x + b.z", 12);
+    want_num("var a = {x: 1}; var b = {z: 0, ...a}; b.x + b.z", 1);
+    want_num("var a = {x: 1, y: 2}; var cc = {y: 9}; var d = {...a, ...cc}; d.x * 10 + d.y", 19);
+    want_num("var b = {...null}; (b ? 1 : 0)", 1);
+    want_num("var a = {m: 5, n: {p: 7}}; var b = {...a}; b.n.p", 7);
+    want_num("var a = {x: 1}; var b = {x: 2, y: 3}; var cc = {...a, ...b, z: 4}; cc.x + cc.y + cc.z", 9);
+    /* メソッド呼び出し spread */
+    want_num("var o = {f: function(a, b) { return a + b; }}; var args = [2, 3]; o.f(...args)", 5);
+    want_num("var o = {f: function(a, b, c) { return a + b + c; }}; var args = [1, 2]; o.f(...args, 3)", 6);
+    want_num("var o = {f: function(a, b, c) { return a - b - c; }}; o.f(10, ...[2, 3])", 5);
+    want_num("var o = {m: function(a, b) { return a * b; }}; var args = [6, 7]; o.m(...args)", 42);
+    /* 配列 rest */
+    want_num("var a, b, r; [a, b, ...r] = [1, 2, 3, 4, 5]; a + b + r.length + r[0] + r[2]", 14);
+    want_num("var first, rest; [first, ...rest] = [10, 20, 30]; first + rest[0] + rest[1]", 60);
+    want_num("var a, rest; [a, ...rest] = [1]; rest.length", 0);
+    want_num("var r; [r] = [7]; r", 7);
+    want_num("var first, rest; var arr = [1,2,3,4]; [first, ...rest] = arr; first + rest.length", 4);
+    want_str("var r; var s = 'abc'; [r] = s; r", "a");
+    /* オブジェクト rest */
+    want_num("var o = {p: 1, q: 2, r: 3}; var p, rest; var {p, ...rest} = o; p + rest.q + rest.r", 6);
+    want_num("var o = {a: 1, b: 2, c: 3}; var rest; var {b, ...rest} = o; rest.a + rest.c", 4);
+    want_num("var o = {a: 1, b: 2}; var rest; var {...rest} = o; rest.a + rest.b", 3);
+    want_num("var o = {a: 1, b: 2, cc: 3}; var rest; var {a, cc, ...rest} = o; rest.b", 2);
 }

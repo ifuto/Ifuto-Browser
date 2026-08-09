@@ -213,6 +213,10 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_CALLT,               /* argc u8 : [this][fn][args...] を this で呼ぶ（super 用） */
     OP_MAKEFS,              /* fidx u32 | srcslot u8 : [親][fn] → fn の env 先頭に親をバインド */
     OP_SUPERGET,            /* name u32 : 親クラス（関数 env の vals[0]）の name を push */
+    OP_OBJSPREAD,           /* pop src → TOS の OBJ に全 props コピー（オブジェクト spread） */
+    OP_MCALLN,              /* slot u32 | name u32 : argc = locals[slot] の動的 MCALL（メソッド spread） */
+    OP_ARRREST,             /* pop start, pop arr → 新規配列 [start..n)（分割 rest） */
+    OP_OBJREST,             /* pop src_obj → 新規 OBJ（全 props コピー。除外は PDEL で） */
     OP_HALT,
     OP_COUNT
 };
@@ -1364,6 +1368,19 @@ static u32 p_lit_object(P *p) {
         for (;;) {
             Lex *lx = &p->lx;
             u32 key;
+            if (p_eat_punct(p, P_ELLIPSIS)) { /* オブジェクト spread: {...a, k: v} */
+                u32 s = p_expr(p);
+                if (s == N_NONE) goto fail;
+                u32 spn = p_node(p, N_SPREAD);
+                if (spn == N_NONE) goto fail;
+                p->nodes[spn].a = s;
+                if (p_scratch(p, &ks, UINT32_MAX) < 0 || p_scratch(p, &vs, spn) < 0) goto fail;
+                if (p_eat_punct(p, P_COMMA)) {
+                    if (p_is_punct(p, P_RC)) break; /* trailing comma 許容 */
+                    continue;
+                }
+                break;
+            }
             if (lx->kind == TK_IDENT || lx->kind == TK_KW || lx->kind == TK_STR) {
                 key = p_intern(p, lx->str_p, lx->str_len);
                 if (key == UINT32_MAX) goto fail;
@@ -3686,11 +3703,18 @@ static void cg_expr(Cg *cg, u32 ni) {
         break;
     }
     case N_OBJLIT: {
-        /* [obj] → (dup,val,PSTORE,POP)* の直線形。最後に obj が TOS に残る */
+        /* [obj] → (dup,val,PSTORE,POP)* の直線形。最後に obj が TOS に残る。
+         * 要素が N_SPREAD なら {...src} を OBJSPREAD でマージ（後勝ち） */
         cg_op(cg, OP_OBJNEW);
         for (u32 i = 0; i < n->c; i++) {
+            u32 ve = cg->p->list[n->b + i];
+            if (ve < cg->p->n_nodes && cg->p->nodes[ve].kind == N_SPREAD) {
+                cg_expr(cg, cg->p->nodes[ve].a);
+                cg_op(cg, OP_OBJSPREAD);
+                continue;
+            }
             cg_op(cg, OP_DUP);
-            cg_expr(cg, cg->p->list[n->b + i]);
+            cg_expr(cg, ve);
             cg_op(cg, OP_PSTORE);
             cg_u32(cg, cg->p->list[n->a + i]);
             cg_op(cg, OP_POP);
@@ -3710,19 +3734,37 @@ static void cg_expr(Cg *cg, u32 ni) {
         cg_u32(cg, n->c);
         break;
     case N_MCALL: {
-        cg_expr(cg, n->a);
+        cg_expr(cg, n->a); /* レシーバ（this）が先に積まれる */
         bool has_spread = false;
         for (u32 i = 0; i < n->c; i++)
             if (cg->p->nodes[cg->p->list[n->b + i]].kind == N_SPREAD) { has_spread = true; break; }
-        if (has_spread) { /* spread を含むメソッド呼び出しは非対応（明白拒否） */
-            akl_errf(cg->rt, "SyntaxError: spread in method call is not supported yet");
-            cg->fail = true;
-            break;
+        if (has_spread) {
+            /* レイアウト [obj][args...]。spread の個数を一時ローカルに累積し、
+             * OP_MCALLN が locals[slot] を argc として使う（関数呼び出し spread と同形） */
+            i32 t = cg_local_add(cg, 0xFFFFFFFEu - (u32)cg->tmp_seq++, 0);
+            if (t < 0) return;
+            cg_op(cg, OP_CONST_I); cg_u32(cg, 0);
+            cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)t);
+            for (u32 i = 0; i < n->c; i++) {
+                u32 el = cg->p->list[n->b + i];
+                if (cg->p->nodes[el].kind == N_SPREAD) {
+                    cg_expr(cg, cg->p->nodes[el].a);
+                    cg_op(cg, OP_ARRSPREADC); cg_u32(cg, (u32)t);
+                } else {
+                    cg_expr(cg, el);
+                    cg_op(cg, OP_LINC); cg_u32(cg, (u32)t); cg_u32(cg, 1);
+                }
+                if (cg->fail) return;
+            }
+            cg_op(cg, OP_MCALLN);
+            cg_u32(cg, (u32)t);
+            cg_u32(cg, n->d);
+        } else {
+            for (u32 i = 0; i < n->c; i++) cg_expr(cg, cg->p->list[n->b + i]);
+            cg_op(cg, OP_MCALL);
+            cg_push_byte(cg, (u8)(n->c & 0xFF));
+            cg_u32(cg, n->d);
         }
-        for (u32 i = 0; i < n->c; i++) cg_expr(cg, cg->p->list[n->b + i]);
-        cg_op(cg, OP_MCALL);
-        cg_push_byte(cg, (u8)(n->c & 0xFF));
-        cg_u32(cg, n->d);
         break;
     }
     case N_DESTR: {
@@ -3738,6 +3780,7 @@ static void cg_expr(Cg *cg, u32 ni) {
             cg_op(cg, OP_UNDEF_T);
             break; /* 右辺なし（var でない代入文では来ない） */
         }
+        u32 idx = 0; /* 配列要素の現在位置（rest 用） */
         for (u32 i = 0; i < n->c; i++) {
             u32 el = cg->p->list[n->a + i];
             u8 ek = cg->p->nodes[el].kind;
@@ -3781,14 +3824,32 @@ static void cg_expr(Cg *cg, u32 ni) {
                     cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
                     cg_op(cg, OP_CONST_I); cg_u32(cg, cg->p->nodes[el].b);
                     cg_op(cg, OP_AGET);
+                    idx = cg->p->nodes[el].b + 1;
                 }
                 if (!cg->fail) cg_store(cg, name, 0, true);
             } else if (ek == N_DSTR_REST) {
-                /* rest: 配列の残りを配列化（専用 opcode は未実装 — 簡易: 残りを
-                 * ループで集める。ここでは OP_ARRREST を新設せず明示拒否する） */
-                akl_errf(cg->rt, "SyntaxError: rest in destructuring is not supported yet");
-                cg->fail = true;
-                break;
+                u32 rname = cg->p->nodes[el].a;
+                if (cg->p->nodes[el].flags & 1) {
+                    /* オブジェクト rest: {a, ...rest} = obj → OBJREST で全コピー後、
+                     * この N_DESTR で既に取り出したキーを PDEL で除外 */
+                    cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
+                    cg_op(cg, OP_OBJREST);
+                    for (u32 j = 0; j < n->c; j++) {
+                        u32 oel = cg->p->list[n->a + j];
+                        if (cg->p->nodes[oel].kind != N_DSTR_EL) continue;
+                        if (cg->p->nodes[oel].flags & 2) continue; /* ネスト要素は除外不可（明示） */
+                        cg_op(cg, OP_DUP);
+                        cg_op(cg, OP_PDEL); cg_u32(cg, cg->p->nodes[oel].b);
+                        cg_op(cg, OP_POP);
+                    }
+                    if (!cg->fail) cg_store(cg, rname, 0, true);
+                } else {
+                    /* 配列 rest: [a, b, ...rest] = arr → 現在 index から末尾までを配列化 */
+                    cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
+                    cg_op(cg, OP_CONST_I); cg_u32(cg, idx); /* 現在位置 */
+                    cg_op(cg, OP_ARRREST);
+                    if (!cg->fail) cg_store(cg, rname, 0, true);
+                }
             }
         }
         break;
@@ -4965,6 +5026,8 @@ static u32 akl_op_imm_len(u8 op) {
         return 5;   /* fidx u32 | srcslot u8 */
     case OP_SUPERGET:
         return 4;
+    case OP_MCALLN:
+        return 8;   /* slot u32 | name u32 */
     case OP_ELOAD: case OP_ESTORE:
         return 4;
     case OP_PDEL:
@@ -8180,6 +8243,9 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
     u32 base = 0;
     bool dead = false; /* defense-in-depth: 下記 AKL_POP 下限突破で立つ（verifier 通過後は発火しない設計） */
     u64 budget = rt->insn_budget_def;
+    /* MCALL/MCALLN 共通化のための共有引数（goto をまたぐため関数先頭で確保） */
+    i32 mcall_argc = 0;
+    u32 mcall_name = 0;
 
 /* stk を top 要素数まで収容できるよう倍々で拡張（rt->stk と共有。AKL_STK_MAX で fail-fast） */
 #define AKL_GROW_TO(top) do { \
@@ -8294,6 +8360,10 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_CALLT] = &&l_CALLT,
         [OP_MAKEFS] = &&l_MAKEFS,
         [OP_SUPERGET] = &&l_SUPERGET,
+        [OP_OBJSPREAD] = &&l_OBJSPREAD,
+        [OP_MCALLN] = &&l_MCALLN,
+        [OP_ARRREST] = &&l_ARRREST,
+        [OP_OBJREST] = &&l_OBJREST,
         [OP_HALT] = &&l_HALT,
     };
 #define AKL_NEXT() do { if (dead) { free(frames); return false; } AKL_BUDGET(); goto *akl_jt[*pc++]; } while (0)
@@ -8921,9 +8991,23 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AKL_NEXT();
     }
     AKL_L(MCALL): {
-        u8 argc = *pc++;
-        u32 name;
-        memcpy(&name, pc, 4); pc += 4;
+        u8 argc8 = *pc++;
+        memcpy(&mcall_name, pc, 4); pc += 4;
+        mcall_argc = argc8;
+        goto mcall_common;
+    }
+    AKL_L(MCALLN): {
+        u32 slot;
+        memcpy(&slot, pc, 4); pc += 4;
+        memcpy(&mcall_name, pc, 4); pc += 4;
+        if (sp <= base + slot) { akl_errf(rt, "local OOB read"); free(frames); return false; }
+        mcall_argc = akl_get_int(stk[base + slot]);
+        if (mcall_argc < 0) mcall_argc = 0;
+        goto mcall_common;
+    }
+    mcall_common: {
+        i32 argc = mcall_argc;
+        u32 name = mcall_name;
         if (argc > 250 || sp < base + argc + 1) { akl_errf(rt, "stack underflow: mcall"); free(frames); return false; }
         AklVal ov = stk[sp - argc - 1];
         if (akl_is_objv(ov) && rt->objs[akl_get_obj(ov)].kind == AKL_OK_HANDLE) {
@@ -10351,6 +10435,79 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AKL_NEXT();
     }
 
+    AKL_L(OBJSPREAD): {
+        /* pop src → TOS の OBJ に全 props コピー（{...src, k: v} の後勝ちを保証）。
+         * src が OBJ 以外（undefined/null/primitive/ARR/STR）は無視（簡易近似。AKL_COMPAT）。 */
+        AklVal srcv = AKL_POP();
+        if (sp <= base) { akl_errf(rt, "stack underflow: objspread"); free(frames); return false; }
+        AklVal dstv = stk[sp - 1];
+        if (!akl_is_objv(srcv) || !akl_is_objv(dstv)) { AKL_NEXT(); }
+        AklObj *so = &rt->objs[akl_get_obj(srcv)];
+        AklObj *do2 = &rt->objs[akl_get_obj(dstv)];
+        if (so->kind != AKL_OK_OBJ || do2->kind != AKL_OK_OBJ) { AKL_NEXT(); }
+        for (u32 i = 0; i < so->u.po.n; i++) {
+            if (do2->u.po.n >= AKL_OBJ_MAX_PROPS) {
+                akl_errf(rt, "object property limit exceeded");
+                free(frames);
+                return false;
+            }
+            if (!obj_prop_set(rt, do2, so->u.po.props[i].name, so->u.po.props[i].v)) {
+                free(frames);
+                return false;
+            }
+        }
+        AKL_NEXT();
+    }
+    AKL_L(ARRREST): {
+        /* pop start, pop arr → 新規配列 [start..n)（配列分割の rest）。 */
+        AklVal sv = AKL_POP();
+        AklVal av = AKL_POP();
+        rt->gc_sp = sp;
+        u32 oi = akl_obj_new(rt);
+        if (oi == UINT32_MAX) { free(frames); return false; }
+        rt->objs[oi].kind = AKL_OK_ARR;
+        u32 cnt = 0;
+        if (akl_is_objv(av) && rt->objs[akl_get_obj(av)].kind == AKL_OK_ARR) {
+            AklObj *ao = &rt->objs[akl_get_obj(av)];
+            i32 st = akl_get_int(sv);
+            if (st < 0) st = 0;
+            if ((u32)st < ao->u.arr.n) {
+                cnt = ao->u.arr.n - (u32)st;
+                if (!akl_arr_grow(rt, &rt->objs[oi], cnt)) { free(frames); return false; }
+                memcpy(rt->objs[oi].u.arr.v, ao->u.arr.v + st, (u64)cnt * sizeof(AklVal));
+            }
+        }
+        rt->objs[oi].u.arr.n = cnt;
+        AKL_PUSH(AKL_MK_OBJ(oi));
+        AKL_NEXT();
+    }
+    AKL_L(OBJREST): {
+        /* pop src_obj → 新規 OBJ（全 props コピー）。オブジェクト分割の rest。
+         * 除外キーは呼出側が DUP;PDEL;POP で削除する。 */
+        AklVal srcv = AKL_POP();
+        rt->gc_sp = sp;
+        u32 oi = akl_obj_new(rt);
+        if (oi == UINT32_MAX) { free(frames); return false; }
+        rt->objs[oi].kind = AKL_OK_OBJ;
+        if (akl_is_objv(srcv) && rt->objs[akl_get_obj(srcv)].kind == AKL_OK_OBJ) {
+            AklObj *so = &rt->objs[akl_get_obj(srcv)];
+            AklObj *no = &rt->objs[oi];
+            for (u32 i = 0; i < so->u.po.n; i++) {
+                if (no->u.po.n >= AKL_OBJ_MAX_PROPS) {
+                    akl_errf(rt, "object property limit exceeded");
+                    free(frames);
+                    return false;
+                }
+                if (!obj_prop_set(rt, no, so->u.po.props[i].name, so->u.po.props[i].v)) {
+                    free(frames);
+                    return false;
+                }
+            }
+        }
+        AKL_PUSH(AKL_MK_OBJ(oi));
+        AKL_NEXT();
+    }
+
     AKL_L(NOP): { AKL_NEXT(); } /* CoJIT 埋め。通常到達不能、到達しても透過 */
 
     AKL_L(NEWREGEX): {
@@ -10705,6 +10862,10 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
             "CALLT",
             "MAKEFS",
             "SUPERGET",
+            "OBJSPREAD",
+            "MCALLN",
+            "ARRREST",
+            "OBJREST",
             "HALT"
         };
         fprintf(stderr, "--- main ---\n");
