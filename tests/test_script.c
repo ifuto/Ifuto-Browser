@@ -305,7 +305,37 @@ static void test_script_fields_length(void) {
     tscr_end(&t);
 }
 
+
+static void test_script_objlit_ext(void) {
+    TScr t;
+    tscr_begin(&t, "<!DOCTYPE html><title>X0</title><div id=a>start</div>"
+                   "<script>"
+                   "var cfg = {theme: 'dark', count: 0};"
+                   "cfg.count ||= 5;"
+                   "cfg.missing ?\?= 'default';"
+                   "var key = 'extra';"
+                   "cfg[key] = 42;"
+                   "var math = { value: 10, get double() { return this.value * 2; }, set double(v) { this.value = v / 2; } };"
+                   "math.double = 20;"
+                   "console.log('ol1', cfg.theme + cfg.count + cfg.missing);"
+                   "console.log('ol2', cfg.extra);"
+                   "console.log('ol3', math.double + ':' + math.value);"
+                   "document.getElementById('a').textContent = cfg.count + ':' + math.double;"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
+    CHECK(strstr(t.logbuf, "[script:console] ol1 dark5default\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] ol2 42\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] ol3 20:10\n") != NULL);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    CHECK(d != NULL);
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 4 && memcmp(txt.p, "5:20", 4) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
+    test_script_objlit_ext();
     test_script_fields_length();
     test_script_spread_rest();
     test_script_class_extends();
