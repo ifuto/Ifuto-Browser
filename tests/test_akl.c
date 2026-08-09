@@ -883,6 +883,7 @@ static void t_v04_regex(void);
 static void t_v04_class_extends(void);
 static void t_v04_spread_rest(void);
 static void t_v04_builtins2(void);
+static void t_v04_fields_len(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -932,6 +933,8 @@ void test_akl(void) {
     t_v04_spread_rest();
     fprintf(stderr, "  %-40s", "t_v04_builtins2");
     t_v04_builtins2();
+    fprintf(stderr, "  %-40s", "t_v04_fields_len");
+    t_v04_fields_len();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1554,4 +1557,31 @@ static void t_v04_builtins2(void) {
     want_bool("Boolean([])", true);
     /* 動的キー参照 */
     want_num("var o = {a: 1, b: 2}; var k = Object.keys(o); k.length + o[k[0]]", 3);
+}
+
+/* ================= v0.4: class フィールド宣言 / 配列 length 代入 ================= */
+static void t_v04_fields_len(void) {
+    /* class フィールド（instance field） */
+    want_num("class A { x = 1; } var a = new A(); a.x", 1);
+    want_num("class A { x = 1; y = 2; } var a = new A(); a.x + a.y", 3);
+    want_num("class A { x = 10; get() { return this.x * 2; } } var a = new A(); a.get()", 20);
+    want_str("class A { name = 'taro'; greet() { return 'hi ' + this.name; } } new A().greet()", "hi taro");
+    want_num("class A { x = 1; } class B extends A { y = 2; } var b = new B(); b.x + b.y", 3);
+    want_num("class A { constructor(v) { this.v = v; } } class B extends A { w = 3; constructor(v) { super(v); } } var b = new B(9); b.v + b.w", 12);
+    want_num("class A { x; } var a = new A(); a.x == undefined ? 1 : 0", 1);
+    want_num("class A { count = 0; inc() { this.count++; return this.count; } } var a = new A(); a.inc(); a.inc(); a.count", 2);
+    want_num("class A { n = 5; } var a = new A(); var b = new A(); b.n = 9; a.n + b.n", 14);
+    want_num("class A { x = 1; } var a = new A(); delete a.x; a.x == undefined ? 1 : 0", 1);
+    want_num("class A { x = 1; } class B extends A { x = 2; } var b = new B(); b.x", 2);
+    want_num("class A { m() { return 1; } } class B extends A { w = 3; } var b = new B(); b.m() + b.w", 4);
+    want_err("class A { static x = 1; }", "static class fields");
+    want_err("class A { static constructor() {} }", "static constructor");
+    /* 配列 length 代入（切り詰め / undefined 拡張） */
+    want_num("var a = [1,2,3,4,5]; a.length = 2; a.length + a[0] + a[1]", 5);
+    want_num("var a = [1]; a.length = 3; a.length + (a[2] == undefined ? 1 : 0)", 4);
+    want_num("var a = []; a.length = 0; a.length", 0);
+    want_num("var a = [1,2,3]; a.length = 0; a.length + (a[1] == undefined ? 1 : 0)", 1);
+    want_num("var a = [1,2,3]; a.length = 1; a[1] == undefined ? 1 : 0", 1);
+    want_num("var a = [1,2]; a.length = 5; a[4] == undefined ? 1 : 0", 1);
+    want_num("var a = [1,2,3]; a.length = 2; a.push(9); a.length + a[2]", 12);
 }

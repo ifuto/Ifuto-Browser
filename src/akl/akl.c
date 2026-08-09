@@ -2390,6 +2390,7 @@ static u32 p_stmt(P *p) {
         }
         if (!p_expect_punct(p, P_LC, "expected '{' after class name")) goto out;
         U32Vec mb = { NULL, 0, 0 };
+        U32Vec flds = { NULL, 0, 0 };
         while (!p_is_punct(p, P_RC) && p->lx.kind != TK_EOF) {
             bool is_static = false;
             if (p_is_kw(p, KW_STATIC)) { is_static = true; lex_next(&p->lx); }
@@ -2397,12 +2398,45 @@ static u32 p_stmt(P *p) {
             bool is_ctor = false;
             if (p->lx.kind == TK_IDENT || p->lx.kind == TK_KW) {
                 if (p->lx.kind == TK_IDENT && p->lx.str_len == 11 &&
-                    memcmp(p->lx.str_p, "constructor", 11) == 0 && !is_static) is_ctor = true;
+                    memcmp(p->lx.str_p, "constructor", 11) == 0) is_ctor = true;
                 mname = p_intern(p, p->lx.str_p, p->lx.str_len);
                 if (mname == UINT32_MAX) { free(mb.v); goto out; }
                 lex_next(&p->lx);
             } else { p->fail = "expected method name"; free(mb.v); goto out; }
-            if (!p_expect_punct(p, P_LP, "expected '('")) { free(mb.v); goto out; }
+            if (is_static && is_ctor) {
+                p->fail = "static constructor is not supported (would shadow class constructor)";
+                free(mb.v);
+                goto out;
+            }
+            if (!p_is_punct(p, P_LP)) {
+                /* フィールド宣言: name [= expr] [;]（instance field）。
+                 * constructor の先頭で this.name = expr を実行する文に変換する。 */
+                if (is_static) {
+                    p->fail = "static class fields are not supported yet";
+                    free(mb.v);
+                    goto out;
+                }
+                u32 fexpr = N_NONE;
+                if (p_eat_punct(p, P_ASSIGN)) {
+                    fexpr = p_expr(p);
+                    if (fexpr == N_NONE) { free(mb.v); goto out; }
+                } else {
+                    fexpr = p_node(p, N_UNDEF);
+                    if (fexpr == N_NONE) { free(mb.v); goto out; }
+                }
+                u32 th = p_node(p, N_THIS);
+                u32 ps = p_node(p, N_PSET);
+                u32 es = p_node(p, N_EXPRSTMT);
+                if (th == N_NONE || ps == N_NONE || es == N_NONE) { free(mb.v); goto out; }
+                p->nodes[ps].a = th;
+                p->nodes[ps].b = fexpr;
+                p->nodes[ps].c = mname;
+                p->nodes[es].a = ps;
+                if (p_scratch(p, &flds, es) < 0) { free(mb.v); goto out; }
+                p_eat_punct(p, P_SEMI);
+                continue;
+            }
+            lex_next(&p->lx); /* '(' */
             u32 pf = 0, pc2 = 0;
             p_params(p, &pf, &pc2);
             if (p->fail) { free(mb.v); goto out; }
@@ -2418,7 +2452,7 @@ static u32 p_stmt(P *p) {
             p->nodes[cm].c = pc2;
             p->nodes[cm].d = body;
             if (is_static) p->nodes[cm].flags |= 1;
-            if (is_ctor) p->nodes[cm].flags |= 2;
+            if (is_ctor && !is_static) p->nodes[cm].flags |= 2;
             if (p_scratch(p, &mb, cm) < 0) { free(mb.v); goto out; }
             /* メソッド間のセミコロンは任意 */
             p_eat_punct(p, P_SEMI);
@@ -2428,32 +2462,75 @@ static u32 p_stmt(P *p) {
          * することで capture 解析 an_walk の対象になる。cg 時生成だと needs_cap が
          * 解析されず super 環境が壊れる — 実測で特定）。
          * extends あり: body = super()（JS では派生クラスの ctor は super 必須）。
-         * extends なし: body 空（new は this を返す）。 */
+         * フィールド文（flds）は constructor body の先頭に挿入する（super() の後）。 */
         {
             bool has_ctor = false;
             for (u32 i = 0; i < mb.n; i++)
                 if ((p->nodes[mb.v[i]].flags & 2) != 0) { has_ctor = true; break; }
             if (!has_ctor) {
                 u32 cm = p_node(p, N_CLASSMETH);
-                if (cm == N_NONE) { free(mb.v); goto out; }
+                if (cm == N_NONE) { free(mb.v); free(flds.v); goto out; }
                 p->nodes[cm].a = p_intern(p, (const u8 *)"constructor", 11);
                 p->nodes[cm].b = N_NONE;
                 p->nodes[cm].c = 0;
                 p->nodes[cm].flags = 2;
-                if (parent != N_NONE) {
-                    u32 sc = p_node(p, N_SUPERCALL);
-                    u32 es = p_node(p, N_EXPRSTMT);
-                    if (sc == N_NONE || es == N_NONE) { free(mb.v); goto out; }
-                    p->nodes[sc].b = N_NONE;
-                    p->nodes[sc].c = 0;
-                    p->nodes[es].a = sc;
-                    p->nodes[cm].d = es;
+                u32 nstmts = flds.n + (parent != N_NONE ? 1u : 0u);
+                if (nstmts > 0) {
+                    u32 *stmts = (u32 *)malloc((u64)nstmts * sizeof(u32));
+                    if (!stmts) { p->fail = "oom: class fields"; free(mb.v); free(flds.v); goto out; }
+                    u32 w = 0;
+                    if (parent != N_NONE) {
+                        u32 sc = p_node(p, N_SUPERCALL);
+                        u32 es = p_node(p, N_EXPRSTMT);
+                        if (sc == N_NONE || es == N_NONE) { free(stmts); free(mb.v); free(flds.v); goto out; }
+                        p->nodes[sc].b = N_NONE;
+                        p->nodes[sc].c = 0;
+                        p->nodes[es].a = sc;
+                        stmts[w++] = es;
+                    }
+                    for (u32 i = 0; i < flds.n; i++) stmts[w++] = flds.v[i];
+                    U32Vec tmp = { NULL, 0, 0 };
+                    for (u32 i = 0; i < nstmts; i++) {
+                        if (p_scratch(p, &tmp, stmts[i]) < 0) { free(stmts); free(tmp.v); free(mb.v); free(flds.v); goto out; }
+                    }
+                    u32 bfirst = p_list_commit(p, &tmp);
+                    free(tmp.v);
+                    free(stmts);
+                    if (bfirst == N_NONE) { free(mb.v); free(flds.v); goto out; }
+                    u32 body = p_node(p, N_BLOCK);
+                    if (body == N_NONE) { free(mb.v); free(flds.v); goto out; }
+                    p->nodes[body].a = bfirst;
+                    p->nodes[body].c = nstmts;
+                    p->nodes[cm].d = body;
                 } else {
                     p->nodes[cm].d = N_NONE;
                 }
-                if (p_scratch(p, &mb, cm) < 0) { free(mb.v); goto out; }
+                if (p_scratch(p, &mb, cm) < 0) { free(mb.v); free(flds.v); goto out; }
+            } else if (flds.n > 0) {
+                /* 既存 constructor の body 末尾にフィールド文を追加（list 領域の直後） */
+                u32 ctor = UINT32_MAX;
+                for (u32 i = 0; i < mb.n; i++)
+                    if ((p->nodes[mb.v[i]].flags & 2) != 0) { ctor = mb.v[i]; break; }
+                u32 bd = p->nodes[ctor].d;
+                if (bd == N_NONE || p->nodes[bd].kind != N_BLOCK) {
+                    p->fail = "constructor body must be a block for fields";
+                    free(mb.v);
+                    free(flds.v);
+                    goto out;
+                }
+                if (p->nodes[bd].a + p->nodes[bd].c != p->n_list) {
+                    p->fail = "internal: block region not contiguous";
+                    free(mb.v);
+                    free(flds.v);
+                    goto out;
+                }
+                for (u32 i = 0; i < flds.n; i++) {
+                    if (p_list_push(p, flds.v[i]) == N_NONE) { free(mb.v); free(flds.v); goto out; }
+                }
+                p->nodes[bd].c += flds.n;
             }
         }
+        free(flds.v);
         u32 mfirst = p_list_commit(p, &mb);
         u32 mcnt = mb.n;
         free(mb.v);
@@ -9163,6 +9240,30 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                     oo->u.rex.last_index = (i32)d;
                 }
                 /* その他のプロパティ代入は静かに無視（独自プロパティ非対応。AKL_COMPAT） */
+                AKL_PUSH(v);
+                AKL_NEXT();
+            }
+            if (oo->kind == AKL_OK_ARR) {
+                u32 nl;
+                const u8 *nb = akl_str(rt, name, &nl);
+                if (!nb) { free(frames); return false; }
+                if (nl == 6 && memcmp(nb, "length", 6) == 0) {
+                    /* arr.length = n: 切り詰め / undefined で拡張（JS 準拠） */
+                    double d = akl_to_integer(rt, v);
+                    if (rt->err[0]) { free(frames); return false; }
+                    if (d < 0 || isnan(d)) { akl_errf(rt, "RangeError: invalid array length"); free(frames); return false; }
+                    u32 n = (u32)d;
+                    if (n < oo->u.arr.n) {
+                        oo->u.arr.n = n; /* 切り詰め（要素は残骸。GC mark 範囲は n のみ） */
+                    } else if (n > oo->u.arr.n) {
+                        if (!akl_arr_grow(rt, oo, n)) { free(frames); return false; }
+                        for (u32 i = oo->u.arr.n; i < n; i++) oo->u.arr.v[i] = AKL_VAL_UNDEF;
+                        oo->u.arr.n = n;
+                    }
+                    AKL_PUSH(v);
+                    AKL_NEXT();
+                }
+                /* 他のプロパティ代入は静かに無視（名前付きプロパティ非対応。AKL_COMPAT） */
                 AKL_PUSH(v);
                 AKL_NEXT();
             }
