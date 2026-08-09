@@ -63,6 +63,11 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | メソッド呼び出し spread `o.m(...args)`（通常引数と混在可） | `o.f(10, ...[2, 3])` | `5` |
 | 配列 rest `[a, b, ...rest] = arr` | `[1,2,3,4]` から | `a=1, b=2, rest=[3,4]` |
 | オブジェクト rest `var {a, ...rest} = o`（取り出したキーを除外） | `var {b, ...rest} = o` | `rest` は b 以外 |
+| `Object.keys` / `Object.values` / `Object.entries` | `Object.keys({a:1,b:2}).join(',')` | `a,b` |
+| `Object.assign(tgt, ...srcs)`（後勝ち・null/undefined 無視） | `Object.assign({}, {a:1}, {b:2,a:9})` | `{a:9, b:2}` |
+| `Object.create(proto)`（prototype 連鎖は非対応） | `Object.create(null)` | 新規オブジェクト |
+| `Array.isArray(x)` | `Array.isArray([1])` | `true` |
+| `String(x)` / `Number(x)` / `Boolean(x)`（呼び出し変換） | `String(42)` / `Number('3.5')` / `Boolean('x')` | `"42"` / `3.5` / `true` |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
 `-1/0 = -Infinity`、`NaN !== NaN`（IEEE 754/JIS X 3010 相当の double 厳密）、
@@ -83,9 +88,11 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | RegExp 独自プロパティ（`re.x = 1`） | 代入は無視（lastIndex のみ更新可） |
 | 式文のオブジェクト分割代入 `({a} = o)` | 非対応（`var {a} = o` の宣言形式は対応済み。`(` で括るとオブジェクトリテラルと解釈され `expected ':'`） |
 | `{...primitive}` のプリミティブ列挙 | 無視（undefined/null は JS 同様無視。number/string はコピーしない） |
-| `String()` / `Number()` コンストラクタ・`Object.keys` 等 | ReferenceError |
+| `new String(x)` / `new Number(x)` / `new Boolean(x)` のラッパーオブジェクト | 空オブジェクトを返す（値は変換関数と同じ。length 等は undefined） |
+| `Object.getPrototypeOf` / `Object.defineProperty` / `Object.freeze` 等 | `TypeError: not a function` |
 | ~~高階関数 `[1,2].map(f)` / `forEach` / `filter`~~ | ✅ v0.3: `map`/`filter`/`forEach`/`some`/`every`/`find`/`findIndex`/`reduce`（VM 再入 akl_call 経由。コールバック fn(elem, idx, arr)、reduce は fn(acc, elem, idx, arr)） |
-| `String()` / `Number()` コンストラクタ・`Object.keys` 等 | ReferenceError |
+| `new String(x)` / `new Number(x)` / `new Boolean(x)` のラッパーオブジェクト | 空オブジェクトを返す（値は変換関数と同じ。length 等は undefined） |
+| `Object.getPrototypeOf` / `Object.defineProperty` / `Object.freeze` 等 | `TypeError: not a function` |
 | `s.length` の代入・配列の `length` 代入 | 無視（length は読み取り専用） |
 | 文字列メソッドの一部（`padStart`/`padEnd`/`localeCompare`/`charAt` 越え等） | `TypeError: not a function` |
 | `JSON` の第 2 引数（replacer/reviver） | 無視（第 1 引数のみ処理） |
@@ -105,7 +112,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 11. ✅ 正規表現（2026-08-09: リテラル/RegExp グローバル/test/exec/match/search/replace/split。エンジンは別ファイル akl_regex.c、バックトラッキング VM + ステップ有界化）
 12. ✅ class extends / super（2026-08-09: OP_MAKEFS で親クラスを関数 env にバインド、OP_SUPERGET/OP_CALLT で解決。継承コピーは __super チェーンを親→子順に。合成 ctor は extends 時 super() 自動呼び出し）
 13. ✅ オブジェクト spread・メソッド呼び出し spread・分割代入 rest（2026-08-09: OP_OBJSPREAD/OP_MCALLN/OP_ARRREST/OP_OBJREST を新設。4 点同期: enum/imm_len/jumptable/ハンドラ）
-14. async/await（コルーチン基盤の設計が必要）
+14. ✅ Object/Array グローバル・String/Number/Boolean コンストラクタ（2026-08-09: keys/values/entries/assign/create/isArray + 呼び出し変換）
+15. async/await（コルーチン基盤の設計が必要）
 
 ## V8 との位置づけ
 

@@ -882,6 +882,7 @@ static void t_v03_syntax3(void);
 static void t_v04_regex(void);
 static void t_v04_class_extends(void);
 static void t_v04_spread_rest(void);
+static void t_v04_builtins2(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -929,6 +930,8 @@ void test_akl(void) {
     t_v04_class_extends();
     fprintf(stderr, "  %-40s", "t_v04_spread_rest");
     t_v04_spread_rest();
+    fprintf(stderr, "  %-40s", "t_v04_builtins2");
+    t_v04_builtins2();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1517,4 +1520,38 @@ static void t_v04_spread_rest(void) {
     want_num("var o = {a: 1, b: 2, c: 3}; var rest; var {b, ...rest} = o; rest.a + rest.c", 4);
     want_num("var o = {a: 1, b: 2}; var rest; var {...rest} = o; rest.a + rest.b", 3);
     want_num("var o = {a: 1, b: 2, cc: 3}; var rest; var {a, cc, ...rest} = o; rest.b", 2);
+}
+
+/* ================= v0.4: Object / Array / String / Number / Boolean 組込 ================= */
+static void t_v04_builtins2(void) {
+    /* Object.keys / values / entries */
+    want_str("Object.keys({a: 1, b: 2}).join(',')", "a,b");
+    want_num("Object.keys({}).length", 0);
+    want_str("Object.values({a: 1, b: 2}).join(',')", "1,2");
+    want_num("var e = Object.entries({x: 5, y: 6}); e.length + e[0][1] + e[1][1]", 13);
+    want_str("Object.entries({p: 7})[0][0]", "p");
+    /* Object.assign */
+    want_num("var t = {}; Object.assign(t, {a: 1}, {b: 2, a: 9}); t.a + t.b", 11);
+    want_num("var t = {z: 0}; Object.assign(t, null, {z: 3}); t.z", 3);
+    /* Object.create（prototype 連鎖は非対応。オブジェクト/ null を返す） */
+    want_num("Object.create(null) ? 1 : 0", 1);
+    want_num("var p = {m: 1}; var o = Object.create(p); (o ? 1 : 0)", 1);
+    /* Array.isArray */
+    want_bool("Array.isArray([1,2])", true);
+    want_bool("Array.isArray({})", false);
+    want_bool("Array.isArray('x')", false);
+    /* String / Number / Boolean コンストラクタ */
+    want_str("String(42) + '!'", "42!");
+    want_str("String(true)", "true");
+    want_str("String(undefined)", "undefined");
+    want_str("String(null)", "null");
+    want_num("Number('3.5') * 2", 7);
+    want_num("Number('abc') != Number('abc') ? 1 : 0", 1);
+    want_num("Number(false)", 0);
+    want_num("Number()", 0);
+    want_bool("Boolean(0)", false);
+    want_bool("Boolean('x')", true);
+    want_bool("Boolean([])", true);
+    /* 動的キー参照 */
+    want_num("var o = {a: 1, b: 2}; var k = Object.keys(o); k.length + o[k[0]]", 3);
 }
