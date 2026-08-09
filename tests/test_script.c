@@ -250,7 +250,38 @@ static void test_script_class_extends(void) {
     tscr_end(&t);
 }
 
+
+static void test_script_spread_rest(void) {
+    TScr t;
+    tscr_begin(&t, "<!DOCTYPE html><title>S0</title><div id=a>start</div>"
+                   "<script>"
+                   "var base = {w: 100, h: 50};"
+                   "var opts = {...base, h: 60};"
+                   "console.log('sp1', opts.w + opts.h);"
+                   "var o = {sum: function(a, b, c) { return a + b + c; }};"
+                   "var args = [1, 2];"
+                   "console.log('sp2', o.sum(...args, 3));"
+                   "var rest;"
+                   "[rest] = [9, 8, 7];"
+                   "var rest2;"
+                   "var {first, ...rest2} = {first: 1, second: 2, third: 3};"
+                   "console.log('sp3', rest2.second + rest2.third);"
+                   "document.getElementById('a').textContent = rest + ':' + first;"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
+    CHECK(strstr(t.logbuf, "[script:console] sp1 160\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] sp2 6\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] sp3 5\n") != NULL);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    CHECK(d != NULL);
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 3 && memcmp(txt.p, "9:1", 3) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
+    test_script_spread_rest();
     test_script_class_extends();
     test_script_regex();
     test_script_mutation();
