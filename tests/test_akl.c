@@ -880,6 +880,7 @@ static void t_v03_hof(void);
 static void t_v03_syntax2(void);
 static void t_v03_syntax3(void);
 static void t_v04_regex(void);
+static void t_v04_class_extends(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -923,6 +924,8 @@ void test_akl(void) {
     t_v03_syntax3();
     fprintf(stderr, "  %-40s", "t_v04_regex");
     t_v04_regex();
+    fprintf(stderr, "  %-40s", "t_v04_class_extends");
+    t_v04_class_extends();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1453,4 +1456,33 @@ static void t_v04_regex(void) {
     want_str("'hello'.match('l+')[0]", "ll");
     want_num("'hello'.search('l')", 2);
     want_num("'a,b'.split('a').length", 2);
+}
+
+/* ================= v0.4: class extends / super ================= */
+static void t_v04_class_extends(void) {
+    /* 継承とメソッドコピー */
+    want_str("class A { hi() { return 'A'; } } class B extends A { } var b = new B(); b.hi()", "A");
+    want_num("class A { m() { return 5; } } class B extends A { m() { return 6; } } new B().m()", 6);
+    want_str("class A { m() { return 'base'; } } class B extends A { m() { return 'B:' + super.m(); } } class C extends B { } var cx = new C(); cx.m()", "B:base");
+    /* super コンストラクタ */
+    want_num("class A { constructor(x) { this.x = x; } get() { return this.x; } } class B extends A { constructor(x) { super(x + 1); } } var b = new B(41); b.get()", 42);
+    want_num("class A { constructor() { this.n = 1; } } class B extends A { constructor() { super(); this.n++; } } var b = new B(); b.n", 2);
+    want_num("class A { constructor() { this.n = 10; } } class B extends A { } var b = new B(); b.n", 10);
+    /* super メソッド呼び出し */
+    want_num("class A { m() { return 1; } } class B extends A { m() { return super.m() + 1; } } var b = new B(); b.m()", 2);
+    want_str("class A { greet() { return 'hi'; } } class B extends A { greet() { return super.greet() + '!'; } } new B().greet()", "hi!");
+    want_num("class A { v() { return 10; } } class B extends A { v() { return super.v() * 2; } } class C extends B { v() { return super.v() + 1; } } new C().v()", 21);
+    want_num("class A { constructor() { this.c = 0; } inc() { this.c++; return this.c; } } class B extends A { inc() { super.inc(); return super.inc(); } } new B().inc()", 2);
+    /* super チェーン + インスタンス状態 */
+    want_num("class A { constructor() { this.v = []; } add(x) { this.v.push(x); return this; } } class B extends A { add(x) { super.add(x * 2); return this; } } var b = new B(); b.add(3).add(4); b.v[0] + b.v[1]", 14);
+    /* static 継承 */
+    want_num("class A { static s() { return 7; } } class B extends A { } B.s()", 7);
+    /* 3 段継承 + 引数伝播 */
+    want_num("class Shape { constructor(w, h) { this.w = w; this.h = h; } area() { return this.w * this.h; } } class Rect extends Shape { constructor(w, h) { super(w, h); } } class Square extends Rect { constructor(s) { super(s, s); } } var sq = new Square(5); sq.area()", 25);
+    /* クロージャ + 継承の共存 */
+    want_num("var x = 99; class A { m() { return x; } } class B extends A { } new B().m()", 99);
+    want_num("class A { m() { return 5; } } class B extends A { n() { return super.m() * 3; } } new B().n()", 15);
+    /* エラー: super はクラス外で使えない */
+    want_err("super.m()", "super");
+    want_err("class A { m() { return 1; } } class B { m() { return super.m(); } } new B().m()", "super");
 }

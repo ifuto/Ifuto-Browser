@@ -210,6 +210,9 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_INSTANCEOF,          /* pop obj, pop f → push (obj は f のインスタンスか) */
     OP_NEW,                 /* argc u8 : new 呼び出し（this=新 OBJ、戻りが obj でなければ this） */
     OP_NEWREGEX,            /* pat STR idx u32 | flags u32 : RegExp オブジェクト生成 */
+    OP_CALLT,               /* argc u8 : [this][fn][args...] を this で呼ぶ（super 用） */
+    OP_MAKEFS,              /* fidx u32 | srcslot u8 : [親][fn] → fn の env 先頭に親をバインド */
+    OP_SUPERGET,            /* name u32 : 親クラス（関数 env の vals[0]）の name を push */
     OP_HALT,
     OP_COUNT
 };
@@ -470,6 +473,36 @@ static u32 akl_gc(AklRT *rt) {
     u64 nobj = (u64)nobjs_live * 2 + 1024;
     rt->gc_next_objs = nobj > rt->max_objs ? rt->max_objs : (u32)nobj;
     return got;
+}
+
+static i32 obj_prop_find(const AklObj *o, u32 name);
+static const u8 *akl_str(AklRT *rt, u32 idx, u32 *len);
+static bool obj_prop_set(AklRT *rt, AklObj *o, u32 name, AklVal v);
+/* クラス継承のメソッドコピー: __super チェーンを親 → 子の順で辿り、constructor 以外の
+ * メソッド/static をインスタンスにコピーする（子が親を上書き）。深さ制限 64。 */
+static bool akl_new_copy_chain(AklRT *rt, AklObj *cls, AklObj *inst, u32 sup_name, u32 depth) {
+    if (depth >= 64 || cls->kind != AKL_OK_OBJ) return true;
+    i32 pi = obj_prop_find(cls, sup_name);
+    if (pi >= 0) {
+        AklVal pv = cls->u.po.props[pi].v;
+        if (akl_is_objv(pv)) {
+            AklObj *po = &rt->objs[akl_get_obj(pv)];
+            if (po->kind == AKL_OK_OBJ) {
+                if (!akl_new_copy_chain(rt, po, inst, sup_name, depth + 1)) return false;
+            }
+        }
+    }
+    for (u32 i = 0; i < cls->u.po.n; i++) {
+        u32 pname = cls->u.po.props[i].name;
+        if (pname == sup_name) continue;
+        u32 kl;
+        const u8 *kp = akl_str(rt, pname, &kl);
+        if (rt->err[0]) return false;
+        if (kl == 11 && memcmp(kp, "constructor", 11) == 0) continue;
+        if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = pname;
+        if (!obj_prop_set(rt, inst, pname, cls->u.po.props[i].v)) return false;
+    }
+    return true;
 }
 
 /* obj_new 直後に後続処理が失敗したときの巻き戻し。
@@ -1062,6 +1095,10 @@ enum {
     N_CASE,     /* a=expr（N_NONE=default）, b=body stmt */
     N_FUNCEXPR, /* 関数式: N_FUNC と同形（d=body）。a=name idx（無名は UINT32_MAX） */
     N_REGEX,    /* 正規表現リテラル: a=pattern STR idx, b=flags（AKL_RX_F_*） */
+    N_SUPER,    /* super: 疑似識別子（親クラスオブジェクト = SUPER_NAME ローカル） */
+    N_SUPERGET, /* super.name: b=name STR idx */
+    N_SUPERMCALL, /* super.name(...): b=name, c=args first, d=argc */
+    N_SUPERCALL,  /* super(...): b=args first, c=argc（親 constructor を this で） */
     N_NONE = 0xFFFFFFFFu
 };
 
@@ -1089,6 +1126,9 @@ typedef struct {
     u32 depth;
     const char *fail;                    /* 構文エラーの原因（短い固定文） */
     char fail_buf[128];                  /* 詳細メッセージ用（regex 等） */
+    u32 super_ctx;                       /* class メソッド body のパース中 > 0（super 許可） */
+    u32 super_name;                      /* 親クラス保持ローカルの疑似名（intern id） */
+    u32 super_prop;                      /* クラスオブジェクトの親参照プロパティ名（intern id） */
 } P;
 
 static u32 p_node(P *p, u8 kind) {
@@ -1594,6 +1634,40 @@ static u32 p_primary(P *p) {
         if (ni != N_NONE) ni = p_postfix(p, ni);
         p->depth--;
         return ni;
+    }
+    if (p_is_kw(p, KW_SUPER)) {
+        /* super は class メソッド body 内のみ（p_class が super_ctx を立てる） */
+        lex_next(&p->lx);
+        if (!p->super_ctx) { p->fail = "super is not allowed here"; p->depth--; return N_NONE; }
+        if (p_is_punct(p, P_LP)) { /* super(...) 親 constructor を this で呼ぶ */
+            u32 af, ac;
+            if (!p_args(p, &af, &ac)) { p->depth--; return N_NONE; }
+            u32 ni = p_node(p, N_SUPERCALL);
+            if (ni != N_NONE) { p->nodes[ni].b = af; p->nodes[ni].c = ac; }
+            p->depth--;
+            return ni;
+        }
+        if (p_eat_punct(p, P_DOT)) {
+            if (p->lx.kind != TK_IDENT) { p->fail = "expected property name after super"; p->depth--; return N_NONE; }
+            u32 name = p_intern(p, p->lx.str_p, p->lx.str_len);
+            if (name == UINT32_MAX) { p->depth--; return N_NONE; }
+            lex_next(&p->lx);
+            if (p_is_punct(p, P_LP)) { /* super.m(...) */
+                u32 af, ac;
+                if (!p_args(p, &af, &ac)) { p->depth--; return N_NONE; }
+                u32 ni = p_node(p, N_SUPERMCALL);
+                if (ni != N_NONE) { p->nodes[ni].b = name; p->nodes[ni].c = af; p->nodes[ni].d = ac; }
+                p->depth--;
+                return ni;
+            }
+            u32 ni = p_node(p, N_SUPERGET);
+            if (ni != N_NONE) p->nodes[ni].b = name;
+            p->depth--;
+            return ni;
+        }
+        p->fail = "expected '(' or '.' after super";
+        p->depth--;
+        return N_NONE;
     }
     if (p_is_kw(p, KW_NEW)) { /* new 演算子: new F(args) / new F().m() */
         lex_next(&p->lx);
@@ -2291,10 +2365,11 @@ static u32 p_stmt(P *p) {
         u32 name = p_intern(p, p->lx.str_p, p->lx.str_len);
         if (name == UINT32_MAX) goto out;
         lex_next(&p->lx);
+        u32 parent = N_NONE;
         if (p_is_kw(p, KW_EXTENDS)) {
-            /* extends は v0.4 対応予定 — 今は明白拒否（クラス本体より前に来る） */
-            p->fail = "class extends is not supported yet";
-            goto out;
+            lex_next(&p->lx);
+            parent = p_expr(p); /* extends 式（class 本体の { は式の続きでない） */
+            if (parent == N_NONE) goto out;
         }
         if (!p_expect_punct(p, P_LC, "expected '{' after class name")) goto out;
         U32Vec mb = { NULL, 0, 0 };
@@ -2315,7 +2390,9 @@ static u32 p_stmt(P *p) {
             p_params(p, &pf, &pc2);
             if (p->fail) { free(mb.v); goto out; }
             if (!p_expect_punct(p, P_LC, "expected '{'")) { free(mb.v); goto out; }
+            if (parent != N_NONE) p->super_ctx++;
             u32 body = p_block_tail(p);
+            if (parent != N_NONE) p->super_ctx--;
             if (body == N_NONE) { free(mb.v); goto out; }
             u32 cm = p_node(p, N_CLASSMETH);
             if (cm == N_NONE) { free(mb.v); goto out; }
@@ -2330,11 +2407,46 @@ static u32 p_stmt(P *p) {
             p_eat_punct(p, P_SEMI);
         }
         if (!p_expect_punct(p, P_RC, "expected '}' after class")) { free(mb.v); goto out; }
+        /* constructor が無い場合、合成コンストラクタをここで追加する（パース時に生成
+         * することで capture 解析 an_walk の対象になる。cg 時生成だと needs_cap が
+         * 解析されず super 環境が壊れる — 実測で特定）。
+         * extends あり: body = super()（JS では派生クラスの ctor は super 必須）。
+         * extends なし: body 空（new は this を返す）。 */
+        {
+            bool has_ctor = false;
+            for (u32 i = 0; i < mb.n; i++)
+                if ((p->nodes[mb.v[i]].flags & 2) != 0) { has_ctor = true; break; }
+            if (!has_ctor) {
+                u32 cm = p_node(p, N_CLASSMETH);
+                if (cm == N_NONE) { free(mb.v); goto out; }
+                p->nodes[cm].a = p_intern(p, (const u8 *)"constructor", 11);
+                p->nodes[cm].b = N_NONE;
+                p->nodes[cm].c = 0;
+                p->nodes[cm].flags = 2;
+                if (parent != N_NONE) {
+                    u32 sc = p_node(p, N_SUPERCALL);
+                    u32 es = p_node(p, N_EXPRSTMT);
+                    if (sc == N_NONE || es == N_NONE) { free(mb.v); goto out; }
+                    p->nodes[sc].b = N_NONE;
+                    p->nodes[sc].c = 0;
+                    p->nodes[es].a = sc;
+                    p->nodes[cm].d = es;
+                } else {
+                    p->nodes[cm].d = N_NONE;
+                }
+                if (p_scratch(p, &mb, cm) < 0) { free(mb.v); goto out; }
+            }
+        }
         u32 mfirst = p_list_commit(p, &mb);
         u32 mcnt = mb.n;
         free(mb.v);
         ni = (mcnt && mfirst == N_NONE) ? N_NONE : p_node(p, N_CLASS);
-        if (ni != N_NONE) { p->nodes[ni].a = name; p->nodes[ni].b = mfirst; p->nodes[ni].c = mcnt; }
+        if (ni != N_NONE) {
+            p->nodes[ni].a = name;
+            p->nodes[ni].b = mfirst;
+            p->nodes[ni].c = mcnt;
+            p->nodes[ni].d = parent;
+        }
         goto out;
     }
     if (p_is_kw(p, KW_FUNCTION)) {
@@ -2696,7 +2808,18 @@ static void an_refs(P *p, u32 ni, U32Vec *out) {
     case N_BLOCK: if (n->a != N_NONE) for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->a + i], out); break;
     case N_TRY: an_refs(p, n->a, out); an_refs(p, n->c, out); an_refs(p, n->d, out); break;
     case N_OBJLIT: for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->b + i], out); break;
-    /* N_FUNC / N_FUNCEXPR: 本体は別関数（スキップ）。N_THIS 等: なし */
+    case N_SUPERMCALL:
+        an_add(out, p->super_name);
+        for (u32 i = 0; i < n->d; i++) an_refs(p, p->list[n->c + i], out);
+        break;
+    case N_SUPERCALL:
+        an_add(out, p->super_name);
+        for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->b + i], out);
+        break;
+    case N_SUPERGET:
+        an_add(out, p->super_name);
+        break;
+    /* N_FUNC / N_FUNCEXPR / N_CLASSMETH: 本体は別関数（スキップ）。N_THIS 等: なし */
     default: break;
     }
 }
@@ -2778,6 +2901,12 @@ static void an_fn(P *p, u32 ni, u32 *anc, u32 anc_n) {
     for (u32 a = anc_n; a-- > 0;) {
         AklFnInfo *gfi = (anc[a] == N_NONE) ? &p->main_fi : &p->fninfo[anc[a]];
         for (u32 i = 0; i < refs.n; i++) {
+            /* SUPER_NAME は祖先のローカルではなく「関数自身の cap env 先頭」
+             * （OP_MAKEFS がバインド）。cap env slot を確保するため needs_cap を立てる。 */
+            if (refs.v[i] == p->super_name) {
+                p->fninfo[ni].needs_cap = 1;
+                continue;
+            }
             for (u32 j = 0; j < gfi->decls.n; j++) {
                 if (refs.v[i] == gfi->decls.v[j]) {
                     if (!an_capture(p, gfi, refs.v[i])) { free(refs.v); return; }
@@ -2800,8 +2929,12 @@ static void an_walk(P *p, u32 ni, u32 *anc, u32 anc_n) {
     if (ni == N_NONE || p->fail) return;
     AklNode *n = &p->nodes[ni];
     switch (n->kind) {
-    case N_FUNC: case N_FUNCEXPR:
+    case N_FUNC: case N_FUNCEXPR: case N_CLASSMETH:
         an_fn(p, ni, anc, anc_n);
+        return;
+    case N_CLASS: /* a=名前, b=メンバー list, c=count, d=親ノード */
+        if (n->d != N_NONE) an_walk(p, n->d, anc, anc_n);
+        for (u32 i = 0; i < n->c; i++) an_walk(p, p->list[n->b + i], anc, anc_n);
         return;
     case N_BLOCK: /* a=first, c=count（N_BLOCK は a が list 先頭 — 他と異なる）。
                     * 空文 N_BLOCK は a=c=N_NONE（cg_stmt の規約と同じガード） */
@@ -2972,6 +3105,7 @@ typedef struct {
     u32 brk_head[64], cont_head[64], cont_kind[64]; u32 n_loops;
     u8 loop_kind[64];           /* 0=loop / 1=switch（continue の解決で switch を飛ばす） */
     u32 tmp_seq;                /* 匿名一時ローカル名の採番（0xFFFFFFFE - n 系列） */
+    bool super_pending;         /* 次に生成する N_CLASSMETH 関数は親（スタック）を env にバインド */
     u16 try_depth;              /* lex 上の try 領域の深さ（catch 本体含む） */
     u8 try_at_loop[64];         /* 各 loop 開設時の try_depth（try 越境 brk/cont の検出用） */
     bool fail;
@@ -3011,7 +3145,9 @@ static i32 cg_local_find(Cg *cg, u32 name) {
 static i32 cg_local_add(Cg *cg, u32 name, u8 is_const) {
     i32 at = cg_local_find(cg, name);
     if (at >= 0) {
-        if (cg->locals[at].is_const) { akl_errf(cg->rt, "reassignment of const binding"); cg->fail = true; return -1; }
+        if (cg->locals[at].is_const) {
+            akl_errf(cg->rt, "reassignment of const binding"); cg->fail = true; return -1;
+        }
         return at;
     }
     if (cg->n_locals >= AKL_MAX_LOCALS) { akl_errf(cg->rt, "too many locals"); cg->fail = true; return -1; }
@@ -3109,7 +3245,9 @@ static u32 cg_global_find(AklRT *rt, u32 name) {
 static u32 cg_global_add(AklRT *rt, u32 name, u8 is_const) {
     u32 at = cg_global_find(rt, name);
     if (at != UINT32_MAX) {
-        if (rt->globals[at].is_const) { akl_errf(rt, "reassignment of const binding"); return UINT32_MAX; }
+        if (rt->globals[at].is_const) {
+            akl_errf(rt, "reassignment of const binding"); return UINT32_MAX;
+        }
         return at;
     }
     if (rt->n_globals == rt->cap_globals) {
@@ -3391,6 +3529,28 @@ static void cg_expr(Cg *cg, u32 ni) {
         break;
     case N_STR:   cg_op(cg, OP_CONST_STR); cg_u32(cg, n->a); break;
     case N_REGEX: cg_op(cg, OP_NEWREGEX); cg_u32(cg, n->a); cg_u32(cg, n->b); break;
+    case N_SUPERGET: /* super.name → 親クラス（関数 env の vals[0]）の name */
+        cg_op(cg, OP_SUPERGET);
+        cg_u32(cg, n->b);
+        break;
+    case N_SUPERMCALL: /* super.name(args) → [this][親.name][args] CALLT */
+        cg_op(cg, OP_THIS);
+        cg_op(cg, OP_SUPERGET);
+        cg_u32(cg, n->b);
+        for (u32 i = 0; i < n->d; i++) cg_expr(cg, cg->p->list[n->c + i]);
+        cg_op(cg, OP_CALLT);
+        cg_push_byte(cg, (u8)(n->d & 0xFF));
+        break;
+    case N_SUPERCALL: { /* super(args) → [this][親.constructor][args] CALLT */
+        u32 cname = p_intern(cg->p, (const u8 *)"constructor", 11);
+        cg_op(cg, OP_THIS);
+        cg_op(cg, OP_SUPERGET);
+        cg_u32(cg, cname);
+        for (u32 i = 0; i < n->c; i++) cg_expr(cg, cg->p->list[n->b + i]);
+        cg_op(cg, OP_CALLT);
+        cg_push_byte(cg, (u8)(n->c & 0xFF));
+        break;
+    }
     case N_BOOL:  cg_op(cg, n->a ? OP_TRUE_T : OP_FALSE_T); break;
     case N_NULL:  cg_op(cg, OP_NULL_T); break;
     case N_UNDEF: cg_op(cg, OP_UNDEF_T); break;
@@ -4013,9 +4173,16 @@ static void cg_fn(Cg *cg, u32 ni) {
         cg->in_func_depth--;
         if (cg->fail) return;
         cg_patch_u32(cg, site, cg_target_here(cg));
-        /* MAKEF: 捕捉元 env slot（現在関数の env チェーン先頭 = 自前 ENV or cap ENV） */
+        /* MAKEF / MAKEFS: 捕捉元 env slot（現在関数の env チェーン先頭 = 自前 ENV or cap ENV）。
+         * MAKEFS は N_CLASSMETH で super_pending のとき（スタックに親クラスがある）。
+         * ネスト関数（N_FUNC）の MAKEF では super_pending を消費しない。 */
         u8 srcslot = (u8)(cg->cur_n_env ? 1 : (cg->cur_needs_cap ? 1 : 0));
-        cg_op(cg, OP_MAKEF);
+        if (cg->super_pending && n->kind == N_CLASSMETH) {
+            cg_op(cg, OP_MAKEFS);
+            cg->super_pending = false;
+        } else {
+            cg_op(cg, OP_MAKEF);
+        }
         cg_u32(cg, fidx);
         cg_push_byte(cg, srcslot);
         if (is_expr) {
@@ -4257,35 +4424,41 @@ static void cg_stmt(Cg *cg, u32 ni) {
     case N_CLASS: {
         /* class Name { constructor(...){} m(){} static s(){} }
          * → OBJNEW; (DUP; cg_fn(member); PSTORE name; POP)* ; クラス名に束縛
-         * constructor メンバーは "constructor" キーで登録（OP_NEW が参照）。 */
+         * constructor メンバーは "constructor" キーで登録（OP_NEW が参照）。
+         * extends がある場合: 親を SUPER_NAME ローカルに保存し（メソッド関数が
+         * capture して super 解決に使う）、クラスオブジェクトには __super
+         * プロパティとして保持（OP_NEW のメソッド継承コピー用）。 */
         u32 cname = p_intern(cg->p, (const u8 *)"constructor", 11);
-        cg_op(cg, OP_OBJNEW);
-        bool has_ctor = false;
-        for (u32 i = 0; i < n->c; i++)
-            if ((cg->p->nodes[cg->p->list[n->b + i]].flags & 2) != 0) { has_ctor = true; break; }
-        if (!has_ctor) { /* constructor なし: 空コンストラクタを合成（new が this を返す） */
-            u32 cm = p_node(cg->p, N_CLASSMETH);
-            if (cm == N_NONE) { cg->fail = true; break; }
-            cg->p->nodes[cm].a = cname;
-            cg->p->nodes[cm].b = N_NONE;
-            cg->p->nodes[cm].c = 0;
-            cg->p->nodes[cm].d = N_NONE;
-            cg->p->nodes[cm].flags = 2;
-            cg_op(cg, OP_DUP);
-            cg_fn(cg, cm);
-            cg_op(cg, OP_PSTORE); cg_u32(cg, cname);
-            cg_op(cg, OP_POP);
+        i32 pslot = -1;
+        if (n->d != N_NONE) {
+            /* 親クラスを一時ローカルに保持（メソッド生成のたびに push して MAKEFS へ） */
+            cg_expr(cg, n->d);
+            pslot = cg_local_add_dummy(cg);
+            if (pslot < 0) break;
+            cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)pslot);
         }
+        cg_op(cg, OP_OBJNEW);
         for (u32 i = 0; i < n->c; i++) {
             u32 m = cg->p->list[n->b + i];
             u32 mname = cg->p->nodes[m].a;
             bool is_ctor = (cg->p->nodes[m].flags & 2) != 0;
             cg_op(cg, OP_DUP);
+            if (pslot >= 0) {
+                cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)pslot);
+                cg->super_pending = true; /* このメソッドは MAKEFS（親を env に） */
+            }
             cg_fn(cg, m); /* 関数値 push（値のみ） */
             cg_op(cg, OP_PSTORE);
             cg_u32(cg, is_ctor ? cname : mname);
             cg_op(cg, OP_POP);
             if (cg->fail) break;
+        }
+        /* クラスオブジェクトに親を __super プロパティで保存（OP_NEW の継承コピー用） */
+        if (pslot >= 0 && !cg->fail) {
+            cg_op(cg, OP_DUP);
+            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)pslot);
+            cg_op(cg, OP_PSTORE); cg_u32(cg, cg->p->super_prop);
+            cg_op(cg, OP_POP);
         }
         /* クラス名に束縛（main はグローバル、関数内はローカル）。
          * cg_store は TOS（クラスオブジェクト）を消費するため OP_POP は不要
@@ -4779,6 +4952,7 @@ static u32 akl_op_imm_len(u8 op) {
         return 17;
     case OP_CALL:
     case OP_NEW:
+    case OP_CALLT:
         return 1;
     case OP_NEWREGEX:
         return 8;
@@ -4787,7 +4961,10 @@ static u32 akl_op_imm_len(u8 op) {
     case OP_MCALL:
         return 5;
     case OP_MAKEF:
+    case OP_MAKEFS:
         return 5;   /* fidx u32 | srcslot u8 */
+    case OP_SUPERGET:
+        return 4;
     case OP_ELOAD: case OP_ESTORE:
         return 4;
     case OP_PDEL:
@@ -8114,6 +8291,9 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_PDEL] = &&l_PDEL, [OP_IDEL] = &&l_IDEL, [OP_INSTANCEOF] = &&l_INSTANCEOF,
         [OP_NEW] = &&l_NEW,
         [OP_NEWREGEX] = &&l_NEWREGEX,
+        [OP_CALLT] = &&l_CALLT,
+        [OP_MAKEFS] = &&l_MAKEFS,
+        [OP_SUPERGET] = &&l_SUPERGET,
         [OP_HALT] = &&l_HALT,
     };
 #define AKL_NEXT() do { if (dead) { free(frames); return false; } AKL_BUDGET(); goto *akl_jt[*pc++]; } while (0)
@@ -8400,6 +8580,76 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         pc = code + rt->funcs[cur].code_off;
         AKL_NEXT();
     }
+    AKL_L(CALLT): {
+        /* レイアウト: [this][fn][args...]（sp-argc-3 = this, sp-argc-2 = fn）。
+         * fn を this で呼ぶ（super の親コンストラクタ/メソッド呼び出し用）。 */
+        u8 argc = *pc++;
+        if (argc > 250 || sp < base + argc + 2) { akl_errf(rt, "stack underflow: callt"); free(frames); return false; }
+        AklVal thisv = stk[sp - argc - 2];
+        AklVal fv = stk[sp - argc - 1];
+        if (!(akl_is_objv(fv))) {
+            akl_errf(rt, "TypeError: not a function");
+            free(frames);
+            return false;
+        }
+        AklObj *fo = &rt->objs[akl_get_obj(fv)];
+        if (fo->kind == AKL_OK_NATIVE) {
+            if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
+            budget -= AKL_NATIVE_COST;
+            rt->gc_sp = sp;
+            u32 nur0 = rt->n_nury;
+            AklVal r;
+            if (!akl_vm_native_call(rt, fo, thisv, argc, stk + sp - argc, &r)) { free(frames); return false; }
+            rt->n_nury = nur0;
+            sp -= argc + 1; /* fn + args を潰す */
+            stk[sp - 1] = r;
+            AKL_NEXT();
+        }
+        if (fo->kind != AKL_OK_FUNC) {
+            akl_errf(rt, "TypeError: not a function");
+            free(frames);
+            return false;
+        }
+        u32 fidx = akl_get_obj(fv);
+        u32 fe_i = rt->objs[fidx].code_off;
+        if (fe_i >= rt->n_funcs) { akl_errf(rt, "internal: bad func ref"); free(frames); return false; }
+        AklFuncEnt *fe = &rt->funcs[fe_i];
+        if (nframes >= AKL_MAX_DEPTH) { akl_errf(rt, "call depth budget exhausted"); free(frames); return false; }
+        u32 nh = 1 + (fe->n_env ? 1u : 0u) + (fe->n_cap ? 1u : 0u);
+        /* this の位置をフレーム base にする（fn スロットは消費）。
+         * RET 後 sp = base+1 = [result] だけが残り、this は消える（CALL と同形）。 */
+        u32 win = sp - argc - 2;
+        u32 nloc = fe->n_locals, npar = fe->n_params;
+        u32 k = nh - 1;
+        AKL_GROW_TO(win + k + argc + 8);
+        if (k) { /* args を hidden 分シフト（win+1 は fn スロット。args の元位置は win+2 から） */
+            for (i32 i = (i32)argc - 1; i >= 0; i--) stk[win + k + i + 1] = stk[win + i + 2];
+        } else if (argc) { /* fn スロット（win+1）を args[0] で潰す */
+            for (i32 i = (i32)argc - 1; i >= 0; i--) stk[win + i + 1] = stk[win + i + 2];
+        }
+        if (nh > 1) {
+            rt->gc_sp = sp;
+            if (!akl_vm_frame_hidden(rt, stk, win, nloc, fe, thisv,
+                                     fo->env == UINT32_MAX ? AKL_VAL_UNDEF : AKL_MK_OBJ(fo->env))) {
+                free(frames);
+                return false;
+            }
+        } else {
+            stk[win] = thisv;
+        }
+        u32 keep = argc < npar ? argc : npar;
+        for (u32 i = nh + keep; i < nloc; i++) stk[win + i] = AKL_VAL_UNDEF;
+        sp = win + nloc;
+        frames[nframes].ret_off = (u32)(pc - code);
+        frames[nframes].base = base;
+        frames[nframes].func = cur;
+        frames[nframes].is_new = 0;
+        nframes++;
+        base = win;
+        cur = fe_i;
+        pc = code + rt->funcs[cur].code_off;
+        AKL_NEXT();
+    }
     AKL_L(RET): {
         if (sp <= base) { akl_errf(rt, "stack underflow: ret"); free(frames); return false; }
         AklVal v = AKL_POP();
@@ -8447,6 +8697,43 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             if (akl_is_objv(ev)) o->env = akl_get_obj(ev);
         }
         AKL_PUSH(AKL_MK_OBJ(oi));
+        AKL_NEXT();
+    }
+    AKL_L(MAKEFS): {
+        u32 fidx;
+        memcpy(&fidx, pc, 4); pc += 4;
+        u8 srcslot = *pc++;
+        if (sp < base + 2 || fidx >= rt->n_funcs) { akl_errf(rt, "stack underflow: makefs"); free(frames); return false; }
+        AklVal parent = stk[sp - 1]; /* レイアウト [class][class][parent] の最上位が親 */
+        rt->gc_sp = sp;
+        u32 oi = akl_obj_new(rt);
+        if (oi == UINT32_MAX) { free(frames); return false; }
+        AklObj *o = &rt->objs[oi];
+        o->kind = AKL_OK_FUNC;
+        o->code_off = fidx;
+        /* 従来の捕捉環境（外側ローカルの capture） */
+        o->env = UINT32_MAX;
+        if (srcslot && sp > base) {
+            AklVal ev = stk[base + srcslot];
+            if (akl_is_objv(ev)) o->env = akl_get_obj(ev);
+        }
+        /* 親 ENV を先頭に挿入: 新 ENV(vals=[parent], parent=捕捉環境)。
+         * SUPERGET はこの vals[0] を親クラスとして読む。 */
+        u32 eo = akl_obj_new(rt);
+        if (eo == UINT32_MAX) { free(frames); return false; }
+        AklObj *en = &rt->objs[eo];
+        en->kind = AKL_OK_ENV;
+        en->u.env.vals = (AklVal *)malloc(sizeof(AklVal));
+        if (!en->u.env.vals) { akl_errf(rt, "oom: makefs env"); free(frames); return false; }
+        en->u.env.vals[0] = parent;
+        en->u.env.n = 1;
+        en->u.env.parent = o->env;
+        rt->heap_bytes += sizeof(AklVal);
+        o->env = eo;
+        /* レイアウト: cg は [class][class][parent] で MAKEFS を発行（DUP 後 LLOAD）。
+         * parent の位置を fn で置換する（sp 不変）→ [class][class][fn]。
+         * 続く PSTORE が class を 1 個消費し、[class] が残る。 */
+        stk[sp - 1] = AKL_MK_OBJ(oi);
         AKL_NEXT();
     }
     AKL_L(OBJNEW): {
@@ -8567,6 +8854,22 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         }
         AklObj *o = &rt->objs[akl_get_obj(ov)];
         i32 pi = obj_prop_find(o, name);
+        if (pi < 0 && o->kind == AKL_OK_OBJ) {
+            /* クラス継承の static: __super チェーンを辿って解決（深さ制限） */
+            u32 sup_name = akl_intern(rt, (const u8 *)"\x00super", 7, NULL);
+            AklObj *co = o;
+            u32 cdepth = 0;
+            while (pi < 0 && co->kind == AKL_OK_OBJ && cdepth++ < 64) {
+                i32 spi = obj_prop_find(co, sup_name);
+                if (spi < 0) break;
+                AklVal pv = co->u.po.props[spi].v;
+                if (!akl_is_objv(pv)) break;
+                co = &rt->objs[akl_get_obj(pv)];
+                pi = obj_prop_find(co, name);
+            }
+            AKL_PUSH(pi >= 0 ? co->u.po.props[pi].v : AKL_VAL_UNDEF);
+            AKL_NEXT();
+        }
         AKL_PUSH(pi >= 0 ? o->u.po.props[pi].v : AKL_VAL_UNDEF); /* 未定義 prop → undefined（JS 同様） */
         AKL_NEXT();
     }
@@ -8679,7 +8982,23 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             AklObj *o = &rt->objs[akl_get_obj(ov)];
             if (o->kind == AKL_OK_OBJ) {
                 i32 pi = obj_prop_find(o, name);
-                if (pi >= 0) fv = o->u.po.props[pi].v;
+                if (pi < 0 && o->kind == AKL_OK_OBJ) {
+                    /* クラス継承の static: __super チェーンを辿って解決（深さ制限） */
+                    u32 sup_name = akl_intern(rt, (const u8 *)"\x00super", 7, NULL);
+                    AklObj *co = o;
+                    u32 cdepth = 0;
+                    while (pi < 0 && co->kind == AKL_OK_OBJ && cdepth++ < 64) {
+                        i32 spi = obj_prop_find(co, sup_name);
+                        if (spi < 0) break;
+                        AklVal pv = co->u.po.props[spi].v;
+                        if (!akl_is_objv(pv)) break;
+                        co = &rt->objs[akl_get_obj(pv)];
+                        pi = obj_prop_find(co, name);
+                    }
+                    if (pi >= 0) fv = co->u.po.props[pi].v;
+                } else if (pi >= 0) {
+                    fv = o->u.po.props[pi].v;
+                }
             }
         }
         if (!akl_is_objv(fv)) { akl_errf(rt, "TypeError: not a function"); free(frames); return false; }
@@ -9383,6 +9702,34 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         rt->objs[akl_get_obj(ev)].u.env.vals[idx] = AKL_POP();
         AKL_NEXT();
     }
+    AKL_L(SUPERGET): {
+        /* 親クラス = 現在関数の cap env の vals[0]（MAKEFS がバインド）。
+         * その name プロパティを push（無ければ undefined）。 */
+        u32 name;
+        memcpy(&name, pc, 4); pc += 4;
+        if (cur >= rt->n_funcs) { akl_errf(rt, "internal: bad func"); free(frames); return false; }
+        u8 cap_slot = (u8)(1 + (rt->funcs[cur].n_env ? 1u : 0u));
+        if (sp <= base + cap_slot) { akl_errf(rt, "stack underflow: superget"); free(frames); return false; }
+        AklVal ev = stk[base + cap_slot];
+        if (!akl_is_objv(ev)) { akl_errf(rt, "internal: super env missing"); free(frames); return false; }
+        AklObj *eo = &rt->objs[akl_get_obj(ev)];
+        if (eo->kind != AKL_OK_ENV || eo->u.env.n < 1) {
+            akl_errf(rt, "internal: super env broken");
+            free(frames);
+            return false;
+        }
+        AklVal parent = eo->u.env.vals[0];
+        AklVal out = AKL_VAL_UNDEF;
+        if (akl_is_objv(parent)) {
+            AklObj *po = &rt->objs[akl_get_obj(parent)];
+            if (po->kind == AKL_OK_OBJ) {
+                i32 pi = obj_prop_find(po, name);
+                if (pi >= 0) out = po->u.po.props[pi].v;
+            }
+        }
+        AKL_PUSH(out);
+        AKL_NEXT();
+    }
     AKL_L(CELOAD): {
         u8 cap_slot = *pc++;
         u8 depth = *pc++;
@@ -9976,21 +10323,17 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         } else {
             stk[win] = thisv;
         }
-        /* クラスメソッドをインスタンスへコピー（constructor 以外。static 含む — 簡易近似） */
+        /* クラスメソッドをインスタンスへコピー（constructor 以外。static 含む — 簡易近似）。
+         * extends の場合: __super チェーンを「親 → 子」の順で辿ってコピーする
+         * （子クラスのメソッドが親を上書きする = JS の継承セマンティクス） */
         if (akl_is_objv(cls_obj)) {
             AklObj *co = &rt->objs[akl_get_obj(cls_obj)];
-            if (co->kind == AKL_OK_OBJ) {
-                AklObj *no2 = &rt->objs[no];
-                for (u32 i = 0; i < co->u.po.n; i++) {
-                    u32 kl;
-                    const u8 *kp = akl_str(rt, co->u.po.props[i].name, &kl);
-                    if (rt->err[0]) { rt->n_nury = nur0; free(frames); return false; }
-                    if (kl == 11 && memcmp(kp, "constructor", 11) == 0) continue;
-                    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = co->u.po.props[i].name;
-                    if (!obj_prop_set(rt, no2, co->u.po.props[i].name, co->u.po.props[i].v)) {
-                        rt->n_nury = nur0; free(frames); return false;
-                    }
-                }
+            AklObj *no2 = &rt->objs[no];
+            u32 sup_name = akl_intern(rt, (const u8 *)"\x00super", 7, NULL);
+            if (!akl_new_copy_chain(rt, co, no2, sup_name, 0)) {
+                rt->n_nury = nur0;
+                free(frames);
+                return false;
             }
         }
         rt->n_nury = nur0;
@@ -10124,6 +10467,9 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
     P p;
     memset(&p, 0, sizeof p);
     p.rt = rt;
+    /* 親クラス保持ローカル・クラス親参照の非公開名（ソースに現れない NUL 入り） */
+    p.super_name = akl_intern(rt, (const u8 *)"\x01super", 7, NULL);
+    p.super_prop = akl_intern(rt, (const u8 *)"\x00super", 7, NULL);
     p.lx.s = (const u8 *)src;
     p.lx.n = (u32)slen;
     p.lx.pos = 0;
@@ -10239,16 +10585,127 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
     rt->gc_live = true;        /* GC は VM ルートが生きている実行中に限る */
     if (getenv("AKL_DUMP")) {
         static const char *const ON[] = {
-            "CONST_I","CONST_D","CONST_STR","TRUE","FALSE","NULL","UNDEF",
-            "ADD","SUB","MUL","DIV","MOD","LT","LE","GT","GE","EQ","NE","SEQ","SNE",
-            "NOT","NEG","POS","TYPEOF","POP","POPV","DUP","LLOAD","LSTORE","GLOAD","GSTORE","JMP",
-            "JMPF","JMPT","CALL","RET","MAKEF","LINC","CJMPF_L","CJMPF_G","GLOAD_S","GSTORE_S",
-            "GINC","GMULC","LMULC","MULCI","ADDCI","SUBCI","MODCI","GADD_P","LADD_P","GADD_G",
-            "CJMPF_MODG","CJMPF_MODL","GSTORE_SPV","LSTORE_PV","LOOPINC_G","LOOPINC_L","LOOPINC_GV","LOOPINC_LV",
-            "NOP","OBJNEW","PLOAD","PSTORE","MCALL","THIS","ELOAD","ESTORE","CELOAD","CESTORE",
-            "ANEW","AGET","ASET","BNOT","BAND","BOR","BXOR","BSHL","BSHR","BUSHR",
-            "POW","KEYSOF","TOARR","ARRPUSH","ARRPUSHALL","ARRSPREADC","CALLN","IN","PDEL","IDEL",
-            "INSTANCEOF","NEW","HALT"
+            "CONST_I",
+            "CONST_D",
+            "CONST_STR",
+            "TRUE_T",
+            "FALSE_T",
+            "NULL_T",
+            "UNDEF_T",
+            "ADD",
+            "SUB",
+            "MUL",
+            "DIV",
+            "MOD",
+            "LT",
+            "LE",
+            "GT",
+            "GE",
+            "EQ",
+            "NE",
+            "SEQ",
+            "SNE",
+            "NOT",
+            "NEG",
+            "POS",
+            "TYPEOF",
+            "POP",
+            "POPV",
+            "DUP",
+            "LLOAD",
+            "LSTORE",
+            "GLOAD",
+            "GSTORE",
+            "JMP",
+            "JMPF",
+            "JMPT",
+            "CALL",
+            "RET",
+            "MAKEF",
+            "LINC",
+            "CJMPF_L",
+            "CJMPF_G",
+            "GLOAD_S",
+            "GSTORE_S",
+            "GINC",
+            "GMULC",
+            "LMULC",
+            "MULCI",
+            "ADDCI",
+            "SUBCI",
+            "MODCI",
+            "GADD_P",
+            "LADD_P",
+            "GADD_G",
+            "CJMPF_MODG",
+            "CJMPF_MODL",
+            "GSTORE_SPV",
+            "LSTORE_PV",
+            "LOOPINC_G",
+            "ADDCI_G",
+            "SUBCI_G",
+            "MULCI_G",
+            "MODCI_G",
+            "ADDCI_L",
+            "SUBCI_L",
+            "MULCI_L",
+            "MODCI_L",
+            "CJMPF_MULGG",
+            "CJMPF_MODGG",
+            "LADD_LL",
+            "RET_L",
+            "ADD_GX",
+            "SUB_GX",
+            "MUL_GX",
+            "MOD_GX",
+            "ADD_LX",
+            "SUB_LX",
+            "MUL_LX",
+            "MOD_LX",
+            "TRY_PUSH",
+            "TRY_LEAVE",
+            "FIN_END",
+            "THROW",
+            "LOOPINC_L",
+            "LOOPINC_GV",
+            "LOOPINC_LV",
+            "NOP",
+            "OBJNEW",
+            "PLOAD",
+            "PSTORE",
+            "MCALL",
+            "THIS",
+            "ELOAD",
+            "ESTORE",
+            "CELOAD",
+            "CESTORE",
+            "ANEW",
+            "AGET",
+            "ASET",
+            "BNOT",
+            "BAND",
+            "BOR",
+            "BXOR",
+            "BSHL",
+            "BSHR",
+            "BUSHR",
+            "POW",
+            "KEYSOF",
+            "TOARR",
+            "ARRPUSH",
+            "ARRPUSHALL",
+            "ARRSPREADC",
+            "CALLN",
+            "IN",
+            "PDEL",
+            "IDEL",
+            "INSTANCEOF",
+            "NEW",
+            "NEWREGEX",
+            "CALLT",
+            "MAKEFS",
+            "SUPERGET",
+            "HALT"
         };
         fprintf(stderr, "--- main ---\n");
         u8 *cp = rt->code + code_from;

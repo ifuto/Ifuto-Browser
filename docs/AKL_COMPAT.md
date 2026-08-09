@@ -54,6 +54,11 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | 正規表現構文: 文字クラス・量詞（非貪欲含む）・グループ・選択・アンカー・`\\d \\w \\s \\b` 等 | — | OK（実測 112 ケースの単体テスト + t_v04_regex） |
 | UTF-8 パターン・対象（コードポイント単位） | `/あ+/.test('あああ')` | `true` |
 | ステップ上限（指数バックトラックの有界化: 500 万ステップ） | `'aaa...'(30個).replace(/(a+)+b/,'x')` | `RangeError` で明白に失敗 |
+| `class B extends A`（メソッド継承・`super` メソッド呼び出し） | `class B extends A { m() { return super.m() + 1; } } new B().m()` | `2` |
+| `super(...)` 親コンストラクタ呼び出し（引数伝播・合成 ctor の自動 super()） | `class B extends A { constructor(x) { super(x + 1); } } new B(41).get()` | `42` |
+| 3 段以上の継承チェーン・`super` の多重呼び出し | `class C extends B extends A ... new C().m()` | OK |
+| static メソッドの継承（`__super` チェーン解決） | `class A { static s(){return 7;} } class B extends A { } B.s()` | `7` |
+| 派生クラスの合成コンストラクタ（extends 時は super() を自動呼び出し） | `class B extends A { } new B().n` | 親が初期化した `n` |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
 `-1/0 = -Infinity`、`NaN !== NaN`（IEEE 754/JIS X 3010 相当の double 厳密）、
@@ -65,7 +70,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 |---|---|
 | 文頭 `{` の曖昧性 | ブロック文が無いので object literal として読み、`{a:1}` 単文は `expected ';'` で明白に失敗（JS とは別解釈、いずれも拒否） |
 | `Math.floor` 等の標準組込オブジェクト | ✅ v0.3 で実装（Math 24 関数 + 定数 8 種） |
-| class の `extends`・`super` | SyntaxError（extends は v0.4 台帳。super は未対応） |
+| `super` のプロパティ取得（`super.x = 1`）・`super[name]` | SyntaxError（super.m() と super(...) のみ対応） |
 | async/await・generator・BigInt | SyntaxError |
 | 正規表現の先読み/後読み `(?=..)` `(?!..)` `(?<=..)`・名前付きキャプチャ `(?<n>..)`・バックリファレンス `\\1` | SyntaxError（コンパイル時） |
 | 文字クラス内の非 ASCII 文字・範囲（`[あ-ん]` 等）・`\\u{...}` | SyntaxError（コンパイル時） |
@@ -95,7 +100,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 9. ✅ テンプレートリテラル・for-in/for-of・デフォルト引数（2026-08-08）
 10. ✅ 分割代入・配列/呼び出し spread・`new`・`class`（2026-08-08。VM 再入とフレーム is_new）
 11. ✅ 正規表現（2026-08-09: リテラル/RegExp グローバル/test/exec/match/search/replace/split。エンジンは別ファイル akl_regex.c、バックトラッキング VM + ステップ有界化）
-12. class extends/super・async/await（優先度順）
+12. ✅ class extends / super（2026-08-09: OP_MAKEFS で親クラスを関数 env にバインド、OP_SUPERGET/OP_CALLT で解決。継承コピーは __super チェーンを親→子順に。合成 ctor は extends 時 super() 自動呼び出し）
+13. async/await（コルーチン基盤の設計が必要）
 
 ## V8 との位置づけ
 
