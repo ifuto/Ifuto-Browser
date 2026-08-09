@@ -203,7 +203,33 @@ static void test_script_gc_churn(void) {
     tscr_end(&t);
 }
 
+
+static void test_script_regex(void) {
+    TScr t;
+    tscr_begin(&t, "<!DOCTYPE html><title>R0</title><div id=a>start</div>"
+                   "<script>"
+                   "var s = 'hello 42 world';"
+                   "console.log('rx1', /\\d+/.exec(s)[0]);"
+                   "console.log('rx2', s.replace(/\\w+/g, function(w){ return w.toUpperCase(); }));"
+                   "console.log('rx3', 'a,b,c'.split(/,/).length);"
+                   "console.log('rx4', 'user@example.com'.replace(/^(.+)@(.+)$/, '$2.$1'));"
+                   "document.getElementById('a').textContent = /42/.test(s) ? 'yes' : 'no';"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
+    CHECK(strstr(t.logbuf, "[script:console] rx1 42\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] rx2 HELLO 42 WORLD\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] rx3 3\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] rx4 example.com.user\n") != NULL);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    CHECK(d != NULL);
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 3 && memcmp(txt.p, "yes", 3) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
+    test_script_regex();
     test_script_mutation();
     test_script_gc_churn();
     test_script_failure_isolation();
