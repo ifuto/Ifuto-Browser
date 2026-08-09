@@ -334,7 +334,38 @@ static void test_script_objlit_ext(void) {
     tscr_end(&t);
 }
 
+
+static void test_script_arrow_promise_async(void) {
+    TScr t;
+    tscr_begin(&t, "<!DOCTYPE html><title>Y0</title><div id=a>start</div>"
+                   "<script>"
+                   "var nums = [1, 2, 3, 4];"
+                   "var doubled = nums.map(x => x * 2);"
+                   "console.log('ap1', doubled.join(','));"
+                   "var total = 0;"
+                   "var p = new Promise(function(res) { res(5); });"
+                   "p.then(function(v) { total = v * 10; });"
+                   "console.log('ap2', total);"
+                   "var r = 0;"
+                   "async function compute() { return await Promise.resolve(7) * 3; }"
+                   "compute().then(function(v) { r = v; });"
+                   "console.log('ap3', r);"
+                   "document.getElementById('a').textContent = doubled[3] + ':' + total + ':' + r;"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
+    CHECK(strstr(t.logbuf, "[script:console] ap1 2,4,6,8\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] ap2 50\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] ap3 21\n") != NULL);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    CHECK(d != NULL);
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 7 && memcmp(txt.p, "8:50:21", 7) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
+    test_script_arrow_promise_async();
     test_script_objlit_ext();
     test_script_fields_length();
     test_script_spread_rest();

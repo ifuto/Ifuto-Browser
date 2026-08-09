@@ -888,6 +888,7 @@ static void t_v04_logassign(void);
 static void t_v04_objlit_ext(void);
 static void t_v04_labels(void);
 static void t_v04_arguments(void);
+static void t_v04_arrow_promise_async(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -947,6 +948,8 @@ void test_akl(void) {
     t_v04_labels();
     fprintf(stderr, "  %-40s", "t_v04_arguments");
     t_v04_arguments();
+    fprintf(stderr, "  %-40s", "t_v04_arrow_promise_async");
+    t_v04_arrow_promise_async();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1699,4 +1702,40 @@ static void t_v04_arguments(void) {
     want_err("arguments", "arguments");
     /* 高階コールバック内 */
     want_num("[1, 2, 3].map(function() { return arguments.length; })[0]", 3);
+}
+
+/* ================= v0.4: アロー関数・Promise・async/await ================= */
+static void t_v04_arrow_promise_async(void) {
+    /* アロー関数 */
+    want_num("var f = (x) => x + 1; f(41)", 42);
+    want_num("var f = x => x * 2; f(21)", 42);
+    want_num("var f = () => 42; f()", 42);
+    want_num("var f = (a, b) => a - b; f(9, 3)", 6);
+    want_num("var f = (a, b) => a + b; f(1, 2) + f(3, 4)", 10);
+    want_num("var f = (x) => { return x * 3; }; f(5)", 15);
+    want_str("[1,2,3].map(x => x * 2).join(',')", "2,4,6");
+    want_num("[1,2,3,4].filter(x => x % 2 == 0).length", 2);
+    want_num("function make() { var n = 5; return (x) => x + n; } var g = make(); g(10)", 15);
+    /* アロー this キャプチャ */
+    want_num("var o = { v: 7, get: function() { return () => this.v; } }; var g = o.get(); g()", 7);
+    want_num("var o = { v: 7, m: function() { return () => this.v; } }; o.m()()", 7);
+    want_num("var o = { v: 3, m: function() { var f = () => this.v; return f(); } }; o.m()", 3);
+    /* Promise（同期解決近似） */
+    want_num("var r = 0; var p = new Promise(function(res) { res(5); }); p.then(function(v) { r = v * 2; }); r", 10);
+    want_num("var r = 0; Promise.resolve(42).then(function(v) { r = v + 1; }); r", 43);
+    want_str("var r = ''; var p = new Promise(function(res, rej) { rej('err'); }); p.catch(function(e) { r = 'caught:' + e; }); r", "caught:err");
+    want_num("var r = 0; var p = new Promise(function(res) { res(7); }); p.then(function(v) { return v; }).then(function(v) { r = v * 2; }); r", 14);
+    want_str("var r = ''; Promise.reject('x').catch(function(e) { r = e + '!'; }); r", "x!");
+    want_num("var r = 0; var p = new Promise(function(res) { res(10); }); p.finally(function() { r = 1; }); r", 1);
+    /* async/await */
+    want_num("var r = 0; async function f() { return 42; } f().then(function(v) { r = v; }); r", 42);
+    want_num("var r = 0; async function f() { return await Promise.resolve(10) * 2; } f().then(function(v) { r = v; }); r", 20);
+    want_num("var r = 0; async function f() { var a = await 5; return a * 2; } f().then(function(v) { r = v; }); r", 10);
+    want_str("var r = ''; async function f() { return 'hello'; } f().then(function(v) { r = v; }); r", "hello");
+    want_num("var r = 0; async function f() { var p = new Promise(function(res) { res(21); }); return await p * 2; } f().then(function(v) { r = v; }); r", 42);
+    want_num("var r = 0; var f = async function() { return 99; }; f().then(function(v) { r = v; }); r", 99);
+    want_num("var r = 0; async function f() { return 1 + await 2; } f().then(function(v) { r = v; }); r", 3);
+    /* エラー */
+    want_err("await 5", "await");
+    want_err("var f = () => { return 1; }; f(); break", "break");
 }
