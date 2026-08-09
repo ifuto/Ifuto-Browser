@@ -727,6 +727,7 @@ enum { KW_VAR, KW_LET, KW_CONST, KW_FUNCTION, KW_RETURN, KW_IF, KW_ELSE, KW_WHIL
        KW_DO, KW_SWITCH, KW_CASE, KW_DEFAULT, KW_THIS,
        KW_VOID, KW_DELETE, KW_IN, KW_NEW, KW_OF, KW_INSTANCEOF,
        KW_CLASS, KW_EXTENDS, KW_STATIC, KW_SUPER,
+       KW_DEBUGGER,
        KW_N };
 static const char *const AKL_KWS[KW_N] = {
     "var", "let", "const", "function", "return", "if", "else", "while",
@@ -734,7 +735,7 @@ static const char *const AKL_KWS[KW_N] = {
     "throw", "try", "catch", "finally",
     "do", "switch", "case", "default", "this",
     "void", "delete", "in", "new", "of", "instanceof",
-    "class", "extends", "static", "super"
+    "class", "extends", "static", "super", "debugger"
 };
 
 enum { P_LP, P_RP, P_LC, P_RC, P_SEMI, P_COMMA, P_ASSIGN, P_PLUS, P_MINUS, P_STAR,
@@ -1147,6 +1148,7 @@ enum {
     N_SWITCH,   /* a=disc node, b=case list first, c=count */
     N_CASE,     /* a=expr（N_NONE=default）, b=body stmt */
     N_FUNCEXPR, /* 関数式: N_FUNC と同形（d=body）。a=name idx（無名は UINT32_MAX） */
+    N_LABEL,    /* ラベル文: a=ラベル名 idx, b=本体文, flags bit0=本体がループ */
     N_OBJKEY,   /* オブジェクト computed キー: a=キー式, b=値（N_OBJLIT の要素） */
     N_LOGASSIGN,/* 論理代入: a=target, b=rhs, op=0(||=) 1(&&=) 2(??=) */
     N_REGEX,    /* 正規表現リテラル: a=pattern STR idx, b=flags（AKL_RX_F_*） */
@@ -2516,6 +2518,36 @@ static u32 p_stmt(P *p) {
     if (++p->depth > AKL_PARSE_DEPTH) { p->depth--; p->fail = "parse depth exhausted"; return N_NONE; }
     u32 ni = N_NONE;
     if (p_eat_punct(p, P_SEMI)) { p->depth--; return p_node(p, N_BLOCK); /* 空文 */ }
+    if (p_is_kw(p, KW_DEBUGGER)) { /* debugger 文は no-op（デバッガは持たない） */
+        lex_next(&p->lx);
+        p_eat_punct(p, P_SEMI);
+        p->depth--;
+        return p_node(p, N_BLOCK);
+    }
+    /* ラベル検出: IDENT の直後が ':' ならラベル文 */
+    if (p->lx.kind == TK_IDENT) {
+        Lex saved = p->lx;
+        lex_next(&p->lx);
+        if (p_is_punct(p, P_COLON)) {
+            u32 lname = p_intern(p, saved.str_p, saved.str_len);
+            if (lname == UINT32_MAX) { p->depth--; return N_NONE; }
+            lex_next(&p->lx); /* ':' を消費 */
+            u32 body = p_stmt(p);
+            if (body == N_NONE) { p->depth--; return N_NONE; }
+            u32 lb = p_node(p, N_LABEL);
+            if (lb == N_NONE) { p->depth--; return N_NONE; }
+            p->nodes[lb].a = lname;
+            p->nodes[lb].b = body;
+            /* 本体がループ文ならラベルはループ付き（break/continue 両方可） */
+            if (body < p->n_nodes) {
+                u8 bk = p->nodes[body].kind;
+                if (bk == N_WHILE || bk == N_FOR || bk == N_DOWHILE) p->nodes[lb].flags |= 1;
+            }
+            p->depth--;
+            return lb;
+        }
+        p->lx = saved; /* ラベルでなければ戻す */
+    }
     if (p_is_kw(p, KW_VAR) || p_is_kw(p, KW_LET) || p_is_kw(p, KW_CONST)) {
         u8 is_const = p->lx.pk == KW_CONST;
         lex_next(&p->lx);
@@ -2971,8 +3003,32 @@ static u32 p_stmt(P *p) {
         if (ni != N_NONE) { p->nodes[ni].a = init; p->nodes[ni].b = cond; p->nodes[ni].c = step; p->nodes[ni].d = body; }
         goto out;
     }
-    if (p_is_kw(p, KW_BREAK))    { lex_next(&p->lx); p_eat_punct(p, P_SEMI); ni = p_node(p, N_BREAK); goto out; }
-    if (p_is_kw(p, KW_CONTINUE)) { lex_next(&p->lx); p_eat_punct(p, P_SEMI); ni = p_node(p, N_CONTINUE); goto out; }
+    if (p_is_kw(p, KW_BREAK)) {
+        lex_next(&p->lx);
+        u32 lname = N_NONE;
+        if (p->lx.kind == TK_IDENT) { /* break label; */
+            lname = p_intern(p, p->lx.str_p, p->lx.str_len);
+            if (lname == UINT32_MAX) goto out;
+            lex_next(&p->lx);
+        }
+        p_eat_punct(p, P_SEMI);
+        ni = p_node(p, N_BREAK);
+        if (ni != N_NONE) p->nodes[ni].a = lname;
+        goto out;
+    }
+    if (p_is_kw(p, KW_CONTINUE)) {
+        lex_next(&p->lx);
+        u32 lname = N_NONE;
+        if (p->lx.kind == TK_IDENT) {
+            lname = p_intern(p, p->lx.str_p, p->lx.str_len);
+            if (lname == UINT32_MAX) goto out;
+            lex_next(&p->lx);
+        }
+        p_eat_punct(p, P_SEMI);
+        ni = p_node(p, N_CONTINUE);
+        if (ni != N_NONE) p->nodes[ni].a = lname;
+        goto out;
+    }
     if (p_is_kw(p, KW_THROW)) {
         lex_next(&p->lx);
         u32 e = p_expr(p);
@@ -3095,6 +3151,7 @@ static void an_refs(P *p, u32 ni, U32Vec *out) {
     case N_BLOCK: if (n->a != N_NONE) for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->a + i], out); break;
     case N_TRY: an_refs(p, n->a, out); an_refs(p, n->c, out); an_refs(p, n->d, out); break;
     case N_OBJLIT: for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->b + i], out); break;
+    case N_LABEL: an_refs(p, n->b, out); break;
     case N_OBJKEY: an_refs(p, n->a, out); an_refs(p, n->b, out); break;
     case N_LOGASSIGN: an_refs(p, n->a, out); an_refs(p, n->b, out); break;
     case N_SPREAD: an_refs(p, n->a, out); break;
@@ -3157,6 +3214,9 @@ static void an_decls(P *p, u32 ni, U32Vec *out) {
         break;
     case N_ARRLIT: case N_OBJLIT:
         for (u32 i = 0; i < n->c; i++) an_decls(p, p->list[n->b + i], out);
+        break;
+    case N_LABEL:
+        an_decls(p, n->b, out);
         break;
     case N_OBJKEY:
         an_decls(p, n->a, out);
@@ -3247,6 +3307,9 @@ static void an_walk(P *p, u32 ni, u32 *anc, u32 anc_n) {
         return;
     case N_ARRLIT: case N_OBJLIT: /* a は list index（name 列）でノードでない */
         for (u32 i = 0; i < n->c; i++) an_walk(p, p->list[n->b + i], anc, anc_n);
+        return;
+    case N_LABEL:
+        an_walk(p, n->b, anc, anc_n);
         return;
     case N_OBJKEY:
         an_walk(p, n->a, anc, anc_n);
@@ -3365,6 +3428,9 @@ static void an_main_decls(P *p, u32 ni, U32Vec *out) {
     case N_ARRLIT: case N_OBJLIT: /* a は list index（name 列）でノードでない */
         for (u32 i = 0; i < n->c; i++) an_main_decls(p, p->list[n->b + i], out);
         break;
+    case N_LABEL:
+        an_main_decls(p, n->b, out);
+        break;
     case N_OBJKEY:
         an_main_decls(p, n->a, out);
         an_main_decls(p, n->b, out);
@@ -3426,6 +3492,11 @@ typedef struct {
     u32 n_outer;
     /* loop の break/continue パッチ連鎖（pos のリストを逆方向リンク: buf[pos]=prev head） */
     u32 brk_head[64], cont_head[64], cont_kind[64]; u32 n_loops;
+    /* ラベル文: 名前 / 対応ループ li（未確定 UINT32_MAX）/ 非ループ break パッチリスト */
+    u32 lbl_name[64], lbl_li[64], lbl_brk_head[64];
+    u8 lbl_is_loop[64];
+    u32 n_lbl;
+    u32 lbl_pending;   /* 次に開設されるループに確定すべきラベル index（UINT32_MAX=無し） */
     u8 loop_kind[64];           /* 0=loop / 1=switch（continue の解決で switch を飛ばす） */
     u32 tmp_seq;                /* 匿名一時ローカル名の採番（0xFFFFFFFE - n 系列） */
     bool super_pending;         /* 次に生成する N_CLASSMETH 関数は親（スタック）を env にバインド */
@@ -3511,6 +3582,14 @@ static i32 cg_local_add_dummy(Cg *cg) {
     cg->locals[cg->n_locals].captured = 0;
     cg->locals[cg->n_locals].env_idx = 0xFF;
     return (i32)cg->n_locals++;
+}
+
+/* ラベル → ループ確定: ループ開設時に、直前に開いたラベル（ループ付き）があれば紐付ける */
+static void cg_lbl_bind(Cg *cg, u32 li) {
+    if (cg->lbl_pending != UINT32_MAX) {
+        cg->lbl_li[cg->lbl_pending] = li;
+        cg->lbl_pending = UINT32_MAX;
+    }
 }
 
 static bool cg_captured(Cg *cg, u32 name, bool store, u32 *env_idx_out);
@@ -4983,6 +5062,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
         u32 cond = cg_target_here(cg);
         u32 s_end = cg_cond_jmpf(cg, n->a);
         u32 li = cg->n_loops++;
+        cg_lbl_bind(cg, li);
         cg->loop_kind[li] = 0;
         cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = cond;
@@ -5011,6 +5091,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
         i32 t_i = cg_local_add(cg, 0xFFFFFFFEu - (u32)cg->tmp_seq++, 0);
         if (t_arr < 0 || t_i < 0) break;
         u32 li = cg->n_loops++;
+        cg_lbl_bind(cg, li);
         cg->loop_kind[li] = 0;
         cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE;
@@ -5063,6 +5144,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
         /* do body while(cond): body を必ず 1 回実行。continue → cond 検査へ */
         if (cg->n_loops >= 64) { akl_errf(cg->rt, "loop nesting budget exhausted"); cg->fail = true; break; }
         u32 li = cg->n_loops++;
+        cg_lbl_bind(cg, li);
         cg->loop_kind[li] = 0;
         cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE;
@@ -5096,6 +5178,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
          *  continue は loop_kind==0 の実ループまで飛ばす。 */
         if (cg->n_loops >= 64) { akl_errf(cg->rt, "loop nesting budget exhausted"); cg->fail = true; break; }
         u32 li = cg->n_loops++;
+        cg_lbl_bind(cg, li);
         cg->loop_kind[li] = 1;
         cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE;
@@ -5196,6 +5279,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
             u32 s_pre = cg_u32(cg, 0);
             u32 body_top = cg_target_here(cg);
             u32 li = cg->n_loops++;
+            cg_lbl_bind(cg, li);
             cg->loop_kind[li] = 0;
             cg->try_at_loop[li] = (u8)cg->try_depth;
             cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE;
@@ -5229,6 +5313,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
             s_end = cg_cond_jmpf(cg, n->b);
         }
         u32 li = cg->n_loops++;
+        cg_lbl_bind(cg, li);
         cg->loop_kind[li] = 0;
         cg->try_at_loop[li] = (u8)cg->try_depth;
         cg->brk_head[li] = N_NONE; cg->cont_head[li] = N_NONE; cg->cont_kind[li] = N_NONE; /* step addr 後決め */
@@ -5253,6 +5338,26 @@ static void cg_stmt(Cg *cg, u32 ni) {
         break;
     }
     case N_BREAK:
+        if (n->a != N_NONE) { /* break label; */
+            i32 found = -1;
+            for (i32 k = (i32)cg->n_lbl - 1; k >= 0; k--)
+                if (cg->lbl_name[k] == n->a) { found = k; break; }
+            if (found < 0) { akl_errf(cg->rt, "undefined label"); cg->fail = true; break; }
+            if (cg->lbl_is_loop[found] && cg->lbl_li[found] != UINT32_MAX) {
+                u32 li = cg->lbl_li[found];
+                u32 site = cg_jmp_op(cg, OP_JMP);
+                u32 prev = cg->brk_head[li];
+                memcpy(&cg->rt->code[site], &prev, 4);
+                cg->brk_head[li] = site;
+            } else {
+                /* 非ループラベル: N_LABEL 終端へ（N_LABEL 処理完了時に一括パッチ） */
+                u32 site = cg_jmp_op(cg, OP_JMP);
+                u32 prev = cg->lbl_brk_head[found];
+                memcpy(&cg->rt->code[site], &prev, 4);
+                cg->lbl_brk_head[found] = site;
+            }
+            break;
+        }
         if (!cg->n_loops) { akl_errf(cg->rt, "break outside loop"); cg->fail = true; break; }
         /* try 領域を跨ぐ制御移動は finally 連鎖が必要。v0.1 は未対応で明白に拒否（台帳） */
         if ((u32)cg->try_depth != cg->try_at_loop[cg->n_loops - 1]) {
@@ -5269,6 +5374,25 @@ static void cg_stmt(Cg *cg, u32 ni) {
         }
         break;
     case N_CONTINUE:
+        if (n->a != N_NONE) { /* continue label; */
+            i32 found = -1;
+            for (i32 k = (i32)cg->n_lbl - 1; k >= 0; k--)
+                if (cg->lbl_name[k] == n->a) { found = k; break; }
+            if (found < 0) { akl_errf(cg->rt, "undefined label"); cg->fail = true; break; }
+            if (!cg->lbl_is_loop[found] || cg->lbl_li[found] == UINT32_MAX) {
+                akl_errf(cg->rt, "continue target is not a loop");
+                cg->fail = true;
+                break;
+            }
+            {
+                u32 li = cg->lbl_li[found];
+                u32 site = cg_jmp_op(cg, OP_JMP);
+                u32 prev = cg->cont_head[li];
+                memcpy(&cg->rt->code[site], &prev, 4);
+                cg->cont_head[li] = site;
+            }
+            break;
+        }
         {
             /* switch は continue の対象でない（JS: 最も内側の実ループへ）。loop_kind==0 を探す */
             u32 li = cg->n_loops;
@@ -5285,6 +5409,32 @@ static void cg_stmt(Cg *cg, u32 ni) {
             cg->cont_head[li] = site;
         }
         break;
+    case N_LABEL: {
+        /* label: stmt。ループ付きラベル（flags bit0）は次に開設されるループに
+         * 紐付け（cg_lbl_bind）。非ループは break label を文終端へパッチ。 */
+        if (cg->n_lbl >= 64) { akl_errf(cg->rt, "label nesting budget exhausted"); cg->fail = true; break; }
+        u32 my = cg->n_lbl++;
+        cg->lbl_name[my] = n->a;
+        cg->lbl_li[my] = UINT32_MAX;
+        cg->lbl_brk_head[my] = N_NONE;
+        cg->lbl_is_loop[my] = (n->flags & 1) != 0;
+        if (cg->lbl_is_loop[my]) cg->lbl_pending = my;
+        cg_stmt(cg, n->b);
+        if (cg->fail) break;
+        /* 文終端: 非ループラベルの break をここにパッチ */
+        if (cg->lbl_brk_head[my] != N_NONE) {
+            u32 end = cg_target_here(cg);
+            u32 s2 = cg->lbl_brk_head[my];
+            while (s2 != N_NONE) {
+                u32 nxt; memcpy(&nxt, &cg->rt->code[s2], 4);
+                cg_patch_u32(cg, s2, end);
+                s2 = nxt;
+            }
+        }
+        cg->n_lbl--;
+        cg->lbl_pending = UINT32_MAX;
+        break;
+    }
     case N_THROW:
         cg_expr(cg, n->a);
         cg_op(cg, OP_THROW);
@@ -11406,6 +11556,7 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
     rt->n_tries = 0; /* 前回 eval が途中終了（uncaught/budget/誤り）した場合の残留を棄却 */
     rt->n_nury = 0; /* 同上（C 側一時ルートの残留棄却。内部規律は各使用者復元） */
     rt->native_err = false;
+    rt->last_val = AKL_VAL_UNDEF; /* 前回 eval の最後の式文の値が残留しないようリセット */
     if (rt->gc_live) { akl_errf(rt, "recursive akl_eval is not supported"); return false; }
     if (!src) { akl_errf(rt, "null source"); return false; }
     u64 slen = strlen(src);

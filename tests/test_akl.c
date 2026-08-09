@@ -596,7 +596,7 @@ static void t_objects(void) {
     want_err("var o = {}; o.f()", "not a function");   /* 無い/非関数メソッド */
     want_num("var o = {a}; o.a == undefined ? 1 : 0", 0); /* shorthand: a 未定義 → o.a は undefined */
     want_num("var x = 9; var o = {a:1, b: x}; o.b", 9);  /* b: x は通常プロパティ */
-    want_err("{a:1}", NULL);                           /* 文頭 {} は object literal と解釈しない（JS 同様の曖昧性解決） */
+    want_num("{a:1}", 1);                              /* 文頭 { はブロック文。a:1 はラベル+式文（JS 準拠） */
     /* prop 数天井 64（1 obj あたり）: 65 個目で明白に失敗 */
     {
         char src[4200];
@@ -886,6 +886,7 @@ static void t_v04_builtins2(void);
 static void t_v04_fields_len(void);
 static void t_v04_logassign(void);
 static void t_v04_objlit_ext(void);
+static void t_v04_labels(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -941,6 +942,8 @@ void test_akl(void) {
     t_v04_objlit_ext();
     fprintf(stderr, "  %-40s", "t_v04_fields_len");
     t_v04_fields_len();
+    fprintf(stderr, "  %-40s", "t_v04_labels");
+    t_v04_labels();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1652,4 +1655,26 @@ static void t_v04_objlit_ext(void) {
     want_num("var o = { _x: 1, get x() { return this._x; }, set x(v) { this._x = v * 2; } }; o.x = 5; o.x", 10);
     want_num("var o = { set s(v) { this._s = v + 1; }, get s() { return this._s; } }; o.s = 41; o.s", 42);
     want_num("var o = { _v: 0, get v() { return this._v; }, set v(nv) { if (nv >= 0) this._v = nv; } }; o.v = 10; o.v = -5; o.v", 10);
+}
+
+/* ================= v0.4: ラベル break/continue・debugger ================= */
+static void t_v04_labels(void) {
+    /* debugger 文は no-op */
+    want_num("debugger; 1+1", 2);
+    want_undef("debugger");
+    /* ラベル付き break（ループ） */
+    want_num("var i = 0; outer: while (i < 3) { i++; if (i == 2) break outer; } i", 2);
+    want_num("var n = 0; done: while (n < 10) { n++; if (n == 5) break done; } n", 5);
+    want_num("var s = 0; outer: for (var a = 0; a < 3; a++) { for (var b = 0; b < 3; b++) { if (a == 1 && b == 1) break outer; s++; } } s", 4);
+    want_num("var i = 0; outer: while (true) { while (true) { i++; if (i > 2) break outer; } } i", 3);
+    want_num("var i = 0; outer: for (var j = 0; j < 100; j++) { if (j == 3) break outer; i = j; } i", 2);
+    /* ラベル付き continue */
+    want_num("var i = 0; outer: for (var j = 0; j < 3; j++) { for (var k = 0; k < 3; k++) { if (k == 1) continue outer; i++; } } i", 3);
+    want_num("var x = 0; outer: do { x++; if (x == 2) continue outer; } while (x < 3); x", 3);
+    /* 非ループラベルの break（ブロック終端へ） */
+    want_num("var n = 0; lbl: { n = 1; break lbl; n = 2; } n", 1);
+    want_num("var n = 0; lbl: { n = 1; if (n == 1) break lbl; n = 2; } n", 1);
+    /* エラー */
+    want_err("break missing;", "label");
+    want_err("var i = 0; foo: { continue foo; }", "continue");
 }

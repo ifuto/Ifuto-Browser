@@ -76,6 +76,9 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | computed キー `{[expr]: v}` | `var k='x'; var o={[k]:9}; o.x` | `9` |
 | メソッド短縮 `{ m() {} }`（this はメソッド呼び出し時に束縛） | `var o={m(){return 42;}}; o.m()` | `42` |
 | getter/setter `{ get x(){} }` / `{ set x(v){} }`（自動呼び出し・this 束縛） | `var o={_x:1, get x(){return this._x;}, set x(v){this._x=v*2;}}; o.x=5; o.x` | `10` |
+| ラベル文 `label: stmt` + `break label` / `continue label`（非ループラベルの break は文終端へ） | `outer: for(...) { break outer; }` | OK |
+| `debugger` 文（no-op） | `debugger; 1+1` | `2` |
+| 文頭 `{a:1}` の曖昧性 | ブロック文 + ラベル + 式文として解釈（JS 準拠） | `1` |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
 `-1/0 = -Infinity`、`NaN !== NaN`（IEEE 754/JIS X 3010 相当の double 厳密）、
@@ -85,7 +88,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 
 | 構文 | 実測エラー |
 |---|---|
-| 文頭 `{` の曖昧性 | ブロック文が無いので object literal として読み、`{a:1}` 単文は `expected ';'` で明白に失敗（JS とは別解釈、いずれも拒否） |
+| `with` 文・ラベルなしの非ループ break（`foo: { break; }` の無名 break） | SyntaxError / break outside loop（ラベル付きは対応） |
 | `Math.floor` 等の標準組込オブジェクト | ✅ v0.3 で実装（Math 24 関数 + 定数 8 種） |
 | `super` のプロパティ取得（`super.x = 1`）・`super[name]` | SyntaxError（super.m() と super(...) のみ対応） |
 | async/await・generator・BigInt | SyntaxError |
@@ -129,7 +132,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 14. ✅ Object/Array グローバル・String/Number/Boolean コンストラクタ（2026-08-09: keys/values/entries/assign/create/isArray + 呼び出し変換）
 15. ✅ class フィールド宣言・配列 length 代入（2026-08-09）
 16. ✅ 論理代入・数値区切り・オブジェクト短縮/computed/メソッド/getter-setter（2026-08-09）
-17. async/await（コルーチン基盤の設計が必要）
+17. ✅ ラベル break/continue・debugger・eval 間 last_val 残留修正（2026-08-09）
+18. async/await（コルーチン基盤の設計が必要）
 
 ## V8 との位置づけ
 
