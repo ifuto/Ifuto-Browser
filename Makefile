@@ -1,5 +1,7 @@
 # Ifuto Browser — build
 # 設計上の固定費を避けるため、依存ライブラリはゼロ（libc のみ）。
+# TLS はロードマップ既定（ARCHITECTURE.md §6）に従い BearSSL（vendor/bearssl、MIT）を
+# 静的リンクする。製品法則「ldd = vdso/libm/libc/ld」は静的リンクで維持される。
 
 CC      ?= cc
 SRC     := $(wildcard src/*.c)
@@ -10,6 +12,17 @@ ENGINE  := $(filter-out src/main.c,$(SRC))
 # 台帳上の大きさ効果は BENCH.md に実測で記録する（旧 v0.0 の「200KB 天井」は
 # E1 統合で再設定 = 台帳の約定どおり実測で扱う）。
 AKLSRC  := $(wildcard src/akl/*.c)
+# BearSSL（vendor/bearssl, MIT）: TLS 1.2 クライアント。サードパーティは警告抑制で
+# コンパイル（自前コードの警告ゼロ規律は維持）。--gc-sections で使用シンボルのみ残る。
+# ec_prime_i31_secp{256,384,521}r1.c は inner.h で #if 0 の旧残骸（型定義が消えており
+# 独立コンパイル不能）のため除外。他の 166 ファイルは全て独立コンパイル可能。
+BEARSRC := $(filter-out vendor/bearssl/src/ec/ec_prime_i31_secp256r1.c \
+                     vendor/bearssl/src/ec/ec_prime_i31_secp384r1.c \
+                     vendor/bearssl/src/ec/ec_prime_i31_secp521r1.c,\
+                     $(wildcard vendor/bearssl/src/*.c vendor/bearssl/src/*/*.c))
+BEARINC := -Ivendor/bearssl/inc -Ivendor/bearssl/src
+# サードパーティは警告を出し得る（Wshadow 等）。自前コードの警告ゼロは維持する。
+BEARWARN := -Wno-shadow -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-unused-but-set-variable -Wno-unused-variable
 WFLAGS  := -std=c11 -Wall -Wextra -Wshadow -Wstrict-prototypes -Wwrite-strings
 BASE    := $(WFLAGS) -fno-strict-aliasing -fstack-protector-strong -D_FORTIFY_SOURCE=2
 REL     := -O2 -DNDEBUG -flto -ffunction-sections -fdata-sections
@@ -26,12 +39,12 @@ $(BUILD):
 # GUI は TUI 廃止（2026-08-01）で単一 UI。ifuto 本体に統合（--gui / --shot）。
 GUISRC := $(wildcard src/gui/*.c)
 HDRS    := $(wildcard src/*.h src/gui/*.h src/akl/*.h)
-$(BUILD)/ifuto: $(SRC) $(GUISRC) $(AKLSRC) $(HDRS) | $(BUILD)
-	$(CC) $(BASE) $(REL) -o $@ $(SRC) $(GUISRC) $(AKLSRC) $(LDFLAGS_REL) -lm
+$(BUILD)/ifuto: $(SRC) $(GUISRC) $(AKLSRC) $(BEARSRC) $(HDRS) | $(BUILD)
+	$(CC) $(BASE) $(REL) $(BEARINC) $(BEARWARN) -o $@ $(SRC) $(GUISRC) $(AKLSRC) $(BEARSRC) $(LDFLAGS_REL) -lm
 
 # 開発用: sanitizer 付きバイナリ（テスト・手動検証は常にこちらで）
-$(BUILD)/ifuto-asan: $(SRC) $(GUISRC) $(AKLSRC) $(HDRS) | $(BUILD)
-	$(CC) $(BASE) $(SAN) -o $@ $(SRC) $(GUISRC) $(AKLSRC) -lm
+$(BUILD)/ifuto-asan: $(SRC) $(GUISRC) $(AKLSRC) $(BEARSRC) $(HDRS) | $(BUILD)
+	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -o $@ $(SRC) $(GUISRC) $(AKLSRC) $(BEARSRC) -lm
 
 gui: $(BUILD)/ifuto
 
@@ -40,30 +53,30 @@ guismoke: $(BUILD)/ifuto
 	python3 tests/gui_smoke.py ./$(BUILD)/ifuto
 
 TESTSRC := $(wildcard tests/*.c)
-$(BUILD)/run_tests: $(TESTSRC) $(ENGINE) $(AKLSRC) $(HDRS) | $(BUILD)
-	$(CC) $(BASE) $(SAN) -Itests -o $@ $(TESTSRC) $(ENGINE) $(AKLSRC) -lm
+$(BUILD)/run_tests: $(TESTSRC) $(ENGINE) $(AKLSRC) $(BEARSRC) $(HDRS) | $(BUILD)
+	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -Itests -o $@ $(TESTSRC) $(ENGINE) $(AKLSRC) $(BEARSRC) -lm
 
 # akl の switch dispatch 側も丸ごと走査する双子バイナリ（片側だけの不具合を封殺）
-$(BUILD)/run_tests_switch: $(TESTSRC) $(ENGINE) $(AKLSRC) $(HDRS) | $(BUILD)
-	$(CC) $(BASE) $(SAN) -DAKL_TEST_SWITCH_DISPATCH -Itests -o $@ $(TESTSRC) $(ENGINE) $(AKLSRC) -lm
+$(BUILD)/run_tests_switch: $(TESTSRC) $(ENGINE) $(AKLSRC) $(BEARSRC) $(HDRS) | $(BUILD)
+	$(CC) $(BASE) $(SAN) -DAKL_TEST_SWITCH_DISPATCH $(BEARINC) $(BEARWARN) -Itests -o $@ $(TESTSRC) $(ENGINE) $(AKLSRC) $(BEARSRC) -lm
 
-$(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) $(AKLSRC) | $(BUILD)
-	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_driver.c $(ENGINE) $(AKLSRC) -lm
+$(BUILD)/fuzz_html: fuzz/fuzz_driver.c $(ENGINE) $(AKLSRC) $(BEARSRC) | $(BUILD)
+	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -I src -o $@ fuzz/fuzz_driver.c $(ENGINE) $(AKLSRC) $(BEARSRC) -lm
 
 $(BUILD)/fuzz_akl: fuzz/fuzz_akl.c $(AKLSRC) | $(BUILD)
-	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_akl.c $(AKLSRC) -lm
+	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -I src -o $@ fuzz/fuzz_akl.c $(AKLSRC) -lm
 
 # リモート入力面（net.c の URL/resolve/head/dechunk）も同じ穴倉で打つ
-$(BUILD)/fuzz_net: fuzz/fuzz_net.c src/net.c src/net.h src/arena.c src/common.c | $(BUILD)
-	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_net.c src/net.c src/arena.c src/common.c -lm
+$(BUILD)/fuzz_net: fuzz/fuzz_net.c src/net.c src/tls.c src/net.h src/arena.c src/common.c $(BEARSRC) | $(BUILD)
+	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -I src -o $@ fuzz/fuzz_net.c src/net.c src/tls.c src/arena.c src/common.c $(BEARSRC) -lm
 
 # 破損 autosave 面（store.c の session/bookmarks 読みパーサ）も同じ穴倉で打つ
 $(BUILD)/fuzz_store: fuzz/fuzz_store.c src/store.c src/store.h src/arena.c src/common.c | $(BUILD)
-	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_store.c src/store.c src/arena.c src/common.c -lm
+	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -I src -o $@ fuzz/fuzz_store.c src/store.c src/arena.c src/common.c -lm
 
 # 拡張導入面（ext_manifest.c 純粋パーサ）も同じ穴倉で打つ
 $(BUILD)/fuzz_ext: fuzz/fuzz_ext.c src/ext_manifest.c src/ext_manifest.h | $(BUILD)
-	$(CC) $(BASE) $(SAN) -I src -o $@ fuzz/fuzz_ext.c src/ext_manifest.c -lm
+	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -I src -o $@ fuzz/fuzz_ext.c src/ext_manifest.c -lm
 
 .PHONY: test golden fuzz bench clean size conformance guard vsx aklbench gui guismoke akltest
 
@@ -90,6 +103,12 @@ cxxtest: $(BUILD)/test_v8compat
 golden: $(BUILD)/ifuto-asan
 	tests/run_golden.sh ./$(BUILD)/ifuto-asan
 
+# TLS 黒盒 smoke（https:// E2E。自己署名 CA + openssl s_server を起動して検証。
+# openssl が無ければ SKIP。実サーバへの接続はこの headless コンテナの egress が
+# TLS ハンドシェイクを遮断するため対象外 — ローカルで全経路を検証する）
+tlssmoke: $(BUILD)/ifuto
+	sh tests/tls_smoke.sh ./$(BUILD)/ifuto
+
 fuzz: $(BUILD)/fuzz_html $(BUILD)/fuzz_akl $(BUILD)/fuzz_net $(BUILD)/fuzz_store $(BUILD)/fuzz_ext
 	fuzz/run_fuzz.sh ./$(BUILD)/fuzz_html 500
 	fuzz/run_fuzz.sh ./$(BUILD)/fuzz_akl 500
@@ -101,11 +120,11 @@ bench: $(BUILD)/ifuto
 	bench/bench.sh ./$(BUILD)/ifuto
 
 # v-chrome 天井の実測検証（PTY 冷間開始/空タブ RSS/idle CPU + 50 タブメタ + セッション復元）
-$(BUILD)/bench_tabmeta: bench/bench_tabmeta.c $(ENGINE) $(AKLSRC) | $(BUILD)
-	$(CC) $(BASE) $(REL) -o $@ bench/bench_tabmeta.c $(ENGINE) $(AKLSRC) $(LDFLAGS_REL) -lm
+$(BUILD)/bench_tabmeta: bench/bench_tabmeta.c $(ENGINE) $(AKLSRC) $(BEARSRC) | $(BUILD)
+	$(CC) $(BASE) $(REL) $(BEARINC) $(BEARWARN) -o $@ bench/bench_tabmeta.c $(ENGINE) $(AKLSRC) $(BEARSRC) $(LDFLAGS_REL) -lm
 
-$(BUILD)/bench_session: bench/bench_session.c $(ENGINE) $(AKLSRC) | $(BUILD)
-	$(CC) $(BASE) $(REL) -o $@ bench/bench_session.c $(ENGINE) $(AKLSRC) $(LDFLAGS_REL) -lm
+$(BUILD)/bench_session: bench/bench_session.c $(ENGINE) $(AKLSRC) $(BEARSRC) | $(BUILD)
+	$(CC) $(BASE) $(REL) $(BEARINC) $(BEARWARN) -o $@ bench/bench_session.c $(ENGINE) $(AKLSRC) $(BEARSRC) $(LDFLAGS_REL) -lm
 
 # Akl dispatch 決定の根拠データ（結果は BENCH.md に中央値で公開）
 $(BUILD)/bench_akl: bench/bench_akl.c $(AKLSRC) | $(BUILD)

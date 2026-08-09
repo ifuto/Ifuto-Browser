@@ -190,6 +190,229 @@ void if_dom_set_text(IfArena *a, IfNode *n, IfStr t) {
     n->last_child = tn;
 }
 
+
+/* ---- v0.3: script DOM バインディング（属性設定・セレクタ照合） ---- */
+
+/* 属性の設定。値は arena に複製し、既存は置換・無ければ追加（budget あり）。
+ * attrs 配列は arena 再確保（n_attrs は小さいので線形コピーで十分）。 */
+bool if_dom_attr_set(IfArena *a, IfNode *n, IfStr name, IfStr value) {
+    if (!a || !n || !name.p || name.n == 0) return false;
+    for (u32 i = 0; i < n->n_attrs; i++) {
+        if (if_str_eq_ci(n->attrs[i].name, name)) {
+            char *vp = (char *)if_arena_alloc(a, (u64)value.n + 1);
+            if (!vp) return false;
+            memcpy(vp, value.p, value.n);
+            vp[value.n] = 0;
+            n->attrs[i].value = if_str(vp, value.n);
+            return true;
+        }
+    }
+    /* 追加: 既存配列 + 1 を arena に複製 */
+    IfAttr *na = (IfAttr *)if_arena_alloc(a, (u64)(n->n_attrs + 1) * sizeof(IfAttr));
+    if (!na) return false;
+    if (n->n_attrs) memcpy(na, n->attrs, (u64)n->n_attrs * sizeof(IfAttr));
+    char *np = (char *)if_arena_alloc(a, (u64)name.n + 1);
+    if (!np) return false;
+    memcpy(np, name.p, name.n);
+    np[name.n] = 0;
+    char *vp = (char *)if_arena_alloc(a, (u64)value.n + 1);
+    if (!vp) return false;
+    memcpy(vp, value.p, value.n);
+    vp[value.n] = 0;
+    na[n->n_attrs].name = if_str(np, name.n);
+    na[n->n_attrs].value = if_str(vp, value.n);
+    n->attrs = na;
+    n->n_attrs++;
+    return true;
+}
+
+/* ---- 最小セレクタの構造化 ---- */
+typedef struct {
+    const char *tag;  u32 tag_n;  /* 0 なら任意 */
+    const char *id;   u32 id_n;   /* 0 ならなし */
+    const char *cls;  u32 cls_n;  /* 最初の .class のみ（複数 class は非対応） */
+} SelPart;
+
+/* 複合セレクタ 1 つをパース（例: div#main.nav）。失敗で false。 */
+static bool sel_part_parse(const char *s, u32 n, SelPart *out) {
+    memset(out, 0, sizeof *out);
+    u32 i = 0;
+    if (i < n && (s[i] == '#' || s[i] == '.')) {
+        /* タグなし（#id / .class から開始） */
+    } else {
+        u32 st = i;
+        while (i < n && s[i] != '#' && s[i] != '.') i++;
+        if (i == st) return false;
+        out->tag = s + st;
+        out->tag_n = i - st;
+    }
+    while (i < n) {
+        char c = s[i];
+        if (c == '#') {
+            i++;
+            u32 st = i;
+            while (i < n && s[i] != '.' && s[i] != '#') i++;
+            if (i == st || out->id_n) return false; /* 複数 id は非対応 */
+            out->id = s + st;
+            out->id_n = i - st;
+        } else if (c == '.') {
+            i++;
+            u32 st = i;
+            while (i < n && s[i] != '.' && s[i] != '#') i++;
+            if (i == st || out->cls_n) return false; /* 複数 class は非対応 */
+            out->cls = s + st;
+            out->cls_n = i - st;
+        } else return false;
+    }
+    return true;
+}
+
+static bool sel_part_matches(const IfNode *n, const SelPart *p) {
+    if (n->kind != IF_NODE_ELEMENT) return false;
+    if (p->tag_n) {
+        const char *tn = if_tag_name(n->tag);
+        if (n->tag == IF_TAG_UNKNOWN) {
+            /* 未知タグ: 名前文字列と CI 比較 */
+            u32 l = (u32)strlen(tn);
+            if (l != p->tag_n) return false;
+            for (u32 i = 0; i < l; i++) {
+                char a = tn[i], b = p->tag[i];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) return false;
+            }
+        } else {
+            if (p->tag_n != (u32)strlen(tn)) return false;
+            for (u32 i = 0; i < p->tag_n; i++) {
+                char a = tn[i], b = p->tag[i];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) return false;
+            }
+        }
+    }
+    if (p->id_n) {
+        IfStr v = if_dom_attr(n, "id");
+        if (v.n != p->id_n || memcmp(v.p, p->id, p->id_n) != 0) return false;
+    }
+    if (p->cls_n) {
+        IfStr v = if_dom_attr(n, "class");
+        /* class 属性にトークンとして含まれるか（case-sensitive） */
+        u32 i = 0;
+        bool found = false;
+        while (i < v.n) {
+            while (i < v.n && (v.p[i] == ' ' || v.p[i] == '\t' || v.p[i] == '\n' || v.p[i] == '\r' || v.p[i] == '\f')) i++;
+            u32 st = i;
+            while (i < v.n && !(v.p[i] == ' ' || v.p[i] == '\t' || v.p[i] == '\n' || v.p[i] == '\r' || v.p[i] == '\f')) i++;
+            if (i - st == p->cls_n && memcmp(v.p + st, p->cls, p->cls_n) == 0) { found = true; break; }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/* セレクタを空白区切りの複合列に分割（子孫結合子）。上限 4。 */
+static u32 sel_split(const char *sel, SelPart *parts, u32 cap) {
+    u32 n = 0;
+    const char *p = sel;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (!*p) break;
+        const char *st = p;
+        while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+        if (n >= cap) return UINT32_MAX; /* 過剰分割 = 非対応 */
+        if (!sel_part_parse(st, (u32)(p - st), &parts[n])) return UINT32_MAX;
+        n++;
+    }
+    return n;
+}
+
+bool if_dom_selector_matches(const IfDom *d, const IfNode *n, const char *sel) {
+    (void)d;
+    if (!n || !sel || !sel[0]) return false;
+    SelPart parts[4];
+    u32 np = sel_split(sel, parts, 4);
+    if (np == UINT32_MAX || np == 0) return false;
+    /* 右端の複合が n 自身にマッチ */
+    if (!sel_part_matches(n, &parts[np - 1])) return false;
+    /* 左の複合群は祖先に「右から順に」マッチ（子孫結合子の意味論） */
+    u32 pi = np - 1;
+    for (const IfNode *a = n->parent; a && pi > 0; a = a->parent) {
+        if (a->kind != IF_NODE_ELEMENT) continue;
+        if (sel_part_matches(a, &parts[pi - 1])) pi--;
+    }
+    return pi == 0;
+}
+
+/* 文書順 DFS（再帰。深さは tree 側の IF_MAX_STACK_DEPTH 制限で安全） */
+static IfNode *qs_rec(IfNode *cur, const SelPart *parts, u32 np) {
+    if (cur->kind == IF_NODE_ELEMENT && sel_part_matches(cur, &parts[np - 1])) {
+        u32 pi = np - 1;
+        for (const IfNode *a = cur->parent; a && pi > 0; a = a->parent) {
+            if (a->kind == IF_NODE_ELEMENT && sel_part_matches(a, &parts[pi - 1])) pi--;
+        }
+        if (pi == 0) return cur;
+    }
+    for (IfNode *c = cur->first_child; c; c = c->next_sibling) {
+        IfNode *r = qs_rec(c, parts, np);
+        if (r) return r;
+    }
+    return NULL;
+}
+
+IfNode *if_dom_query_selector(const IfDom *d, const char *sel) {
+    if (!d || !sel || !sel[0]) return NULL;
+    SelPart parts[4];
+    u32 np = sel_split(sel, parts, 4);
+    if (np == UINT32_MAX || np == 0) return NULL;
+    if (!d->root) return NULL;
+    return qs_rec(d->root, parts, np);
+}
+
+static u32 ebt_rec(IfNode *cur, u16 tag_id, bool any, const char *tag, u32 tn,
+                    IfNode **out, u32 cap, u32 cnt) {
+    if (cur->kind == IF_NODE_ELEMENT) {
+        bool match;
+        if (any) match = true;
+        else if (tag_id != IF_TAG_UNKNOWN) match = cur->tag == tag_id;
+        else {
+            const char *nm = if_tag_name(cur->tag);
+            u32 l = (u32)strlen(nm);
+            match = l == tn;
+            for (u32 i = 0; match && i < l; i++) {
+                char a = nm[i], b = tag[i];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) match = false;
+            }
+        }
+        if (match) {
+            if (cnt < cap) out[cnt] = cur;
+            cnt++;
+        }
+    }
+    for (IfNode *c = cur->first_child; c; c = c->next_sibling)
+        cnt = ebt_rec(c, tag_id, any, tag, tn, out, cap, cnt);
+    return cnt;
+}
+
+u32 if_dom_elements_by_tag(IfNode *root, const char *tag, IfNode **out, u32 cap) {
+    if (!root) return 0;
+    u32 tn = (u32)strlen(tag);
+    bool any = tn == 0 || (tn == 1 && tag[0] == '*');
+    u16 tag_id = IF_TAG_UNKNOWN;
+    if (!any) {
+        for (u16 i = 1; i < IF_TAG_N_TAGS; i++) {
+            if (tn == (u32)strlen(IF_TAGS[i].s) &&
+                if_str_eq_ci(if_str(tag, tn), if_str(IF_TAGS[i].s, (u32)strlen(IF_TAGS[i].s)))) {
+                tag_id = i;
+                break;
+            }
+        }
+    }
+    return ebt_rec(root, tag_id, any, tag, tn, out, cap, 0);
+}
+
 IfNode *if_dom_title_set(IfArena *a, IfDom *d, IfStr t) {
     if (!a || !d) return NULL;
     IfNode *ttl = if_dom_find_tag_dfs(d, IF_TAG_TITLE);

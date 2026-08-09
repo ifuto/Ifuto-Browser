@@ -17,19 +17,20 @@
 
 typedef struct {
     char host[256];
-    u16  port;      /* 省略時 80 */
+    u16  port;      /* 省略時 80（https は 443） */
     bool has_port;  /* URL に明示 :port があったか（Host ヘッダ生成に使う） */
+    bool tls;       /* https://（fetch_once が TLS レイヤを通す） */
     char path[768]; /* 常に '/' 始まり（?query 含む、#fragment は除去済み） */
 } IfHttpUrl;
 
-/* http://host[:port]/path[?query] を分解。#fragment は除去。
- * 受理しないもの: http 以外の scheme、userinfo('@')、IPv6 bracket、
+/* http(s)://host[:port]/path[?query] を分解。#fragment は除去。
+ * 受理しないもの: http/https 以外の scheme、userinfo('@')、IPv6 bracket、
  * 空 host、port 0/非数/桁溢れ、host/path の長さ溢れ。 */
 bool if_http_parse_url(const char *url, IfHttpUrl *out);
 
 /* base（現在の絶対 URL）に対して Location 値 loc を解決して out(cap) へ。
  * absolute / "//host" scheme-relative / "/abs" / 相対 / "?q" を受理。
- * http:// に落ちない解決結果は受理しない（false）。 */
+ * base と同じ scheme（http/https）に落ちない解決結果は受理しない（false）。 */
 bool if_http_resolve_url(const char *base, const char *loc, char *out, size_t cap);
 
 /* 応答ヘッダの解析結果。buf 内参照のみ持つ（所有権は移らない）。 */
@@ -55,7 +56,7 @@ bool if_http_dechunk(IfArena *a, const u8 *p, u64 n, IfStr *out);
  * 回まで内部で追跡する。404 等でも応答が届けば成功扱いで status に乗せる
  * （普通のブラウザが 404 ページを描画するのと同じ）。
  * 失敗時のみ err に分類文字列（"bad url"/"dns"/"connect"/"send"/"recv"/
- * "too large"/"bad response"/"truncated"/"redirect loop"）。 */
+ * "too large"/"bad response"/"truncated"/"redirect loop"/"tls"/"cert"/"ca"）。 */
 bool if_http_get(IfArena *a, const char *url, IfStr *out_body, u32 *out_status,
                  const char **err);
 

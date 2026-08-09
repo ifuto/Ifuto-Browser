@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L /* getaddrinfo, poll */
 #include "net.h"
+#include "tls.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,14 +23,26 @@ static const char *E_BIG = "too large";
 static const char *E_RESP = "bad response";
 static const char *E_TRUNC = "truncated";
 static const char *E_LOOP = "redirect loop";
+static const char *E_TLS = "tls";
+static const char *E_CERT = "cert";
+static const char *E_CA = "ca";
 
 /* ---- URL 分解 ---- */
 
 bool if_http_parse_url(const char *url, IfHttpUrl *out) {
-    if (!url || strncmp(url, "http://", 7) != 0) return false;
-    const char *p = url + 7;
+    if (!url) return false;
+    bool tls;
+    if (strncmp(url, "http://", 7) == 0) {
+        tls = false;
+    } else if (strncmp(url, "https://", 8) == 0) {
+        tls = true;
+    } else {
+        return false;
+    }
+    const char *p = url + (tls ? 8 : 7);
     memset(out, 0, sizeof *out);
-    out->port = 80;
+    out->tls = tls;
+    out->port = tls ? 443 : 80;
     /* fragment はここで切る（以後一切見ない） */
     const char *frag = strchr(p, '#');
     size_t rem = frag ? (size_t)(frag - p) : strlen(p);
@@ -103,12 +116,17 @@ bool if_http_resolve_url(const char *base, const char *loc, char *out, size_t ca
     while (ln && (loc[ln - 1] == ' ' || loc[ln - 1] == '\t' ||
                   loc[ln - 1] == '\r' || loc[ln - 1] == '\n')) ln--;
     if (ln == 0) return false;
-    if (strncmp(base, "http://", 7) != 0) return false;
+    bool tls = strncmp(base, "https://", 8) == 0;
+    const char *sch = tls ? "https://" : "http://";
+    if (strncmp(base, sch, tls ? 8 : 7) != 0) return false;
     int w;
-    if (ln >= 7 && strncmp(loc, "http://", 7) == 0) {
+    if (ln >= (tls ? 8 : 7) && strncmp(loc, sch, tls ? 8 : 7) == 0) {
         w = snprintf(out, cap, "%.*s", (int)ln, loc);
+    } else if (ln >= (tls ? 8 : 7) && strncmp(loc, tls ? "http://" : "https://", tls ? 7 : 8) == 0) {
+        /* scheme 変更（http<->https）は現行は追わない（正直な拒否） */
+        return false;
     } else if (ln >= 2 && loc[0] == '/' && loc[1] == '/') {
-        w = snprintf(out, cap, "http:%.*s", (int)ln, loc);
+        w = snprintf(out, cap, "%s%.*s", sch, (int)(ln - 2), loc + 2);
     } else if (loc[0] == '/') {
         size_t o = base_origin_len(base);
         w = snprintf(out, cap, "%.*s%.*s", (int)o, base, (int)ln, loc);
@@ -138,6 +156,7 @@ bool if_http_resolve_url(const char *base, const char *loc, char *out, size_t ca
         }
     }
     if (w < 0 || (size_t)w >= cap) return false;
+    if (tls) return strncmp(out, "https://", 8) == 0 && out[8] != 0;
     return strncmp(out, "http://", 7) == 0 && out[7] != 0;
 }
 
@@ -367,7 +386,18 @@ static bool fetch_once(IfArena *a, const IfHttpUrl *u, IfStr *out_body,
     int fd = connect_one(u->host, u->port);
     if (fd == -2) { *err = E_DNS; return false; }
     if (fd < 0) { *err = E_CONN; return false; }
-    /* Host: 明示 :port のときだけ付ける（既定 80 は載せない普通の形） */
+    /* https: TLS 1.2 ハンドシェイク（CA 検証 + サーバ名照合は BearSSL が実施） */
+    IfTls *tls = NULL;
+    if (u->tls) {
+        tls = if_tls_client(fd, u->host, err);
+        if (!tls) {
+            close(fd);
+            /* BearSSL の err 分類（tls/cert/ca）を net の分類へ写像 */
+            if (*err == E_TLS || *err == E_CERT || *err == E_CA) { /* そのまま */ }
+            return false;
+        }
+    }
+    /* Host: 明示 :port のときだけ付ける（既定 80/443 は載せない普通の形） */
     char req[1280];
     int rl;
     if (u->has_port)
@@ -382,24 +412,67 @@ static bool fetch_once(IfArena *a, const IfHttpUrl *u, IfStr *out_body,
                       "User-Agent: Ifuto/0.3\r\nAccept: */*\r\n"
                       "Connection: close\r\n\r\n",
                       u->path, u->host);
-    if (rl < 0 || (size_t)rl >= sizeof req) { close(fd); *err = E_URL; return false; }
-    if (!send_all(fd, (const u8 *)req, (size_t)rl)) { close(fd); *err = E_SEND; return false; }
-    /* EOF まで読む（Connection: close を宣言済み） */
-    u64 cap = 0, n = 0;
-    u8 *buf = NULL;
-    for (;;) {
-        if (n >= IF_HTTP_MAX_BYTES) { close(fd); *err = E_BIG; return false; }
-        buf = (u8 *)if_arena_grow(a, buf, &cap, n + 16384, 1);
-        ssize_t r = recv(fd, buf + n, (size_t)(cap - n), 0);
-        if (r < 0) {
-            if (errno == EINTR) continue;
+    if (rl < 0 || (size_t)rl >= sizeof req) {
+        if (tls) if_tls_close(tls);
+        close(fd);
+        *err = E_URL;
+        return false;
+    }
+    if (tls) {
+        if (!if_tls_send_all(tls, (const u8 *)req, (size_t)rl, err)) {
+            if_tls_close(tls);
             close(fd);
-            *err = E_RECV;
             return false;
         }
-        if (r == 0) break;
-        n += (u64)r;
+    } else if (!send_all(fd, (const u8 *)req, (size_t)rl)) {
+        close(fd);
+        *err = E_SEND;
+        return false;
     }
+    /* EOF まで読む（Connection: close を宣言済み）。Content-Length が確定したら
+     * その分だけ読んで早期完了（TLS では close_notify 待ちの無駄を省く） */
+    u64 cap = 0, n = 0;
+    u8 *buf = NULL;
+    u64 body_need = UINT64_MAX; /* 未確定 */
+    for (;;) {
+        if (n >= IF_HTTP_MAX_BYTES) {
+            if (tls) if_tls_close(tls);
+            close(fd);
+            *err = E_BIG;
+            return false;
+        }
+        buf = (u8 *)if_arena_grow(a, buf, &cap, n + 16384, 1);
+        ssize_t r;
+        if (tls) {
+            r = if_tls_recv(tls, buf + n, cap - n, err);
+            if (r < 0) {
+                if_tls_close(tls);
+                close(fd);
+                return false;
+            }
+            if (r == 0) break; /* close_notify / FIN = EOF */
+        } else {
+            r = recv(fd, buf + n, (size_t)(cap - n), 0);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                *err = E_RECV;
+                return false;
+            }
+            if (r == 0) break;
+        }
+        n += (u64)r;
+        /* ヘッダが揃ったら Content-Length を確認し、必要量を確定 */
+        if (body_need == UINT64_MAX) {
+            IfHttpHead hh;
+            if (if_http_head_parse(buf, n, &hh)) {
+                if (hh.content_length != UINT64_MAX)
+                    body_need = hh.body_off + hh.content_length;
+            }
+        }
+        if (body_need != UINT64_MAX && n >= body_need) break;
+    }
+    if (tls) if_tls_close(tls);
     close(fd);
     IfHttpHead h;
     if (!if_http_head_parse(buf, n, &h)) { *err = E_RESP; return false; }

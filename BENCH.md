@@ -16,9 +16,11 @@
 - 起動速度は ` /bin/true` 経路での最小/中央値に subprocess wall time を使う
   （`/usr/bin/time` 非存在、bash 組込の `time` のみ）。
 
-## 現行スナップショット（2026-08-08 計測・`build/ifuto` 502,664B）
+## 現行スナップショット（2026-08-08 計測・`build/ifuto` 675,216B）
 
-直前差分（A1 文字コード層, docs/CHARSET.md）: SJIS/EUC-JP 変換表 +49,152B。
+直前差分（HTTPS/TLS, BearSSL 静的リンク, src/tls.c + vendor/bearssl）:
++172,552B（TLS 1.2 クライアント + x509 検証。--gc-sections で使用シンボルのみ）。
+ldd = vdso/libm/libc/ld のまま（静的リンク）。A1 文字コード層は +49,152B。
 md ミッション経路は関門外（`if (!md_doc)` ゲート）のまま、A1 後の n=7 再計測は
 median **122.23ms**・peak_rss 224,988KB（帯内一致・回帰なし。同時並行 fuzz 計測の
 215ms 汚染値は棄却・静粛状態再計測で確定。台帳として方法論違反を記録する）。
@@ -87,6 +89,7 @@ min **1.40ms** / median **1.66ms** / p90 1.96ms。
 | ゲート | 現行値 |
 |---|---|
 | WPT tree-construction（`tests/wpt-tree-construction`、WPT master `5b6a1e6`） | **1922/1922 (100.0%)**、skip 12 = `#script-on` のみ（fragment 196 件は `--fragment CTX` で実行済） |
+| TLS smoke（`make tlssmoke`、自己署名 CA + openssl s_server E2E） | 3 checks（https 取得 / CA 不一致 cert 拒否 / IP SAN 非対応の明示） |
 | 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,986 checks / 0 failures** ×2（script 実行配線 + HANDLE GC 機械証明 + 入力 compaction + 文字コード層 60 checks オラクル込み） |
 | 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **21/21**（+4 = Shift_JIS/EUC-JP E2E、+1 = 変換表再生成一致） |
 | golden（`tests/run_golden.sh`） | 1/1 |

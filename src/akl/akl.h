@@ -33,6 +33,11 @@ void   akl_free(AklRT *rt);
  * （理由は akl_error の文字列）。out は NULL 可。 */
 bool akl_eval(AklRT *rt, const char *src, AklVal *out);
 
+/* v0.3 再入呼び出し（高階関数のコールバック等）: fn（FUNC/NATIVE）を argc/argv で呼ぶ。
+ * FUNC は VM を再入実行（outer スタックは GC ルートとして退避）。コールバック内の
+ * 例外・budget 枯渇は false で rt->err に倒れる。再入深さ上限 AKL_MAX_REENTRY。 */
+bool akl_call(AklRT *rt, AklVal fn, int argc, const AklVal *argv, AklVal *out);
+
 /* 1 回の eval で許す命令数の上限（既定 10,000,000）。0 にすると呼び出し側責任で
  * 「全命令即枯渇」になるので 1 以上を渡すこと。ブラウザ統合時はタブ経路ごとに設定する。 */
 void akl_set_insn_budget(AklRT *rt, uint64_t budget);
@@ -123,6 +128,12 @@ typedef struct AklHandleVTab {
 } AklHandleVTab;
 AklVal akl_mkhandle(AklRT *rt, const AklHandleVTab *vt, void *ptr); /* pin 規約は mkobject 同様 */
 bool akl_is_handle(AklRT *rt, AklVal v);
+
+/* v0.3: ホスト側から配列を生成（items は n 個の値。n==0 は空配列）。
+ * 生成直後は未ルートなので即座に束縛/返すこと（mkstring と同じライフサイクル規約）。 */
+AklVal akl_mkarray(AklRT *rt, const AklVal *items, uint32_t n);
+/* 配列の要素数（非配列は 0） */
+uint32_t akl_arr_len(AklRT *rt, AklVal arr);
 
 
 /* 組込側責任の上限引上げ（0 は据置）。既定値はブラウザ製品値（台帳の睩殺防止）。

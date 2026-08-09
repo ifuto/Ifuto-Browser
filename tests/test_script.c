@@ -38,6 +38,9 @@ static void tscr_end(TScr *t) {
     if_arena_destroy(&t->a);
 }
 
+static void test_script_dom_binding_v03(void);
+static void test_script_selector_edge(void);
+
 static void test_script_mutation(void) {
     TScr t;
     tscr_begin(&t, "<!DOCTYPE html><title>T0</title><div id=a>Hello</div>"
@@ -209,4 +212,57 @@ void test_script(void) {
     test_script_svg_and_document_shape();
     test_script_textcontent_and_globals();
     test_script_count_cap();
+    test_script_dom_binding_v03();
+    test_script_selector_edge();
 }
+
+static void test_script_dom_binding_v03(void) {
+    /* v0.3: querySelector / getElementsByTagName / getAttribute / setAttribute / style */
+    TScr t;
+    tscr_begin(&t, "<div id=main class=content><p class=first>Hello</p><p>World</p></div>"
+                   "<script>"
+                   "var el = document.querySelector('#main p.first');"
+                   "document.title = 'qs:' + el.textContent;"
+                   "var ps = document.getElementsByTagName('p');"
+                   "document.title = document.title + ':' + ps.length;"
+                   "var p0 = document.querySelector('p');"
+                   "document.title = document.title + ':' + p0.getAttribute('class');"
+                   "p0.setAttribute('data-x', '42');"
+                   "document.title = document.title + ':' + p0.getAttribute('data-x');"
+                   "var st = document.querySelector('p').style;"
+                   "st.color = 'blue';"
+                   "document.title = document.title + ':' + st.color;"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0);
+    CHECK(t.dom->title.n == 24 && memcmp(t.dom->title.p, "qs:Hello:2:first:42:blue", 24) == 0);
+    /* setAttribute が DOM に反映 */
+    IfNode *p0 = if_dom_query_selector(t.dom, "p");
+    CHECK(p0 != NULL);
+    IfStr dv = if_dom_attr(p0, "data-x");
+    CHECK(dv.n == 2 && memcmp(dv.p, "42", 2) == 0);
+    /* style 属性が "color:blue" を含む */
+    IfStr sv = if_dom_attr(p0, "style");
+    CHECK(sv.n >= 10 && memmem(sv.p, sv.n, "color:blue", 10) != NULL);
+    tscr_end(&t);
+}
+
+static void test_script_selector_edge(void) {
+    /* セレクタの境界: 非対応形は null（明示拒否）、子孫は祖先を辿る */
+    TScr t;
+    tscr_begin(&t, "<div id=a><section><p class=x>deep</p></section></div>"
+                   "<script>"
+                   "var a = document.querySelector('div section p');"
+                   "var b = document.querySelector('div > p');"      /* > は非対応 → null */
+                   "var c = document.querySelector('.x');"
+                   "var d = document.querySelector('p.x');"
+                   "document.title = (a ? a.textContent : 'na') + ':' + (b ? 'b' : 'nb')"
+                   "             + ':' + (c ? c.textContent : 'nc') + ':' + (d ? 'd' : 'nd');"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0);
+    CHECK(t.dom->title.n == 14 && memcmp(t.dom->title.p, "deep:nb:deep:d", 14) == 0);
+    tscr_end(&t);
+}
+
+

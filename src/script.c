@@ -95,10 +95,167 @@ static bool doc_call(AklRT *rt, void *ptr, const char *name, u32 len,
         *out = e ? akl_mkhandle(rt, &elem_vt, e) : akl_mknull();
         return true;
     }
+    if (len == 13 && memcmp(name, "querySelector", 13) == 0) {
+        if (argc != 1) { akl_native_throw(rt, "querySelector expects 1 argument"); return true; }
+        u32 ln = 0;
+        const char *b = akl_as_str(rt, argv[0], &ln);
+        if (!b) { akl_native_throw(rt, "querySelector expects a string"); return true; }
+        /* セレクタは NUL 終端が必要 → 短命 arena へコピー（GC 不発火の区間で使用） */
+        char sbuf[512];
+        if (ln >= sizeof sbuf) { akl_native_throw(rt, "querySelector: selector too long"); return true; }
+        memcpy(sbuf, b, ln);
+        sbuf[ln] = 0;
+        IfNode *e = g_dom ? if_dom_query_selector(g_dom, sbuf) : NULL;
+        *out = e ? akl_mkhandle(rt, &elem_vt, e) : akl_mknull();
+        return true;
+    }
+    if (len == 20 && memcmp(name, "getElementsByTagName", 20) == 0) {
+        if (argc != 1) { akl_native_throw(rt, "getElementsByTagName expects 1 argument"); return true; }
+        u32 ln = 0;
+        const char *b = akl_as_str(rt, argv[0], &ln);
+        if (!b) { akl_native_throw(rt, "getElementsByTagName expects a string"); return true; }
+        char tbuf[64];
+        if (ln >= sizeof tbuf) { akl_native_throw(rt, "getElementsByTagName: name too long"); return true; }
+        memcpy(tbuf, b, ln);
+        tbuf[ln] = 0;
+        /* 全マッチをまず数える（cap 1024 に制限して巨大文書の爆発を防ぐ） */
+        IfNode *list[1024];
+        u32 total = g_dom ? if_dom_elements_by_tag(g_dom->root, tbuf, list, 1024) : 0;
+        u32 cnt = total < 1024 ? total : 1024;
+        AklVal *vals = (AklVal *)malloc((u64)(cnt ? cnt : 1) * sizeof(AklVal));
+        if (!vals) { akl_native_throw(rt, "oom: getElementsByTagName"); return true; }
+        for (u32 i = 0; i < cnt; i++)
+            vals[i] = akl_mkhandle(rt, &elem_vt, list[i]);
+        *out = akl_mkarray(rt, vals, cnt);
+        free(vals);
+        if (akl_is_undefined(*out)) akl_native_throw(rt, akl_error(rt)[0] ? akl_error(rt) : "oom");
+        return true;
+    }
     return false; /* 未定義メソッド → TypeError: not a function */
 }
 
 static const AklHandleVTab doc_vt = { "HTMLDocument", doc_get, doc_set, doc_call };
+
+/* ---- element.style: style 属性のプロパティ get/set ---- */
+/* style 属性文字列から prop の値を抽出（";" 区切り・":" 区切り。CI 名照合） */
+static bool style_get_prop(IfStr style_attr, const char *prop, IfStr *out) {
+    u32 pl = (u32)strlen(prop);
+    u32 i = 0;
+    while (i < style_attr.n) {
+        while (i < style_attr.n && (style_attr.p[i] == ';' || style_attr.p[i] == ' ' || style_attr.p[i] == '\t')) i++;
+        u32 ns = i;
+        while (i < style_attr.n && style_attr.p[i] != ':') i++;
+        if (i >= style_attr.n) break;
+        u32 ne = i;
+        /* 名前 CI 照合 */
+        if (ne - ns == pl) {
+            bool eq = true;
+            for (u32 k = 0; k < pl; k++) {
+                char a = style_attr.p[ns + k], b = prop[k];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) { eq = false; break; }
+            }
+            if (eq) {
+                i++; /* ':' の後 */
+                while (i < style_attr.n && (style_attr.p[i] == ' ' || style_attr.p[i] == '\t')) i++;
+                u32 vs = i;
+                while (i < style_attr.n && style_attr.p[i] != ';') i++;
+                u32 ve = i;
+                while (ve > vs && (style_attr.p[ve - 1] == ' ' || style_attr.p[ve - 1] == '\t')) ve--;
+                *out = if_str(style_attr.p + vs, ve - vs);
+                return true;
+            }
+        }
+        while (i < style_attr.n && style_attr.p[i] != ';') i++;
+        if (i < style_attr.n) i++;
+    }
+    return false;
+}
+/* style 属性に prop: value を設定（既存は置換・無ければ追加） */
+static bool style_set_prop(IfArena *a, IfNode *n, const char *prop, IfStr value) {
+    IfStr cur = if_dom_attr(n, "style");
+    u32 pl = (u32)strlen(prop);
+    /* 既存 prop を除去した残りを構築 */
+    u8 *buf = (u8 *)malloc(cur.n ? cur.n : 1);
+    if (!buf) return false;
+    u32 bl = 0;
+    u32 i = 0;
+    bool replaced = false;
+    while (i < cur.n) {
+        u32 seg_start = i;
+        while (i < cur.n && cur.p[i] != ';') i++;
+        u32 seg_end = i;
+        if (i < cur.n) i++; /* ';' を跨ぐ */
+        /* セグメント内の名前部を CI 照合 */
+        u32 ns = seg_start;
+        while (ns < seg_end && (cur.p[ns] == ' ' || cur.p[ns] == '\t')) ns++;
+        u32 ne = ns;
+        while (ne < seg_end && cur.p[ne] != ':') ne++;
+        if (ne - ns == pl) {
+            bool eq = true;
+            for (u32 k = 0; k < pl; k++) {
+                char a = cur.p[ns + k], b = prop[k];
+                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) { eq = false; break; }
+            }
+            if (eq) { replaced = true; continue; } /* このセグメントは捨てる */
+        }
+        if (bl + (seg_end - seg_start) + 1 <= cur.n) {
+            memcpy(buf + bl, cur.p + seg_start, seg_end - seg_start);
+            bl += seg_end - seg_start;
+            if (i <= cur.n && bl < cur.n) buf[bl++] = ';';
+        }
+    }
+    /* 新しい prop: value を追記 */
+    u32 need = bl + pl + 1 + value.n + 1;
+    u8 *nb = (u8 *)realloc(buf, need);
+    if (!nb) { free(buf); return false; }
+    buf = nb;
+    if (bl && buf[bl - 1] != ';') buf[bl++] = ';';
+    if (bl && buf[bl - 1] == ';' && bl >= 2 && buf[bl - 2] == ';') bl--; /* 空セグメント重複防止 */
+    memcpy(buf + bl, prop, pl);
+    bl += pl;
+    buf[bl++] = ':';
+    memcpy(buf + bl, value.p, value.n);
+    bl += value.n;
+    buf[bl] = 0;
+    bool ok = if_dom_attr_set(a, n, if_str("style", 5), if_str((const char *)buf, bl));
+    free(buf);
+    return ok && replaced; /* replaced が false でも追加は成功（呼出側は ok を見る） */
+}
+
+static bool style_get(AklRT *rt, void *ptr, const char *name, u32 len, AklVal *out) {
+    IfNode *n = (IfNode *)ptr;
+    char prop[128];
+    if (len >= sizeof prop) return false;
+    memcpy(prop, name, len);
+    prop[len] = 0;
+    IfStr cur = if_dom_attr(n, "style");
+    IfStr v;
+    if (style_get_prop(cur, prop, &v)) {
+        *out = akl_mkstring(rt, v.p ? v.p : "", v.n);
+        return true;
+    }
+    *out = akl_mkstring(rt, "", 0);
+    return true;
+}
+static bool style_set(AklRT *rt, void *ptr, const char *name, u32 len, AklVal v) {
+    IfNode *n = (IfNode *)ptr;
+    char prop[128];
+    if (len >= sizeof prop) return false;
+    memcpy(prop, name, len);
+    prop[len] = 0;
+    AklVal sv = akl_tostring(rt, v);
+    if (akl_error(rt)[0]) return true;
+    u32 ln = 0;
+    const char *b = akl_as_str(rt, sv, &ln);
+    if (!b) { akl_native_throw(rt, "style: tostring failed"); return true; }
+    if (g_arena) style_set_prop(g_arena, n, prop, if_str(b, ln));
+    return true;
+}
+static const AklHandleVTab style_vt = { "CSSStyleDeclaration", style_get, style_set, NULL };
 
 static bool elem_get(AklRT *rt, void *ptr, const char *name, u32 len, AklVal *out) {
     IfNode *n = (IfNode *)ptr;
@@ -122,6 +279,47 @@ static bool elem_get(AklRT *rt, void *ptr, const char *name, u32 len, AklVal *ou
         *out = akl_mkstring(rt, up, (u32)tl); /* JS: HTML 要素の tagName は大文字 */
         return true;
     }
+    if (len == 5 && memcmp(name, "style", 5) == 0) {
+        *out = akl_mkhandle(rt, &style_vt, n);
+        return true;
+    }
+    if (len == 12 && memcmp(name, "getAttribute", 12) == 0) {
+        return false; /* メソッドは call 経由 */
+    }
+    return false;
+}
+
+/* 要素メソッド（v0.3: getAttribute / setAttribute） */
+static bool elem_call(AklRT *rt, void *ptr, const char *name, u32 len,
+                      int argc, const AklVal *argv, AklVal *out) {
+    IfNode *n = (IfNode *)ptr;
+    if (len == 12 && memcmp(name, "getAttribute", 12) == 0) {
+        if (argc != 1) { akl_native_throw(rt, "getAttribute expects 1 argument"); return true; }
+        u32 an = 0;
+        const char *ab = akl_as_str(rt, argv[0], &an);
+        if (!ab) { akl_native_throw(rt, "getAttribute expects a string"); return true; }
+        char abuf[128];
+        if (an >= sizeof abuf) { akl_native_throw(rt, "getAttribute: name too long"); return true; }
+        memcpy(abuf, ab, an);
+        abuf[an] = 0;
+        IfStr v = if_dom_attr(n, abuf);
+        *out = akl_mkstring(rt, v.p ? v.p : "", v.n);
+        return true;
+    }
+    if (len == 12 && memcmp(name, "setAttribute", 12) == 0) {
+        if (argc != 2) { akl_native_throw(rt, "setAttribute expects 2 arguments"); return true; }
+        u32 an = 0, vn = 0;
+        const char *ab = akl_as_str(rt, argv[0], &an);
+        const char *vb = akl_as_str(rt, argv[1], &vn);
+        if (!ab || !vb) { akl_native_throw(rt, "setAttribute expects strings"); return true; }
+        char abuf[128];
+        if (an >= sizeof abuf) { akl_native_throw(rt, "setAttribute: name too long"); return true; }
+        memcpy(abuf, ab, an);
+        abuf[an] = 0;
+        if (g_arena) if_dom_attr_set(g_arena, n, if_str(abuf, an), if_str(vb, vn));
+        *out = akl_mkundefined();
+        return true;
+    }
     return false;
 }
 
@@ -137,7 +335,8 @@ static bool elem_set(AklRT *rt, void *ptr, const char *name, u32 len, AklVal v) 
     return true;
 }
 
-static const AklHandleVTab elem_vt = { "HTMLElement", elem_get, elem_set, NULL };
+
+static const AklHandleVTab elem_vt = { "HTMLElement", elem_get, elem_set, elem_call };
 
 /* 文書順 DFS（script 収集。深さは tree 側 IF_MAX_STACK_DEPTH 制限で再帰安全） */
 static u32 collect_scripts_rec(IfNode *n, IfNode **out, u32 cap, u32 cnt) {

@@ -12,6 +12,9 @@ JIT は恒久禁止の自作インタプリタ。凍結正本: docs/SCRIPTING.md
 **文字コード変換**（v0.3: Shift_JIS 系 / EUC-JP → UTF-8 正規化。HTTP charset > BOM >
 meta prescan > UTF-8 既定。変換表は python codec 生成の再生成一致オラクル凍結、
 波ダッシュ 6 件は cp932 採用と明記。凍結正本: docs/CHARSET.md）+
+**HTTPS**（v0.3: BearSSL 静的リンクで TLS 1.2 + システム CA 検証 + サーバ名照合。
+自作 TLS は禁止（ARCHITECTURE §6）。製品法則 ldd = vdso/libm/libc/ld は維持。
+`tests/tls_smoke.sh` がローカル自己署名 CA + openssl s_server で E2E 検証）+
 **viewport 窓グリッド**（grid は文書全体ではなく可視窓のみ materialize）+
 ローカル永続化（セッション・履歴・ブックマーク。全て tmp→rename→fsync の原子書換）。
 
@@ -25,7 +28,7 @@ HTML/MD(untrusted) → [md→html] → tokenizer → DOM ─slim 剃り→ CSS c
 
 | 指標 | v0.1 (CLI) | 現在（v0.3-dev, GUI + ストア込み） |
 |---|---|---|
-| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **490.9 KB**（502,664 B。akl 拡張機構＋ネイティブ層/オブジェクト＋`<script>` 実行配線＋文字コード変換表（SJIS/EUC-JP、+49.2 KB）統合。ldd = vdso/libm/libc/ld のみ） |
+| バイナリ ifuto（stripped・LTO、GUI 統合済単一） | 80 KB | **659.4 KB**（675,216 B。akl 言語完全化＋組込関数＋文字コード変換表＋**TLS（BearSSL 静的リンク、+172 KB）** 統合。ldd = vdso/libm/libc/ld のみ） |
 | コールドスタート | 1.1 ms（spawn 込み） | **min 1.40 ms / median 1.66 ms**（CLI tiny render 300 連、2026-08-07 実測） |
 | 空タブ UI 常駐 RSS | — | **1.43 MB**（天井 4 MB） |
 | アンロード済み 50 タブ メタ | — | **14.7 KB**（天井 2 MB） |
@@ -71,8 +74,9 @@ GUI キー: `Ctrl+L` オムニボックス、Enter 確定 / Esc 解除、`Ctrl+T
 サブセット（type/class/id/universal、子孫・子結合子、カスケード+重要度+inline style）・
 ブロック/インラインレイアウト・全角折り返し・リスト・罫線・pre・リンク収集。
 
-**対応していないもの（嘘をつかない）**: JS、ネットワーク、画像デコード、フォント描画、
-テーブル真正レイアウト、flex/grid、マルチプロセス・サンドボックス、GPU。
+**対応していないもの（嘘をつかない）**: 画像デコード、フォント描画、テーブル真正
+レイアウト、flex/grid、マルチプロセス・サンドボックス、GPU。TLS は BearSSL（TLS 1.2 まで、
+IP 直打ち URL の SAN 検証は BearSSL の制限で不可 — docs/CHARSET.md 同様の台帳）。
 これらは ARCHITECTURE.md §6 のロードマップに検証基準つきで並んでいる。
 
 ## ドキュメント

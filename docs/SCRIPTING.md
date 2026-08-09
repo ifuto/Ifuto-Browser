@@ -49,15 +49,28 @@
     （無ければ head があれば生成し `IfDom.title` を同期）。
   - `document.body` / `document.documentElement` — 要素 HANDLE（無ければ null）。
   - `document.getElementById(id)` — 一致要素 HANDLE（無ければ null。id 値は case-sensitive）。
+  - `document.querySelector(sel)` — 最小 CSS セレクタで最初の一致要素（無ければ null）。
+    対応: `tag` / `.class` / `#id` / 複合（`div#main.nav`） / 子孫結合子（空白区切り、
+    例 `div section p`）。**非対応（null を返す明白拒否）**: `>` 子結合子・カンマ・
+    属性セレクタ・疑似クラス・複数 class。
+  - `document.getElementsByTagName(name)` — 一致要素の配列（文書順。`*` は全要素。
+    上限 1024 件で切詰め。未知タグ名も文字列 CI 照合）。
 - 要素 HANDLE
   - `.textContent` — 取得: 子孫 TEXT 連結。設定: 子群を単一 TEXT に置換（値は JS ToString 経由）。
   - `.id`（属性値文字列）、`.tagName`（HTML ns は大文字）。
+  - `.getAttribute(name)` / `.setAttribute(name, value)` — 属性の取得/設定
+    （値は JS ToString 経由・DOM arena へ複製。name は 127 バイト上限）。
+  - `.style` — CSSStyleDeclaration HANDLE。プロパティ get/set が style 属性を操作
+    （例: `el.style.color = 'blue'` は style 属性を更新し、以後のスタイル適用に反映）。
+    既存プロパティは置換・無ければ追加。非対応プロパティも文字列として保持。
 - HANDLE の未定義プロパティ読みは **undefined**、未定義メソッド呼出しは
   **TypeError: not a function**、setter 不在/拒否は TypeError。`typeof handle === "object"`、
   文字列化は `"[object HTMLDocument]"` / `"[object HTMLElement]"`。
-- **非対象（v1 で明白拒否）**: src 属性取得・querySelector・イベント・`innerHTML`・
-  属性一般・DOM 走査 API。akl 言語側の非対応機能は docs/AKL_COMPAT.md が正本
-  （例: `String()` コンストラクタは未実装 — 文字列化は `''+v` を使う）。
+- 配列高階関数（`map`/`filter`/`forEach`/`some`/`every`/`find`/`findIndex`/`reduce`）は
+  スクリプト内で使用可能（コールバックはクロージャ・ネスト・例外伝播に対応）。
+- **非対象（v1 で明白拒否）**: src 属性取得・イベント・`innerHTML`・DOM 走査 API
+  （children/parentNode 等）・classList。akl 言語側の非対応機能は docs/AKL_COMPAT.md が
+  正本（例: `String()` コンストラクタは未実装 — 文字列化は `''+v` を使う）。
 
 ## 6. 寿命・構造安全の証明（HANDLE ptr 規約）
 

@@ -34,7 +34,7 @@ static double now_ms(void) {
 
 static IfStr read_all(IfArena *a, const char *path, IfStr *out_ctype) {
     /* http:// はネットワーク取得（v0.3）。以後の pipeline はファイル入力と同一 */
-    if (strncmp(path, "http://", 7) == 0) {
+    if (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0) {
         IfStr body;
         u32 status = 0;
         const char *err = NULL;

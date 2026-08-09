@@ -17,8 +17,14 @@ static void test_http_parse(void) {
     CHECK(strcmp(u.path, "/a/b?x=1") == 0); /* fragment 除去、query 保持 */
     CHECK(if_http_parse_url("http://example.com?q=1", &u));
     CHECK(strcmp(u.path, "/?q=1") == 0); /* "?query" は "/?" 正規化 */
+    /* v0.3: https 受理（tls フラグ + 既定 port 443） */
+    CHECK(if_http_parse_url("https://example.com/", &u));
+    CHECK(u.tls && u.port == 443 && !u.has_port);
+    CHECK(strcmp(u.host, "example.com") == 0 && strcmp(u.path, "/") == 0);
+    CHECK(if_http_parse_url("https://example.com:8443/a", &u));
+    CHECK(u.tls && u.port == 8443 && u.has_port);
     /* 拒否群（曖昧解釈しない） */
-    CHECK(!if_http_parse_url("https://example.com/", &u));
+    CHECK(!if_http_parse_url("ftp://example.com/", &u));
     CHECK(!if_http_parse_url("http://user@example.com/", &u)); /* userinfo */
     CHECK(!if_http_parse_url("http://[::1]:8080/", &u));       /* IPv6 bracket */
     CHECK(!if_http_parse_url("http://example.com:0/", &u));

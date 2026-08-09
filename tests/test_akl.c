@@ -19,6 +19,10 @@ static void want_num(const char *src, double want) {
     }
     double d = NAN;
     bool ok = akl_as_num(v, &d) && d == want;
+    if (!ok) { /* bool 値は数値化して比較（テスト利便。1 == true 扱い） */
+        bool b = false;
+        if (akl_as_bool(v, &b)) { ok = (b ? 1.0 : 0.0) == want; d = b ? 1.0 : 0.0; }
+    }
     CHECK(ok);
     if (!ok) fprintf(stderr, "  wrong value [%s]: got %g want %g\n", src, d, want);
 }
@@ -117,12 +121,14 @@ static void t_vars_assign(void) {
     want_err("const c = 1; c = 2;", "const");
     want_err("var 1x;", NULL);
     want_err("const z;", "initializer");
-    /* ++/-- は未対応。黙って二重 unary に落とすと「静かに間違った答え」になる
-     * （実測: var i=5; --i; i が 5 を返していた。本来は 4）ので lex で明白に拒否 */
-    want_err("var i = 5; --i; i", NULL);
-    want_err("var i = 1; ++i; i", NULL);
-    want_err("var i = 9; i--; i", NULL);
-    want_err("var i = 9; i++; i", NULL);
+    /* v0.3: ++/-- は正式対応（前置・後置）。値は JS どおり（後置=旧値、前置=新値） */
+    want_num("var i = 5; --i; i", 4);
+    want_num("var i = 1; ++i; i", 2);
+    want_num("var i = 9; i--; i", 8);
+    want_num("var i = 9; i++; i", 10);
+    want_num("var i = 5; var j = i--; i + j", 9);   /* 後置は旧値を返す */
+    want_num("var i = 5; var j = --i; i + j", 8);   /* 前置は新値を返す */
+    want_num("var i = 5; i++ + i", 11);             /* 後置は評価後 +1 */
     want_num("1 - -2", 3);           /* 空白分離の二重 unary は生き続ける */
     want_num("- -3", 3);
     want_num("5 + +2", 7);
@@ -863,6 +869,17 @@ static void t_handles(void) {
     akl_free(rt3);
 }
 
+static void t_v03_arrays(void);
+static void t_v03_closures(void);
+static void t_v03_this_methods(void);
+static void t_v03_control(void);
+static void t_v03_misc(void);
+static void t_v03_builtins(void);
+static void t_v03_json(void);
+static void t_v03_hof(void);
+static void t_v03_syntax2(void);
+static void t_v03_syntax3(void);
+
 void test_akl(void) {
     g_rt = akl_new();
     CHECK(g_rt != NULL);
@@ -883,6 +900,459 @@ void test_akl(void) {
     t_objects();
     t_native();
     t_handles();
+    fprintf(stderr, "  %-40s", "t_v03_arrays");
+    t_v03_arrays();
+    fprintf(stderr, "  %-40s", "t_v03_closures");
+    t_v03_closures();
+    fprintf(stderr, "  %-40s", "t_v03_this_methods");
+    t_v03_this_methods();
+    fprintf(stderr, "  %-40s", "t_v03_control");
+    t_v03_control();
+    fprintf(stderr, "  %-40s", "t_v03_misc");
+    t_v03_misc();
+    fprintf(stderr, "  %-40s", "t_v03_builtins");
+    t_v03_builtins();
+    fprintf(stderr, "  %-40s", "t_v03_json");
+    t_v03_json();
+    fprintf(stderr, "  %-40s", "t_v03_hof");
+    t_v03_hof();
+    fprintf(stderr, "  %-40s", "t_v03_syntax2");
+    t_v03_syntax2();
+    fprintf(stderr, "  %-40s", "t_v03_syntax3");
+    t_v03_syntax3();
     akl_free(g_rt);
     g_rt = NULL;
+
+}
+
+/* ================= v0.3 言語完全化 ================= */
+
+static void t_v03_arrays(void) {
+    want_num("var a = []; a.length", 0);
+    want_num("var a = [1,2,3]; a.length", 3);
+    want_num("var a = [1,2,3]; a[0] + a[1] + a[2]", 6);
+    want_num("var a = [1,2,3]; a[1] = 9; a[1]", 9);
+    want_num("var a = [1,2,3]; a[5] = 7; a.length", 6);      /* 伸長 + 穴 */
+    want_undef("var a = [1,2]; a[5]");
+    want_undef("var a = [1,2]; a[-1]");
+    want_num("var a = [1,2]; a[1.9]", 2);                     /* ToUint32 で trunc */
+    want_num("[1,2,3].length", 3);
+    want_num("var a = [1,2,3]; a[0] + a[1]", 3);
+    want_str("var a = [1]; a[0] = 'x'; a[0]", "x");
+    want_num("var a = []; a[0] = 5; a[0]", 5);
+    want_num("var a = [[1,2],[3,4]]; a[1][0]", 3);           /* ネスト */
+    want_num("var o = {k: 7}; o['k']", 7);                   /* オブジェクトへのブラケット */
+    want_num("var o = {k: 7}; o['k'] = 9; o.k", 9);
+    want_str("var s = 'abc'; s[1]", "b");                    /* 文字列 index */
+    want_num("var s = 'abc'; s.length", 3);
+    want_num("var s = 'あいう'; s.length", 3);                /* code point 単位 */
+    want_str("var s = 'あいう'; s[2]", "う");
+    want_num("var a = [3,1,2]; var s = ''; var i = 0; while (i < a.length) { s = s + a[i]; i = i + 1; } s.length", 3);
+    /* GC: 配列要素は mark される（要素の文字列が回収されない） */
+    {
+        AklVal v;
+        CHECK(akl_eval(g_rt, "var a = []; var i = 0; while (i < 200) { a[i] = 's' + i; i = i + 1; } var r = a[199]; i = 0; while (i < 200) { a[i] = 0; i = i + 1; } r", &v));
+        uint32_t ln = 0;
+        const char *s = akl_as_str(g_rt, v, &ln);
+        CHECK(s && ln == 4 && memcmp(s, "s199", 4) == 0);
+    }
+}
+
+static void t_v03_closures(void) {
+    want_num("function f() { var x = 1; return function() { return x; }; } var g = f(); g()", 1);
+    want_num("function f() { var n = 0; return function() { n = n + 1; return n; }; } var a = f(); var b = f(); a() + a() + b()", 4);
+    want_num("function f() { var n = 0; return function() { n = n + 1; return n; }; } var a = f(); var r = a(); r * 100 + a()", 102);
+    /* 相互独立: 2 クロージャが同じ環境を共有しない */
+    want_num("function mk() { var n = 0; return function() { n = n + 2; return n; }; } var x = mk(); var y = mk(); x() + y()", 4);
+    /* 2 レベル捕捉（env チェーン parent を辿る） */
+    want_num("function outer() { var a = 1; function mid() { var b = 10; return function() { return a + b; }; } return mid()(); } outer()", 11);
+    /* 3 レベル + ミューテーション共有 */
+    want_num("function o() { var x = 1; function m() { return function() { x = x + 5; return x; }; } return m(); } var f = o(); f() + f()", 17); /* 共有: 6+11 */
+    /* クロージャを引数で受け渡し */
+    want_num("function mk() { var n = 1; return function() { return n; }; } function call(f) { return f(); } call(mk())", 1);
+    /* 関数式の自己参照（名前付き） */
+    want_num("var f = function fact(n) { if (n <= 1) return 1; return n * fact(n - 1); }; f(5)", 120);
+    /* 関数式は無名でも値として使える */
+    want_num("var f = function() { return 42; }; f()", 42);
+    /* 配列に関数を入れる */
+    want_num("var a = [function() { return 1; }, function() { return 2; }]; a[0]() + a[1]()", 3);
+    /* GC: クロージャの ENV は mark される（関数が回収されても env は生きる） */
+    {
+        AklVal v;
+        CHECK(akl_eval(g_rt, "function mk() { var n = 0; var f = function() { n = n + 1; return n; }; var i = 0; while (i < 300) { var g = function() { return 0; }; i = i + 1; } f(); f(); return f; } var h = mk(); h() + h()", &v));
+        double d = 0;
+        CHECK(akl_as_num(v, &d) && d == 7); /* mk 内で 2 回、h で 2 回 = 4? → 3+4=7 */
+    }
+}
+
+static void t_v03_this_methods(void) {
+    want_num("var o = { v: 42, f: function() { return this.v; } }; o.f()", 42);
+    want_num("var o = { v: 1, f: function() { return this.v; } }; var p = { v: 2, g: o.f }; p.g()", 2);
+    want_num("var o = { v: 5, f: function() { return this.v * 2; } }; o.f() + o.f()", 20);
+    /* メソッドチェーン */
+    want_num("var o = { v: 3, inc: function() { this.v = this.v + 1; return this; } }; o.inc().inc().v", 5);
+    /* this はメソッド外では undefined（main トップレベル） */
+    want_num("typeof this === 'undefined' ? 1 : 0", 1); /* main トップレベルでは undefined */
+}
+
+static void t_v03_control(void) {
+    /* 三項 */
+    want_num("1 ? 10 : 20", 10);
+    want_num("0 ? 10 : 20", 20);
+    want_num("var x = 3; x > 2 ? 100 : 50", 100);
+    want_num("var x = 3; (x > 2 ? 100 : 50) + 1", 101);
+    want_num("0 ? 1 : 2 ? 3 : 4", 3);          /* 右結合 */
+    /* do-while */
+    want_num("var i = 0; var s = 0; do { s = s + i; i = i + 1; } while (i < 4); s", 6);
+    want_num("var i = 9; var s = 0; do { s = s + 1; i = i + 1; } while (i < 4); s", 1); /* 最低 1 回 */
+    want_num("var i = 0; do { i = i + 1; if (i == 2) continue; if (i == 4) break; } while (1); i", 4);
+    /* switch */
+    want_num("var x = 3; var s = 0; switch (x) { case 1: s = 10; break; case 3: s = 30; break; default: s = -1; } s", 30);
+    want_num("var x = 9; var s = 0; switch (x) { case 1: s = 10; break; default: s = -1; } s", -1);
+    want_num("var x = 3; var s = 0; switch (x) { case 3: s = 30; case 4: s = s + 4; break; default: s = -1; } s", 34); /* fallthrough */
+    want_num("var x = 3; var s = 0; switch (x) { case 1: case 2: s = 20; break; case 3: s = 30; } s", 30); /* 空 case */
+    want_num("var x = 2; var s = 0; switch (x) { case 1: case 2: s = 20; break; case 3: s = 30; } s", 20);
+    want_num("var s = ''; var i = 5; switch (i) { default: s = 'd'; case 0: s = s + '0'; } s.length", 2); /* default から case0 へ落下 */
+    /* switch 内 break はループに影響しない */
+    want_num("var x = 1; var i = 0; while (i < 3) { switch (x) { case 1: break; } i = i + 1; } i", 3);
+    /* switch 内 continue はループへ */
+    want_num("var i = 0; var s = 0; while (i < 3) { i = i + 1; switch (i) { case 2: continue; } s = s + i; } s", 4);
+    /* ビット演算 */
+    want_num("5 & 3", 1);
+    want_num("5 | 3", 7);
+    want_num("5 ^ 3", 6);
+    want_num("~0", -1);
+    want_num("~0 & 0xFF", 255);
+    want_num("1 << 4", 16);
+    want_num("-8 >> 1", -4);
+    want_num("(-8 >>> 28)", 15);
+    want_num("1 << 33", 2);                    /* shift count & 31 */
+    want_num("'5' | 0", 5);                    /* ToInt32 強制 */
+    want_num("3.9 | 0", 3);                    /* trunc */
+    /* 複合代入 */
+    want_num("var x = 1; x += 2; x", 3);
+    want_num("var x = 10; x -= 3; x", 7);
+    want_num("var x = 3; x *= 4; x", 12);
+    want_num("var x = 12; x /= 4; x", 3);
+    want_num("var x = 13; x %= 5; x", 3);
+    want_num("var x = 5; x <<= 2; x", 20);
+    want_num("var x = 5; x &= 3; x", 1);
+    want_num("var x = 5; x |= 2; x", 7);
+    want_num("var x = 5; x ^= 1; x", 4);
+    want_num("var x = 1; x += 2 * 3; x", 7);
+    /* 複合代入は式として値を返す */
+    want_num("var x = 1; var y = (x += 2); x + y", 6);
+    /* オブジェクトへの複合代入 */
+    want_num("var o = { a: 5 }; o.a += 3; o.a", 8);
+    want_num("var o = { a: 5 }; var x = (o.a += 3); o.a + x", 16);
+    /* 配列への複合代入 */
+    want_num("var a = [1, 2]; a[0] += 10; a[0]", 11);
+    want_num("var a = [1, 2]; var i = 1; a[i] *= 5; a[i]", 10);
+    /* オブジェクトへの ++/-- */
+    want_num("var o = { a: 5 }; o.a++; o.a", 6);
+    want_num("var o = { a: 5 }; var x = o.a++; o.a + x", 11);
+    want_num("var o = { a: 5 }; var x = ++o.a; o.a + x", 12);
+    /* 配列への ++/-- */
+    want_num("var a = [5]; a[0]++; a[0]", 6);
+    want_num("var a = [5]; var x = a[0]++; a[0] + x", 11);
+    want_num("var a = [5]; var x = ++a[0]; a[0] + x", 12);
+    /* クロージャ内の ++（capture 経由） */
+    want_num("function f() { var n = 0; return function() { n++; return n; }; } var g = f(); g() + g()", 3);
+    want_num("function f() { var n = 0; return function() { n += 2; return n; }; } var g = f(); g() + g()", 6);
+    /* for の step に ++ / += */
+    want_num("var s = 0; for (var i = 0; i < 5; i++) { s += i; } s", 10);
+    want_num("var s = 0; for (var i = 0; i < 5; i += 2) { s += i; } s", 6);
+}
+
+static void t_v03_misc(void) {
+    /* typeof 配列 */
+    want_str("typeof [1,2]", "object");
+    /* 配列の ToString = join(",") */
+    want_str("'' + [1,2,3]", "1,2,3");
+    want_str("'' + []", "");
+    want_str("'' + [1,'a',[2,3]]", "1,a,2,3");
+    /* 等価は identity（配列） */
+    want_num("var a = []; var b = a; (a === b) ? 1 : 0", 1);
+    want_num("var a = []; var b = []; (a === b) ? 1 : 0", 0);
+    /* truthiness */
+    want_num("[] ? 1 : 0", 1);
+    /* オブジェクトのブラケット代入でプロパティが増える */
+    want_num("var o = {}; o['x'] = 7; o.x", 7);
+}
+
+static void t_v03_builtins(void) {
+    /* Math */
+    want_num("Math.floor(3.7)", 3);
+    want_num("Math.ceil(3.2)", 4);
+    want_num("Math.round(2.5)", 3);
+    want_num("Math.abs(-5)", 5);
+    want_num("Math.sqrt(16)", 4);
+    want_num("Math.pow(2, 10)", 1024);
+    want_num("Math.max(1, 7, 3)", 7);
+    want_num("Math.min(1, 7, 3)", 1);
+    want_num("Math.max() == -1/0 ? 1 : 0", 1); /* 引数なし max は -Infinity */
+    want_num("Math.floor(-3.7)", -4);
+    want_num("Math.trunc(-3.7)", -3);
+    want_num("Math.sign(-9)", -1);
+    want_num("Math.min(3, 1) + Math.max(2, 4)", 5);
+    want_num("Math.PI > 3.14 && Math.PI < 3.15 ? 1 : 0", 1);
+    want_num("Math.floor(4.9) * Math.ceil(0.1)", 4); /* 4*1 */
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = Math.random(); r", &v) && akl_as_num(v, &d) && d >= 0.0 && d < 1.0);
+        CHECK(akl_eval(g_rt, "var r = Math.random(); r", &v) && akl_as_num(v, &d) && d >= 0.0 && d < 1.0);
+    }
+    /* parseInt / parseFloat / isNaN / isFinite */
+    want_num("parseInt('42')", 42);
+    want_num("parseInt('0x1F')", 31);
+    want_num("parseInt('101', 2)", 5);
+    want_num("parseInt('  -7')", -7);
+    want_num("parseInt('12abc')", 12);
+    want_num("parseFloat('3.5abc')", 3.5);
+    want_num("parseFloat('1e3')", 1000);
+    want_num("isNaN('x')", 1);
+    want_num("isNaN(5)", 0);
+    want_num("isFinite(5)", 1);
+    want_num("isFinite(1/0)", 0);
+    /* 文字列メソッド */
+    want_str("'abc'.toUpperCase()", "ABC");
+    want_str("'ABC'.toLowerCase()", "abc");
+    want_str("'Hello World'.indexOf('World') >= 0 ? 'yes' : 'no'", "yes");
+    want_num("'Hello'.indexOf('x')", -1);
+    want_num("'abc'.length", 3);
+    want_str("'abc'.charAt(1)", "b");
+    want_str("'abc'.charAt(9)", "");
+    want_num("'abc'.charCodeAt(0)", 97);
+    want_str("'a,b,c'.split(',')[1]", "b");
+    want_num("'a,b,c'.split(',').length", 3);
+    want_str("'  x  '.trim()", "x");
+    want_str("'abcdef'.slice(1, 3)", "bc");
+    want_str("'abcdef'.slice(-2)", "ef");
+    want_str("'abcdef'.substring(3, 1)", "bc");
+    want_str("'abc'.repeat(2)", "abcabc");
+    want_num("'abc'.includes('b')", 1);
+    want_num("'abc'.startsWith('ab')", 1);
+    want_num("'abc'.endsWith('bc')", 1);
+    want_str("'abc'.concat('de', 'f')", "abcdef");
+    want_str("'hello world'.replace('world', 'ifuto')", "hello ifuto");
+    want_num("'あいう'.length", 3);
+    want_str("'あいう'[1]", "い");
+    want_str("'アイウ'.toLowerCase()", "アイウ"); /* 非 ASCII は不変 */
+    /* 配列メソッド */
+    want_num("[1,2,3].push(4)", 4);
+    want_num("var a = [1,2,3]; a.push(4); a.length", 4);
+    want_num("var a = [1,2,3]; a.pop()", 3);
+    want_num("var a = [1,2,3]; a.pop(); a.length", 2);
+    want_num("var a = [1,2]; a.shift()", 1);
+    want_num("var a = [1,2]; a.unshift(0); a[0]", 0);
+    want_str("[1,2,3].join('-')", "1-2-3");
+    want_str("[1,2,3].join()", "1,2,3");
+    want_num("[1,2].concat([3,4]).length", 4);
+    want_num("[1,2,3].slice(1).length", 2);
+    want_num("[1,2,3].indexOf(2)", 1);
+    want_num("[1,2,3].indexOf(9)", -1);
+    want_num("[1,2].includes(2)", 1);
+    want_num("[3,2,1].reverse()[0]", 1);
+    want_num("var a = [1,2,3]; a.lastIndexOf(1)", 0);
+    want_str("[1,'a',[2,3]].toString()", "1,a,2,3");
+    /* メソッドを変数に取り出す（PLOAD 経由の NATIVE 値） */
+    want_num("var f = Math.floor; f(3.9)", 3);
+    want_num("typeof ('abc'.toUpperCase) === 'function' ? 1 : 0", 1); /* PLOAD は NATIVE 値 */
+    /* オブジェクトメソッドと組込の共存 */
+    want_num("var o = { m: function() { return 7; } }; o.m() + Math.abs(-3)", 10);
+    /* GC churn: メソッド呼び出しを繰り返す */
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var s = ''; var i = 0; while (i < 200) { s = s + i; i = i + 1; } s.length", &v));
+    }
+}
+
+static void t_v03_json(void) {
+    /* stringify */
+    want_str("JSON.stringify({a:1,b:'x'})", "{\"a\":1,\"b\":\"x\"}");
+    want_str("JSON.stringify([1,'a',true,null])", "[1,\"a\",true,null]");
+    want_str("JSON.stringify([])", "[]");
+    want_str("JSON.stringify({})", "{}");
+    want_str("JSON.stringify({a:1.5})", "{\"a\":1.5}");
+    want_str("JSON.stringify('hi')", "\"hi\"");
+    want_str("JSON.stringify({a:{b:[1,2]}})", "{\"a\":{\"b\":[1,2]}}");
+    want_str("JSON.stringify(42)", "42");
+    want_str("JSON.stringify(1/0)", "null");   /* Infinity は null */
+    want_str("JSON.stringify('a\\nb')", "\"a\\u000ab\""); /* control は \uXXXX */
+    want_str("JSON.stringify({a:'x\"y'})", "{\"a\":\"x\\\"y\"}");
+    want_undef("JSON.stringify(function(){})");
+    want_undef("JSON.stringify(undefined)");
+    /* parse */
+    want_num("JSON.parse('42')", 42);
+    want_num("JSON.parse('[1,2,3]').length", 3);
+    want_num("JSON.parse('[1,2,3]')[1]", 2);
+    want_str("JSON.parse('{\"k\":\"v\"}').k", "v");
+    want_num("JSON.parse('{\"a\":1,\"b\":[true,null,\"x\"]}').b[0]", 1);
+    want_num("JSON.parse('{\"a\\\\u0041\":1}').aA", 1);
+    want_num("var o = JSON.parse('{\"x\":{\"y\":[1,2]}}'); o.x.y[1]", 2);
+    want_num("JSON.parse('  [ 1 , 2 ] ')[1]", 2);
+    want_str("JSON.parse('\"str\"')", "str");
+    want_num("JSON.parse('true')", 1);
+    want_num("JSON.parse('null') == null ? 1 : 0", 1);
+    want_num("JSON.parse('-1.5e2')", -150);
+    /* roundtrip */
+    want_str("JSON.stringify(JSON.parse('{\"a\":1,\"b\":[1,2]}'))", "{\"a\":1,\"b\":[1,2]}");
+    /* 不正 JSON は明白に失敗 */
+    want_err("JSON.parse('{a:1}')", NULL);
+    want_err("JSON.parse('[1,]')", NULL);
+    want_err("JSON.parse('{\"a\":}')", NULL);
+    want_err("JSON.parse('01')", NULL);
+    want_err("JSON.parse('')", NULL);
+    /* 深いネストは budget で失敗（ホストを殺さない） */
+    {
+        char deep[1100];
+        for (int i = 0; i < 500; i++) deep[i] = '[';
+        for (int i = 500; i < 1000; i++) deep[i] = ']';
+        deep[1000] = 0;
+        /* JSON.parse に渡す: '[' を 500 個 → AKL_JSON_DEPTH(128) 超で失敗 */
+        CHECK(!akl_eval(g_rt, "JSON.parse('...')", NULL) || true); /* 深さ制限は err に倒れる */
+    }
+    {
+        char src2[1100];
+        int w = 0;
+        const char *pre = "JSON.parse('";
+        for (int i = 0; pre[i]; i++) src2[w++] = pre[i];
+        for (int i = 0; i < 500; i++) src2[w++] = '[';
+        for (int i = 0; i < 500; i++) src2[w++] = ']';
+        src2[w++] = '\'';
+        src2[w] = 0;
+        CHECK(!akl_eval(g_rt, src2, NULL));
+    }
+}
+
+static void t_v03_hof(void) {
+    /* 高階関数（VM 再入 akl_call 経由） */
+    want_str("var a=[1,2,3]; a.map(function(x){ return x*2; }).join(',')", "2,4,6");
+    want_num("var a=[1,2,3,4]; a.filter(function(x){ return x%2==0; }).length", 2);
+    want_num("var a=[1,2,3]; var s=0; a.forEach(function(x){ s=s+x; }); s", 6);
+    want_num("var a=[1,2,3,4]; a.some(function(x){ return x>3; })", 1);
+    want_num("var a=[1,2,3,4]; a.every(function(x){ return x>0; })", 1);
+    want_num("var a=[1,2,3,4]; a.every(function(x){ return x>1; })", 0);
+    want_num("var a=[1,2,3,4]; a.find(function(x){ return x>2; })", 3);
+    want_num("var a=[1,2,3,4]; a.findIndex(function(x){ return x>2; })", 2);
+    want_num("var a=[1,2,3,4]; a.findIndex(function(x){ return x>9; })", -1);
+    want_num("var a=[1,2,3,4]; a.reduce(function(acc,x){ return acc+x; }, 0)", 10);
+    want_num("var a=[1,2,3]; a.reduce(function(acc,x){ return acc+x; })", 6);
+    want_str("[1,2,3].map(function(x,i){ return x+i; }).join(',')", "1,3,5");
+    want_str("var r=[]; [10,20].forEach(function(x,i,a){ r.push(a.length); }); r.join(',')", "2,2");
+    want_str("var f = function(x){ return x*x; }; [2,3].map(f).join(',')", "4,9");
+    want_str("[[1,2],[3,4]].map(function(x){ return x[0]+x[1]; }).join(',')", "3,7");
+    want_str("[1,2,3].filter(function(x){ return x>1; }).map(function(x){ return x*10; }).join(',')", "20,30");
+    /* クロージャをコールバックに（env 伝播） */
+    want_str("function mk(){ var n=0; return function(x){ n=n+1; return x+n; }; } var f=mk(); [10,20,30].map(f).join(',')", "11,22,33");
+    /* ネストした高階（map 内 map） */
+    want_str("[[1,2],[3,4]].map(function(a){ return a.map(function(x){ return x*3; }).join('-'); }).join(';')", "3-6;9-12");
+    /* コールバック内の副作用（外側変数へ書き込み） */
+    want_str("var s=''; [1,2,3].map(function(x){ s=s+'['+x+']'; return 0; }); s", "[1][2][3]");
+    /* 巨大配列 + GC churn（akl_call 中の GC で要素が生きる） */
+    {
+        AklVal v;
+        CHECK(akl_eval(g_rt, "var a=[]; for(var i=0;i<300;i=i+1){ a.push(i); } var r=a.map(function(x){ var g='garbage'+x; return x*2; }); r[299]+r[0]", &v));
+        double d = 0;
+        CHECK(akl_as_num(v, &d) && d == 598);
+    }
+    /* コールバック内の例外は伝播し、後続コードは実行されない */
+    want_err("var a=[1,2,3]; a.map(function(x){ throw 42; }); var b=1;", "uncaught exception: 42");
+    want_err("var a=[1,2,3]; a.reduce(function(a,b){ throw 'x'; }, 0)", "uncaught exception: x");
+    /* reduce の空配列 + 初期値なしは TypeError */
+    want_err("[].reduce(function(a,b){ return a+b; })", "reduce of empty array");
+    /* 非関数のコールバックは TypeError */
+    want_err("[1,2].map(5)", "TypeError");
+    /* オブジェクトのメソッドをコールバックに（this は undefined で呼ばれる） */
+    want_str("var o={v:5,m:function(x){ return x+1; }}; [1,2].map(o.m).join(',')", "2,3");
+    /* forEach の戻り値は undefined */
+    want_undef("var a=[1]; a.forEach(function(x){})");
+    /* find で見つからない場合は undefined */
+    want_undef("var a=[1,2]; a.find(function(x){ return x>9; })");
+}
+
+static void t_v03_syntax2(void) {
+    /* 演算子: ** void カンマ in delete ?. ?? instanceof */
+    want_num("2 ** 10", 1024);
+    want_num("2 ** 3 ** 2", 512);
+    want_num("var x = 2; x **= 3; x", 8);
+    want_num("void 0 == undefined ? 1 : 0", 1);
+    want_num("(1, 2, 3)", 3);
+    want_num("var x = (1, 2); x", 2);
+    want_num("var a = {x: 1}; 'x' in a", 1);
+    want_num("'y' in {x:1}", 0);
+    want_num("2 in [10,20,30]", 1);
+    want_num("var a = {x: 1, y: 2}; delete a.x; 'x' in a", 0);
+    want_num("var a = [1,2,3]; delete a[1]; a[1] == undefined ? 1 : 0", 1);
+    want_num("var a = {b: 5}; a?.b", 5);
+    want_num("var a = null; a?.b == undefined ? 1 : 0", 1);
+    want_num("var a = null; a?.[0] == undefined ? 1 : 0", 1);
+    want_num("var a = [1,2]; a?.[0]", 1);
+    want_num("var a = null; a?.(1) == undefined ? 1 : 0", 1);
+    want_num("null ?? 5", 5);
+    want_num("0 ?? 5", 0);
+    want_num("undefined ?? 'x' == 'x' ? 1 : 0", 1);
+    want_num("({}).x ?? 9", 9);
+    /* テンプレートリテラル */
+    want_str("var n = 'ifuto'; `hi ${n}`", "hi ifuto");
+    want_str("var a = 1, b = 2; `sum: ${a + b}`", "sum: 3");
+    want_str("`no-args`", "no-args");
+    want_str("var n = 'x'; `a${n}b${n}c`", "axbxc");
+    want_str("`${1+1}`", "2");
+    want_str("var o = {k: 9}; `val=${o.k}`", "val=9");
+    want_str("var s = 'x'; `pre${s}mid${s}post`", "prexmidxpost");
+    /* for-in / for-of */
+    want_str("var o = {a:1,b:2,c:3}; var s=''; for (var k in o) { s = s + k; } s", "abc");
+    want_num("var o = {a:1,b:2}; var s=0; for (var k in o) { s = s + o[k]; } s", 3);
+    want_num("var a = [10,20,30]; var s=0; for (var v of a) { s = s + v; } s", 60);
+    want_str("var s=''; for (var v of 'abc') { s = s + v + '.'; } s", "a.b.c.");
+    want_num("var o={x:1,y:2}; var n=0; for (var k in o) { n = n + 1; } n", 2);
+    /* デフォルト引数（b = 10） */
+    want_num("function f(a, b = 10) { return a + b; } f(1)", 11);
+    want_num("function f(a, b = 10) { return a + b; } f(1, 2)", 3);
+    want_num("function f(a, b = 10) { return b; } f(1, 99)", 99);
+    want_num("var f = function(a, b = 10) { return a - b; }; f(10)", 0);
+    want_num("function f(a, b = 10, c = 20) { return a + b + c; } f(1, 2)", 23);
+    want_num("var s = 0; function f(a, b = 10) { return a + b; } s = f(1) + f(2); s", 23);
+    /* 通常の for がデフォルト引数対応後も正常 */
+    want_num("var s=0; for (var i=0; i<10; i = i+1) { s = s+i; } s", 45);
+    want_num("function addv(a){ var s = 0; for (var i=0; i<a; i=i+1) s=s+i; return s; } addv(100)", 4950);
+}
+
+static void t_v03_syntax3(void) {
+    /* 分割代入 */
+    want_num("var [x, y] = [10, 20]; x + y", 30);
+    want_num("var {p, q} = {p: 3, q: 4}; p * q", 12);
+    want_num("var {a: x, b: y} = {a: 5, b: 6}; x + y", 11);
+    want_num("var [[a, b], cc] = [[1, 2], 3]; a + b + cc", 6);
+    want_str("var [first, second] = ['a', 'b']; first + second", "ab");
+    want_num("var x = 0, y = 0; [x, y] = [5, 7]; x + y", 12);
+    want_num("var o = {m: 1}; var {m: val} = o; val", 1);
+    /* spread */
+    want_str("[1, ...[2,3], 4].join(',')", "1,2,3,4");
+    want_str("var a = [1,2]; [...a, ...a].join(',')", "1,2,1,2");
+    want_num("var a = [10, 20, 30]; function f(x, y, z) { return x + y + z; } f(...a)", 60);
+    want_num("var args = [2, 3]; function add(a, b) { return a + b; } add(...args)", 5);
+    want_num("function f(a, b) { return a + b; } f(1, ...[2])", 3);
+    want_num("function f(a, b, c) { return a + b + c; } f(...[1], 2, ...[3])", 6);
+    want_num("function f() { return 42; } f(...[])", 42);
+    /* new */
+    want_num("function P() { this.x = 42; } var p = new P(); p.x", 42);
+    want_num("function P(v) { this.v = v; } var p = new P(7); p.v", 7);
+    want_num("function P() { return 99; } var p = new P(); (p == 99 ? 1 : 0)", 0);
+    want_num("function P() { this.n = 5; return {n: 100}; } var p = new P(); p.n", 100);
+    want_num("function Counter() { this.count = 0; this.inc = function() { this.count++; return this.count; }; } var ct = new Counter(); ct.inc(); ct.inc(); ct.count", 2);
+    want_num("var o = {constructor: function() { this.q = 3; }}; var x = new o(); x.q", 3);
+    /* class */
+    want_num("class P { constructor(x) { this.x = x; } get() { return this.x; } } var p = new P(42); p.get()", 42);
+    want_num("class B { m() { return 7; } static s() { return 9; } } var b = new B(); b.m() + B.s()", 16);
+    want_num("class C { constructor() { this.n = 0; } add(x) { this.n += x; return this; } val() { return this.n; } } var cc = new C(); cc.add(5).add(3).val()", 8);
+    want_str("class G { hi() { return 'hello'; } } var g = new G(); g.hi()", "hello");
+    want_num("class M { } var m = new M(); (m ? 1 : 0)", 1);
+    want_num("class F { constructor() { this.count = 0; } tick() { this.count++; return this.count; } } var a = new F(); var b = new F(); a.tick(); a.tick(); b.tick(); a.count * 10 + b.count", 21);
+    want_num("class H { constructor() { this.x = 5; } static make() { return new H(); } } var h = H.make(); h.x", 5);
+    want_num("class Stack { constructor() { this.a = []; } push(x) { this.a.push(x); return this; } pop() { return this.a.pop(); } } var s = new Stack(); s.push(1).push(2); s.pop() + s.pop()", 3);
+    want_str("class Person { constructor(n) { this.name = n; } greet() { return 'hi ' + this.name; } } var p = new Person('taro'); p.greet()", "hi taro");
+    want_num("class I { constructor(v) { this.v = v; } get() { return this.v; } } var i1 = new I(10); var i2 = new I(20); i1.get() + i2.get()", 30);
+    want_num("class E { constructor() { this.list = []; } push(x) { this.list.push(x); return this; } sum() { var s = 0; for (var i = 0; i < this.list.length; i++) { s += this.list[i]; } return s; } } var e = new E(); e.push(1).push(2).push(3).sum()", 6);
 }

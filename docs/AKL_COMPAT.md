@@ -52,27 +52,34 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 
 | 構文 | 実測エラー |
 |---|---|
-| 配列リテラル `[1,2,3]` / 要素アクセス `o["k"]`・`a[i]` | SyntaxError（lex 拒否） |
-| ブラケットプロパティアクセス `o["k"]` | SyntaxError（`.` のみ） |
-| `this`・メソッド shorthand・computed key・shorthand `{a}` | SyntaxError（`o.f()` の self は native 専用で `this` バインドは渡らない） |
-| 文字列プロパティ `s.length`（および数値/bool のプロパティ） | `TypeError: property access on non-object value`（暗黙ボックス化はしない） |
-| `Math.floor` 等の標準組込オブジェクト | `ReferenceError: Math is not defined`（ホスト登録のみ存在） |
 | 文頭 `{` の曖昧性 | ブロック文が無いので object literal として読み、`{a:1}` 単文は `expected ';'` で明白に失敗（JS とは別解釈、いずれも拒否） |
-| 関数式・IIFE・アロー関数 | SyntaxError |
-| **クロージャ捕捉**（ネスト関数から外スコープの局所変数） | `ReferenceError: n is not defined` |
-| 三項演算子 `?:`、do-while、switch、for-in/for-of | SyntaxError |
-| `++` `--`・複合代入 `+=` 等 | SyntaxError（黙った誤答はない。lex で拒否） |
-| ビット演算 `& \| ^ ~ << >>`、`**` | SyntaxError |
-| class・async/await・generator・template literal・BigInt | SyntaxError |
-| `new`・`?.`・`??`・regex literal・spread・destructuring | SyntaxError |
-| `void`・カンマ演算子・`instanceof`・`delete`・`in` | SyntaxError |
+| `Math.floor` 等の標準組込オブジェクト | ✅ v0.3 で実装（Math 24 関数 + 定数 8 種） |
+| class の `extends`・`super` | SyntaxError（extends は v0.4 台帳。super は未対応） |
+| async/await・generator・BigInt | SyntaxError |
+| regex literal `/.../`・`RegExp` | SyntaxError（v0.4 台帳） |
+| オブジェクト spread `{...obj}` | SyntaxError（配列 spread は対応済み） |
+| メソッド呼び出しの spread `o.m(...a)` | SyntaxError（関数呼び出しの spread は対応済み） |
+| 分割代入の rest パターン `[a, ...rest]` | SyntaxError（基本分割代入は対応済み） |
+| `String()` / `Number()` コンストラクタ・`Object.keys` 等 | ReferenceError |
+| ~~高階関数 `[1,2].map(f)` / `forEach` / `filter`~~ | ✅ v0.3: `map`/`filter`/`forEach`/`some`/`every`/`find`/`findIndex`/`reduce`（VM 再入 akl_call 経由。コールバック fn(elem, idx, arr)、reduce は fn(acc, elem, idx, arr)） |
+| `String()` / `Number()` コンストラクタ・`Object.keys` 等 | ReferenceError |
+| `s.length` の代入・配列の `length` 代入 | 無視（length は読み取り専用） |
+| 文字列メソッドの一部（`match`/`search`/`padStart`/`localeCompare` 等） | `TypeError: not a function` |
+| `JSON` の第 2 引数（replacer/reviver） | 無視（第 1 引数のみ処理） |
 
 ## ロードマップ（優先度順。完了時にこの表へ実測で追記する）
 
-1. ✅ オブジェクトリテラル + プロパティアクセス（2026-08-08 実測で上表へ。配列とブラケットは次）
-2. 関数式 + クロージャ捕捉（環境 record の導入）
-3. 三項演算子・switch・do-while・`++`/`--`・複合代入
-4. ビット演算/シフト（double→int32 変換規則含む）
+1. ✅ オブジェクトリテラル + プロパティアクセス（2026-08-08）
+2. ✅ 配列・ブラケット・関数式 + クロージャ捕捉・`this`（2026-08-08。AKL_OK_ENV チェーン）
+3. ✅ 三項演算子・switch・do-while・`++`/`--`・複合代入（2026-08-08）
+4. ✅ ビット演算/シフト（2026-08-08）
+5. ✅ Math / String / Array 組込 + parseInt/parseFloat/isNaN/isFinite（2026-08-08）
+6. ✅ JSON.stringify / JSON.parse（2026-08-08）
+7. ✅ 高階関数（2026-08-08: VM 再入 akl_call。outer スタックは root_stks として GC ルート化）
+8. ✅ 演算子群 `**`/`void`/カンマ/`in`/`delete`/`?.`/`??`/`instanceof`（2026-08-08）
+9. ✅ テンプレートリテラル・for-in/for-of・デフォルト引数（2026-08-08）
+10. ✅ 分割代入・配列/呼び出し spread・`new`・`class`（2026-08-08。VM 再入とフレーム is_new）
+11. class extends/super・RegExp・async/await（優先度順）
 
 ## V8 との位置づけ
 

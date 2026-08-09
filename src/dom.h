@@ -161,6 +161,22 @@ IfStr if_dom_text_content(IfArena *a, const IfNode *n);
 IfNode *if_dom_find_tag_dfs(const IfDom *d, u16 tag); /* 文書順最初の ELEMENT（無ければ NULL） */
 IfNode *if_dom_find_by_id(const IfDom *d, IfStr id);  /* id 属性一致の最初の ELEMENT（値は case-sensitive、無ければ NULL） */
 void    if_dom_set_text(IfArena *a, IfNode *n, IfStr t); /* ELEMENT 子群を単一 TEXT 子に置換（t.n==0 は全子除去） */
+
+/* ---- v0.3: script DOM バインディング用 ---- */
+/* 属性の設定（無ければ追加・既存は置換・値を arena に複製）。false = OOM/budget */
+bool if_dom_attr_set(IfArena *a, IfNode *n, IfStr name, IfStr value);
+
+/* 最小 CSS セレクタ照合（querySelector 用）:
+ *  - 複合: tag / .class / #id / 組み合わせ（例: div#main.nav）
+ *  - 子孫結合子: 空白区切り（例: "div p span"）
+ *  - 非対応（NULL を返す）: '>' ',' 属性セレクタ 疑似クラス ワイルドカード以外の複雑形
+ * 対象要素のみの照合（子孫結合子は祖先を辿って判定）。 */
+bool if_dom_selector_matches(const IfDom *d, const IfNode *n, const char *sel);
+/* 文書順で最初にマッチする要素（無ければ NULL。sel が非対応なら NULL） */
+IfNode *if_dom_query_selector(const IfDom *d, const char *sel);
+/* 指定タグ（文字列。未知タグは一致しない。"" や "*" は全要素）の全要素を
+ * out に文書順で収集。戻り値は総数（cap 超も数える）。 */
+u32 if_dom_elements_by_tag(IfNode *root, const char *tag, IfNode **out, u32 cap);
 IfNode *if_dom_title_set(IfArena *a, IfDom *d, IfStr t); /* <title> 設定（無ければ head 先頭に生成）。d->title も更新 */
 
 /* ---- 入力 compaction（v0.3 本丸・GUI 実ブラウズ経路専用） ----
