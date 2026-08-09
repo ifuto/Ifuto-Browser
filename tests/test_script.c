@@ -228,7 +228,30 @@ static void test_script_regex(void) {
     tscr_end(&t);
 }
 
+
+static void test_script_class_extends(void) {
+    TScr t;
+    tscr_begin(&t, "<!DOCTYPE html><title>E0</title><div id=a>start</div>"
+                   "<script>"
+                   "class Shape { constructor(w, h) { this.w = w; this.h = h; } area() { return this.w * this.h; } }"
+                   "class Rect extends Shape { constructor(w, h) { super(w, h); } describe() { return 'rect:' + this.area(); } }"
+                   "class Square extends Rect { constructor(s) { super(s, s); } }"
+                   "var sq = new Square(5);"
+                   "console.log('ex1', sq.area());"
+                   "document.getElementById('a').textContent = sq.describe();"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
+    CHECK(strstr(t.logbuf, "[script:console] ex1 25\n") != NULL);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    CHECK(d != NULL);
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 7 && memcmp(txt.p, "rect:25", 7) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
+    test_script_class_extends();
     test_script_regex();
     test_script_mutation();
     test_script_gc_churn();
