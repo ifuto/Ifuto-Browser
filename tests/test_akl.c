@@ -1887,6 +1887,20 @@ static void t_v04_map_set(void) {
     /* 上限超過は明白に失敗（黙って無視しない） */
     want_err("var m = new Map(); for (var i = 0; i < 5000; i++) m.set('k' + i, i);", "Map/Set size limit");
     want_err("var s = new Set(); for (var i = 0; i < 5000; i++) s.add(i);", "Map/Set size limit");
+    /* v0.5 ハッシュ索引: SameValueZero との整合（int 5 === double 5.0、NaN 同値、±0 同値） */
+    want_str("var m = new Map(); m.set(5, 'int'); m.set(5.0, 'dbl'); m.get(5) + ':' + m.get(5.0)", "dbl:dbl");
+    want_num("var m = new Map(); m.set(NaN, 1); m.set(NaN, 2); m.size * 10 + m.get(NaN)", 12);
+    want_str("var m = new Map(); m.set(0, 'a'); m.set(-0, 'b'); m.size + ':' + m.get(0)", "1:b");
+    want_num("var m = new Map(); m.set('k' + 1, 7); m.set('k' + 2, 8); m.get('k' + 1) + m.get('k' + 2)", 15);
+    /* delete 後の再挿入（再ハッシュ経路） */
+    want_str("var m = new Map(); m.set('a', 1); m.set('b', 2); m.delete('a'); m.set('a', 9); m.get('a') + ':' + m.get('b')", "9:2");
+    want_str("var s = new Set(); s.add('x'); s.add('y'); s.delete('x'); s.add('x'); s.size + ':' + s.has('x')", "2:true");
+    /* clear 後の再利用 */
+    want_str("var m = new Map(); m.set('a', 1); m.clear(); m.set('b', 2); m.size + ':' + m.get('b')", "1:2");
+    /* 挿入順は維持（ハッシュは索引に過ぎない） */
+    want_str("var m = new Map(); m.set('z', 1); m.set('a', 2); m.set('m', 3); m.keys().join(',')", "z,a,m");
+    /* オブジェクトキーは同一性 */
+    want_str("var m = new Map(); var o = {id: 1}; m.set(o, 'obj'); m.get(o) + ':' + m.get({id: 1})", "obj:undefined");
 }
 
 /* ================= v0.5: import / export（モジュール） ================= */

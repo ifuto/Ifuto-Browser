@@ -198,11 +198,19 @@ malloc アローナ」にほぼ比例し、無駄は小さい（実測で確認�
 観測基盤: `--stats` に `resid_rss_kb`（script 実行前後の常駐 RSS 差）を追加。
 maxrss（ピーク）と常駐を分けて測れるようにした。今後の省メモリ施策はこの差分で判定する。
 
-採用（AklObj 縮小）:
+採用（AklObj 縮小 + Map/Set ハッシュ化）:
 - **Map の keys/vals 2 本配列を交互ペア配列 [k0,v0,k1,v1,...] に統合**（AklObj 64B → 56B、
   8B/オブジェクト減。Map 1 個あたりの管理も 1 本化）。実測: Map 4,096 キーで
   maxrss −150KB、速度変化なし（fib30 74.2ms / strcat 4.3ms）。GC mark・Map メソッド
   全 7 種・teardown をペア配列対応。
+- **Map/Set にハッシュ索引（開番地法、load ≤ 0.5）を追加**: Map/Set の GC 回収バグ修正
+  （39e0d24）により線形走査の O(n) コストが顕在化した（Map.set 4,000 件 105ms —
+  バグ時は死んだエントリとの高速比較で実費が隠れていた）。ハッシュ化で
+  **0.74ms（142 倍）**。キーは SameValueZero と整合（文字列=内容、int/double 正規化、
+  NaN/±0 同値、オブジェクト=index）。挿入順は kv 配列で維持（JS の Map 反復順序）。
+  delete は末尾スワップ + 全再ハッシュ（稀）。data は [hash][kv] 1 ブロックで
+  AklObj 56B 維持。script_multi2（Map 4,000 + 配列 5,000）は修正前 150ms →
+  **58ms**（バグ有りの元々 108ms より速い）。
 
 ## akl 速度最適化（2026-08-10、ユーザ方針「Aklus は速度重視」）
 

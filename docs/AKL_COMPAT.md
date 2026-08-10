@@ -175,7 +175,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 19. ✅ アロー関数・Promise・async/await（2026-08-09: 同期解決近似。AklObj 64B 化（thisv + PROMISE kind）。lexer の TK_KW str_p 未設定バグを修正（.catch 等のプロパティ名が旧トークンを指していた））
 19b. ✅ BigInt（2026-08-10: AKL_OK_BIGINT + OP_CONST_BIG。スキャン時に u64 蓄積で 2^53 超も正確。akl_bin_add 等の融合命令経由でも i64 正確を保証）
 19c. ✅ generator（2026-08-10: AKL_OK_GEN + OP_YIELD。akl_call 再入機構で本体を実行して yield 値を蓄積。AklFuncEnt に is_gen 追加。an_* に N_YIELD 追跡を追加（クロージャ capture 漏れ修正））
-19d. ✅ Map / Set・Object.fromEntries・Array.from・padStart/padEnd・flat・hasOwnProperty（2026-08-10: 線形走査の有界化 AKL_MAP_MAX=4096。GC は keys/vals を mark。**v0.5 修正: akl_gc_kind_children に MAP/SET が欠落しており、キー STR が GC で回収されて size が壊れる潜伏バグを修正（3500 個超で顕在化）。上限超過は黙って無視でなく RangeError で明白失敗**）
+19d. ✅ Map / Set・Object.fromEntries・Array.from・padStart/padEnd・flat・hasOwnProperty（2026-08-10: 有界化 AKL_MAP_MAX=4096。**v0.5: ハッシュ索引化（開番地法。線形走査 O(n) を O(1) 平均に。Map.set 4,000 件 105ms→0.74ms）。SameValueZero 整合（int 5 === 5.0、NaN/±0 同値、文字列=内容、オブジェクト=同一性）。挿入順維持。GC は kv を mark。**v0.5 修正: akl_gc_kind_children に MAP/SET が欠落していた潜伏バグを修正（キー STR が GC 回収されて size が壊れる）。上限超過は RangeError で明白失敗**）
 19e. ✅ import / export（2026-08-10: 全形式 — 名前付き/default/`* as ns`/副作用のみ/re-export `{a as b} from`/`export * from`/`export default 式・関数・class`/動的 `import()`。モジュール本体は「関数スコープでコンパイルされた匿名関数」として再入 akl_call で実行（var がモジュールローカルになる構造保証）。レジストリは GC ルート、VM 中コンパイルの定数は comp_pins 区間でスイープから保護。循環 import は state==1 検出で TypeError。export は宣言時点のスナップショット近似）
 19f. ✅ クラス getter/setter 構文 `get x()` / `set x(v)`（2026-08-10: オブジェクトリテラルの "get:\x01name" 特殊名機構を class 本体に拡張。`static get`/継承/`super` 対応。setter 引数 1 個・getter 引数 0 個を強制、`get constructor()` は明白拒否）
 

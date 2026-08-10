@@ -132,11 +132,20 @@ typedef struct {
         struct { u8 state; u8 pad[3]; AklVal value; } pr; /* PROMISE: 0=pending 1=resolved 2=rejected */
         i64 big;                                          /* BIGINT: 64bit 整数値 */
         struct { u32 arr; u32 pos; } gen;                 /* GEN: yield 蓄積配列 obj idx + 次位置 */
-        struct { AklVal *kv; u32 n, cap; } mp; /* MAP: キー/値の交互ペア配列（[k0,v0,...]）。
-                                                    * 2 本配列より 8B 小さく AklObj 64→56B（v0.5 省メモリ） */
-        struct { AklVal *v; u32 n, cap; } st;             /* SET: 値配列（重複なし） */
+        struct { u8 *data; u32 n, cap; } mp; /* MAP: data = [hash u32×cap*2][kv AklVal×cap*2] の
+                                                    * 1 ブロック（ハッシュ索引付き。AklObj 56B 維持） */
+        struct { u8 *data; u32 n, cap; } st;  /* SET: data = [hash u32×cap*2][v AklVal×cap]（同上） */
     } u;
-} AklObj; /* 64B（v0.4: FUNC.thisv + PROMISE 追加で 56B から +8B。ARCH 台帳記録） */
+} AklObj; /* 56B（v0.5: Map を data 1 本化して 64B から削減。ARCH 台帳記録） */
+
+/* Map/Set データレイアウト: data = [hash u32×cap*2][kv/v AklVal×…] の 1 ブロック
+ * （AklObj の union を 16B に保つ。GC マーク・sweep もこのマクロ経由） */
+#define AKL_MAP_HASH(mp) ((u32 *)(mp)->data)
+#define AKL_MAP_KV(mp)   ((AklVal *)((u8 *)(mp)->data + (mp)->cap * 2u * sizeof(u32)))
+#define AKL_MAP_BLK(cap) ((u64)(cap) * 2u * (sizeof(u32) + sizeof(AklVal)))
+#define AKL_SET_HASH(st) ((u32 *)(st)->data)
+#define AKL_SET_V(st)    ((AklVal *)((u8 *)(st)->data + (st)->cap * 2u * sizeof(u32)))
+#define AKL_SET_BLK(cap) ((u64)(cap) * 2u * sizeof(u32) + (u64)(cap) * sizeof(AklVal))
 
 /* ============================== runtime ============================== */
 
@@ -512,9 +521,10 @@ static u32 akl_gc(AklRT *rt) {
                             if (akl_gc_kind_children(rt->objs[ci].kind) && wn < span) wl[wn++] = ci;
                         }
                     }
-                } else if (ro->kind == AKL_OK_MAP) { /* MAP: 交互ペア配列 */
+                } else if (ro->kind == AKL_OK_MAP) { /* MAP: [hash][kv] 1 ブロック */
+                    AklVal *kvp = AKL_MAP_KV(&ro->u.mp);
                     for (u32 k = 0; k < ro->u.mp.n; k++) {
-                        AklVal kv2[2] = { ro->u.mp.kv[2 * k], ro->u.mp.kv[2 * k + 1] };
+                        AklVal kv2[2] = { kvp[2 * k], kvp[2 * k + 1] };
                         for (int j = 0; j < 2; j++) {
                             if (!akl_is_objv(kv2[j])) continue;
                             u32 ci = akl_get_obj(kv2[j]);
@@ -524,9 +534,10 @@ static u32 akl_gc(AklRT *rt) {
                             }
                         }
                     }
-                } else if (ro->kind == AKL_OK_SET) { /* SET: 値 */
+                } else if (ro->kind == AKL_OK_SET) { /* SET: [hash][v] 1 ブロック */
+                    AklVal *svp = AKL_SET_V(&ro->u.st);
                     for (u32 k = 0; k < ro->u.st.n; k++) {
-                        AklVal ev2 = ro->u.st.v[k];
+                        AklVal ev2 = svp[k];
                         if (!akl_is_objv(ev2)) continue;
                         u32 ci = akl_get_obj(ev2);
                         if (ci >= rt->pin_mark && ci < rt->n_objs && !mk[ci - rt->pin_mark]) {
@@ -579,13 +590,13 @@ static u32 akl_gc(AklRT *rt) {
             akl_rex_free(o->u.rex.rx);
             rt->heap_bytes -= o->len; /* len = コンパイル済みサイズ概算 */
         }
-        if (o->kind == AKL_OK_MAP && o->u.mp.kv) {
-            rt->heap_bytes -= (u64)o->u.mp.cap * sizeof(AklVal) * 2;
-            free(o->u.mp.kv);
+        if (o->kind == AKL_OK_MAP && o->u.mp.data) {
+            rt->heap_bytes -= AKL_MAP_BLK(o->u.mp.cap);
+            free(o->u.mp.data);
         }
-        if (o->kind == AKL_OK_SET && o->u.st.v) {
-            rt->heap_bytes -= (u64)o->u.st.cap * sizeof(AklVal);
-            free(o->u.st.v);
+        if (o->kind == AKL_OK_SET && o->u.st.data) {
+            rt->heap_bytes -= AKL_SET_BLK(o->u.st.cap);
+            free(o->u.st.data);
         }
         o->kind = 0; o->bytes = NULL; o->len = 0; o->code_off = 0; o->name = 0;
         o->env = UINT32_MAX;
@@ -10046,16 +10057,91 @@ static const AklMethEntry AKL_GEN_METHODS[AKL_GEN_METH_N] = {
 };
 
 
-/* ================= Map / Set（ハッシュなし線形走査。要素数上限付き） ================= */
+/* ================= Map / Set（ハッシュ索引 + 挿入順配列。要素数上限付き） =================
+ * v0.5 再設計: 従来は線形走査（O(n)）で、Map.set 4,000 件が ~105ms（実測）。キーを
+ * ハッシュし O(1) 平均にする。挿入順は kv 配列（JS の Map 反復順序を維持）、ハッシュ表は
+ * 開番地法（load ≤ 0.5、エントリ = kv 位置 + 1、0 = 空）。data は [hash][kv] の 1 ブロック
+ * malloc で、AklObj の union は 16B のまま（56B 維持）。
+ * ハッシュは SameValueZero と整合: 文字列は内容、数値は double 正規化（±0 → 0、NaN → 定数、
+ * int は double 化 — strict_eq で 5 === 5.0 は true のため）、BigInt は i64、他オブジェクトは
+ * index（同一性）。delete は末尾スワップ後に全再ハッシュ（delete は稀）。 */
 
-#define AKL_MAP_MAX 4096u /* 線形走査の有界化（実用上限） */
+#define AKL_MAP_MAX 4096u /* 要素数上限（実用上限。超過は RangeError で明白失敗） */
+
+/* FNV-1a 32bit（文字列キーの内容ハッシュ。短キーで十分高速） */
+static u32 akl_hash_bytes(const u8 *p, u32 n) {
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+static u32 akl_hash_mix(u64 x) {
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+    return (u32)x;
+}
+/* SameValueZero と整合するキーのハッシュ */
+static u32 akl_map_hash_key(AklRT *rt, AklVal k) {
+    i64 bi;
+    if (akl_is_big(rt, k, &bi)) return akl_hash_mix((u64)bi);
+    double d;
+    if (akl_numv(k, &d)) {
+        if (isnan(d)) return 0x51ED270Bu;
+        if (d == 0.0) return 0; /* ±0 を同一視（SameValueZero と整合） */
+        u64 bits;
+        memcpy(&bits, &d, 8);
+        return akl_hash_mix(bits);
+    }
+    if (akl_is_objv(k)) {
+        u32 oi = akl_get_obj(k);
+        if (oi < rt->n_objs) {
+            u8 kk = rt->objs[oi].kind;
+            if (kk == AKL_OK_STR || kk == AKL_OK_ROPE) {
+                u32 ln;
+                const u8 *bp = akl_str(rt, oi, &ln); /* ROPE はここで平坦化（以後 STR 化） */
+                if (!bp) return 0;
+                return akl_hash_bytes(bp, ln);
+            }
+            if (kk == AKL_OK_BIGINT) { /* big 値は既に上で捕捉済みだが防御的に */
+                return akl_hash_mix((u64)rt->objs[oi].u.big);
+            }
+        }
+        return akl_hash_mix((u64)oi); /* オブジェクトは同一性（index） */
+    }
+    if (k == AKL_VAL_TRUE) return 0x0BABE5u;
+    if (k == AKL_VAL_FALSE) return 0x0FACADEu;
+    if (k == AKL_VAL_NULL) return 0x0BEEFu;
+    return 0x0DEADu; /* undefined */
+}
+
+/* ハッシュ表を n エントリ分再構築（grow / delete 後の再挿入。delete は稀なので全走査でよい） */
+static void akl_map_rehash(AklRT *rt, AklObj *o) {
+    u32 mask = o->u.mp.cap * 2 - 1;
+    u32 *h = AKL_MAP_HASH(&o->u.mp);
+    AklVal *kv = AKL_MAP_KV(&o->u.mp);
+    memset(h, 0, (u64)o->u.mp.cap * 2 * sizeof(u32));
+    for (u32 i = 0; i < o->u.mp.n; i++) {
+        u32 pos = akl_map_hash_key(rt, kv[2 * i]) & mask;
+        while (h[pos]) pos = (pos + 1) & mask;
+        h[pos] = i + 1;
+    }
+}
+static void akl_set_rehash(AklRT *rt, AklObj *o) {
+    u32 mask = o->u.st.cap * 2 - 1;
+    u32 *h = AKL_SET_HASH(&o->u.st);
+    AklVal *v = AKL_SET_V(&o->u.st);
+    memset(h, 0, (u64)o->u.st.cap * 2 * sizeof(u32));
+    for (u32 i = 0; i < o->u.st.n; i++) {
+        u32 pos = akl_map_hash_key(rt, v[i]) & mask;
+        while (h[pos]) pos = (pos + 1) & mask;
+        h[pos] = i + 1;
+    }
+}
 
 static AklVal akl_map_make(AklRT *rt) {
     rt->gc_sp = rt->gc_sp;
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
     rt->objs[oi].kind = AKL_OK_MAP;
-    rt->objs[oi].u.mp.kv = NULL;
+    rt->objs[oi].u.mp.data = NULL;
     rt->objs[oi].u.mp.n = rt->objs[oi].u.mp.cap = 0;
     return AKL_MK_OBJ(oi);
 }
@@ -10064,7 +10150,7 @@ static AklVal akl_set_make(AklRT *rt) {
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
     rt->objs[oi].kind = AKL_OK_SET;
-    rt->objs[oi].u.st.v = NULL;
+    rt->objs[oi].u.st.data = NULL;
     rt->objs[oi].u.st.n = rt->objs[oi].u.st.cap = 0;
     return AKL_MK_OBJ(oi);
 }
@@ -10074,12 +10160,20 @@ static bool akl_map_grow(AklRT *rt, AklObj *o, u32 need) {
     if (need <= o->u.mp.cap) return true;
     u32 nc = o->u.mp.cap ? o->u.mp.cap * 2 : 4;
     if (nc > AKL_MAP_MAX) nc = AKL_MAP_MAX;
-    /* 交互ペア配列 [k0,v0,...]: 長さ 2*nc。realloc 1 本（2 本管理より 8B/Map 小さい） */
-    AklVal *nk = (AklVal *)realloc(o->u.mp.kv, (u64)nc * 2 * sizeof(AklVal));
-    if (!nk) { akl_errf(rt, "oom: map grow"); return false; }
-    rt->heap_bytes += (u64)(nc - o->u.mp.cap) * sizeof(AklVal) * 2;
-    o->u.mp.kv = nk;
+    /* [hash u32×nc*2][kv AklVal×nc*2] の 1 ブロック（realloc 1 回。旧 kv は先頭 cap 分が
+     * 新ブロック前半にそのまま残る — hash 領域に食われないようコピーで退避する） */
+    u8 *nd = (u8 *)realloc(o->u.mp.data, AKL_MAP_BLK(nc));
+    if (!nd) { akl_errf(rt, "oom: map grow"); return false; }
+    if (o->u.mp.data && o->u.mp.cap > 0) {
+        /* 旧レイアウト [hash(cap)][kv(cap)] → 新 [hash(nc)][kv(nc)]: kv を後方へ移動 */
+        memmove(nd + nc * 2 * sizeof(u32),
+                nd + o->u.mp.cap * 2 * sizeof(u32),
+                (u64)o->u.mp.n * 2 * sizeof(AklVal));
+    }
+    rt->heap_bytes += AKL_MAP_BLK(nc) - AKL_MAP_BLK(o->u.mp.cap);
+    o->u.mp.data = nd;
     o->u.mp.cap = nc;
+    akl_map_rehash(rt, o);
     return true;
 }
 static bool akl_set_grow(AklRT *rt, AklObj *o, u32 need) {
@@ -10087,12 +10181,48 @@ static bool akl_set_grow(AklRT *rt, AklObj *o, u32 need) {
     if (need <= o->u.st.cap) return true;
     u32 nc = o->u.st.cap ? o->u.st.cap * 2 : 4;
     if (nc > AKL_MAP_MAX) nc = AKL_MAP_MAX;
-    AklVal *nv = (AklVal *)realloc(o->u.st.v, (u64)nc * sizeof(AklVal));
-    if (!nv) { akl_errf(rt, "oom: set grow"); return false; }
-    rt->heap_bytes += (u64)(nc - o->u.st.cap) * sizeof(AklVal);
-    o->u.st.v = nv;
+    u8 *nd = (u8 *)realloc(o->u.st.data, AKL_SET_BLK(nc));
+    if (!nd) { akl_errf(rt, "oom: set grow"); return false; }
+    if (o->u.st.data && o->u.st.cap > 0) {
+        memmove(nd + nc * 2 * sizeof(u32),
+                nd + o->u.st.cap * 2 * sizeof(u32),
+                (u64)o->u.st.n * sizeof(AklVal));
+    }
+    rt->heap_bytes += AKL_SET_BLK(nc) - AKL_SET_BLK(o->u.st.cap);
+    o->u.st.data = nd;
     o->u.st.cap = nc;
+    akl_set_rehash(rt, o);
     return true;
+}
+
+static bool akl_same_value_zero(AklRT *rt, AklVal a, AklVal b); /* 前方宣言（hash find が先） */
+
+/* ハッシュ探索: 見つかれば kv 位置（0..n-1）、無ければ UINT32_MAX */
+static u32 akl_map_find(AklRT *rt, AklObj *o, AklVal k) {
+    if (o->u.mp.n == 0) return UINT32_MAX;
+    u32 mask = o->u.mp.cap * 2 - 1;
+    u32 *h = AKL_MAP_HASH(&o->u.mp);
+    AklVal *kv = AKL_MAP_KV(&o->u.mp);
+    u32 pos = akl_map_hash_key(rt, k) & mask;
+    while (h[pos]) {
+        u32 e = h[pos] - 1;
+        if (e < o->u.mp.n && akl_same_value_zero(rt, kv[2 * e], k)) return e;
+        pos = (pos + 1) & mask;
+    }
+    return UINT32_MAX;
+}
+static u32 akl_set_find(AklRT *rt, AklObj *o, AklVal v) {
+    if (o->u.st.n == 0) return UINT32_MAX;
+    u32 mask = o->u.st.cap * 2 - 1;
+    u32 *h = AKL_SET_HASH(&o->u.st);
+    AklVal *vp = AKL_SET_V(&o->u.st);
+    u32 pos = akl_map_hash_key(rt, v) & mask;
+    while (h[pos]) {
+        u32 e = h[pos] - 1;
+        if (e < o->u.st.n && akl_same_value_zero(rt, vp[e], v)) return e;
+        pos = (pos + 1) & mask;
+    }
+    return UINT32_MAX;
 }
 
 /* キー等値判定: SameValueZero 近似（=== + NaN 同値） */
@@ -10113,16 +10243,24 @@ static AklVal akl_m_map_set(AklRT *rt, AklVal self, int argc, const AklVal *argv
     AklVal v = argc > 1 ? argv[1] : akl_mkundefined();
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_is_objv(k) ? akl_get_obj(k) : rt->n_objs;
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_is_objv(v) ? akl_get_obj(v) : rt->n_objs;
-    for (u32 i = 0; i < o->u.mp.n; i++)
-        if (akl_same_value_zero(rt, o->u.mp.kv[2 * i], k)) { o->u.mp.kv[2 * i + 1] = v; return self; }
+    u32 fi = akl_map_find(rt, o, k);
+    if (fi != UINT32_MAX) { AKL_MAP_KV(&o->u.mp)[2 * fi + 1] = v; return self; }
     if (!akl_map_grow(rt, o, o->u.mp.n + 1)) {
         /* 上限超過は「黙って無視」でなく明白失敗（grow が err 設定済み。native_err を立てる） */
         akl_native_throw(rt, rt->err[0] ? rt->err : "RangeError: Map/Set size limit exceeded");
         return akl_mkundefined();
     }
-    o->u.mp.kv[2 * o->u.mp.n] = k;
-    o->u.mp.kv[2 * o->u.mp.n + 1] = v;
-    o->u.mp.n++;
+    {
+        AklVal *kvp = AKL_MAP_KV(&o->u.mp);
+        kvp[2 * o->u.mp.n] = k;
+        kvp[2 * o->u.mp.n + 1] = v;
+        u32 mask = o->u.mp.cap * 2 - 1;
+        u32 *hp = AKL_MAP_HASH(&o->u.mp);
+        u32 pos = akl_map_hash_key(rt, k) & mask;
+        while (hp[pos]) pos = (pos + 1) & mask;
+        hp[pos] = o->u.mp.n + 1;
+        o->u.mp.n++;
+    }
     return self;
 }
 static AklVal akl_m_map_get(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10131,8 +10269,8 @@ static AklVal akl_m_map_get(AklRT *rt, AklVal self, int argc, const AklVal *argv
         return akl_native_typeerr(rt, "TypeError: not a Map");
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal k = argc > 0 ? argv[0] : akl_mkundefined();
-    for (u32 i = 0; i < o->u.mp.n; i++)
-        if (akl_same_value_zero(rt, o->u.mp.kv[2 * i], k)) return o->u.mp.kv[2 * i + 1];
+    u32 fi = akl_map_find(rt, o, k);
+    if (fi != UINT32_MAX) return AKL_MAP_KV(&o->u.mp)[2 * fi + 1];
     return akl_mkundefined();
 }
 static AklVal akl_m_map_has(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10141,8 +10279,7 @@ static AklVal akl_m_map_has(AklRT *rt, AklVal self, int argc, const AklVal *argv
         return akl_native_typeerr(rt, "TypeError: not a Map");
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal k = argc > 0 ? argv[0] : akl_mkundefined();
-    for (u32 i = 0; i < o->u.mp.n; i++)
-        if (akl_same_value_zero(rt, o->u.mp.kv[2 * i], k)) return AKL_VAL_TRUE;
+    if (akl_map_find(rt, o, k) != UINT32_MAX) return AKL_VAL_TRUE;
     return AKL_VAL_FALSE;
 }
 static AklVal akl_m_map_delete(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10151,13 +10288,14 @@ static AklVal akl_m_map_delete(AklRT *rt, AklVal self, int argc, const AklVal *a
         return akl_native_typeerr(rt, "TypeError: not a Map");
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal k = argc > 0 ? argv[0] : akl_mkundefined();
-    for (u32 i = 0; i < o->u.mp.n; i++) {
-        if (akl_same_value_zero(rt, o->u.mp.kv[2 * i], k)) {
-            o->u.mp.kv[2 * i] = o->u.mp.kv[2 * (o->u.mp.n - 1)];
-            o->u.mp.kv[2 * i + 1] = o->u.mp.kv[2 * (o->u.mp.n - 1) + 1];
-            o->u.mp.n--;
-            return AKL_VAL_TRUE;
-        }
+    u32 fi = akl_map_find(rt, o, k);
+    if (fi != UINT32_MAX) {
+        AklVal *kvp = AKL_MAP_KV(&o->u.mp);
+        kvp[2 * fi] = kvp[2 * (o->u.mp.n - 1)];
+        kvp[2 * fi + 1] = kvp[2 * (o->u.mp.n - 1) + 1];
+        o->u.mp.n--;
+        akl_map_rehash(rt, o); /* スワップで位置が変わるため全再ハッシュ（delete は稀） */
+        return AKL_VAL_TRUE;
     }
     return AKL_VAL_FALSE;
 }
@@ -10178,7 +10316,8 @@ static AklVal akl_m_map_keys(AklRT *rt, AklVal self, int argc, const AklVal *arg
     rt->objs[oi].kind = AKL_OK_ARR;
     if (o->u.mp.n > 0) {
         if (!akl_arr_grow(rt, &rt->objs[oi], o->u.mp.n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
-        for (u32 k = 0; k < o->u.mp.n; k++) rt->objs[oi].u.arr.v[k] = o->u.mp.kv[2 * k];
+        AklVal *kvp = AKL_MAP_KV(&o->u.mp);
+        for (u32 k = 0; k < o->u.mp.n; k++) rt->objs[oi].u.arr.v[k] = kvp[2 * k];
     }
     rt->objs[oi].u.arr.n = o->u.mp.n;
     return AKL_MK_OBJ(oi);
@@ -10193,7 +10332,8 @@ static AklVal akl_m_map_values(AklRT *rt, AklVal self, int argc, const AklVal *a
     rt->objs[oi].kind = AKL_OK_ARR;
     if (o->u.mp.n > 0) {
         if (!akl_arr_grow(rt, &rt->objs[oi], o->u.mp.n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
-        for (u32 k = 0; k < o->u.mp.n; k++) rt->objs[oi].u.arr.v[k] = o->u.mp.kv[2 * k + 1];
+        AklVal *kvp = AKL_MAP_KV(&o->u.mp);
+        for (u32 k = 0; k < o->u.mp.n; k++) rt->objs[oi].u.arr.v[k] = kvp[2 * k + 1];
     }
     rt->objs[oi].u.arr.n = o->u.mp.n;
     return AKL_MK_OBJ(oi);
@@ -10207,13 +10347,21 @@ static AklVal akl_m_set_add(AklRT *rt, AklVal self, int argc, const AklVal *argv
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal v = argc > 0 ? argv[0] : akl_mkundefined();
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_is_objv(v) ? akl_get_obj(v) : rt->n_objs;
-    for (u32 i = 0; i < o->u.st.n; i++)
-        if (akl_same_value_zero(rt, o->u.st.v[i], v)) return self;
+    if (akl_set_find(rt, o, v) != UINT32_MAX) return self;
     if (!akl_set_grow(rt, o, o->u.st.n + 1)) {
         akl_native_throw(rt, rt->err[0] ? rt->err : "RangeError: Map/Set size limit exceeded");
         return akl_mkundefined();
     }
-    o->u.st.v[o->u.st.n++] = v;
+    {
+        AklVal *vp = AKL_SET_V(&o->u.st);
+        vp[o->u.st.n] = v;
+        u32 mask = o->u.st.cap * 2 - 1;
+        u32 *hp = AKL_SET_HASH(&o->u.st);
+        u32 pos = akl_map_hash_key(rt, v) & mask;
+        while (hp[pos]) pos = (pos + 1) & mask;
+        hp[pos] = o->u.st.n + 1;
+        o->u.st.n++;
+    }
     return self;
 }
 static AklVal akl_m_set_has(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10222,8 +10370,7 @@ static AklVal akl_m_set_has(AklRT *rt, AklVal self, int argc, const AklVal *argv
         return akl_native_typeerr(rt, "TypeError: not a Set");
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal v = argc > 0 ? argv[0] : akl_mkundefined();
-    for (u32 i = 0; i < o->u.st.n; i++)
-        if (akl_same_value_zero(rt, o->u.st.v[i], v)) return AKL_VAL_TRUE;
+    if (akl_set_find(rt, o, v) != UINT32_MAX) return AKL_VAL_TRUE;
     return AKL_VAL_FALSE;
 }
 static AklVal akl_m_set_delete(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10232,12 +10379,13 @@ static AklVal akl_m_set_delete(AklRT *rt, AklVal self, int argc, const AklVal *a
         return akl_native_typeerr(rt, "TypeError: not a Set");
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal v = argc > 0 ? argv[0] : akl_mkundefined();
-    for (u32 i = 0; i < o->u.st.n; i++) {
-        if (akl_same_value_zero(rt, o->u.st.v[i], v)) {
-            o->u.st.v[i] = o->u.st.v[o->u.st.n - 1];
-            o->u.st.n--;
-            return AKL_VAL_TRUE;
-        }
+    u32 fi = akl_set_find(rt, o, v);
+    if (fi != UINT32_MAX) {
+        AklVal *vp = AKL_SET_V(&o->u.st);
+        vp[fi] = vp[o->u.st.n - 1];
+        o->u.st.n--;
+        akl_set_rehash(rt, o);
+        return AKL_VAL_TRUE;
     }
     return AKL_VAL_FALSE;
 }
@@ -10258,7 +10406,7 @@ static AklVal akl_m_set_values(AklRT *rt, AklVal self, int argc, const AklVal *a
     rt->objs[oi].kind = AKL_OK_ARR;
     if (o->u.st.n > 0) {
         if (!akl_arr_grow(rt, &rt->objs[oi], o->u.st.n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
-        memcpy(rt->objs[oi].u.arr.v, o->u.st.v, (u64)o->u.st.n * sizeof(AklVal));
+        memcpy(rt->objs[oi].u.arr.v, AKL_SET_V(&o->u.st), (u64)o->u.st.n * sizeof(AklVal));
     }
     rt->objs[oi].u.arr.n = o->u.st.n;
     return AKL_MK_OBJ(oi);
@@ -13833,8 +13981,8 @@ void akl_free(AklRT *rt) {
         if (rt->objs[i].kind == AKL_OK_REGEX) akl_rex_free(rt->objs[i].u.rex.rx);
         /* v0.4 組込 Map/Set の配列（GC スイープと同単位。生存値が globals 等に
          * 残る場合の teardown リークを塞ぐ — 実測: script テストで 33 件検出） */
-        if (rt->objs[i].kind == AKL_OK_MAP) free(rt->objs[i].u.mp.kv);
-        if (rt->objs[i].kind == AKL_OK_SET) free(rt->objs[i].u.st.v);
+        if (rt->objs[i].kind == AKL_OK_MAP) free(rt->objs[i].u.mp.data);
+        if (rt->objs[i].kind == AKL_OK_SET) free(rt->objs[i].u.st.data);
     }
     free(rt->objs);
     free(rt->free_objs);
