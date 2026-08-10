@@ -894,6 +894,7 @@ static void t_v04_bigint(void);
 static void t_v04_generator(void);
 static void t_v04_map_set(void);
 static void t_v05_import_export(void);
+static void t_v05_class_accessors(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -963,6 +964,8 @@ void test_akl(void) {
     t_v04_map_set();
     fprintf(stderr, "  %-40s", "t_v05_import_export");
     t_v05_import_export();
+    fprintf(stderr, "  %-40s", "t_v05_class_accessors");
+    t_v05_class_accessors();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -2046,4 +2049,31 @@ static void t_v05_import_export(void) {
         CHECK(akl_as_num(v, &d) && d == 42);
         if (d != 42) break;
     }
+}
+
+/* ================= v0.5: クラス getter/setter 構文 ================= */
+static void t_v05_class_accessors(void) {
+    /* 基本 get/set（変数名は cc — 既存テストの const c と衝突しない規約） */
+    want_num("class C { constructor() { this._x = 1; } get x() { return this._x; } set x(v) { this._x = v; } }"
+             " var cc = new C(); cc.x + 10", 11);
+    want_num("class C { constructor() { this._x = 1; } get x() { return this._x; } set x(v) { this._x = v; } }"
+             " var cc = new C(); cc.x = 99; cc.x", 99);
+    /* インスタンスごとに独立したバッキングフィールド */
+    want_num("class C { constructor() { this._x = 0; } get x() { return this._x; } set x(v) { this._x = v; } }"
+             " var ca = new C(); var cb = new C(); ca.x = 5; cb.x + ca.x", 5);
+    /* static getter */
+    want_num("class C { static get s() { return 42; } } C.s", 42);
+    /* メソッド名 get/set（アクセサと誤認しない） */
+    want_num("class C { get() { return 7; } } new C().get()", 7);
+    want_num("class C { set() { return 8; } } new C().set()", 8);
+    /* 継承 + getter */
+    want_num("class B { constructor() { this._v = 3; } get v() { return this._v; } }"
+             " class C extends B { } var cc = new C(); cc.v", 3);
+    /* getter 内の this はインスタンス */
+    want_str("class C { constructor() { this.n = 'a'; } get label() { return this.n + '!'; } }"
+             " var cc = new C(); cc.label", "a!");
+    /* エラー: setter の引数は 1 個 / getter に引数不可 */
+    want_err("class C { set x(a, b) { } }", "setter");
+    want_err("class C { get x(a) { return 1; } }", "getter");
+    want_err("class C { get constructor() { return 1; } }", "accessor");
 }

@@ -137,7 +137,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | `new String(x)` / `new Number(x)` / `new Boolean(x)` のラッパーオブジェクト | 空オブジェクトを返す（値は変換関数と同じ。length 等は undefined） |
 | `Object.getPrototypeOf` / `Object.defineProperty` / `Object.freeze` 等 | `TypeError: not a function` |
 | class の static フィールド `static x = 1` / `static constructor()` | SyntaxError（static constructor は class の constructor プロパティを壊すため明白拒否） |
-| class の getter/setter `get x()` / `set x(v)` | SyntaxError（メソッドとして読むと `expected ';'` 系統） |
+| ~~class の getter/setter `get x()` / `set x(v)`~~ | ✅ v0.5（2026-08-10: オブジェクトリテラルと同一の "get:\x01name" 特殊名 + PLOAD/PSTORE フォールバック。static アクセサ・継承・`super` も対応。setter は引数 1 個必須、getter は引数不可、`get constructor()` は明白拒否） |
 | ~~高階関数 `[1,2].map(f)` / `forEach` / `filter`~~ | ✅ v0.3: `map`/`filter`/`forEach`/`some`/`every`/`find`/`findIndex`/`reduce`（VM 再入 akl_call 経由。コールバック fn(elem, idx, arr)、reduce は fn(acc, elem, idx, arr)） |
 | `new String(x)` / `new Number(x)` / `new Boolean(x)` のラッパーオブジェクト | 空オブジェクトを返す（値は変換関数と同じ。length 等は undefined） |
 | `Object.getPrototypeOf` / `Object.defineProperty` / `Object.freeze` 等 | `TypeError: not a function` |
@@ -149,10 +149,10 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 
 ## ロードマップ（優先度順。完了時にこの表へ実測で追記する）
 
-> **v0.5（2026-08-10）**: import/export 対応済み（下記 19e）。未対応として残るのは
-> Symbol・Proxy・クラス getter/setter 構文のみ — 「将来拡張」とする
-> （ユーザ要求「完全実装しないと意味ない」への攻めとして import/export を先行実装。
-> 残り 3 項目は別途）。詳細は各表の実測エラーを参照。
+> **v0.5（2026-08-10）**: import/export 対応済み（下記 19e）+ クラス getter/setter 構文
+> 対応済み（19f）。未対応として残るのは Symbol・Proxy のみ — 「将来拡張」とする
+> （ユーザ要求「完全実装しないと意味ない」への攻め。残り 2 項目は別途）。
+> 詳細は各表の実測エラーを参照。
 
 1. ✅ オブジェクトリテラル + プロパティアクセス（2026-08-08）
 2. ✅ 配列・ブラケット・関数式 + クロージャ捕捉・`this`（2026-08-08。AKL_OK_ENV チェーン）
@@ -177,6 +177,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 19c. ✅ generator（2026-08-10: AKL_OK_GEN + OP_YIELD。akl_call 再入機構で本体を実行して yield 値を蓄積。AklFuncEnt に is_gen 追加。an_* に N_YIELD 追跡を追加（クロージャ capture 漏れ修正））
 19d. ✅ Map / Set・Object.fromEntries・Array.from・padStart/padEnd・flat・hasOwnProperty（2026-08-10: 線形走査の有界化 AKL_MAP_MAX=4096。GC は keys/vals を mark）
 19e. ✅ import / export（2026-08-10: 全形式 — 名前付き/default/`* as ns`/副作用のみ/re-export `{a as b} from`/`export * from`/`export default 式・関数・class`/動的 `import()`。モジュール本体は「関数スコープでコンパイルされた匿名関数」として再入 akl_call で実行（var がモジュールローカルになる構造保証）。レジストリは GC ルート、VM 中コンパイルの定数は comp_pins 区間でスイープから保護。循環 import は state==1 検出で TypeError。export は宣言時点のスナップショット近似）
+19f. ✅ クラス getter/setter 構文 `get x()` / `set x(v)`（2026-08-10: オブジェクトリテラルの "get:\x01name" 特殊名機構を class 本体に拡張。`static get`/継承/`super` 対応。setter 引数 1 個・getter 引数 0 個を強制、`get constructor()` は明白拒否）
 
 ## V8 との位置づけ
 

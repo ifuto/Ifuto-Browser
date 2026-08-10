@@ -3022,6 +3022,28 @@ static u32 p_class_decl(P *p, bool name_req) {
     while (!p_is_punct(p, P_RC) && p->lx.kind != TK_EOF) {
         bool is_static = false;
         if (p_is_kw(p, KW_STATIC)) { is_static = true; lex_next(&p->lx); }
+        /* getter/setter 判定: 'get'/'set' + 名前 + '(' を先読み（オブジェクトリテラルと
+         * 同規約）。アクセサの格納名は "get:\x01name" / "set:\x01name" 特殊名 —
+         * PLOAD/PSTORE のフォールバックが this=obj で呼ぶ。 */
+        bool is_acc = false, is_get = false;
+        if (p->lx.kind == TK_IDENT && p->lx.str_len == 3 &&
+            (memcmp(p->lx.str_p, "get", 3) == 0 || memcmp(p->lx.str_p, "set", 3) == 0)) {
+            Lex saved = p->lx;
+            lex_next(&p->lx);
+            if (p->lx.kind == TK_IDENT) {
+                Lex saved2 = p->lx;
+                lex_next(&p->lx);
+                if (p_is_punct(p, P_LP)) {
+                    is_acc = true;
+                    is_get = memcmp(saved.str_p, "get", 3) == 0;
+                    p->lx = saved2; /* 名前トークンで復元 */
+                } else {
+                    p->lx = saved;
+                }
+            } else {
+                p->lx = saved;
+            }
+        }
         u32 mname;
         bool is_ctor = false;
         if (p->lx.kind == TK_IDENT || p->lx.kind == TK_KW) {
@@ -3031,6 +3053,7 @@ static u32 p_class_decl(P *p, bool name_req) {
             if (mname == UINT32_MAX) { goto fail; }
             lex_next(&p->lx);
         } else { p->fail = "expected method name"; goto fail; }
+        if (is_acc && is_ctor) { p->fail = "accessor named constructor is not allowed"; goto fail; }
         if (is_static && is_ctor) {
             p->fail = "static constructor is not supported (would shadow class constructor)";
             goto fail;
@@ -3081,6 +3104,15 @@ static u32 p_class_decl(P *p, bool name_req) {
         p->nodes[cm].d = body;
         if (is_static) p->nodes[cm].flags |= 1;
         if (is_ctor && !is_static) p->nodes[cm].flags |= 2;
+        if (is_acc) {
+            /* アクセサ: 引数検査（get は 0 / set は 1）と特殊名格納 */
+            if (is_get && pc2 > 0) { p->fail = "getter takes no arguments"; goto fail; }
+            if (!is_get && pc2 != 1) { p->fail = "setter takes exactly one argument"; goto fail; }
+            u32 skey = p_special_prop_name(p, is_get ? "get" : "set", mname);
+            if (skey == UINT32_MAX) goto fail;
+            p->nodes[cm].a = skey; /* cg_class_body が PSTORE する格納名 */
+            p->nodes[cm].flags |= is_get ? 4u : 8u;
+        }
         if (p_scratch(p, &mb, cm) < 0) { goto fail; }
         /* メソッド間のセミコロンは任意 */
         p_eat_punct(p, P_SEMI);

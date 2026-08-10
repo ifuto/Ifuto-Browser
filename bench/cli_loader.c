@@ -1,7 +1,9 @@
 /* akl_cli 用モジュールローダ: ファイルパス解決（base のディレクトリ基準）+ data: URI。
  * 契約は src/akl/akl.h の AklModuleLoader。out_src / out_id は malloc で確保し
  * AKL 側が free する。解決できない場合は両方 NULL を返す。 */
-#define _POSIX_C_SOURCE 200809L /* realpath / strdup */
+#if !defined(_XOPEN_SOURCE) && !defined(_POSIX_C_SOURCE)
+#define _XOPEN_SOURCE 700 /* realpath / strdup */
+#endif
 #include "../src/akl/akl.h"
 #include <stdio.h>
 #include <stdlib.h>
