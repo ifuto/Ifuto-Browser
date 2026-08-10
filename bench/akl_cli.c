@@ -45,6 +45,20 @@ static int cmpd(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
     return x < y ? -1 : x > y ? 1 : 0;
 }
+/* モジュール構文（import/export の単語）を含むか。文字列/コメント中の偽陽性は
+ * 「より安全側」= サンドボックス無効化方向のみに作用する。 */
+static bool src_has_module_syntax(const char *s) {
+    while (*s) {
+        while (*s && !((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_')) s++;
+        if (!*s) break;
+        const char *w = s;
+        while ((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z') || *s == '_' || (*s >= '0' && *s <= '9')) s++;
+        size_t ln = (size_t)(s - w);
+        if ((ln == 6 && memcmp(w, "import", 6) == 0) || (ln == 6 && memcmp(w, "export", 6) == 0)) return true;
+    }
+    return false;
+}
+
 static char *slurp(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
@@ -84,6 +98,18 @@ int main(int argc, char **argv) {
     if (times > 256) times = 256;
     char *src = slurp(file);
     if (!src) { fprintf(stderr, "cannot read %s\n", file); return 2; }
+    /* v0.5: ファイルベースのモジュールローダ（import 解決）。エントリはモジュールとして
+     * も評価される（top-level import/export を含む場合。通常は classic と同一動作） */
+    extern void cli_module_loader(AklRT *rt, const char *spec, const char *base,
+                                  void *udata, char **out_src, char **out_id);
+    /* モジュール構文を含むソースは、ローダのファイル I/O がサンドボックスの
+     * open 禁止と構造的に衝突するため、サンドボックスを適用しない（明示通知） */
+    if (src_has_module_syntax(src)) {
+        if (want_sandbox) {
+            fprintf(stderr, "[cli] module syntax detected: sandbox disabled (module loader needs file I/O)\n");
+            want_sandbox = 0;
+        }
+    }
     /* ハッキング耐性（ユーザ要求）: 入力の解釈・実行は不可逆サンドボックスの内側で行う。
      * ファイルは lock 前に読み込み済み（allowlist は open を含まない）。
      * --no-sandbox 指定時のみ明示的に素通し（デバッグ用。規定は ON） */
@@ -106,10 +132,20 @@ int main(int argc, char **argv) {
         if (!tn || !tn[0]) { if (budget) akl_set_insn_budget(rt, budget); }
         if (!use_cojit) akl_set_cojit(rt, 0);
         AklVal v;
+        akl_set_module_loader(rt, cli_module_loader, NULL);
+        akl_set_module_base(rt, file);
         double t0 = now_ms();
         bool ok = akl_eval(rt, src, &v);
+        if (!ok) {
+            /* モジュール専用構文（import/export 宣言）が原因ならモジュールとして再試行。
+             * パース失敗は実行前に確定するため副作用なし（安全な再試行）。 */
+            const char *er = akl_error(rt);
+            if (er && (strstr(er, "only allowed in modules"))) {
+                ok = akl_eval_module(rt, src, file, &v);
+            }
+        }
         ts[t] = now_ms() - t0;
-        if (!ok) { fprintf(stderr, "eval failed: %s\n", akl_error(rt)); akl_free(rt); return 1; }
+        if (!ok) { fprintf(stderr, "eval failed: %s\n", akl_error(rt)); akl_free(rt); free(src); return 1; }
         if (t == times - 1) print_val(rt, v); /* 最終 rep の完了値（vsx 互換の print 規約） */
         akl_free(rt);
     }

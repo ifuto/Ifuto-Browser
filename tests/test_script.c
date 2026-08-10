@@ -93,13 +93,14 @@ static void test_script_skip_rules(void) {
     tscr_begin(&t, "<div id=a>X</div>"
                    "<script src=\"http://example.invalid/x.js\">var bad=1;</script>"
                    "<script type=\"text/vbscript\">vb junk</script>"
-                   "<script type=\"module\">console.log('mod');</script>" /* type!=text/javascript は明白スキップ */
+                   "<script type=\"module\">console.log('mod');</script>" /* v0.5: module は実行（import は loader 未装備で明白失敗） */
                    "<script></script>"
                    "<script type=\"TEXT/JAVASCRIPT\">document.getElementById('a').textContent='run';</script>");
     tscr_run(&t);
-    CHECK(t.rep.n_run == 1);      /* type 値の大文字小文字は無視（HTML 規則） */
-    CHECK(t.rep.n_skipped == 4);  /* src / vbscript / module / 空 */
+    CHECK(t.rep.n_run == 2);      /* text/javascript + module */
+    CHECK(t.rep.n_skipped == 3);  /* src / vbscript / 空 */
     CHECK(t.rep.n_errors == 0);
+    CHECK(strstr(t.logbuf, "[script:console] mod\n") != NULL);
     IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
     IfStr txt = if_dom_text_content(&t.a, d);
     CHECK(txt.n == 3 && memcmp(txt.p, "run", 3) == 0);

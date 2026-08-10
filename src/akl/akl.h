@@ -42,6 +42,23 @@ bool akl_call(AklRT *rt, AklVal fn, int argc, const AklVal *argv, AklVal *out);
  * 「全命令即枯渇」になるので 1 以上を渡すこと。ブラウザ統合時はタブ経路ごとに設定する。 */
 void akl_set_insn_budget(AklRT *rt, uint64_t budget);
 
+/* ---- v0.5 モジュール（import / export） ----
+ * ローダ: spec（import の引数文字列）と base（import した側のモジュール id。無ければ
+ * akl_set_module_base の値、それも無ければ NULL）から、ソース文字列と解決済み id を
+ * out_src / out_id に malloc で確保して返す（AKL 側が free する）。解決できない場合は
+ * 両方 NULL を返す（"cannot resolve module" エラーに倒れる）。ローダ未登録での
+ * import は "module loader not installed" で明白に失敗する。 */
+typedef void (*AklModuleLoader)(AklRT *rt, const char *spec, const char *base,
+                                void *udata, char **out_src, char **out_id);
+void akl_set_module_loader(AklRT *rt, AklModuleLoader loader, void *udata);
+/* ローダ解決の基点 id（エントリモジュール等。無ければ NULL のまま） */
+void akl_set_module_base(AklRT *rt, const char *base);
+
+/* src をモジュールとして評価（import/export 許可・最上位スコープはモジュールスコープ）。
+ * base はこのモジュールの id（ローダの解決基点。NULL 可）。戻り値規約は akl_eval と同一。
+ * エントリモジュールの export は破棄される（import 側の収集物のみが namespace になる）。 */
+bool akl_eval_module(AklRT *rt, const char *src, const char *base, AklVal *out);
+
 /* CoJIT（静的検証駆動の AOT 特化: runtime codegen は行わない）の ON/OFF。
  * 既定 ON。特化器は失敗しても汎用命令のまま残るため、off は主に監査・差分検証用 */
 void akl_set_cojit(AklRT *rt, int enabled);

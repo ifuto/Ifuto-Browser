@@ -394,7 +394,11 @@ IfScriptReport if_script_run(IfArena *dom_arena, IfDom *dom, FILE *log) {
         IfStr src = if_dom_attr(sn, "src");
         if (src.p && src.n) { rep.n_skipped++; continue; } /* 外部 script 取得は v1 非対象（明白に数える） */
         IfStr ty = if_dom_attr(sn, "type");
-        if (ty.p && ty.n && !if_str_eq_ci(ty, if_str("text/javascript", 15))) { rep.n_skipped++; continue; }
+        bool is_module = false;
+        if (ty.p && ty.n) {
+            if (if_str_eq_ci(ty, if_str("module", 6))) is_module = true;
+            else if (!if_str_eq_ci(ty, if_str("text/javascript", 15))) { rep.n_skipped++; continue; }
+        }
         IfStr txt = if_dom_text_content(&sc, sn);
         if (!txt.p || !txt.n) { rep.n_skipped++; continue; } /* 空 script（<script></script>） */
         rep.n_run++;
@@ -402,7 +406,9 @@ IfScriptReport if_script_run(IfArena *dom_arena, IfDom *dom, FILE *log) {
         if (memchr(txt.p, 0, txt.n))   { rep.n_errors++; fprintf(lg, "[script] FAILED: source contains NUL\n"); continue; }
         char *cs = (char *)if_arena_alloc(&sc, (u64)txt.n + 1);
         memcpy(cs, txt.p, txt.n); cs[txt.n] = 0;
-        if (!akl_eval(rt, cs, NULL)) {
+        bool ok_s = is_module ? akl_eval_module(rt, cs, "<inline>", NULL)
+                              : akl_eval(rt, cs, NULL);
+        if (!ok_s) {
             char w[129];
             snprintf(w, sizeof w, "%.128s", akl_error(rt));
             w[128] = 0;

@@ -266,6 +266,26 @@ typedef struct AklRootStk {
     struct AklRootStk *next;
 } AklRootStk;
 
+/* v0.5 モジュール（import/export）: 解決済み id をキーにしたモジュールレコード。
+ * state: 0=未完了（レジストリ未登録） 1=loading 2=done 3=failed。
+ * exports は OBJ（prop name=export 名 → 値）。ns は完了時に exports から構築した
+ * namespace OBJ（同一モジュールへの import は全て同一 ns を共有 — JS の仕様通り）。
+ * 循環 import は state==1 の参照で TypeError（近似。AKL_COMPAT に明記）。 */
+typedef struct {
+    char *id;              /* 解決済み id（ローダが malloc。AKL が free） */
+    char *err;             /* state==3 の失敗メッセージ（malloc。AKL が free） */
+    u8 state;
+    u8 _p[3];
+    AklVal ns;             /* namespace OBJ（done 後。GC ルート: レジストリ経由で mark） */
+    u32 exports;           /* 書き込み先 OBJ obj index（GC ルート同上） */
+} AklModule;
+
+/* VM 実行中のコンパイル（モジュール読み込み）で生成された定数等の pin 区間。
+ * コードが obj index を即値で参照するため、pin_mark 水準を超えた位置でも
+ * スイープ対象にしない（sweep されると dangling index になる — 構造的禁止）。
+ * 次回 akl_eval で pin_mark が全区間を追い越すため、eval 開始時に破棄してよい。 */
+typedef struct { u32 from, to; } AklCompPin;
+
 struct AklRT {
     /* ヒープ（obj index 参照。mark-sweep GC: スイープは index 不変・穴再利用。
      * 構造的安全: コンパイル生成物（< pin_mark）はゴミになり得ない構成で、
@@ -310,6 +330,14 @@ struct AklRT {
     AklVal gen_meth_vals[AKL_GEN_METH_N];
     AklVal map_meth_vals[AKL_MAP_METH_N];
     AklVal set_meth_vals[AKL_SET_METH_N];
+    /* v0.5 モジュール（import/export） */
+    AklModule *modules; u32 n_modules, cap_modules; /* レジストリ（id 順。GC ルート） */
+    AklModule *cur_module;   /* 実行中のモジュール本体（__export の書き込み先） */
+    AklModuleLoader mod_loader; void *mod_udata;
+    char *base_id;           /* ローダ解決の基点（akl_set_module_base。AKL が free） */
+    AklCompPin *comp_pins; u32 n_comp_pins, cap_comp_pins;
+    bool compiling;          /* VM 中コンパイル中（GC は [compiling_from, n_objs) を根扱い） */
+    u32 compiling_from;
     char err[256];
     bool native_err;    /* native が akl_native_throw した（VM はこれを見て eval を失敗に） */
     /* 定数除数の剰余を magic-multiply に強度削減する直写メモ（8 エントリ）。
@@ -378,6 +406,22 @@ static u32 akl_gc(AklRT *rt) {
         if (rt->tries[i].kind == AKL_TE_FIN) akl_gc_mark_val(rt, rt->tries[i].pending, mk);
     for (u32 i = 0; i < rt->n_globals; i++) akl_gc_mark_val(rt, rt->globals[i].v, mk);
     if (rt->cur_gen_arr != UINT32_MAX) akl_gc_mark_val(rt, AKL_MK_OBJ(rt->cur_gen_arr), mk);
+    /* v0.5 モジュール: レジストリ（ns / exports OBJ）は GC ルート。
+     * 本体 FUNC は comp_pins 区間に含まれるため個別 mark 不要。 */
+    for (u32 i = 0; i < rt->n_modules; i++) {
+        if (rt->modules[i].ns != AKL_VAL_UNDEF) akl_gc_mark_val(rt, rt->modules[i].ns, mk);
+        if (rt->modules[i].exports != UINT32_MAX) akl_gc_mark_val(rt, AKL_MK_OBJ(rt->modules[i].exports), mk);
+    }
+    for (u32 i = 0; i < rt->n_comp_pins; i++) {
+        u32 from = rt->comp_pins[i].from, to = rt->comp_pins[i].to;
+        if (from < rt->pin_mark) from = rt->pin_mark;
+        if (to > rt->n_objs) to = rt->n_objs;
+        for (u32 j = from; j < to; j++) mk[j - rt->pin_mark] = 1;
+    }
+    if (rt->compiling) { /* 進行中のコンパイル生成物（区間確定前） */
+        u32 from = rt->compiling_from < rt->pin_mark ? rt->pin_mark : rt->compiling_from;
+        for (u32 j = from; j < rt->n_objs; j++) mk[j - rt->pin_mark] = 1;
+    }
     for (u32 i = 0; i < rt->n_nury; i++) {
         u32 oi = rt->nury[i];
         if (oi >= rt->pin_mark && oi < rt->n_objs) mk[oi - rt->pin_mark] = 1;
@@ -601,7 +645,10 @@ static u32 akl_obj_new(AklRT *rt) {
     if (rt->n_objs - rt->n_free >= rt->gc_next_objs) akl_gc(rt); /* 生存オブジェクト数の適応閾値
         * （n_objs は free-list 再利用で単調にしか見えないので live = n_objs - n_free で裁う。
         *  これを誤ると freelist 充填後に毎回 GC する常勤化バグになる — 実測 9ms→265ms 退行） */
-    if (rt->n_free) {
+    if (rt->n_free && !rt->compiling) {
+        /* VM 中コンパイル（モジュール読み込み）中は free-list を使わない:
+         * コンパイル生成物は [compiling_from, n_objs) の pin 区間で保護され、
+         * 区間外 index の再利用があるとコード即値がスイープ対象に落ちる（構造的禁止）。 */
         u32 idx = rt->free_objs[--rt->n_free];
         memset(&rt->objs[idx], 0, sizeof(AklObj));
         return idx;
@@ -808,6 +855,7 @@ enum { KW_VAR, KW_LET, KW_CONST, KW_FUNCTION, KW_RETURN, KW_IF, KW_ELSE, KW_WHIL
        KW_VOID, KW_DELETE, KW_IN, KW_NEW, KW_OF, KW_INSTANCEOF,
        KW_CLASS, KW_EXTENDS, KW_STATIC, KW_SUPER,
        KW_DEBUGGER, KW_ASYNC, KW_AWAIT, KW_YIELD,
+       KW_IMPORT, KW_EXPORT,
        KW_N };
 static const char *const AKL_KWS[KW_N] = {
     "var", "let", "const", "function", "return", "if", "else", "while",
@@ -815,7 +863,8 @@ static const char *const AKL_KWS[KW_N] = {
     "throw", "try", "catch", "finally",
     "do", "switch", "case", "default", "this",
     "void", "delete", "in", "new", "of", "instanceof",
-    "class", "extends", "static", "super", "debugger", "async", "await", "yield"
+    "class", "extends", "static", "super", "debugger", "async", "await", "yield",
+    "import", "export"
 };
 
 enum { P_LP, P_RP, P_LC, P_RC, P_SEMI, P_COMMA, P_ASSIGN, P_PLUS, P_MINUS, P_STAR,
@@ -1282,6 +1331,14 @@ enum {
     N_SUPERGET, /* super.name: b=name STR idx */
     N_SUPERMCALL, /* super.name(...): b=name, c=args first, d=argc */
     N_SUPERCALL,  /* super(...): b=args first, c=argc（親 constructor を this で） */
+    /* v0.5 モジュール（import/export） */
+    N_IMPORT,     /* a=spec N_STR, b=最初の N_IMPORTB, c=束縛数（0=副作用のみ import） */
+    N_IMPORTB,    /* a=ローカル名 idx, b=import 名 idx, c=次束縛,
+                   * flags bit0=default, bit1=star（b 不使用） */
+    N_EXPORT,     /* a=export 名 idx, b=値ノード（re-export 時は import 名 idx）,
+                   * c=spec N_STR（re-export 時のみ）, d=次 N_EXPORT,
+                   * flags bit0=star re-export */
+    N_IMPORTDYN,  /* import(expr): a=引数ノード（Promise 解決の動的 import 近似） */
     N_NONE = 0xFFFFFFFFu
 };
 
@@ -1315,6 +1372,7 @@ typedef struct {
     u32 gen_body;                        /* generator 関数本体のパース中 > 0（yield 許可） */
     u32 super_name;                      /* 親クラス保持ローカルの疑似名（intern id） */
     u32 super_prop;                      /* クラスオブジェクトの親参照プロパティ名（intern id） */
+    u32 is_module;                       /* v0.5: モジュールとして解析（import/export 許可） */
 } P;
 
 static u32 p_node(P *p, u8 kind) {
@@ -1873,6 +1931,20 @@ static u32 p_primary(P *p) {
     if (p->fail) return N_NONE;
     if (++p->depth > AKL_PARSE_DEPTH) { p->depth--; p->fail = "parse depth exhausted"; return N_NONE; }
     Lex *lx = &p->lx;
+    if (p_is_kw(p, KW_IMPORT)) {
+        /* 動的 import: import("spec") → __import native（Promise 解決の同期近似）。
+         * import.meta は未対応（明白に拒否）。宣言は p_stmt 側が先に消費する。 */
+        lex_next(lx);
+        if (p_is_punct(p, P_DOT)) { p->fail = "import.meta is not supported"; p->depth--; return N_NONE; }
+        if (!p_expect_punct(p, P_LP, "expected '(' after import")) { p->depth--; return N_NONE; }
+        u32 a = p_expr(p);
+        if (a == N_NONE || !p_expect_punct(p, P_RP, "expected ')'")) { p->depth--; return N_NONE; }
+        u32 ni = p_node(p, N_IMPORTDYN);
+        if (ni != N_NONE) p->nodes[ni].a = a;
+        if (ni != N_NONE) ni = p_postfix(p, ni);
+        p->depth--;
+        return ni;
+    }
     if (lx->kind == TK_NUM) {
         u32 ni;
         if (lx->num_is_big) {
@@ -2610,8 +2682,496 @@ static u32 p_logical_or(P *p) {
     return lhs;
 }
 
+/* ============================== v0.5 モジュール（import/export） ============================== */
+static u32 p_stmt(P *p);           /* export <decl> の再帰パース用 */
+static u32 p_class_decl(P *p, bool name_req);
+
+/* 現在トークンが指定の識別子か（from / as は文脈キーワード — 予約語化しない） */
+static bool p_ident_is(P *p, const char *s) {
+    size_t ln = strlen(s);
+    return p->lx.kind == TK_IDENT && p->lx.str_len == ln &&
+           memcmp(p->lx.str_p, s, ln) == 0;
+}
+
+/* 宣言文（p_stmt の返り値）から宣言名を収集: N_VAR / N_FUNC / N_CLASS / N_BLOCK(複数宣言) */
+static void p_decl_names(P *p, u32 ni, U32Vec *out) {
+    if (ni == N_NONE || p->fail) return;
+    AklNode *n = &p->nodes[ni];
+    if (n->kind == N_VAR) { p_scratch(p, out, n->a); return; }
+    if ((n->kind == N_FUNC || n->kind == N_CLASS) && n->a != UINT32_MAX) p_scratch(p, out, n->a);
+    if (n->kind == N_BLOCK && n->a != N_NONE)
+        for (u32 i = 0; i < n->c; i++) p_decl_names(p, p->list[n->a + i], out);
+}
+
+/* 文字列リテラルの N_STR ノード生成（モジュール spec 用）。p->lx は TK_STR。 */
+static u32 p_spec_node(P *p) {
+    u32 idx = p_intern(p, p->lx.str_p, p->lx.str_len);
+    if (idx == UINT32_MAX) return N_NONE;
+    u32 ni = p_node(p, N_STR);
+    if (ni == N_NONE) return N_NONE;
+    p->nodes[ni].a = idx;
+    return ni;
+}
+
+/* import 宣言。p->lx は KW_IMPORT（モジュール最上位のみ — 呼出側で検査済み） */
+static u32 p_import_decl(P *p) {
+    u32 spec = N_NONE, first = N_NONE, cnt = 0;
+    lex_next(&p->lx);
+    if (p->lx.kind == TK_STR) {
+        /* import "m"（副作用のみ） */
+        spec = p_spec_node(p);
+        if (spec == N_NONE) return N_NONE;
+        lex_next(&p->lx);
+    } else if (p_is_punct(p, P_STAR)) {
+        /* import * as ns from "m" */
+        lex_next(&p->lx);
+        if (!p_ident_is(p, "as")) { p->fail = "expected 'as' after *"; return N_NONE; }
+        lex_next(&p->lx);
+        if (p->lx.kind != TK_IDENT) { p->fail = "expected namespace name"; return N_NONE; }
+        u32 ns = p_intern(p, p->lx.str_p, p->lx.str_len);
+        if (ns == UINT32_MAX) return N_NONE;
+        lex_next(&p->lx);
+        if (!p_ident_is(p, "from")) { p->fail = "expected 'from'"; return N_NONE; }
+        lex_next(&p->lx);
+        if (p->lx.kind != TK_STR) { p->fail = "expected module specifier string"; return N_NONE; }
+        spec = p_spec_node(p);
+        if (spec == N_NONE) return N_NONE;
+        lex_next(&p->lx);
+        u32 b = p_node(p, N_IMPORTB);
+        if (b == N_NONE) return N_NONE;
+        p->nodes[b].a = ns;
+        p->nodes[b].flags = 2; /* star */
+        first = b; cnt = 1;
+    } else if (p_is_punct(p, P_LC)) {
+        /* import { a, b as c } from "m" */
+        lex_next(&p->lx);
+        u32 last = N_NONE;
+        if (!p_is_punct(p, P_RC)) {
+            for (;;) {
+                if (p->lx.kind != TK_IDENT && p->lx.kind != TK_KW) { p->fail = "expected import name"; return N_NONE; }
+                u32 iname = p_intern(p, p->lx.str_p, p->lx.str_len);
+                if (iname == UINT32_MAX) return N_NONE;
+                lex_next(&p->lx);
+                u32 lname = iname;
+                if (p_ident_is(p, "as")) {
+                    lex_next(&p->lx);
+                    if (p->lx.kind != TK_IDENT) { p->fail = "expected import alias"; return N_NONE; }
+                    lname = p_intern(p, p->lx.str_p, p->lx.str_len);
+                    if (lname == UINT32_MAX) return N_NONE;
+                    lex_next(&p->lx);
+                }
+                u32 b = p_node(p, N_IMPORTB);
+                if (b == N_NONE) return N_NONE;
+                p->nodes[b].a = lname;
+                p->nodes[b].b = iname;
+                if (last != N_NONE) p->nodes[last].c = b;
+                else first = b;
+                last = b; cnt++;
+                if (!p_eat_punct(p, P_COMMA)) break;
+                if (p_is_punct(p, P_RC)) break; /* 末尾カンマ許容 */
+            }
+        }
+        if (!p_expect_punct(p, P_RC, "expected '}'")) return N_NONE;
+        if (!p_ident_is(p, "from")) { p->fail = "expected 'from'"; return N_NONE; }
+        lex_next(&p->lx);
+        if (p->lx.kind != TK_STR) { p->fail = "expected module specifier string"; return N_NONE; }
+        spec = p_spec_node(p);
+        if (spec == N_NONE) return N_NONE;
+        lex_next(&p->lx);
+    } else if (p->lx.kind == TK_IDENT) {
+        /* import def from "m"（def が "from" でも可: import from "m"） */
+        u32 lname = p_intern(p, p->lx.str_p, p->lx.str_len);
+        if (lname == UINT32_MAX) return N_NONE;
+        lex_next(&p->lx);
+        if (!p_ident_is(p, "from") && p->lx.kind != TK_STR) { p->fail = "expected 'from'"; return N_NONE; }
+        if (p_ident_is(p, "from")) lex_next(&p->lx);
+        if (p->lx.kind != TK_STR) { p->fail = "expected module specifier string"; return N_NONE; }
+        spec = p_spec_node(p);
+        if (spec == N_NONE) return N_NONE;
+        lex_next(&p->lx);
+        u32 b = p_node(p, N_IMPORTB);
+        if (b == N_NONE) return N_NONE;
+        p->nodes[b].a = lname;
+        p->nodes[b].flags = 1; /* default */
+        first = b; cnt = 1;
+    } else {
+        p->fail = "expected module specifier or import binding";
+        return N_NONE;
+    }
+    p_eat_punct(p, P_SEMI);
+    u32 ni = p_node(p, N_IMPORT);
+    if (ni == N_NONE) return N_NONE;
+    p->nodes[ni].a = spec;
+    p->nodes[ni].b = first;
+    p->nodes[ni].c = cnt;
+    return ni;
+}
+
+/* export 宣言。p->lx は KW_EXPORT（モジュール最上位のみ — 呼出側で検査済み） */
+static u32 p_export_decl(P *p) {
+    u32 head = N_NONE, tail = N_NONE;
+    lex_next(&p->lx);
+    if (p_is_punct(p, P_STAR)) {
+        /* export * from "m"（export * as ns は明白に拒否） */
+        lex_next(&p->lx);
+        if (p_ident_is(p, "as")) { p->fail = "export * as ns is not supported"; return N_NONE; }
+        if (!p_ident_is(p, "from")) { p->fail = "expected 'from'"; return N_NONE; }
+        lex_next(&p->lx);
+        if (p->lx.kind != TK_STR) { p->fail = "expected module specifier string"; return N_NONE; }
+        u32 spec = p_spec_node(p);
+        if (spec == N_NONE) return N_NONE;
+        lex_next(&p->lx);
+        p_eat_punct(p, P_SEMI);
+        u32 x = p_node(p, N_EXPORT);
+        if (x == N_NONE) return N_NONE;
+        p->nodes[x].c = spec;
+        p->nodes[x].flags = 1; /* star */
+        return x;
+    }
+    if (p_is_punct(p, P_LC)) {
+        /* export { a, b as c, default as d } [from "m"]（キーワード名はプロパティ名と同規約） */
+        lex_next(&p->lx);
+        if (!p_is_punct(p, P_RC)) {
+            for (;;) {
+                if (p->lx.kind != TK_IDENT && p->lx.kind != TK_KW) { p->fail = "expected export name"; return N_NONE; }
+                u32 iname = p_intern(p, p->lx.str_p, p->lx.str_len);
+                if (iname == UINT32_MAX) return N_NONE;
+                lex_next(&p->lx);
+                u32 ename = iname;
+                if (p_ident_is(p, "as")) {
+                    lex_next(&p->lx);
+                    if (p->lx.kind != TK_IDENT) { p->fail = "expected export alias"; return N_NONE; }
+                    ename = p_intern(p, p->lx.str_p, p->lx.str_len);
+                    if (ename == UINT32_MAX) return N_NONE;
+                    lex_next(&p->lx);
+                }
+                u32 x = p_node(p, N_EXPORT);
+                if (x == N_NONE) return N_NONE;
+                p->nodes[x].a = ename;
+                u32 ref = p_node(p, N_IDENT);
+                if (ref == N_NONE) return N_NONE;
+                p->nodes[ref].a = iname;
+                p->nodes[x].b = ref; /* from が現れたら b を name idx に変換 */
+                if (tail != N_NONE) p->nodes[tail].d = x;
+                else head = x;
+                tail = x;
+                if (!p_eat_punct(p, P_COMMA)) break;
+                if (p_is_punct(p, P_RC)) break;
+            }
+        }
+        if (!p_expect_punct(p, P_RC, "expected '}'")) return N_NONE;
+        if (p_ident_is(p, "from")) {
+            lex_next(&p->lx);
+            if (p->lx.kind != TK_STR) { p->fail = "expected module specifier string"; return N_NONE; }
+            u32 spec = p_spec_node(p);
+            if (spec == N_NONE) return N_NONE;
+            lex_next(&p->lx);
+            for (u32 x = head; x != N_NONE; x = p->nodes[x].d) {
+                p->nodes[x].b = p->nodes[p->nodes[x].b].a; /* N_IDENT → name idx */
+                p->nodes[x].c = spec;
+            }
+        }
+        p_eat_punct(p, P_SEMI);
+        return head;
+    }
+    if (p_is_kw(p, KW_DEFAULT)) {
+        /* export default <expr> / function / class */
+        lex_next(&p->lx);
+        u32 name_def = p_intern(p, (const u8 *)"default", 7);
+        if (name_def == UINT32_MAX) return N_NONE;
+        u32 val = N_NONE;
+        if (p_is_kw(p, KW_FUNCTION) || p_is_kw(p, KW_ASYNC)) {
+            /* named → 宣言（値は N_IDENT 参照。ブロック [decl, export] に包む） */
+            Lex saved = p->lx;
+            lex_next(&p->lx); /* function または async を skip */
+            if (p_is_kw(p, KW_FUNCTION)) lex_next(&p->lx); /* async function の function を skip */
+            if (p_is_punct(p, P_STAR)) lex_next(&p->lx);
+            bool named = p->lx.kind == TK_IDENT;
+            p->lx = saved;
+            if (named) {
+                u32 decl = p_stmt(p);
+                if (decl == N_NONE) return N_NONE;
+                u32 nm = (decl < p->n_nodes) ? p->nodes[decl].a : UINT32_MAX;
+                if (nm == UINT32_MAX) { p->fail = "internal: default function name"; return N_NONE; }
+                u32 ref = p_node(p, N_IDENT);
+                if (ref == N_NONE) return N_NONE;
+                p->nodes[ref].a = nm;
+                U32Vec sc = { NULL, 0, 0 };
+                if (p_scratch(p, &sc, decl) < 0) { free(sc.v); return N_NONE; }
+                u32 x = p_node(p, N_EXPORT);
+                if (x == N_NONE) { free(sc.v); return N_NONE; }
+                p->nodes[x].a = name_def;
+                p->nodes[x].b = ref;
+                if (p_scratch(p, &sc, x) < 0) { free(sc.v); return N_NONE; }
+                u32 first = p_list_commit(p, &sc);
+                u32 cnt = sc.n;
+                free(sc.v);
+                u32 blk = p_node(p, N_BLOCK);
+                if (blk == N_NONE) return N_NONE;
+                p->nodes[blk].a = first;
+                p->nodes[blk].c = cnt;
+                p_eat_punct(p, P_SEMI);
+                return blk;
+            }
+            val = p_expr_comma(p); /* 関数式（無名 generator / async 含む） */
+            if (val == N_NONE) return N_NONE;
+        } else if (p_is_kw(p, KW_CLASS)) {
+            Lex saved = p->lx;
+            lex_next(&p->lx);
+            bool named = p->lx.kind == TK_IDENT;
+            p->lx = saved;
+            if (named) {
+                u32 decl = p_stmt(p);
+                if (decl == N_NONE) return N_NONE;
+                u32 nm = (decl < p->n_nodes) ? p->nodes[decl].a : UINT32_MAX;
+                if (nm == UINT32_MAX) { p->fail = "internal: default class name"; return N_NONE; }
+                u32 ref = p_node(p, N_IDENT);
+                if (ref == N_NONE) return N_NONE;
+                p->nodes[ref].a = nm;
+                U32Vec sc = { NULL, 0, 0 };
+                if (p_scratch(p, &sc, decl) < 0) { free(sc.v); return N_NONE; }
+                u32 x = p_node(p, N_EXPORT);
+                if (x == N_NONE) { free(sc.v); return N_NONE; }
+                p->nodes[x].a = name_def;
+                p->nodes[x].b = ref;
+                if (p_scratch(p, &sc, x) < 0) { free(sc.v); return N_NONE; }
+                u32 first = p_list_commit(p, &sc);
+                u32 cnt = sc.n;
+                free(sc.v);
+                u32 blk = p_node(p, N_BLOCK);
+                if (blk == N_NONE) return N_NONE;
+                p->nodes[blk].a = first;
+                p->nodes[blk].c = cnt;
+                p_eat_punct(p, P_SEMI);
+                return blk;
+            }
+            val = p_class_decl(p, false); /* 無名 class */
+            if (val == N_NONE) return N_NONE;
+        } else {
+            val = p_expr_comma(p);
+            if (val == N_NONE) return N_NONE;
+        }
+        p_eat_punct(p, P_SEMI);
+        u32 x = p_node(p, N_EXPORT);
+        if (x == N_NONE) return N_NONE;
+        p->nodes[x].a = name_def;
+        p->nodes[x].b = val;
+        return x;
+    }
+    if (p_is_kw(p, KW_VAR) || p_is_kw(p, KW_LET) || p_is_kw(p, KW_CONST) ||
+        p_is_kw(p, KW_FUNCTION) || p_is_kw(p, KW_CLASS) || p_is_kw(p, KW_ASYNC)) {
+        /* export <decl>: 宣言をパースし、全宣言名を export に追加したブロックにする */
+        u32 decl = p_stmt(p);
+        if (decl == N_NONE) return N_NONE;
+        U32Vec names = { NULL, 0, 0 };
+        p_decl_names(p, decl, &names);
+        if (names.n == 0 || p->fail) { free(names.v); if (!p->fail) p->fail = "export declaration has no names"; return N_NONE; }
+        U32Vec sc = { NULL, 0, 0 };
+        if (p_scratch(p, &sc, decl) < 0) { free(names.v); free(sc.v); return N_NONE; }
+        for (u32 i = 0; i < names.n; i++) {
+            u32 nm = names.v[i];
+            u32 ref = p_node(p, N_IDENT);
+            if (ref == N_NONE) { free(names.v); free(sc.v); return N_NONE; }
+            p->nodes[ref].a = nm;
+            u32 x = p_node(p, N_EXPORT);
+            if (x == N_NONE) { free(names.v); free(sc.v); return N_NONE; }
+            p->nodes[x].a = nm;
+            p->nodes[x].b = ref;
+            if (p_scratch(p, &sc, x) < 0) { free(names.v); free(sc.v); return N_NONE; }
+        }
+        free(names.v);
+        u32 first = p_list_commit(p, &sc);
+        u32 cnt = sc.n;
+        free(sc.v);
+        u32 blk = p_node(p, N_BLOCK);
+        if (blk == N_NONE) return N_NONE;
+        p->nodes[blk].a = first;
+        p->nodes[blk].c = cnt;
+        return blk;
+    }
+    p->fail = "expected export declaration";
+    return N_NONE;
+}
+
 /* ---- 文 ---- */
+static u32 p_class_decl(P *p, bool name_req);
 static u32 p_stmt(P *p);
+
+/* class 宣言（文）。name_req=true は名前必須（文頭）。false は無名可
+ * （export default 用。無名時 a=UINT32_MAX で、値としてのみ使われる）。 */
+static u32 p_class_decl(P *p, bool name_req) {
+    lex_next(&p->lx);
+    u32 name = UINT32_MAX;
+    if (p->lx.kind == TK_IDENT) {
+        name = p_intern(p, p->lx.str_p, p->lx.str_len);
+        if (name == UINT32_MAX) return N_NONE;
+        lex_next(&p->lx);
+    } else if (name_req) {
+        p->fail = "expected class name";
+        return N_NONE;
+    }
+    u32 parent = N_NONE;
+    if (p_is_kw(p, KW_EXTENDS)) {
+        lex_next(&p->lx);
+        parent = p_expr(p); /* extends 式（class 本体の { は式の続きでない） */
+        if (parent == N_NONE) goto fail;
+    }
+    if (!p_expect_punct(p, P_LC, "expected '{' after class name")) goto fail;
+    U32Vec mb = { NULL, 0, 0 };
+    U32Vec flds = { NULL, 0, 0 };
+    while (!p_is_punct(p, P_RC) && p->lx.kind != TK_EOF) {
+        bool is_static = false;
+        if (p_is_kw(p, KW_STATIC)) { is_static = true; lex_next(&p->lx); }
+        u32 mname;
+        bool is_ctor = false;
+        if (p->lx.kind == TK_IDENT || p->lx.kind == TK_KW) {
+            if (p->lx.kind == TK_IDENT && p->lx.str_len == 11 &&
+                memcmp(p->lx.str_p, "constructor", 11) == 0) is_ctor = true;
+            mname = p_intern(p, p->lx.str_p, p->lx.str_len);
+            if (mname == UINT32_MAX) { goto fail; }
+            lex_next(&p->lx);
+        } else { p->fail = "expected method name"; goto fail; }
+        if (is_static && is_ctor) {
+            p->fail = "static constructor is not supported (would shadow class constructor)";
+            goto fail;
+        }
+        if (!p_is_punct(p, P_LP)) {
+            /* フィールド宣言: name [= expr] [;]（instance field）。
+             * constructor の先頭で this.name = expr を実行する文に変換する。 */
+            if (is_static) {
+                p->fail = "static class fields are not supported yet";
+                goto fail;
+            }
+            u32 fexpr = N_NONE;
+            if (p_eat_punct(p, P_ASSIGN)) {
+                fexpr = p_expr(p);
+                if (fexpr == N_NONE) { goto fail; }
+            } else {
+                fexpr = p_node(p, N_UNDEF);
+                if (fexpr == N_NONE) { goto fail; }
+            }
+            u32 th = p_node(p, N_THIS);
+            u32 ps = p_node(p, N_PSET);
+            u32 es = p_node(p, N_EXPRSTMT);
+            if (th == N_NONE || ps == N_NONE || es == N_NONE) { goto fail; }
+            p->nodes[ps].a = th;
+            p->nodes[ps].b = fexpr;
+            p->nodes[ps].c = mname;
+            p->nodes[es].a = ps;
+            if (p_scratch(p, &flds, es) < 0) { goto fail; }
+            p_eat_punct(p, P_SEMI);
+            continue;
+        }
+        lex_next(&p->lx); /* '(' */
+        u32 pf = 0, pc2 = 0;
+        p_params(p, &pf, &pc2);
+        if (p->fail) { goto fail; }
+        if (!p_expect_punct(p, P_LC, "expected '{'")) { goto fail; }
+        if (parent != N_NONE) p->super_ctx++;
+        p->fn_body++;
+        u32 body = p_block_tail(p);
+        p->fn_body--;
+        if (parent != N_NONE) p->super_ctx--;
+        if (body == N_NONE) { goto fail; }
+        u32 cm = p_node(p, N_CLASSMETH);
+        if (cm == N_NONE) { goto fail; }
+        p->nodes[cm].a = mname;
+        p->nodes[cm].b = pf;
+        p->nodes[cm].c = pc2;
+        p->nodes[cm].d = body;
+        if (is_static) p->nodes[cm].flags |= 1;
+        if (is_ctor && !is_static) p->nodes[cm].flags |= 2;
+        if (p_scratch(p, &mb, cm) < 0) { goto fail; }
+        /* メソッド間のセミコロンは任意 */
+        p_eat_punct(p, P_SEMI);
+    }
+    if (!p_expect_punct(p, P_RC, "expected '}' after class")) { goto fail; }
+    /* constructor が無い場合、合成コンストラクタをここで追加する（パース時に生成
+     * することで capture 解析 an_walk の対象になる。cg 時生成だと needs_cap が
+     * 解析されず super 環境が壊れる — 実測で特定）。
+     * extends あり: body = super()（JS では派生クラスの ctor は super 必須）。
+     * フィールド文（flds）は constructor body の先頭に挿入する（super() の後）。 */
+    {
+        bool has_ctor = false;
+        for (u32 i = 0; i < mb.n; i++)
+            if ((p->nodes[mb.v[i]].flags & 2) != 0) { has_ctor = true; break; }
+        if (!has_ctor) {
+            u32 cm = p_node(p, N_CLASSMETH);
+            if (cm == N_NONE) { goto fail; }
+            p->nodes[cm].a = p_intern(p, (const u8 *)"constructor", 11);
+            p->nodes[cm].b = N_NONE;
+            p->nodes[cm].c = 0;
+            p->nodes[cm].flags = 2;
+            u32 nstmts = flds.n + (parent != N_NONE ? 1u : 0u);
+            if (nstmts > 0) {
+                u32 *stmts = (u32 *)malloc((u64)nstmts * sizeof(u32));
+                if (!stmts) { p->fail = "oom: class fields"; goto fail; }
+                u32 w = 0;
+                if (parent != N_NONE) {
+                    u32 sc = p_node(p, N_SUPERCALL);
+                    u32 es = p_node(p, N_EXPRSTMT);
+                    if (sc == N_NONE || es == N_NONE) { free(stmts); goto fail; }
+                    p->nodes[sc].b = N_NONE;
+                    p->nodes[sc].c = 0;
+                    p->nodes[es].a = sc;
+                    stmts[w++] = es;
+                }
+                for (u32 i = 0; i < flds.n; i++) stmts[w++] = flds.v[i];
+                U32Vec tmp = { NULL, 0, 0 };
+                for (u32 i = 0; i < nstmts; i++) {
+                    if (p_scratch(p, &tmp, stmts[i]) < 0) { free(stmts); free(tmp.v); goto fail; }
+                }
+                u32 bfirst = p_list_commit(p, &tmp);
+                free(tmp.v);
+                free(stmts);
+                if (bfirst == N_NONE) { goto fail; }
+                u32 body = p_node(p, N_BLOCK);
+                if (body == N_NONE) { goto fail; }
+                p->nodes[body].a = bfirst;
+                p->nodes[body].c = nstmts;
+                p->nodes[cm].d = body;
+            } else {
+                p->nodes[cm].d = N_NONE;
+            }
+            if (p_scratch(p, &mb, cm) < 0) { goto fail; }
+        } else if (flds.n > 0) {
+            /* 既存 constructor の body 末尾にフィールド文を追加（list 領域の直後） */
+            u32 ctor = UINT32_MAX;
+            for (u32 i = 0; i < mb.n; i++)
+                if ((p->nodes[mb.v[i]].flags & 2) != 0) { ctor = mb.v[i]; break; }
+            u32 bd = p->nodes[ctor].d;
+            if (bd == N_NONE || p->nodes[bd].kind != N_BLOCK) {
+                p->fail = "constructor body must be a block for fields";
+                goto fail;
+            }
+            if (p->nodes[bd].a + p->nodes[bd].c != p->n_list) {
+                p->fail = "internal: block region not contiguous";
+                goto fail;
+            }
+            for (u32 i = 0; i < flds.n; i++) {
+                if (p_list_push(p, flds.v[i]) == N_NONE) { goto fail; }
+            }
+            p->nodes[bd].c += flds.n;
+        }
+    }
+    free(flds.v);
+    u32 mfirst = p_list_commit(p, &mb);
+    u32 mcnt = mb.n;
+    free(mb.v);
+    u32 ni = (mcnt && mfirst == N_NONE) ? N_NONE : p_node(p, N_CLASS);
+    if (ni != N_NONE) {
+        p->nodes[ni].a = name;
+        p->nodes[ni].b = mfirst;
+        p->nodes[ni].c = mcnt;
+        p->nodes[ni].d = parent;
+    }
+    return ni;
+
+fail:
+    free(mb.v);
+    free(flds.v);
+    return N_NONE;
+}
 
 /* 分割代入パターンのパース。現在トークンは P_LBR（配列）または P_LC（オブジェクト）。
  * 返り値は N_DESTR ノード（右辺なし）。 */
@@ -2806,6 +3366,35 @@ static u32 p_stmt(P *p) {
         p->depth--;
         return p_node(p, N_BLOCK);
     }
+    if (p_is_kw(p, KW_IMPORT)) {
+        /* 動的 import import(...) は式（p_primary）。文頭では後続トークンで判定し、
+         * 宣言でなければ式文の汎用経路（p_stmt 末尾）へ落とす。 */
+        Lex saved_imp = p->lx;
+        lex_next(&p->lx);
+        bool dyn_imp = p_is_punct(p, P_LP) || p_is_punct(p, P_DOT); /* import(...) / import.meta */
+        /* 先読みが文字列リテラル（import "m"）のとき lex_next が esc バッファを
+         * realloc し得る — 浅い復元だと新バッファがリークして旧ポインタに戻る
+         * （実測: 副作用 import で 64B リーク）。新バッファを引き継ぐ。 */
+        u8 *esc_imp = p->lx.esc;
+        u32 esc_imp_cap = p->lx.esc_cap;
+        p->lx = saved_imp;
+        p->lx.esc = esc_imp;
+        p->lx.esc_cap = esc_imp_cap;
+        if (!dyn_imp) {
+            /* 宣言: モジュール最上位のみ */
+            if (!p->is_module) { p->fail = "import is only allowed in modules"; p->depth--; return N_NONE; }
+            if (p->depth != 1) { p->fail = "import is only allowed at module top level"; p->depth--; return N_NONE; }
+            ni = p_import_decl(p);
+            goto out;
+        }
+        /* fall through: 式文（import("m") 等） */
+    }
+    if (p_is_kw(p, KW_EXPORT)) {
+        if (!p->is_module) { p->fail = "export is only allowed in modules"; p->depth--; return N_NONE; }
+        if (p->depth != 1) { p->fail = "export is only allowed at module top level"; p->depth--; return N_NONE; }
+        ni = p_export_decl(p);
+        goto out;
+    }
     /* ラベル検出: IDENT の直後が ':' ならラベル文 */
     if (p->lx.kind == TK_IDENT) {
         Lex saved = p->lx;
@@ -2883,176 +3472,7 @@ static u32 p_stmt(P *p) {
         ni = N_NONE;
         goto out;
     }
-    if (p_is_kw(p, KW_CLASS)) {
-        lex_next(&p->lx);
-        if (p->lx.kind != TK_IDENT) { p->fail = "expected class name"; goto out; }
-        u32 name = p_intern(p, p->lx.str_p, p->lx.str_len);
-        if (name == UINT32_MAX) goto out;
-        lex_next(&p->lx);
-        u32 parent = N_NONE;
-        if (p_is_kw(p, KW_EXTENDS)) {
-            lex_next(&p->lx);
-            parent = p_expr(p); /* extends 式（class 本体の { は式の続きでない） */
-            if (parent == N_NONE) goto out;
-        }
-        if (!p_expect_punct(p, P_LC, "expected '{' after class name")) goto out;
-        U32Vec mb = { NULL, 0, 0 };
-        U32Vec flds = { NULL, 0, 0 };
-        while (!p_is_punct(p, P_RC) && p->lx.kind != TK_EOF) {
-            bool is_static = false;
-            if (p_is_kw(p, KW_STATIC)) { is_static = true; lex_next(&p->lx); }
-            u32 mname;
-            bool is_ctor = false;
-            if (p->lx.kind == TK_IDENT || p->lx.kind == TK_KW) {
-                if (p->lx.kind == TK_IDENT && p->lx.str_len == 11 &&
-                    memcmp(p->lx.str_p, "constructor", 11) == 0) is_ctor = true;
-                mname = p_intern(p, p->lx.str_p, p->lx.str_len);
-                if (mname == UINT32_MAX) { free(mb.v); goto out; }
-                lex_next(&p->lx);
-            } else { p->fail = "expected method name"; free(mb.v); goto out; }
-            if (is_static && is_ctor) {
-                p->fail = "static constructor is not supported (would shadow class constructor)";
-                free(mb.v);
-                goto out;
-            }
-            if (!p_is_punct(p, P_LP)) {
-                /* フィールド宣言: name [= expr] [;]（instance field）。
-                 * constructor の先頭で this.name = expr を実行する文に変換する。 */
-                if (is_static) {
-                    p->fail = "static class fields are not supported yet";
-                    free(mb.v);
-                    goto out;
-                }
-                u32 fexpr = N_NONE;
-                if (p_eat_punct(p, P_ASSIGN)) {
-                    fexpr = p_expr(p);
-                    if (fexpr == N_NONE) { free(mb.v); goto out; }
-                } else {
-                    fexpr = p_node(p, N_UNDEF);
-                    if (fexpr == N_NONE) { free(mb.v); goto out; }
-                }
-                u32 th = p_node(p, N_THIS);
-                u32 ps = p_node(p, N_PSET);
-                u32 es = p_node(p, N_EXPRSTMT);
-                if (th == N_NONE || ps == N_NONE || es == N_NONE) { free(mb.v); goto out; }
-                p->nodes[ps].a = th;
-                p->nodes[ps].b = fexpr;
-                p->nodes[ps].c = mname;
-                p->nodes[es].a = ps;
-                if (p_scratch(p, &flds, es) < 0) { free(mb.v); goto out; }
-                p_eat_punct(p, P_SEMI);
-                continue;
-            }
-            lex_next(&p->lx); /* '(' */
-            u32 pf = 0, pc2 = 0;
-            p_params(p, &pf, &pc2);
-            if (p->fail) { free(mb.v); goto out; }
-            if (!p_expect_punct(p, P_LC, "expected '{'")) { free(mb.v); goto out; }
-            if (parent != N_NONE) p->super_ctx++;
-            p->fn_body++;
-            u32 body = p_block_tail(p);
-            p->fn_body--;
-            if (parent != N_NONE) p->super_ctx--;
-            if (body == N_NONE) { free(mb.v); goto out; }
-            u32 cm = p_node(p, N_CLASSMETH);
-            if (cm == N_NONE) { free(mb.v); goto out; }
-            p->nodes[cm].a = mname;
-            p->nodes[cm].b = pf;
-            p->nodes[cm].c = pc2;
-            p->nodes[cm].d = body;
-            if (is_static) p->nodes[cm].flags |= 1;
-            if (is_ctor && !is_static) p->nodes[cm].flags |= 2;
-            if (p_scratch(p, &mb, cm) < 0) { free(mb.v); goto out; }
-            /* メソッド間のセミコロンは任意 */
-            p_eat_punct(p, P_SEMI);
-        }
-        if (!p_expect_punct(p, P_RC, "expected '}' after class")) { free(mb.v); goto out; }
-        /* constructor が無い場合、合成コンストラクタをここで追加する（パース時に生成
-         * することで capture 解析 an_walk の対象になる。cg 時生成だと needs_cap が
-         * 解析されず super 環境が壊れる — 実測で特定）。
-         * extends あり: body = super()（JS では派生クラスの ctor は super 必須）。
-         * フィールド文（flds）は constructor body の先頭に挿入する（super() の後）。 */
-        {
-            bool has_ctor = false;
-            for (u32 i = 0; i < mb.n; i++)
-                if ((p->nodes[mb.v[i]].flags & 2) != 0) { has_ctor = true; break; }
-            if (!has_ctor) {
-                u32 cm = p_node(p, N_CLASSMETH);
-                if (cm == N_NONE) { free(mb.v); free(flds.v); goto out; }
-                p->nodes[cm].a = p_intern(p, (const u8 *)"constructor", 11);
-                p->nodes[cm].b = N_NONE;
-                p->nodes[cm].c = 0;
-                p->nodes[cm].flags = 2;
-                u32 nstmts = flds.n + (parent != N_NONE ? 1u : 0u);
-                if (nstmts > 0) {
-                    u32 *stmts = (u32 *)malloc((u64)nstmts * sizeof(u32));
-                    if (!stmts) { p->fail = "oom: class fields"; free(mb.v); free(flds.v); goto out; }
-                    u32 w = 0;
-                    if (parent != N_NONE) {
-                        u32 sc = p_node(p, N_SUPERCALL);
-                        u32 es = p_node(p, N_EXPRSTMT);
-                        if (sc == N_NONE || es == N_NONE) { free(stmts); free(mb.v); free(flds.v); goto out; }
-                        p->nodes[sc].b = N_NONE;
-                        p->nodes[sc].c = 0;
-                        p->nodes[es].a = sc;
-                        stmts[w++] = es;
-                    }
-                    for (u32 i = 0; i < flds.n; i++) stmts[w++] = flds.v[i];
-                    U32Vec tmp = { NULL, 0, 0 };
-                    for (u32 i = 0; i < nstmts; i++) {
-                        if (p_scratch(p, &tmp, stmts[i]) < 0) { free(stmts); free(tmp.v); free(mb.v); free(flds.v); goto out; }
-                    }
-                    u32 bfirst = p_list_commit(p, &tmp);
-                    free(tmp.v);
-                    free(stmts);
-                    if (bfirst == N_NONE) { free(mb.v); free(flds.v); goto out; }
-                    u32 body = p_node(p, N_BLOCK);
-                    if (body == N_NONE) { free(mb.v); free(flds.v); goto out; }
-                    p->nodes[body].a = bfirst;
-                    p->nodes[body].c = nstmts;
-                    p->nodes[cm].d = body;
-                } else {
-                    p->nodes[cm].d = N_NONE;
-                }
-                if (p_scratch(p, &mb, cm) < 0) { free(mb.v); free(flds.v); goto out; }
-            } else if (flds.n > 0) {
-                /* 既存 constructor の body 末尾にフィールド文を追加（list 領域の直後） */
-                u32 ctor = UINT32_MAX;
-                for (u32 i = 0; i < mb.n; i++)
-                    if ((p->nodes[mb.v[i]].flags & 2) != 0) { ctor = mb.v[i]; break; }
-                u32 bd = p->nodes[ctor].d;
-                if (bd == N_NONE || p->nodes[bd].kind != N_BLOCK) {
-                    p->fail = "constructor body must be a block for fields";
-                    free(mb.v);
-                    free(flds.v);
-                    goto out;
-                }
-                if (p->nodes[bd].a + p->nodes[bd].c != p->n_list) {
-                    p->fail = "internal: block region not contiguous";
-                    free(mb.v);
-                    free(flds.v);
-                    goto out;
-                }
-                for (u32 i = 0; i < flds.n; i++) {
-                    if (p_list_push(p, flds.v[i]) == N_NONE) { free(mb.v); free(flds.v); goto out; }
-                }
-                p->nodes[bd].c += flds.n;
-            }
-        }
-        free(flds.v);
-        u32 mfirst = p_list_commit(p, &mb);
-        u32 mcnt = mb.n;
-        free(mb.v);
-        ni = (mcnt && mfirst == N_NONE) ? N_NONE : p_node(p, N_CLASS);
-        if (ni != N_NONE) {
-            p->nodes[ni].a = name;
-            p->nodes[ni].b = mfirst;
-            p->nodes[ni].c = mcnt;
-            p->nodes[ni].d = parent;
-        }
-        goto out;
-    }
-    if (p_is_kw(p, KW_ASYNC)) {
+    if (p_is_kw(p, KW_CLASS)) { ni = p_class_decl(p, true); goto out; }    if (p_is_kw(p, KW_ASYNC)) {
         /* async function 宣言（async が識別子として使われる場合はロールバック） */
         Lex saved = p->lx;
         lex_next(&p->lx);
@@ -3478,6 +3898,11 @@ static void an_refs(P *p, u32 ni, U32Vec *out) {
     case N_OBJKEY: an_refs(p, n->a, out); an_refs(p, n->b, out); break;
     case N_YIELD: an_refs(p, n->a, out); break;
     case N_LOGASSIGN: an_refs(p, n->a, out); an_refs(p, n->b, out); break;
+    case N_IMPORTDYN: an_refs(p, n->a, out); break;
+    case N_EXPORT: /* re-export 時 b は name idx（ノードでない）。値ノードのみ辿る */
+        if (n->c == N_NONE) an_refs(p, n->b, out);
+        else an_refs(p, n->c, out);
+        break;
     case N_SPREAD: an_refs(p, n->a, out); break;
     case N_SUPERMCALL:
         an_add(out, p->super_name);
@@ -3548,6 +3973,9 @@ static void an_decls(P *p, u32 ni, U32Vec *out) {
         break;
     case N_YIELD:
         an_decls(p, n->a, out);
+        break;
+    case N_IMPORT: /* 束縛名はモジュールの宣言（capture 解析の対象） */
+        for (u32 b = n->b; b != N_NONE; b = p->nodes[b].c) an_add(out, p->nodes[b].a);
         break;
     case N_LOGASSIGN:
         an_decls(p, n->a, out);
@@ -3642,6 +4070,12 @@ static void an_walk(P *p, u32 ni, u32 *anc, u32 anc_n) {
         an_walk(p, n->a, anc, anc_n);
         an_walk(p, n->b, anc, anc_n);
         return;
+    case N_IMPORTDYN:
+        an_walk(p, n->a, anc, anc_n);
+        return;
+    case N_EXPORT: /* b は値ノード（匿名関数式/無名クラスはここから辿る） */
+        if (n->c == N_NONE) an_walk(p, n->b, anc, anc_n);
+        return;
     case N_YIELD:
         an_walk(p, n->a, anc, anc_n);
         return;
@@ -3706,6 +4140,21 @@ static void an_walk(P *p, u32 ni, u32 *anc, u32 anc_n) {
 static void an_main_decls(P *p, u32 ni, U32Vec *out) {
     if (ni == N_NONE || p->fail) return;
     AklNode *n = &p->nodes[ni];
+    /* v0.5 モジュール: 最上位はモジュールスコープ（関数スコープ近似）なので、
+     * var/let/const・関数・class・import 束縛も main 擬似関数の宣言として収集する
+     * （ネスト関数からの capture 解析の対象になる。classic ではグローバルなので不要） */
+    if (p->is_module) {
+        switch (n->kind) {
+        case N_VAR: an_add(out, n->a); break;
+        case N_FUNC: case N_CLASS:
+            if (n->a != UINT32_MAX) an_add(out, n->a);
+            break;
+        case N_IMPORT:
+            for (u32 b = n->b; b != N_NONE; b = p->nodes[b].c) an_add(out, p->nodes[b].a);
+            break;
+        default: break;
+        }
+    }
     switch (n->kind) {
     case N_TRY:
         if (n->b != UINT32_MAX) an_add(out, n->b);
@@ -3836,6 +4285,7 @@ typedef struct {
     bool super_pending;         /* 次に生成する N_CLASSMETH 関数は親（スタック）を env にバインド */
     u16 try_depth;              /* lex 上の try 領域の深さ（catch 本体含む） */
     u8 try_at_loop[64];         /* 各 loop 開設時の try_depth（try 越境 brk/cont の検出用） */
+    u32 m_load, m_export, m_rexport, m_import; /* v0.5 モジュール native の intern 名 */
     bool fail;
 } Cg;
 
@@ -4025,6 +4475,17 @@ static bool cg_captured(Cg *cg, u32 name, bool store, u32 *env_idx_out) {
 }
 
 /* name のストア命令を出す（main では G、関数内では L 解決→capture→見つからなければ G） */
+/* v0.5: 組込モジュール native（\x01 接頭 — ユーザ識別子と衝突不能）の直結 GLOAD。
+ * akl_new で const グローバル登録済みなので cg_global_add は既存 const を「再宣言」と
+ * 誤認して失敗する — 参照は cg_global_find のみを使う（不在は防御的に追加）。 */
+static void cg_load_global_native(Cg *cg, u32 name) {
+    u32 gi = cg_global_find(cg->rt, name);
+    if (gi == UINT32_MAX) gi = cg_global_add(cg->rt, name, 1);
+    if (gi == UINT32_MAX) { cg->fail = true; return; }
+    cg_op(cg, OP_GLOAD_S);
+    cg_u32(cg, gi);
+}
+
 static bool cg_store(Cg *cg, u32 name, u8 decl_const, bool decl) {
     /* capture 解決が先（関数内からの代入は全て CESTORE 経由。const は解析対象外:
      * 解析は名前ベースなので const ローカルも capture され得る — const は不変なので
@@ -4106,6 +4567,7 @@ static bool cg_load(Cg *cg, u32 name) {
 }
 
 static void cg_expr(Cg *cg, u32 ni);
+static void cg_class_body(Cg *cg, u32 ni);
 static void cg_stmt(Cg *cg, u32 ni);
 static void cg_fn(Cg *cg, u32 ni);
 
@@ -4265,6 +4727,15 @@ static void cg_expr(Cg *cg, u32 ni) {
         break;
     case N_STR:   cg_op(cg, OP_CONST_STR); cg_u32(cg, n->a); break;
     case N_ARGS:  cg_op(cg, OP_ARGS); break;
+    case N_IMPORTDYN: /* import("spec"): __import native → 解決済み Promise（同期近似） */
+        cg_load_global_native(cg, cg->m_import);
+        cg_expr(cg, n->a);
+        cg_op(cg, OP_CALL);
+        cg_push_byte(cg, 1);
+        break;
+    case N_CLASS: /* 無名クラス（export default の値。束縛しない） */
+        cg_class_body(cg, ni);
+        break;
     case N_AWAIT: cg_expr(cg, n->a); cg_op(cg, OP_AWAIT); break;
     case N_YIELD:
         /* yield expr: 値を蓄積（YIELD が pop）しつつ、式の値としてスタックに残す（DUP）。
@@ -5124,6 +5595,55 @@ static void cg_fn(Cg *cg, u32 ni) {
         }
         }
 
+static void cg_class_body(Cg *cg, u32 ni) {
+    AklNode *n = &cg->p->nodes[ni];
+    /* class Name { constructor(...){} m(){} static s(){} }
+     * → OBJNEW; (DUP; cg_fn(member); PSTORE name; POP)* ; クラス名に束縛
+     * constructor メンバーは "constructor" キーで登録（OP_NEW が参照）。
+     * extends がある場合: 親を SUPER_NAME ローカルに保存し（メソッド関数が
+     * capture して super 解決に使う）、クラスオブジェクトには __super
+     * プロパティとして保持（OP_NEW のメソッド継承コピー用）。 */
+    u32 cname = p_intern(cg->p, (const u8 *)"constructor", 11);
+    i32 pslot = -1;
+    if (n->d != N_NONE) {
+        /* 親クラスを一時ローカルに保持（メソッド生成のたびに push して MAKEFS へ） */
+        cg_expr(cg, n->d);
+        pslot = cg_local_add_dummy(cg);
+        if (pslot < 0) return;
+        cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)pslot);
+    }
+    cg_op(cg, OP_OBJNEW);
+    for (u32 i = 0; i < n->c; i++) {
+        u32 m = cg->p->list[n->b + i];
+        u32 mname = cg->p->nodes[m].a;
+        bool is_ctor = (cg->p->nodes[m].flags & 2) != 0;
+        cg_op(cg, OP_DUP);
+        if (pslot >= 0) {
+            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)pslot);
+            cg->super_pending = true; /* このメソッドは MAKEFS（親を env に） */
+        }
+        cg_fn(cg, m); /* 関数値 push（値のみ） */
+        cg_op(cg, OP_PSTORE);
+        cg_u32(cg, is_ctor ? cname : mname);
+        cg_op(cg, OP_POP);
+        if (cg->fail) return;
+    }
+    /* クラスオブジェクトに親を __super プロパティで保存（OP_NEW の継承コピー用） */
+    if (pslot >= 0 && !cg->fail) {
+        cg_op(cg, OP_DUP);
+        cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)pslot);
+        cg_op(cg, OP_PSTORE); cg_u32(cg, cg->p->super_prop);
+        cg_op(cg, OP_POP);
+    }
+}
+static void cg_class(Cg *cg, u32 ni) {
+    cg_class_body(cg, ni);
+    /* クラス名に束縛（main はグローバル、関数内はローカル）。
+     * cg_store は TOS（クラスオブジェクト）を消費するため OP_POP は不要
+     * — 余分な POP が空 pop でスタックを壊す（実測で特定） */
+    if (!cg->fail && cg->p->nodes[ni].a != UINT32_MAX) cg_store(cg, cg->p->nodes[ni].a, 0, true);
+}
+
 static void cg_stmt(Cg *cg, u32 ni) {
     if (cg->fail || ni == N_NONE) return; /* N_NONE = 空本体（合成コンストラクタ等） */
     AklNode *n = &cg->p->nodes[ni];
@@ -5338,49 +5858,81 @@ static void cg_stmt(Cg *cg, u32 ni) {
         cg_expr(cg, ni); /* 分割代入（右辺評価 + 要素 store） */
         cg_op(cg, OP_POP); /* 式文として値は捨てる */
         break;
-    case N_CLASS: {
-        /* class Name { constructor(...){} m(){} static s(){} }
-         * → OBJNEW; (DUP; cg_fn(member); PSTORE name; POP)* ; クラス名に束縛
-         * constructor メンバーは "constructor" キーで登録（OP_NEW が参照）。
-         * extends がある場合: 親を SUPER_NAME ローカルに保存し（メソッド関数が
-         * capture して super 解決に使う）、クラスオブジェクトには __super
-         * プロパティとして保持（OP_NEW のメソッド継承コピー用）。 */
-        u32 cname = p_intern(cg->p, (const u8 *)"constructor", 11);
-        i32 pslot = -1;
-        if (n->d != N_NONE) {
-            /* 親クラスを一時ローカルに保持（メソッド生成のたびに push して MAKEFS へ） */
-            cg_expr(cg, n->d);
-            pslot = cg_local_add_dummy(cg);
-            if (pslot < 0) break;
-            cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)pslot);
-        }
-        cg_op(cg, OP_OBJNEW);
-        for (u32 i = 0; i < n->c; i++) {
-            u32 m = cg->p->list[n->b + i];
-            u32 mname = cg->p->nodes[m].a;
-            bool is_ctor = (cg->p->nodes[m].flags & 2) != 0;
-            cg_op(cg, OP_DUP);
-            if (pslot >= 0) {
-                cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)pslot);
-                cg->super_pending = true; /* このメソッドは MAKEFS（親を env に） */
+/* class 本体の codegen: クラスオブジェクトを TOS に生成（名前への束縛は呼出側）。
+ * 無名クラス（export default class {} 等。a=UINT32_MAX）は束縛せず値のみ残す。 */
+    case N_CLASS:
+        cg_class(cg, ni);
+        break;
+    case N_IMPORT: {
+        /* import "spec" / import {a, b as c} from "spec" 等。
+         * __load(spec) → ns を取得し、各束縛へ展開（const ローカル = 再代入は
+         * compile 時エラー。JS の import 束縛の性質に整合）。 */
+        cg_load_global_native(cg, cg->m_load); /* fn を先に（CALL 規約: fn が args の下） */
+        cg_expr(cg, n->a);                      /* spec STR */
+        cg_op(cg, OP_CALL); cg_push_byte(cg, 1); /* → ns */
+        if (cg->fail) break;
+        u32 dname = p_intern(cg->p, (const u8 *)"default", 7);
+        if (dname == UINT32_MAX) { cg->fail = true; break; }
+        u32 nb = n->b;
+        u32 cnt = n->c;
+        while (cnt > 0 && nb != N_NONE) {
+            AklNode *B = &cg->p->nodes[nb];
+            bool is_star = (B->flags & 2) != 0;
+            bool is_last = (B->c == N_NONE);
+            if (!is_last) cg_op(cg, OP_DUP);
+            /* 非最終束縛は DUP したコピーを PLOAD が消費する（POP は不要 —
+             * 入れると残った ns まで捨てて次の PLOAD がローカルを誤 pop する） */
+            if (is_star) {
+                cg_store(cg, B->a, 1, true); /* ns そのものを束縛 */
+            } else {
+                cg_op(cg, OP_PLOAD);
+                cg_u32(cg, (B->flags & 1) ? dname : B->b);
+                cg_store(cg, B->a, 1, true);
             }
-            cg_fn(cg, m); /* 関数値 push（値のみ） */
-            cg_op(cg, OP_PSTORE);
-            cg_u32(cg, is_ctor ? cname : mname);
-            cg_op(cg, OP_POP);
-            if (cg->fail) break;
+            nb = B->c;
+            cnt--;
         }
-        /* クラスオブジェクトに親を __super プロパティで保存（OP_NEW の継承コピー用） */
-        if (pslot >= 0 && !cg->fail) {
-            cg_op(cg, OP_DUP);
-            cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)pslot);
-            cg_op(cg, OP_PSTORE); cg_u32(cg, cg->p->super_prop);
-            cg_op(cg, OP_POP);
+        if (n->c == 0) cg_op(cg, OP_POP); /* 束縛なし import（副作用のみ。ns を破棄） */
+        break;
+    }
+    case N_EXPORT: {
+        /* export 名/値 のチェーン。__export(name, value) を name→value 順で呼ぶ。
+         * re-export は __load で対象 ns を取得してから同名/別名で __export。 */
+        for (u32 x = ni; x != N_NONE && !cg->fail; x = cg->p->nodes[x].d) {
+            AklNode *X = &cg->p->nodes[x];
+            if (X->c != N_NONE) {
+                if (X->flags & 1) {
+                    /* export * from "m": __reexportstar(ns)。
+                     * CALL 規約は fn が args の下なので、ns は一時ローカルを経由する。 */
+                    i32 t = cg_local_add_dummy(cg);
+                    if (t < 0) break;
+                    cg_load_global_native(cg, cg->m_load);
+                    cg_expr(cg, X->c);
+                    cg_op(cg, OP_CALL); cg_push_byte(cg, 1);
+                    cg_op(cg, OP_LSTORE); cg_u32(cg, (u32)t);
+                    cg_load_global_native(cg, cg->m_rexport);
+                    cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
+                    cg_op(cg, OP_CALL); cg_push_byte(cg, 1);
+                    cg_op(cg, OP_POP);
+                } else {
+                    /* export {a as b} from "m": __export("b", ns.a) */
+                    cg_load_global_native(cg, cg->m_export);
+                    cg_op(cg, OP_CONST_STR); cg_u32(cg, X->a);
+                    cg_load_global_native(cg, cg->m_load);
+                    cg_expr(cg, X->c);
+                    cg_op(cg, OP_CALL); cg_push_byte(cg, 1);
+                    cg_op(cg, OP_PLOAD); cg_u32(cg, X->b);
+                    cg_op(cg, OP_CALL); cg_push_byte(cg, 2);
+                    cg_op(cg, OP_POP);
+                }
+            } else {
+                cg_load_global_native(cg, cg->m_export);
+                cg_op(cg, OP_CONST_STR); cg_u32(cg, X->a);
+                cg_expr(cg, X->b);
+                cg_op(cg, OP_CALL); cg_push_byte(cg, 2);
+                cg_op(cg, OP_POP);
+            }
         }
-        /* クラス名に束縛（main はグローバル、関数内はローカル）。
-         * cg_store は TOS（クラスオブジェクト）を消費するため OP_POP は不要
-         * — 余分な POP が空 pop でスタックを壊す（実測で特定） */
-        if (!cg->fail) cg_store(cg, n->a, 0, true);
         break;
     }
     case N_VAR:
@@ -9713,6 +10265,254 @@ static const AklMethEntry AKL_PROMISE_METHODS[AKL_PROMISE_METH_N] = {
     {"finally", akl_m_promise_finally}
 };
 
+/* ================= v0.5 モジュール（import/export） =================
+ * 設計: 静的 import は codegen が __load（\x01__load）native 呼び出しに展開する。
+ * モジュール本体は「関数スコープでコンパイルされた匿名関数」として再入 akl_call で
+ * 実行され（var がモジュールローカルになる構造保証）、export は __export が
+ * 現在モジュール（rt->cur_module）の exports OBJ に書き込む。完了時に exports から
+ * namespace OBJ（スナップショット。凍結なし — AKL_COMPAT に明記）を構築する。
+ * レジストリ（rt->modules）は GC ルート。VM 中コンパイルの生成物は comp_pins 区間で
+ * スイープから保護される（コード即値の dangling index 防止 — 構造的禁止）。
+ * 循環 import は state==1（loading）の再参照で TypeError（近似）。 */
+static bool akl_compile_src(AklRT *rt, const char *src, bool is_module, u32 *out_idx, AklVal *out_fn);
+
+static AklModule *akl_module_find(AklRT *rt, const char *id) {
+    for (u32 i = 0; i < rt->n_modules; i++)
+        if (strcmp(rt->modules[i].id, id) == 0) return &rt->modules[i];
+    return NULL;
+}
+
+/* レコード追加（同一 id は内容を初期化して再利用）。state=1 で開始。 */
+static AklModule *akl_module_add(AklRT *rt, const char *id) {
+    AklModule *m = akl_module_find(rt, id);
+    if (m) {
+        free(m->err);
+        m->err = NULL;
+        m->state = 1;
+        m->ns = AKL_VAL_UNDEF;
+        m->exports = UINT32_MAX;
+        return m;
+    }
+    if (rt->n_modules == rt->cap_modules) {
+        u32 nc = rt->cap_modules ? rt->cap_modules * 2 : 8;
+        AklModule *nm = (AklModule *)realloc(rt->modules, (u64)nc * sizeof(AklModule));
+        if (!nm) { akl_errf(rt, "oom: modules"); return NULL; }
+        rt->modules = nm; rt->cap_modules = nc;
+    }
+    AklModule *r = &rt->modules[rt->n_modules++];
+    memset(r, 0, sizeof *r);
+    r->id = (char *)malloc(strlen(id) + 1);
+    if (!r->id) { rt->n_modules--; akl_errf(rt, "oom: module id"); return NULL; }
+    memcpy(r->id, id, strlen(id) + 1);
+    r->state = 1;
+    r->ns = AKL_VAL_UNDEF;
+    r->exports = UINT32_MAX;
+    return r;
+}
+
+/* 完了処理: exports OBJ → namespace OBJ（スナップショット。64 prop 上限は OBJ 規約）。
+ * 失敗時 false（rt->err 設定済み）。 */
+static bool akl_module_finish(AklRT *rt, AklModule *m) {
+    u32 no = akl_obj_new(rt);
+    if (no == UINT32_MAX) return false;
+    rt->objs[no].kind = AKL_OK_OBJ;
+    m->ns = AKL_MK_OBJ(no); /* レジストリ mark で即ルート化（以後の GC から保護） */
+    AklObj *ex = &rt->objs[m->exports];
+    for (u32 i = 0; i < ex->u.po.n; i++) {
+        if (!obj_prop_set(rt, &rt->objs[no], ex->u.po.props[i].name, ex->u.po.props[i].v)) return false;
+    }
+    m->state = 2;
+    return true;
+}
+
+/* 失敗レコード化（err をコピーして state=3）。 */
+static void akl_module_fail(AklRT *rt, AklModule *m) {
+    if (m->state == 3) return;
+    m->state = 3;
+    size_t ln = strlen(rt->err);
+    m->err = (char *)malloc(ln + 1);
+    if (m->err) memcpy(m->err, rt->err, ln + 1);
+}
+
+/* モジュール読み込みの核心: 解決 → キャッシュ/循環判定 → コンパイル → 本体実行 → ns。
+ * 失敗時は native_err を立てて undefined を返す（呼出側は直ちに返す規約）。 */
+static AklVal akl_module_load(AklRT *rt, const char *spec) {
+    if (!rt->mod_loader) {
+        akl_errf(rt, "Error: module loader not installed (import unavailable in this build)");
+        akl_native_throw(rt, rt->err);
+        return akl_mkundefined();
+    }
+    const char *base = rt->cur_module ? rt->cur_module->id
+                     : (rt->base_id ? rt->base_id : NULL);
+    char *src = NULL, *id = NULL;
+    rt->mod_loader(rt, spec, base, rt->mod_udata, &src, &id);
+    if (!src || !id) {
+        akl_errf(rt, "Error: cannot resolve module '%s'", spec);
+        akl_native_throw(rt, rt->err);
+        free(src);
+        free(id);
+        return akl_mkundefined();
+    }
+    AklModule *m = akl_module_find(rt, id);
+    if (m) {
+        if (m->state == 2) { free(src); free(id); return m->ns; }
+        if (m->state == 1) {
+            akl_errf(rt, "TypeError: circular import of '%s'", id);
+            akl_native_throw(rt, rt->err);
+            free(src); free(id);
+            return akl_mkundefined();
+        }
+        /* state==3: 失敗済みモジュールの再 import は再実行せず失敗を再提示
+         * （無限再帰・無限再コンパイルの構造的防止） */
+        akl_errf(rt, "%s", m->err ? m->err : "module evaluation failed");
+        akl_native_throw(rt, rt->err);
+        free(src); free(id);
+        return akl_mkundefined();
+    }
+    m = akl_module_add(rt, id);
+    if (!m) { free(src); free(id); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    /* 以降のネスト（コンパイル・本体実行）で rt->modules が realloc され得るため、
+     * 生ポインタを保持しない（index は安定 — add は append/reuse のみで順序不変） */
+    u32 mi = (u32)(m - rt->modules);
+    {
+        u32 eo = akl_obj_new(rt);
+        if (eo == UINT32_MAX) { free(src); free(id); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+        rt->objs[eo].kind = AKL_OK_OBJ;
+        rt->modules[mi].exports = eo; /* 直後にレジストリ mark されるため GC 安全 */
+    }
+    /* VM 中コンパイル: compiling 区間 [compiling_from, n_objs) を GC の根扱い +
+     * free-list 不使用（akl_obj_new）で、全区間がコンパイル生成物になることを保証。
+     * 完了後に comp_pins へ確定 commit する（以後の GC は常に mark）。 */
+    u32 pin_from = rt->n_objs;
+    bool was_compiling = rt->compiling;
+    rt->compiling = true;
+    rt->compiling_from = pin_from;
+    u32 fn_idx = 0;
+    AklVal fnv;
+    bool ok = akl_compile_src(rt, src, true, &fn_idx, &fnv);
+    rt->compiling = was_compiling;
+    free(src);
+    if (ok) {
+        if (rt->n_comp_pins == rt->cap_comp_pins) {
+            u32 nc = rt->cap_comp_pins ? rt->cap_comp_pins * 2 : 4;
+            AklCompPin *np = (AklCompPin *)realloc(rt->comp_pins, (u64)nc * sizeof(AklCompPin));
+            if (np) { rt->comp_pins = np; rt->cap_comp_pins = nc; }
+        }
+        if (rt->n_comp_pins < rt->cap_comp_pins) {
+            rt->comp_pins[rt->n_comp_pins].from = pin_from;
+            rt->comp_pins[rt->n_comp_pins].to = rt->n_objs;
+            rt->n_comp_pins++;
+        }
+    } else {
+        akl_module_fail(rt, &rt->modules[mi]);
+        akl_native_throw(rt, rt->err);
+        free(id);
+        return akl_mkundefined();
+    }
+    /* 本体実行（再入 akl_call。cur_module をこのレコードに切替） */
+    AklModule *prev = rt->cur_module;
+    rt->cur_module = &rt->modules[mi];
+    AklVal dummy;
+    bool ok2 = akl_call(rt, fnv, 0, NULL, &dummy);
+    rt->cur_module = prev;
+    if (!ok2) {
+        akl_module_fail(rt, &rt->modules[mi]);
+        akl_native_throw(rt, rt->err);
+        free(id);
+        return akl_mkundefined();
+    }
+    if (!akl_module_finish(rt, &rt->modules[mi])) {
+        akl_module_fail(rt, &rt->modules[mi]);
+        akl_native_throw(rt, rt->err);
+        free(id);
+        return akl_mkundefined();
+    }
+    free(id);
+    return rt->modules[mi].ns;
+}
+
+/* __load(spec): 静的 import の展開先。namespace を返す */
+static AklVal akl_m_load_module(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (argc < 1 || !akl_is_string(rt, argv[0]))
+        return akl_native_typeerr(rt, "TypeError: import specifier must be a string");
+    u32 ln;
+    const u8 *bp = akl_str(rt, akl_get_obj(argv[0]), &ln);
+    if (rt->err[0]) return akl_mkundefined();
+    char *spec = (char *)malloc((u64)ln + 1);
+    if (!spec) { akl_native_throw(rt, "oom: import specifier"); return akl_mkundefined(); }
+    memcpy(spec, bp, ln);
+    spec[ln] = 0;
+    AklVal ns = akl_module_load(rt, spec);
+    free(spec);
+    return ns;
+}
+
+/* __export(name, value): 現在モジュールの exports に記録 */
+static AklVal akl_m_export(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (argc < 2 || !akl_is_string(rt, argv[0]))
+        return akl_native_typeerr(rt, "TypeError: export name must be a string");
+    AklModule *m = rt->cur_module;
+    if (!m) { akl_native_throw(rt, "SyntaxError: export outside module"); return akl_mkundefined(); }
+    if (m->exports == UINT32_MAX) {
+        u32 eo = akl_obj_new(rt);
+        if (eo == UINT32_MAX) { akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+        rt->objs[eo].kind = AKL_OK_OBJ;
+        m->exports = eo;
+    }
+    if (!obj_prop_set(rt, &rt->objs[m->exports], akl_get_obj(argv[0]), argv[1])) {
+        akl_native_throw(rt, rt->err);
+        return akl_mkundefined();
+    }
+    return akl_mkundefined();
+}
+
+/* __reexportstar(ns): ns の全 export（default 以外）を現在モジュールへ再 export */
+static AklVal akl_m_reexport_star(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (argc < 1 || !akl_is_objv(argv[0])) return akl_native_typeerr(rt, "TypeError: not an object");
+    AklModule *m = rt->cur_module;
+    if (!m) { akl_native_throw(rt, "SyntaxError: export outside module"); return akl_mkundefined(); }
+    u32 oi = akl_get_obj(argv[0]);
+    if (oi >= rt->n_objs || rt->objs[oi].kind != AKL_OK_OBJ) return akl_mkundefined();
+    if (m->exports == UINT32_MAX) {
+        u32 eo = akl_obj_new(rt);
+        if (eo == UINT32_MAX) { akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+        rt->objs[eo].kind = AKL_OK_OBJ;
+        m->exports = eo;
+    }
+    u32 dname = akl_intern(rt, (const u8 *)"default", 7, NULL);
+    if (dname == UINT32_MAX) { akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    for (u32 i = 0; i < rt->objs[oi].u.po.n; i++) {
+        AklProp *pr = &rt->objs[oi].u.po.props[i];
+        if (pr->name == dname) continue;
+        if (!obj_prop_set(rt, &rt->objs[m->exports], pr->name, pr->v)) {
+            akl_native_throw(rt, rt->err);
+            return akl_mkundefined();
+        }
+    }
+    return akl_mkundefined();
+}
+
+/* __import(spec): 動的 import。解決済み Promise で返す（同期解決近似） */
+static AklVal akl_m_import_dyn(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (argc < 1 || !akl_is_string(rt, argv[0]))
+        return akl_native_typeerr(rt, "TypeError: import specifier must be a string");
+    u32 ln;
+    const u8 *bp = akl_str(rt, akl_get_obj(argv[0]), &ln);
+    if (rt->err[0]) return akl_mkundefined();
+    char *spec = (char *)malloc((u64)ln + 1);
+    if (!spec) { akl_native_throw(rt, "oom: import specifier"); return akl_mkundefined(); }
+    memcpy(spec, bp, ln);
+    spec[ln] = 0;
+    AklVal ns = akl_module_load(rt, spec);
+    free(spec);
+    if (rt->native_err) return akl_mkundefined();
+    return akl_promise_make(rt, 1, ns);
+}
+
 static bool akl_builtins_install(AklRT *rt) {
     u32 n_nan = akl_mkstr(rt, (const u8 *)"Math", 4);
     u32 n_parseInt = akl_mkstr(rt, (const u8 *)"parseInt", 8);
@@ -9883,6 +10683,11 @@ static bool akl_builtins_install(AklRT *rt) {
         rt->set_meth_vals[i] = akl_mknative(rt, AKL_SET_METHODS[i].fn, NULL);
         if (akl_is_undefined(rt->set_meth_vals[i])) return false;
     }
+    /* v0.5 モジュール native（\x01 接頭でユーザ識別子と構造的に衝突不能） */
+    if (!akl_native_register(rt, "\x01__load", akl_m_load_module, NULL)) return false;
+    if (!akl_native_register(rt, "\x01__export", akl_m_export, NULL)) return false;
+    if (!akl_native_register(rt, "\x01__reexportstar", akl_m_reexport_star, NULL)) return false;
+    if (!akl_native_register(rt, "\x01__import", akl_m_import_dyn, NULL)) return false;
     return true;
 }
 
@@ -12958,12 +13763,20 @@ AklRT *akl_new(void) {
 
 void akl_free(AklRT *rt) {
     if (!rt) return;
+    for (u32 i = 0; i < rt->n_modules; i++) { free(rt->modules[i].id); free(rt->modules[i].err); }
+    free(rt->modules);
+    free(rt->comp_pins);
+    free(rt->base_id);
     for (u32 i = 0; i < rt->n_objs; i++) {
         if (rt->objs[i].kind == AKL_OK_STR) free(rt->objs[i].bytes);
         if (rt->objs[i].kind == AKL_OK_OBJ) free(rt->objs[i].u.po.props);
         if (rt->objs[i].kind == AKL_OK_ARR) free(rt->objs[i].u.arr.v);
         if (rt->objs[i].kind == AKL_OK_ENV) free(rt->objs[i].u.env.vals);
         if (rt->objs[i].kind == AKL_OK_REGEX) akl_rex_free(rt->objs[i].u.rex.rx);
+        /* v0.4 組込 Map/Set の配列（GC スイープと同単位。生存値が globals 等に
+         * 残る場合の teardown リークを塞ぐ — 実測: script テストで 33 件検出） */
+        if (rt->objs[i].kind == AKL_OK_MAP) { free(rt->objs[i].u.mp.keys); free(rt->objs[i].u.mp.vals); }
+        if (rt->objs[i].kind == AKL_OK_SET) free(rt->objs[i].u.st.v);
     }
     free(rt->objs);
     free(rt->free_objs);
@@ -12979,13 +13792,11 @@ void akl_free(AklRT *rt) {
 void akl_set_cojit(AklRT *rt, int enabled) { if (rt) rt->cojit_off = !enabled; }
 uint32_t akl_cojit_count(AklRT *rt) { return rt ? rt->cojit_applied : 0; }
 
-bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
-    rt->err[0] = 0;
-    rt->n_tries = 0; /* 前回 eval が途中終了（uncaught/budget/誤り）した場合の残留を棄却 */
-    rt->n_nury = 0; /* 同上（C 側一時ルートの残留棄却。内部規律は各使用者復元） */
-    rt->native_err = false;
-    rt->last_val = AKL_VAL_UNDEF; /* 前回 eval の最後の式文の値が残留しないようリセット */
-    if (rt->gc_live) { akl_errf(rt, "recursive akl_eval is not supported"); return false; }
+/* ソースをコンパイルして funcs 末尾にエントリ関数を追記する（実行はしない）。
+ * is_module=true なら import/export を許可し、最上位スコープを関数スコープ（=モジュール
+ * スコープ近似）として扱う。out_idx に funcs index、out_fn（NULL 可）に FUNC AklVal を返す。
+ * 失敗時 false（rt->err 設定済み。funcs/code は巻き戻し済み）。 */
+static bool akl_compile_src(AklRT *rt, const char *src, bool is_module, u32 *out_idx, AklVal *out_fn) {
     if (!src) { akl_errf(rt, "null source"); return false; }
     u64 slen = strlen(src);
     if (slen > AKL_MAX_SRC) { akl_errf(rt, "source budget exhausted"); return false; }
@@ -12993,6 +13804,7 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
     P p;
     memset(&p, 0, sizeof p);
     p.rt = rt;
+    p.is_module = is_module ? 1 : 0;
     /* 親クラス保持ローカル・クラス親参照の非公開名（ソースに現れない NUL 入り） */
     p.super_name = akl_intern(rt, (const u8 *)"\x01super", 7, NULL);
     p.super_prop = akl_intern(rt, (const u8 *)"\x00super", 7, NULL);
@@ -13070,7 +13882,26 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
     rt->funcs[main_idx].code_off = code_from;
     rt->funcs[main_idx].name = 0;
     rt->funcs[main_idx].n_params = 0;
-    cg.in_func_depth = 0;
+    /* モジュールは最上位がモジュールスコープ（= 関数スコープ近似）。main はグローバル */
+    cg.in_func_depth = is_module ? 1 : 0;
+    /* v0.5 モジュール native の intern 名（\x01 接頭でユーザ識別子と衝突不能） */
+    cg.m_load = akl_intern(rt, (const u8 *)"\x01__load", 7, NULL);
+    cg.m_export = akl_intern(rt, (const u8 *)"\x01__export", 9, NULL);
+    cg.m_rexport = akl_intern(rt, (const u8 *)"\x01__reexportstar", 15, NULL);
+    cg.m_import = akl_intern(rt, (const u8 *)"\x01__import", 9, NULL);
+    if (cg.m_load == UINT32_MAX || cg.m_export == UINT32_MAX ||
+        cg.m_rexport == UINT32_MAX || cg.m_import == UINT32_MAX) {
+        free(cg.locals);
+        if (p.fninfo) {
+            for (u32 i = 0; i < p.fninfo_n; i++) { free(p.fninfo[i].cap_names); free(p.fninfo[i].decls.v); }
+            free(p.fninfo);
+        }
+        free(p.main_fi.cap_names);
+        free(p.main_fi.decls.v);
+        free(p.nodes); free(p.list); free(p.lx.esc);
+        rt->n_funcs = main_idx; rt->code_len = code_from;
+        return false;
+    }
     {
         u32 nh0 = cg_hidden(&cg);
         for (u32 i = 0; i < nh0; i++) cg_local_add_dummy(&cg);
@@ -13107,8 +13938,37 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
 
     if (!akl_verify(rt, f0->code_off)) return false;
 
+    if (out_fn) {
+        /* モジュール本体関数の FUNC 値（env なし・this 未固定）。
+         * 生成は pin 区間内（呼出側が compiling を管理）。 */
+        u32 oi = akl_obj_new(rt);
+        if (oi == UINT32_MAX) { rt->n_funcs = main_idx; rt->code_len = code_from; return false; }
+        AklObj *o = &rt->objs[oi];
+        o->kind = AKL_OK_FUNC;
+        o->code_off = main_idx;
+        o->name = 0;
+        o->env = UINT32_MAX;
+        o->thisv = AKL_VAL_UNDEF;
+        *out_fn = AKL_MK_OBJ(oi);
+    }
+    if (out_idx) *out_idx = main_idx;
+    return true;
+}
+
+bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
+    rt->err[0] = 0;
+    rt->n_tries = 0; /* 前回 eval が途中終了（uncaught/budget/誤り）した場合の残留を棄却 */
+    rt->n_nury = 0; /* 同上（C 側一時ルートの残留棄却。内部規律は各使用者復元） */
+    rt->native_err = false;
+    rt->last_val = AKL_VAL_UNDEF; /* 前回 eval の最後の式文の値が残留しないようリセット */
+    if (rt->gc_live) { akl_errf(rt, "recursive akl_eval is not supported"); return false; }
+    u32 main_idx;
+    if (!akl_compile_src(rt, src, false, &main_idx, NULL)) return false;
+
     rt->pin_mark = rt->n_objs; /* コンパイル由来はスイープ対象外。実行時生成物のみ集める */
+    rt->n_comp_pins = 0;       /* pin_mark が前 eval の VM 中コンパイル区間を追い越したので破棄 */
     rt->gc_live = true;        /* GC は VM ルートが生きている実行中に限る */
+    u32 code_from = rt->funcs[main_idx].code_off;
     if (getenv("AKL_DUMP")) {
         static const char *const ON[] = {
             "CONST_I",
@@ -13268,6 +14128,72 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
 
     if (out) *out = rt->last_val;
     return true;
+}
+
+/* v0.5: src をモジュールとして評価（import/export 許可・最上位はモジュールスコープ）。
+ * base はエントリモジュールの id（import 解決の基点。NULL は空 id）。
+ * エントリの export は誰からも参照されないが、循環 import 検出と namespace 共有のため
+ * レコードを登録する（同一 id の再実行は内容を初期化して再利用）。 */
+bool akl_eval_module(AklRT *rt, const char *src, const char *base, AklVal *out) {
+    rt->err[0] = 0;
+    rt->n_tries = 0;
+    rt->n_nury = 0;
+    rt->native_err = false;
+    rt->last_val = AKL_VAL_UNDEF;
+    if (rt->gc_live) { akl_errf(rt, "recursive akl_eval is not supported"); return false; }
+    u32 main_idx;
+    if (!akl_compile_src(rt, src, true, &main_idx, NULL)) return false;
+    rt->pin_mark = rt->n_objs;
+    rt->n_comp_pins = 0;
+
+    const char *eid = base ? base : "";
+    AklModule *rec = akl_module_add(rt, eid);
+    if (!rec) return false;
+    u32 mi = (u32)(rec - rt->modules); /* 本体実行中のネスト add で realloc され得る */
+    if (rec->exports == UINT32_MAX) {
+        u32 eo = akl_obj_new(rt);
+        if (eo == UINT32_MAX) return false;
+        rt->objs[eo].kind = AKL_OK_OBJ;
+        rt->modules[mi].exports = eo;
+    }
+    rt->gc_live = true;
+    AklModule *prev = rt->cur_module;
+    rt->cur_module = &rt->modules[mi];
+    bool vm_ok = vm_exec(rt, main_idx, NULL, 0, AKL_VAL_UNDEF, AKL_VAL_UNDEF, false);
+    rt->cur_module = prev;
+    if (vm_ok) {
+        if (!akl_module_finish(rt, &rt->modules[mi])) vm_ok = false;
+    }
+    if (!vm_ok && rt->modules[mi].state != 3) {
+        if (!rt->err[0]) akl_errf(rt, "module evaluation failed");
+        rt->modules[mi].state = 3;
+    }
+    /* eval 終了時の残骸回収（akl_eval と同一規約） */
+    rt->gc_sp = 0;
+    rt->gc_live = true;
+    akl_gc(rt);
+    rt->gc_live = false;
+    if (!vm_ok) return false;
+
+    if (out) *out = rt->last_val;
+    return true;
+}
+
+/* v0.5: モジュールローダ設定（解決失敗時は out_src/out_id 両方 NULL を返す契約） */
+void akl_set_module_loader(AklRT *rt, AklModuleLoader loader, void *udata) {
+    if (!rt) return;
+    rt->mod_loader = loader;
+    rt->mod_udata = udata;
+}
+void akl_set_module_base(AklRT *rt, const char *base) {
+    if (!rt) return;
+    free(rt->base_id);
+    rt->base_id = NULL;
+    if (base) {
+        size_t ln = strlen(base);
+        char *nb = (char *)malloc(ln + 1);
+        if (nb) { memcpy(nb, base, ln + 1); rt->base_id = nb; }
+    }
 }
 
 /* v0.3 再入呼び出し（高階関数のコールバック等）: fn（FUNC または NATIVE）を呼ぶ。

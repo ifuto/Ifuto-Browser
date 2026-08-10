@@ -141,8 +141,8 @@ cssbench: $(BUILD)/bench_css
 	$(BUILD)/bench_css
 
 # Akl 単体 CLI（比較ベンチ / make guard の被測定バイナリ。本体には不加入）
-$(BUILD)/akl: bench/akl_cli.c $(AKLSRC) src/sandbox.c | $(BUILD)
-	$(CC) $(BASE) $(REL) -o $@ bench/akl_cli.c $(AKLSRC) src/sandbox.c $(LDFLAGS_REL) -lm
+$(BUILD)/akl: bench/akl_cli.c bench/cli_loader.c $(AKLSRC) src/sandbox.c | $(BUILD)
+	$(CC) $(BASE) $(REL) -o $@ bench/akl_cli.c bench/cli_loader.c $(AKLSRC) src/sandbox.c $(LDFLAGS_REL) -lm
 
 # RSS 測定ラッパ（python 直測は fork/exec 間の python ページ混入で ~10MB 誤計るため C 製）
 $(BUILD)/rssrun: bench/rssrun.c | $(BUILD)

@@ -125,6 +125,15 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | computed メソッド名 `{ [k]() {} }` | SyntaxError（computed キーは通常プロパティのみ） |
 | getter-only プロパティへの代入 | 通常プロパティとして新規作成（JS の strict エラー/非 strict 無視とは異なる近似。AKL_COMPAT 注記） |
 | `{...primitive}` のプリミティブ列挙 | 無視（undefined/null は JS 同様無視。number/string はコピーしない） |
+| 循環 import（A→B→A） | `TypeError: circular import of '...'`（JS は live binding で成立し得る。本実装は構造的防止で明白に失敗） |
+| export の live binding（再代入の import 側反映） | 非対応。export は宣言時点の値のスナップショット（import 完了時に namespace へ写像）。namespace は凍結なしの普通のオブジェクト |
+| `import.meta` | `SyntaxError: import.meta is not supported` |
+| `export * as ns from "m"` | `SyntaxError: export * as ns is not supported` |
+| モジュール最上位の `await` | `SyntaxError: await is only allowed in async functions`（トップレベル await 非対応） |
+| モジュール最上位の `arguments` | `ReferenceError: arguments is not defined`（JS と一致） |
+| モジュールの strict 化 | 非対応（classic と同一の非 strict 近似。`this` は undefined、var はモジュールスコープ） |
+| namespace の export 数 64 超 | `property budget exhausted`（OBJ の prop 上限。機械生成モジュールは要注意） |
+| エントリ（`akl_eval_module` / `<script type="module">`）の import 解決 | ブラウザ本体はローダ未装備のため `Error: module loader not installed`（CLI はファイル/data: URI 解決） |
 | `new String(x)` / `new Number(x)` / `new Boolean(x)` のラッパーオブジェクト | 空オブジェクトを返す（値は変換関数と同じ。length 等は undefined） |
 | `Object.getPrototypeOf` / `Object.defineProperty` / `Object.freeze` 等 | `TypeError: not a function` |
 | class の static フィールド `static x = 1` / `static constructor()` | SyntaxError（static constructor は class の constructor プロパティを壊すため明白拒否） |
@@ -140,10 +149,10 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 
 ## ロードマップ（優先度順。完了時にこの表へ実測で追記する）
 
-> **v0.4 完了宣言（2026-08-10）**: ブラウザページ script で実用される構文・組込は
-> 対応済み。以下に「未対応」として残る項目（import/export・Symbol・Proxy・
-> クラス getter/setter 等）は、ページ内スクリプトでの実用頻度が極めて低いため
-> 「将来拡張」とする。詳細は各表の実測エラーを参照。
+> **v0.5（2026-08-10）**: import/export 対応済み（下記 19e）。未対応として残るのは
+> Symbol・Proxy・クラス getter/setter 構文のみ — 「将来拡張」とする
+> （ユーザ要求「完全実装しないと意味ない」への攻めとして import/export を先行実装。
+> 残り 3 項目は別途）。詳細は各表の実測エラーを参照。
 
 1. ✅ オブジェクトリテラル + プロパティアクセス（2026-08-08）
 2. ✅ 配列・ブラケット・関数式 + クロージャ捕捉・`this`（2026-08-08。AKL_OK_ENV チェーン）
@@ -167,6 +176,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 19b. ✅ BigInt（2026-08-10: AKL_OK_BIGINT + OP_CONST_BIG。スキャン時に u64 蓄積で 2^53 超も正確。akl_bin_add 等の融合命令経由でも i64 正確を保証）
 19c. ✅ generator（2026-08-10: AKL_OK_GEN + OP_YIELD。akl_call 再入機構で本体を実行して yield 値を蓄積。AklFuncEnt に is_gen 追加。an_* に N_YIELD 追跡を追加（クロージャ capture 漏れ修正））
 19d. ✅ Map / Set・Object.fromEntries・Array.from・padStart/padEnd・flat・hasOwnProperty（2026-08-10: 線形走査の有界化 AKL_MAP_MAX=4096。GC は keys/vals を mark）
+19e. ✅ import / export（2026-08-10: 全形式 — 名前付き/default/`* as ns`/副作用のみ/re-export `{a as b} from`/`export * from`/`export default 式・関数・class`/動的 `import()`。モジュール本体は「関数スコープでコンパイルされた匿名関数」として再入 akl_call で実行（var がモジュールローカルになる構造保証）。レジストリは GC ルート、VM 中コンパイルの定数は comp_pins 区間でスイープから保護。循環 import は state==1 検出で TypeError。export は宣言時点のスナップショット近似）
 
 ## V8 との位置づけ
 

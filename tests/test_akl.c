@@ -1,6 +1,7 @@
 /* Akl v0.0 テスト。dispatch 両モード（computed-goto / switch）で同一バイナリを
  * 2 回ビルドして走らせる前提（Makefile: run_tests / run_tests_switch）。
  * どちらかでだけ失敗するような差分は dispatch バグなので即座に止める。 */
+#define _POSIX_C_SOURCE 200809L /* strdup（モジュールテストのローダ） */
 #include "tests.h"
 #include "../src/akl/akl.h"
 #include "../src/common.h"
@@ -892,6 +893,7 @@ static void t_v04_arrow_promise_async(void);
 static void t_v04_bigint(void);
 static void t_v04_generator(void);
 static void t_v04_map_set(void);
+static void t_v05_import_export(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -959,6 +961,8 @@ void test_akl(void) {
     t_v04_generator();
     fprintf(stderr, "  %-40s", "t_v04_map_set");
     t_v04_map_set();
+    fprintf(stderr, "  %-40s", "t_v05_import_export");
+    t_v05_import_export();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1869,4 +1873,177 @@ static void t_v04_map_set(void) {
     want_bool("var o = {a: 1}; o.hasOwnProperty('a')", true);
     want_bool("var o = {a: 1}; o.hasOwnProperty('b')", false);
     want_bool("var o = {a: 1}; o.hasOwnProperty('toString')", false);
+}
+
+/* ================= v0.5: import / export（モジュール） ================= */
+/* 静的モジュール表を提供するテスト用ローダ（id = spec そのまま。AKL 側が free） */
+static void test_mod_loader(AklRT *rt, const char *spec, const char *base,
+                            void *udata, char **out_src, char **out_id) {
+    (void)rt; (void)udata; (void)base;
+    *out_src = NULL; *out_id = NULL;
+    static const struct { const char *id; const char *src; } T[] = {
+        {"test:m1", "export const x = 42;\n"
+                    "export function add(a, b) { return a + b; }\n"
+                    "export default 'hello';"},
+        {"test:m2", "import { x, add } from 'test:m1';\n"
+                    "export const total = x + add(1, 2);"},
+        {"test:side", "var counter = 0;\n"
+                      "export function bump() { counter = counter + 1; return counter; }\n"
+                      "export function peek() { return counter; }"},
+        {"test:once", "export var n = 0;\n"
+                      "n = n + 1;\n"
+                      "export { n };"},
+        {"test:reexport", "export { x as xx } from 'test:m1';\n"
+                          "export * from 'test:m1';\n"
+                          "export { default as dflt } from 'test:m1';"},
+        {"test:cycleA", "import { b } from 'test:cycleB';\n"
+                        "export const a = 1;"},
+        {"test:cycleB", "import { a } from 'test:cycleA';\n"
+                        "export const b = 2;"},
+        {"test:fail", "export const q = 1;\n"
+                      "throw 'boom';"},
+        {"test:usethis", "export const t = typeof this;"},
+        {"test:capture", "var counter = 0;\n"
+                         "export function bump() { counter = counter + 1; return counter; }\n"
+                         "export function peek() { return counter; }"},
+        {"test:dfltexpr", "export default 1 + 2 * 3;"},
+        {"test:alias", "export const alpha = 1;\n"
+                       "export const beta = 2;"},
+        {"test:dfltfn", "export default function() { return 7; }"},
+        {"test:dfltfnnamed", "export default function g() { return 8; }\n"
+                             "export { g };"},
+        {"test:dfltcls", "export default class { m() { return 5; } }"},
+        {"test:dfltclsnamed", "export default class C { m() { return 6; } }"},
+    };
+    for (size_t i = 0; i < sizeof T / sizeof T[0]; i++) {
+        if (strcmp(spec, T[i].id) == 0) {
+            *out_src = strdup(T[i].src);
+            *out_id = strdup(T[i].id);
+            return;
+        }
+    }
+}
+
+/* モジュール評価ヘルパ（エントリは base 付きで akl_eval_module） */
+static void mod_num(const char *src, double want) {
+    AklVal v;
+    if (!akl_eval_module(g_rt, src, "test:entry", &v)) {
+        fprintf(stderr, "  mod eval failed [%s]: %s\n", src, akl_error(g_rt));
+        CHECK(0);
+        return;
+    }
+    double d = NAN;
+    bool ok = akl_as_num(v, &d) && d == want;
+    if (!ok) {
+        bool b = false;
+        if (akl_as_bool(v, &b)) { ok = (b ? 1.0 : 0.0) == want; d = b ? 1.0 : 0.0; }
+    }
+    CHECK(ok);
+    if (!ok) fprintf(stderr, "  wrong mod value [%s]: got %g want %g\n", src, d, want);
+}
+static void mod_str(const char *src, const char *want) {
+    AklVal v;
+    if (!akl_eval_module(g_rt, src, "test:entry", &v)) {
+        fprintf(stderr, "  mod eval failed [%s]: %s\n", src, akl_error(g_rt));
+        CHECK(0);
+        return;
+    }
+    uint32_t ln = 0;
+    const char *s = akl_as_str(g_rt, v, &ln);
+    bool ok = s && strlen(want) == ln && memcmp(s, want, ln) == 0;
+    CHECK(ok);
+    if (!ok) fprintf(stderr, "  wrong mod string [%s]: got '%.*s' want '%s'\n",
+                     src, s ? (int)ln : 0, s ? s : "", want);
+}
+static void mod_bool(const char *src, bool want) {
+    AklVal v;
+    if (!akl_eval_module(g_rt, src, "test:entry", &v)) {
+        fprintf(stderr, "  mod eval failed [%s]: %s\n", src, akl_error(g_rt));
+        CHECK(0);
+        return;
+    }
+    bool b = false;
+    CHECK(akl_as_bool(v, &b) && b == want);
+}
+static void mod_err(const char *src, const char *needle) {
+    AklVal v;
+    if (akl_eval_module(g_rt, src, "test:entry", &v)) {
+        fprintf(stderr, "  mod expected error [%s]\n", src);
+        CHECK(0);
+        return;
+    }
+    const char *er = akl_error(g_rt);
+    CHECK(strstr(er, needle) != NULL);
+    if (!strstr(er, needle)) fprintf(stderr, "  wrong error [%s]: %s\n", src, er);
+}
+
+static void t_v05_import_export(void) {
+    akl_set_module_loader(g_rt, test_mod_loader, NULL);
+
+    /* 基本: 名前付き import/export */
+    mod_num("import { x, add } from 'test:m1';\nx + add(1, 2)", 45);
+    mod_num("import { x } from 'test:m1';\nx * 2", 84);
+    /* default import/export */
+    mod_str("import def from 'test:m1';\ndef + '!'", "hello!");
+    /* namespace import（同一モジュールの ns は同一オブジェクト） */
+    mod_num("import * as ns from 'test:m1';\nns.x + ns.add(2, 3)", 47);
+    mod_bool("import * as a from 'test:m1';\nimport * as b from 'test:m1';\na === b", true);
+    /* import 別名 */
+    mod_num("import { x as y, add as plus } from 'test:m1';\ny + plus(0, 1)", 43);
+    /* モジュールキャッシュ（2 回目は再評価されない） */
+    mod_num("import { n } from 'test:once';\nn", 1);
+    mod_num("import { n } from 'test:once';\nn", 1);
+    /* モジュールローカル var はモジュールスコープ（グローバル汚染なし） */
+    mod_num("import { bump } from 'test:side';\nbump() + bump()", 3);
+    /* クロージャがモジュールローカルを capture（別モジュールで検証） */
+    mod_num("import { bump, peek } from 'test:capture';\nbump(); peek()", 1);
+    /* re-export（名前指定 / スター / default の名前付き再 export） */
+    mod_num("import { xx } from 'test:reexport';\nxx", 42);
+    mod_num("import { x } from 'test:reexport';\nx + 1", 43);
+    mod_str("import { dflt } from 'test:reexport';\ndflt", "hello");
+    /* 副作用のみ import */
+    mod_num("import 'test:side';\n1", 1);
+    /* エントリの export は破棄（最終式文の値が last_val） */
+    mod_num("export const ignored = 9;\n7", 7);
+    /* モジュール最上位の this / arguments は undefined 系 */
+    mod_str("import { t } from 'test:usethis';\nt", "undefined");
+    /* 動的 import（同期解決近似の Promise） */
+    mod_num("var r = 0;\nimport('test:m1').then(function(ns) { r = ns.x; });\nr", 42);
+    /* 動的 import は classic スクリプトでも使用可 */
+    want_num("var r = 0;\nimport('test:m1').then(function(ns) { r = ns.x; });\nr", 42);
+
+    /* export default: 式 / 無名関数 / 名前付き関数 / 無名クラス / 名前付きクラス */
+    mod_num("import v from 'test:dfltexpr';\nv", 7);
+    mod_num("import f from 'test:dfltfn';\nf()", 7);
+    mod_num("import f from 'test:dfltfnnamed';\nf()", 8);
+    mod_num("import C from 'test:dfltcls';\nnew C().m()", 5);
+    mod_num("import C from 'test:dfltclsnamed';\nnew C().m()", 6);
+
+    /* エラー系 */
+    mod_err("import { a } from 'test:cycleA';\na", "circular import");
+    mod_err("import { z } from 'test:nope';\nz", "cannot resolve module");
+    mod_err("import { q } from 'test:fail';\nq", "boom");
+    mod_err("import { x } from 'test:m1';\nx = 1", "const");
+    mod_err("import.meta", "import.meta is not supported");
+    mod_err("function f() { export var x = 1; }", "top level");
+    mod_err("{ import { x } from 'test:m1'; }", "top level");
+    mod_err("export { z } from 'test:nope';", "cannot resolve");
+    /* classic スクリプトでの宣言は構文エラー */
+    want_err("import { x } from 'test:m1';", "only allowed in modules");
+    want_err("export const e = 1;", "only allowed in modules");
+    /* 実行時エラーはレコードに保存され、再 import も失敗を再提示 */
+    mod_err("import { q } from 'test:fail';\nq", "boom");
+
+    /* GC との相互作用: 多数のモジュール評価を連続実行しても壊れない */
+    for (int i = 0; i < 200; i++) {
+        AklVal v;
+        if (!akl_eval_module(g_rt, "import { x } from 'test:m1';\nx", "test:entry", &v)) {
+            fprintf(stderr, "  module stress failed at %d: %s\n", i, akl_error(g_rt));
+            CHECK(0);
+            break;
+        }
+        double d = NAN;
+        CHECK(akl_as_num(v, &d) && d == 42);
+        if (d != 42) break;
+    }
 }
