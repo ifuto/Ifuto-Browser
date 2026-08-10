@@ -891,6 +891,7 @@ static void t_v04_arguments(void);
 static void t_v04_arrow_promise_async(void);
 static void t_v04_bigint(void);
 static void t_v04_generator(void);
+static void t_v04_map_set(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -956,6 +957,8 @@ void test_akl(void) {
     t_v04_bigint();
     fprintf(stderr, "  %-40s", "t_v04_generator");
     t_v04_generator();
+    fprintf(stderr, "  %-40s", "t_v04_map_set");
+    t_v04_map_set();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1815,4 +1818,55 @@ static void t_v04_generator(void) {
     want_num("function make() { var n = 10; return function*() { yield n; yield n + 1; }; } var g = make(); var it = g(); it.next().value + it.next().value", 21);
     /* エラー: generator 外の yield */
     want_err("yield 1;", "yield");
+}
+
+/* ================= v0.4: Map / Set / 組込充実 ================= */
+static void t_v04_map_set(void) {
+    /* Map */
+    want_num("var m = new Map(); m.set('a', 1); m.get('a')", 1);
+    want_num("var m = new Map(); m.set('a', 1); m.set('b', 2); m.get('b') + m.get('a')", 3);
+    want_num("var m = new Map(); m.set('a', 1); m.set('a', 9); m.get('a')", 9);
+    want_str("var m = new Map(); m.set('a', 1); m.has('a') + ':' + m.has('x')", "true:false");
+    want_str("var m = new Map(); m.set('a', 1); m.delete('a') + ':' + m.size", "true:0");
+    want_num("var m = new Map(); m.set('a', 1); m.clear(); m.size", 0);
+    want_num("var m = new Map([['a', 1], ['b', 2]]); m.get('b')", 2);
+    want_num("var m = new Map(); m.set('x', 5); m.keys().length + m.values()[0]", 6);
+    want_num("var m = new Map(); m.size", 0);
+    want_str("var m = new Map(); m.set(1, 'one'); m.get(1)", "one");
+    want_str("var m = new Map(); var k = {id: 1}; m.set(k, 'obj'); m.get(k)", "obj");
+    want_num("var m = new Map(); m.set(1, 10); m.set(2, 20); var ks = m.keys(); ks[0] + ks[1] + m.values()[0] + m.values()[1]", 33);
+    /* Set */
+    want_bool("var s = new Set(); s.add(1); s.has(1)", true);
+    want_num("var s = new Set(); s.add(1); s.add(2); s.add(1); s.size", 2);
+    want_str("var s = new Set(); s.add(1); s.delete(1) + ':' + s.size", "true:0");
+    want_num("var s = new Set([1, 2, 3]); s.size", 3);
+    want_num("var s = new Set(); s.add('a'); s.clear(); s.size", 0);
+    want_num("var s = new Set(); s.add(5); var v = s.values(); v[0]", 5);
+    want_num("var s = new Set(); s.add(1); s.add(2); var v = s.values(); v[0] + v[1]", 3);
+    want_num("var s = new Set(); s.add(NaN); s.add(NaN); s.size", 1);
+    /* Object.fromEntries */
+    want_num("Object.fromEntries([['a', 1], ['b', 2]]).b", 2);
+    want_num("Object.fromEntries([['x', 9]]).x", 9);
+    /* Array.from */
+    want_num("Array.from([1, 2, 3]).length", 3);
+    want_num("Array.from([5, 6])[1]", 6);
+    want_num("Array.from('abc').length", 3);
+    want_num("Array.from('あいう').length", 3);
+    want_str("Array.from('ab').join('-')", "a-b");
+    /* padStart / padEnd */
+    want_str("'abc'.padStart(5, '*')", "**abc");
+    want_str("'abc'.padEnd(6, '-')", "abc---");
+    want_str("'abc'.padStart(5)", "  abc");
+    want_str("'123'.padStart(6, '0')", "000123");
+    want_str("'abc'.padStart(2, 'x')", "abc");
+    want_str("'あ'.padEnd(3, 'い')", "あいい");
+    /* flat */
+    want_num("[1, [2, 3], [4, [5]]].flat().length", 4);
+    want_str("[1, [2, 3]].flat().join(',')", "1,2,3");
+    want_str("[1, [2, [3, [4]]]].flat(2).join('')", "1234");
+    want_str("[1, [2, 3]].flat(0).join(',')", "1,2,3");
+    /* hasOwnProperty */
+    want_bool("var o = {a: 1}; o.hasOwnProperty('a')", true);
+    want_bool("var o = {a: 1}; o.hasOwnProperty('b')", false);
+    want_bool("var o = {a: 1}; o.hasOwnProperty('toString')", false);
 }

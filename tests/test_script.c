@@ -414,7 +414,39 @@ static void test_script_generator(void) {
     tscr_end(&t);
 }
 
+
+static void test_script_map_set(void) {
+    TScr t;
+    tscr_begin(&t, "<!DOCTYPE html><title>V0</title><div id=a>start</div>"
+                   "<script>"
+                   "var counts = new Map();"
+                   "counts.set('apple', 3);"
+                   "counts.set('banana', 5);"
+                   "var total = counts.get('apple') + counts.get('banana');"
+                   "console.log('ms1', total);"
+                   "console.log('ms2', counts.size);"
+                   "var seen = new Set();"
+                   "seen.add('x'); seen.add('y'); seen.add('x');"
+                   "console.log('ms3', seen.size);"
+                   "var padded = '42'.padStart(4, '0');"
+                   "console.log('ms4', padded);"
+                   "document.getElementById('a').textContent = total + ':' + seen.size + ':' + padded;"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
+    CHECK(strstr(t.logbuf, "[script:console] ms1 8\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] ms2 2\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] ms3 2\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] ms4 0042\n") != NULL);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    CHECK(d != NULL);
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 8 && memcmp(txt.p, "8:2:0042", 8) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
+    test_script_map_set();
     test_script_generator();
     test_script_bigint();
     test_script_arrow_promise_async();

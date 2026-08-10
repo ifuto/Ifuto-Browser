@@ -85,6 +85,12 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | BigInt `123n`（10/16/2/8 進・区切り可）。64bit 符号付き範囲内 | `9007199254740993n + 1n` | `9007199254740994`（i64 正確） |
 | BigInt 演算 `+ - * / %`（同士は i64 正確・0 除算は RangeError）・比較・`==`（10n==10 は true）・`===`（10n===10 は false）・`typeof` | `10n / 3n` | `3n` |
 | generator `function*` / `yield`（next() で `{value, done}` を返す。全同期実行で yield 値を蓄積する近似） | `function* g(){yield 1; yield 2;} var it=g(); it.next().value` | `1` |
+| `Map`（set/get/has/delete/clear/keys/values/size。キーは任意値・NaN 同値） | `var m=new Map(); m.set('a',1); m.get('a')` | `1` |
+| `Set`（add/has/delete/clear/values/size。重複排除・NaN 同値） | `var s=new Set(); s.add(1); s.add(1); s.size` | `1` |
+| `Object.fromEntries` / `Array.from`（配列コピー・文字列はコードポイント単位） | `Object.fromEntries([['a',1]]).a` / `Array.from('あ').length` | `1` / `1` |
+| `String.padStart/padEnd`（コードポイント長・pad 文字列対応） | `'123'.padStart(6, '0')` | `000123` |
+| `Array.flat(depth)`（ネスト平坦化） | `[1,[2,3]].flat().join(',')` | `1,2,3` |
+| `obj.hasOwnProperty(k)` | `({a:1}).hasOwnProperty('a')` | `true` |
 | 文頭 `{a:1}` の曖昧性 | ブロック文 + ラベル + 式文として解釈（JS 準拠） | `1` |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
@@ -155,6 +161,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 19. ✅ アロー関数・Promise・async/await（2026-08-09: 同期解決近似。AklObj 64B 化（thisv + PROMISE kind）。lexer の TK_KW str_p 未設定バグを修正（.catch 等のプロパティ名が旧トークンを指していた））
 19b. ✅ BigInt（2026-08-10: AKL_OK_BIGINT + OP_CONST_BIG。スキャン時に u64 蓄積で 2^53 超も正確。akl_bin_add 等の融合命令経由でも i64 正確を保証）
 19c. ✅ generator（2026-08-10: AKL_OK_GEN + OP_YIELD。akl_call 再入機構で本体を実行して yield 値を蓄積。AklFuncEnt に is_gen 追加。an_* に N_YIELD 追跡を追加（クロージャ capture 漏れ修正））
+19d. ✅ Map / Set・Object.fromEntries・Array.from・padStart/padEnd・flat・hasOwnProperty（2026-08-10: 線形走査の有界化 AKL_MAP_MAX=4096。GC は keys/vals を mark）
 
 ## V8 との位置づけ
 
