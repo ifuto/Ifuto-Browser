@@ -290,8 +290,19 @@ int main(int argc, char **argv) {
      * script RT は if_script_run 内で必ず破棄される → DOM arena 解体より先死ぬ
      * （HANDLE ptr 規約の構造保証。akl/akl.h の AklHandleVTab 注記参照）。 */
     double tscr0 = now_ms();
+    /* 常駐 RSS 観測（script 実行前後。ページ表示後の「死蔵」を監視） */
+    long rss_before = 0;
+    {
+        FILE *sf = fopen("/proc/self/statm", "r");
+        if (sf) { long total = 0, rss = 0; if (fscanf(sf, "%ld %ld", &total, &rss) == 2) rss_before = rss; fclose(sf); }
+    }
     IfScriptReport srep = if_script_run(&a, dom, stderr);
     double script_ms = now_ms() - tscr0;
+    long rss_after = 0;
+    {
+        FILE *sf = fopen("/proc/self/statm", "r");
+        if (sf) { long total = 0, rss = 0; if (fscanf(sf, "%ld %ld", &total, &rss) == 2) rss_after = rss; fclose(sf); }
+    }
 
     /* lazy style: md fast-DOM × CLI 行スイープでは style 全面走査を消し、
      * layout の DFS 訪問時に必要箇所だけ解決する（解決値は if_style_apply と同値。
@@ -357,8 +368,8 @@ int main(int argc, char **argv) {
             fclose(st);
         }
         if (srep.n_run)
-            fprintf(stderr, "ifuto stats: scripts=%u errors=%u skipped=%u script_ms=%.2f\n",
-                    srep.n_run, srep.n_errors, srep.n_skipped, script_ms);
+            fprintf(stderr, "ifuto stats: scripts=%u errors=%u skipped=%u script_ms=%.2f resid_rss_kb=%ld (script 前後差 %+ld)\n",
+                    srep.n_run, srep.n_errors, srep.n_skipped, script_ms, rss_after * 4, (rss_after - rss_before) * 4);
         fprintf(stderr,
             "ifuto stats: read=%.2fms parse=%.2fms style=%.2fms layout=%.2fms render=%.2fms total=%.2fms\n"
             "  nodes=%u parse_errors=%u grid=%dx%d links=%u peak_rss_kb=%llu\n"

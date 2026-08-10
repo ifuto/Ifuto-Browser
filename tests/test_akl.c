@@ -1876,6 +1876,17 @@ static void t_v04_map_set(void) {
     want_bool("var o = {a: 1}; o.hasOwnProperty('a')", true);
     want_bool("var o = {a: 1}; o.hasOwnProperty('b')", false);
     want_bool("var o = {a: 1}; o.hasOwnProperty('toString')", false);
+    /* v0.5 回帰: GC が Map のキー STR を回収しない（akl_gc_kind_children に MAP/SET が
+     * 欠落していた潜伏バグ。3500 個超で size が重複扱いになり増えなくなる）。
+     * GC が obj 数 4096 で発火する量を超えても size が正確であること。 */
+    want_num("var m = new Map(); for (var i = 0; i < 4000; i++) m.set('k' + i, i); m.size", 4000);
+    want_num("var m = new Map(); for (var i = 0; i < 4096; i++) m.set('k' + i, i); m.get('k4095')", 4095);
+    want_num("var m = new Map(); for (var i = 0; i < 4000; i++) m.set('k' + i, i); m.get('k1000') + m.get('k3999')", 4999);
+    /* Set も同様 */
+    want_num("var s = new Set(); for (var i = 0; i < 4000; i++) s.add('v' + i); s.size", 4000);
+    /* 上限超過は明白に失敗（黙って無視しない） */
+    want_err("var m = new Map(); for (var i = 0; i < 5000; i++) m.set('k' + i, i);", "Map/Set size limit");
+    want_err("var s = new Set(); for (var i = 0; i < 5000; i++) s.add(i);", "Map/Set size limit");
 }
 
 /* ================= v0.5: import / export（モジュール） ================= */

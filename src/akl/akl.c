@@ -372,11 +372,18 @@ static void akl_errf(AklRT *rt, const char *fmt, ...) {
     va_end(ap);
 }
 
-/* GC 伝播が必要なオブジェクト種別（子参照を持つ） */
+/* GC 伝播が必要なオブジェクト種別（子参照を持つ）。
+ * v0.5 修正: AKL_OK_MAP / AKL_OK_SET が欠落していた（v0.4 導入時の潜伏バグ）。
+ * 欠落すると MAP/SET のキー・値 STR が mark されずスイープで回収され、free スロット
+ * 再利用で「同じ index の別 STR」に化けて Map のキー比較が壊れる（実測: キー 3500 個
+ * 超で size が重複扱いになり増えなくなる。GC が発火する obj 数 4096 と一致）。 */
 static bool akl_gc_kind_children(u8 k) {
     return k == AKL_OK_ROPE || k == AKL_OK_OBJ || k == AKL_OK_ARR ||
-           k == AKL_OK_ENV || k == AKL_OK_FUNC || k == AKL_OK_PROMISE;
+           k == AKL_OK_ENV || k == AKL_OK_FUNC || k == AKL_OK_PROMISE ||
+           k == AKL_OK_MAP || k == AKL_OK_SET;
 }
+
+static u32 akl_str_flatten(AklRT *rt, u32 idx, u8 **out_bytes); /* 前方宣言（GC 内 ROPE 圧縮で使用） */
 
 /* ---- mark-sweep GC。ルートは VM スタック(gc_sp スナップショット)＋globals＋nursery＋last_val。
  * スイープは index を動かさない（バイトコード中の CONST_STR/MAKEF オペランド = obj index を
@@ -724,7 +731,6 @@ static bool obj_prop_set(AklRT *rt, AklObj *o, u32 name, AklVal v) {
     return true;
 }
 
-static u32 akl_str_flatten(AklRT *rt, u32 idx, u8 **out_bytes); /* 前方宣言 */
 
 /* UTF-8 バイト列のコードポイント数（s[i] / .length の単位。非 BMP は 1 と数える
  * 既知偏差 — UTF-16 code unit ではなく code point 単位。AKL_COMPAT に明記） */
@@ -7352,6 +7358,10 @@ static bool akl_bin_add(AklRT *rt, AklVal va, AklVal vb, u32 sp, AklVal *out) {
                 if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = rib;
             }
             u32 da = akl_str_depth(rt, ia), db = akl_str_depth(rt, rib);
+            /* 深さ上限 4096。v0.5 検討: 1024/2048 は連結ループのフラット化頻度を上げ
+             * 速度悪化（1024 で strcat 10 万連結 +58%）。GC 時フラット化は毎 GC の
+             * heap_bytes 課金で GC 頻発スパイラル（実測 18MB）。ROPE 64B×4096=256KB は
+             * 許容と判断し 4096 を維持（速度優先の方針と整合） */
             if ((da > db ? da : db) + 1 > 4096) {
                 u32 deep = da >= db ? ia : rib;
                 u32 tl;
@@ -10108,7 +10118,11 @@ static AklVal akl_m_map_set(AklRT *rt, AklVal self, int argc, const AklVal *argv
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_is_objv(v) ? akl_get_obj(v) : rt->n_objs;
     for (u32 i = 0; i < o->u.mp.n; i++)
         if (akl_same_value_zero(rt, o->u.mp.keys[i], k)) { o->u.mp.vals[i] = v; return self; }
-    if (!akl_map_grow(rt, o, o->u.mp.n + 1)) return akl_mkundefined();
+    if (!akl_map_grow(rt, o, o->u.mp.n + 1)) {
+        /* 上限超過は「黙って無視」でなく明白失敗（grow が err 設定済み。native_err を立てる） */
+        akl_native_throw(rt, rt->err[0] ? rt->err : "RangeError: Map/Set size limit exceeded");
+        return akl_mkundefined();
+    }
     o->u.mp.keys[o->u.mp.n] = k;
     o->u.mp.vals[o->u.mp.n] = v;
     o->u.mp.n++;
@@ -10198,7 +10212,10 @@ static AklVal akl_m_set_add(AklRT *rt, AklVal self, int argc, const AklVal *argv
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_is_objv(v) ? akl_get_obj(v) : rt->n_objs;
     for (u32 i = 0; i < o->u.st.n; i++)
         if (akl_same_value_zero(rt, o->u.st.v[i], v)) return self;
-    if (!akl_set_grow(rt, o, o->u.st.n + 1)) return akl_mkundefined();
+    if (!akl_set_grow(rt, o, o->u.st.n + 1)) {
+        akl_native_throw(rt, rt->err[0] ? rt->err : "RangeError: Map/Set size limit exceeded");
+        return akl_mkundefined();
+    }
     o->u.st.v[o->u.st.n++] = v;
     return self;
 }
@@ -11830,6 +11847,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         }
         /* getter 自動呼び出し: 通常 prop が無ければ "get:\x01name" を探して this=obj で呼ぶ */
         if (o->kind == AKL_OK_OBJ) {
+            u32 o_idx2 = akl_get_obj(ov);
             u32 nl2;
             const u8 *nb2 = akl_str(rt, name, &nl2);
             if (!nb2) { free(frames); return false; }
@@ -11841,6 +11859,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 rt->gc_sp = sp + 1; /* ov は stk[sp] に残存（GC ルート） */
                 u32 gname = akl_intern(rt, gbuf, 4 + nl2, NULL);
                 if (gname != UINT32_MAX) {
+                    o = &rt->objs[o_idx2]; /* intern の新規 STR で obj 配列が realloc され得る（UAF 修正） */
                     i32 gi = obj_prop_find(o, gname);
                     if (gi >= 0) {
                         AklVal fn = o->u.po.props[gi].v;
@@ -11964,7 +11983,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             akl_errf(rt, "TypeError: property store on non-object value");
             free(frames); return false;
         }
-        AklObj *so = &rt->objs[akl_get_obj(ov)];
+        u32 so_idx = akl_get_obj(ov);
+        AklObj *so = &rt->objs[so_idx];
         if (so->kind == AKL_OK_OBJ) {
             /* setter 自動呼び出し: 通常 prop に代入する前に "set:\x01name" を探す */
             u32 nl3;
@@ -11978,6 +11998,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 rt->gc_sp = sp + 2; /* ov/v は stk 残存（GC ルート） */
                 u32 sname = akl_intern(rt, sbuf, 4 + nl3, NULL);
                 if (sname != UINT32_MAX) {
+                    so = &rt->objs[so_idx]; /* intern の新規 STR で obj 配列が realloc され得る（UAF 修正） */
                     i32 si = obj_prop_find(so, sname);
                     if (si >= 0) {
                         AklVal fn = so->u.po.props[si].v;

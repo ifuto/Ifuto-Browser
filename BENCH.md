@@ -169,6 +169,35 @@ CALL 命令の native 判定 1 分岐（fib は CALL ホットのため現れ、
 機能追加の必然コストとして採用・台帳記録。バイトコード列差分はゼロ（新 opcode は
 既存構文からは出ない。verify の else-if 鎖に 2 分岐追加のみ=compile 時微増）。
 
+## akl メモリ（2026-08-10、ユーザ方針「Aklus も省メモリはする」）
+
+実測（akl_cli --rss、プロセス単体、このマシン）: 空 eval 1,544KB / Map 4,096 キー +2,600KB /
+10 万文字連結 +2,700KB / fib30 不変。ピーク RSS は「生存オブジェクト量 × 64B + 生存 STR +
+malloc アローナ」にほぼ比例し、無駄は小さい（実測で確認）。
+
+採用（メモリ管理の正しさ = 省メモリの基盤）:
+- **akl_gc_kind_children に AKL_OK_MAP / AKL_OK_SET を追加**（v0.4 導入時の潜伏バグ。
+  MAP/SET のキー・値 STR が mark されずスイープで回収され、free スロット再利用で
+  「同一 index の別 STR」に化けて Map のキー比較が壊れる。実測: キー 3,500 個超で
+  size が重複扱いになり増えなくなる（GC 発火 obj 数 4,096 と一致）。データ破損級）。
+- **Map/Set 上限（4,096）超過を明白失敗化**: 従来は grow 失敗を黙って無視（size が
+  4,096 で止まる）。RangeError で fail-stop に変更。
+- **PLOAD/PSTORE の getter/setter 探索 UAF 修正**: akl_intern（新規 STR → obj 配列
+  realloc）の後に古いオブジェクトポインタを使っていた（ASan heap-use-after-free で
+  検出。50000 オブジェクト生成 + 代入で顕在化）。
+
+不採用（実測で棄却）:
+- GC 時 ROPE フラット化: 連結ループで毎 GC フラット化 → heap_bytes 課金が増え続け
+  GC 頻発スパイラル（10 万連結で maxrss 2.9MB → 18.7MB 悪化）。撤回。
+- ROPE 深さ上限 4096 → 1024/2048: フラット化頻度が上がり strcat 10 万連結が
+  +58%（1024）悪化。ROPE ノード 64B × 4096 = 256KB は許容と判断し 4096 維持。
+- eval 終了時の obj 配列 cap 縮小（realloc）: glibc の realloc 縮小は OS にページを
+  返さず、A/B 実測で常駐 RSS 44KB しか減らない。再拡張コストだけ残る。撤回。
+- eval 終了時の VM スタック縮小: 初期 8KB のまま拡張が稀で効果なし。撤回。
+
+観測基盤: `--stats` に `resid_rss_kb`（script 実行前後の常駐 RSS 差）を追加。
+maxrss（ピーク）と常駐を分けて測れるようにした。今後の省メモリ施策はこの差分で判定する。
+
 ## akl 速度最適化（2026-08-10、ユーザ方針「Aklus は速度重視」）
 
 - ADD の int32 fast path を VM ハンドラ内にインライン化（SUB/MUL/MOD と同型。従来は
