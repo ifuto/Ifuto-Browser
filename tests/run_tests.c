@@ -22,6 +22,7 @@ void test_md(void);
 void test_md_slice_oracle(void);
 void test_raster(void);
 void test_http(void);
+void test_image(void);
 
 int main(void) {
     fprintf(stderr, "[arena]\n");
@@ -55,6 +56,8 @@ int main(void) {
     RUN(test_raster);
     fprintf(stderr, "[http]\n");
     RUN(test_http);
+    fprintf(stderr, "[image]\n");
+    RUN(test_image);
     fprintf(stderr, "----\nchecks: %d, failures: %d\n", g_if_test_checks, g_if_test_failures);
     return g_if_test_failures ? 1 : 0;
 }

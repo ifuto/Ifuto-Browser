@@ -69,7 +69,7 @@
 | slim-DOM（法則「画面描画に関係ないものは DOM しない」）: **template 配下**を DOM 非構築（script は v0.3 で実行対象のため本文ごと残す = 法則の正しい適用。renderer は従来機構で script subtree を描画しない）。**style は cascade が本文を読むので剃らない**。構築状態機械は完全実行、root は marker 残置。**入力 compaction（v0.3 本丸）は取り込み時複製で実装済**: GUI のみ `if_dom_copy_strings` で切片の誕生点複製→一時入力 arena 即破棄（walk 型は +62ms 実測棄却。ΔVmHWM −3.4MB/16MB 文書・50 タブ換算 −170MB。BENCH.md 台帳） | 剃りの単タブ効用は従来通り限定（ノードヘッダ+走査回避。IfNode 80B が全体の 55% で真の支配項） | slim 変異 fuzz、attrs 側の tokenizer 層剃り、IfNode 縮小は高 churn リスク棚上げ |
 | レンダ grid は viewport 窓のみ materialize（`IfGrid.y_off`、GUI/CLI 共用ビルダ） | 窓再構築はスクロール/リサイズ/タブ切替ごとに O(boxes) クリップ走査 | 差分ペイント（v0.3 候補） |
 | Markdown 表示: `.md` は md.c が多層防御つき HTML に変換して共通パイプラインへ（生 HTML 素通し禁止） | MD の入れ子深度上限で飽和（quote 8 / list 16） | MD 全構文網羅（v0.3 継続） |
-| 画像・メディアはプレースホルダ | 実デコードなし | v0.3 |
+| 画像デコードは **実装済**（v0.4: src/image.c。PNG（8bit RGBA/RGB/グレー±α・全フィルタ・zlib inflate 内蔵）と BMP（24/32bpp）。`--imgdecode FILE` で PPM 出力。img タグへの統合は次） | パレット/インターレース/16bit PNG は明白拒否 | img タグ描画統合 |
 | HTTP/1.1 取得は **実装済**（src/net.c、防御的 4 パーサ + fuzz_net。plaintext のみ） | — | 済 |
 | HTTPS/TLS は **実装済**（v0.3: BearSSL 静的リンク。TLS 1.2・ECDHE-RSA/AES-GCM・
   システム CA バンドル（`IFUTO_CA_BUNDLE` で override）をトラストアンカーに
@@ -78,7 +78,7 @@
   headless コンテナの egress が TLS ハンドシェイクを遮断するため検証対象外と明記） | BearSSL の既知制限: IP 直打ち URL の SAN 照合不可（DNS 名のみ）。TLS 1.3 は
   BearSSL の上限外（サーバが 1.3 のみなら接続不能）。セッション再開・
   クライアント証明書・SNI 以外の拡張は未使用 | BearSSL のアップストリーム追随 |
-| 画像・メディアはプレースホルダ | 実デコードなし | v0.3 |
+| 画像デコードは **実装済**（v0.4: src/image.c。PNG（8bit RGBA/RGB/グレー±α・全フィルタ・zlib inflate 内蔵）と BMP（24/32bpp）。`--imgdecode FILE` で PPM 出力。img タグへの統合は次） | パレット/インターレース/16bit PNG は明白拒否 | img タグ描画統合 |
 
 ## 4. セキュリティモデル（防御的。現状の残存攻撃面を隠さない）
 
@@ -118,7 +118,7 @@ layout（座標系は差し替え可能）──→ [backend 境界: 矩形/文�
 | v0.1 ✅ | 垂直スライス: パース〜端末描画。テスト・fuzz・ベンチ・ゴールデン | 本コミット |
 | v0.2 ✅ | **適合性マイルストーン（2026-08-07 完了）**: WPT tree-construction 採点ハーネス（`tests/wpt-tree-construction/`、WPT master `5b6a1e6` ピン・61 ファイル 1,934 テスト byte-exact 一致を照合済）。**実行可能 1,922/1,922 = 100.0%**（skip は `#script-on` 12 件のみ = scripting UA 前提・恒久）。fragment 解析（WHATWG 13.4）実装で #document-fragment 196 件も全合格。WHATWG 全実体参照 2,125 名・quirks・foster・AAA・table モード群・in-template・foreign content 完全表まで搭載。HTTP/1.1 クライアント（src/net.c、plaintext・防御的 4 パーサ + fuzz_net）も搭載済。**文字コード層（src/charset.c、正本 docs/CHARSET.md）搭載済: Shift_JIS 系/EUC-JP → UTF-8 正規化、変換表は python codec 生成の再生成一致オラクル凍結、波ダッシュ 6 件は cp932 採用と明記**。以降: マージン相殺親子貫通、テーブルレイアウト | 100.0% 維持（後退は全件 oracle で即検出） |
 | v-chrome ✅ | **GUI クローム（製品最終形）**: 生 X11 単一 UI（TUI は廃止、`--ui` は案内のみ）にタブ・オムニボックス・スクロール・リンクフォーカス/hover/クリック・ステータス帯を実装。slice-2 永続化（session/history/bookmarks を tmp→rename→fsync で単一 dir 原子管理・遅延復元・restore-first 起動）・自前フォント（5x7 + 16x16 全角、かな全量・漢字 103 字）・`--shot` 決定ラスタ検証（gui_smoke 51 checks）・md fast-DOM ロード・拡張 E1（akl、戻り値効果スキーマ、docs/EXTENSIONS.md）。残: グループ折りたたみ・プリセット・履歴/ブックマーク連携の候補・ダッシュボード、漢字第 6 陣、anchor 遷移 | 全ゲート緑 + GUI smoke 緑 |
-| v0.3 | ソフトピクセルラスタ + backend 境界凍結（**製品の最終形は GUI（2026-07-29 ユーザ決定）**。TUI/ANSI 層はこの headless コンテナでの正確性・性能ゲート用途の検証バックエンドと位置づける。`exe を開いて Edge/Chrome と同じように使える` が最終形） + 画像デコード（まず BMP/PNG 静的、ImageMagick には頼らない）+ Vulkan（このコンテナで headless 検証可能なら） | 同一文書のセル版・ピクセル版で視覚一貫 |
+| v0.3 | ソフトピクセルラスタ + backend 境界凍結（**製品の最終形は GUI（2026-07-29 ユーザ決定）**。TUI/ANSI 層はこの headless コンテナでの正確性・性能ゲート用途の検証バックエンドと位置づける。`exe を開いて Edge/Chrome と同じように使える` が最終形） + ~~画像デコード~~（**v0.4 で先行実装済み: src/image.c**。ImageMagick には頼らない）+ Vulkan（このコンテナで headless 検証可能なら） | 同一文書のセル版・ピクセル版で視覚一貫 |
 | v0.4 | **Akl（自作 JS エンジン、ユーザ決定 2026-07-29）**: C11・JIT なし（JIT=攻撃面+メモリの両方を排除。W^X 全域、実行可能書き込みページゼロを構造保証。ユーザ提示動機「半分弱のウイルス無効化」は未検証値として扱い、検証可能な不変条件のみをここに採用する）。値は NaN-boxed 8B、ヒープ参照は obj 配列の u32 index。**v0.0 ✅（2026-07-29）: 字句 → recursive-descent → one-pass codegen → 全検証 verifier（opcode/即値/ジャンプ先境界/locals 参照/命令開始 bitmap）→ スタック VM**（計画の木歩きより強い形で着陸。dispatch は computed-goto/switch のデュアル構成で実測裁定 = goto 既定、1.005〜1.295×, BENCH.md。NaN/Inf 定数・ToString 往復最短精度・短絡生値・loose/strict 等価・全 budget fail-stop まで入る）。**v0.1: 配列/オブジェクト + mark-sweep GC**。DOM バインディング（querySelector・textContent・style 書換）は GC 安定後。**v0.2 ✅（2026-07-31）: JS 例外（throw/try/catch/finally、cross-frame 巻き戻し、v0.1 限界=try 越境 break/continue は明白な compile エラー）+ CoJIT（静的検証駆動の AOT 特化、runtime codegen ゼロで JIT 禁止に抵触しない。特化後は verify 再走査＋on/off 差分オラクルで機械監査）+ 例外機構の cold 分離（inline 展開で arith+24%/branch+42% のレイアウト悪化を同定・復元）**。**v0.3 ✅（2026-08-08、ユーザ指令により v0.4 計画から前倒し: 「akl が立ってないとブラウザとして正常に動作しない」）**: **ネイティブ登録層**（AKL_OK_NATIVE・`akl_native_register`/`akl_global_set`/`akl_mkobject`/`akl_prop_set`/`akl_tostring` 公開面、メソッド呼出 self 伝播（native のみ・`this` は言語に非導入）、1 呼出 1024 insn 固定課金 `AKL_NATIVE_COST`、`akl_native_throw` の明白失敗規約、nursery 一時ルート保護、登録系は VM 停止中限定で構造拒否、native 内からの再帰 eval 拒否）+ **オブジェクトモデル**（AKL_OK_OBJ: `{k:v}` リテラル・`.prop`・`.method()`・代入・参照共有・identity `===`。1 obj 64 prop 上限、prop name は intern STR で GC 伝播 mark。AklObj は 32→48B で mine は live 数比例のみ）＋拡張全 RT の `console.log` 常設（docs/EXTENSIONS.md §3-A・ext_smoke 12 checks）。配列・ブラケット `[i]`・関数式/クロージャは明白拒否のまま（AKL_COMPAT.md 実測表）。**DOM バインディング本体（querySelector 等）と `<script>` 実行配線は未実装（ここが次）** | JS からのレイアウト再計算が end-to-end で動く |
 | v0.4b | **array-DOM（ユーザ提示「ツリーを Array に」を採択）**: IfNode をポインタの森から u32 index リンクの巨大配列へ。目的はメモリ理論極限（ノード当たりバイト数を半減見積——計測値を BENCH.md に出してから移行。未計測の見積 promise は書かない）| 移行前後で全ゲート無変化 + ノード当たりバイト数の公開 |
 | v0.5 | プロセス分離（サイト分離）＋ seccomp サンドボックス。footprint/RSS への影響を数値で示してから適用 | 攻撃面評価を文書化、境界テスト追加 |

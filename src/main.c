@@ -15,6 +15,7 @@
 #include "chrome.h"
 #include "ext.h"
 #include "net.h"
+#include "image.h"
 #include "charset.h" /* v0.3 A1: Shift_JIS/EUC-JP → UTF-8（docs/CHARSET.md） */
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -120,7 +121,8 @@ static void usage(FILE *f) {
           "  --links          print collected links\n"
           "  --stats          print timing/memory stats to stderr\n"
           "  --ext DIR        load extensions from DIR at chrome init (GUI/--shot。E1)\n"
-          "  --show-paths     list persisted-data paths (INV-9; no side effects)\n", f);
+          "  --show-paths     list persisted-data paths (INV-9; no side effects)\n"
+          "  --imgdecode     decode PNG/BMP file to PPM on stdout (image tooling)\n", f);
 }
 
 /* INV-9: 永続データの発見可能なパス一覧。--show-paths は副作用ゼロ（mkdir しない） */
@@ -149,7 +151,7 @@ static int show_paths(void) {
 int main(int argc, char **argv) {
     i32 width = 100;
     int ansi = 1, do_style = 1, links = 0, stats = 0, force_md = 0;
-    enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM, M_STYLES, M_GUI } mode = M_RENDER;
+    enum { M_RENDER, M_DOM, M_LAYOUT, M_TOKENS, M_WPTDOM, M_STYLES, M_GUI, M_IMGDECODE } mode = M_RENDER;
     const char *path = NULL, *shot = NULL, *frag_ctx = NULL;
     bool legacy_ui = false;
 
@@ -164,6 +166,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--fragment") == 0 && i + 1 < argc) frag_ctx = argv[++i];
         else if (strcmp(argv[i], "--dump-styles") == 0) mode = M_STYLES;
         else if (strcmp(argv[i], "--gui") == 0) mode = M_GUI;
+        else if (strcmp(argv[i], "--imgdecode") == 0) mode = M_IMGDECODE;
         else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) shot = argv[++i];
         else if (strcmp(argv[i], "--ui") == 0) { mode = M_GUI; legacy_ui = true; }
         else if (strcmp(argv[i], "--links") == 0) links = 1;
@@ -179,6 +182,31 @@ int main(int argc, char **argv) {
     if (!path && mode != M_GUI && !shot) { usage(stderr); return 2; }
     if (legacy_ui)
         fputs("ifuto: --ui(TUI) は完全廃止。GUI（--gui）へ移行しました\n", stderr);
+    if (mode == M_IMGDECODE) {
+        /* 画像デコード → PPM 出力（デコーダの検証・画像ツール） */
+        if (!path) { usage(stderr); return 2; }
+        FILE *f = fopen(path, "rb");
+        if (!f) { fprintf(stderr, "ifuto: cannot read %s\n", path); return 1; }
+        fseek(f, 0, SEEK_END);
+        long n = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        u8 *buf = (u8 *)malloc(n ? (size_t)n : 1);
+        if (!buf || fread(buf, 1, n, f) != (size_t)n) { fclose(f); free(buf); fprintf(stderr, "ifuto: read failed\n"); return 1; }
+        fclose(f);
+        char ierr[128];
+        IfImage *img = if_img_decode(buf, (u32)n, ierr, sizeof ierr);
+        free(buf);
+        if (!img) { fprintf(stderr, "ifuto: %s\n", ierr); return 1; }
+        printf("P6\n%u %u\n255\n", img->w, img->h);
+        for (u64 i = 0; i < (u64)img->w * img->h; i++) {
+            u8 *p = img->px + i * 4;
+            fputc(p[0], stdout);
+            fputc(p[1], stdout);
+            fputc(p[2], stdout);
+        }
+        if_img_free(img);
+        return 0;
+    }
     if (shot) return if_gui_shot(path, shot);
     if (mode == M_GUI) return if_gui_run(path);
     if (width < 4 || width > 100000) { fprintf(stderr, "ifuto: bad --width\n"); return 2; }
