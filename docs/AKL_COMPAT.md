@@ -84,6 +84,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | `async function`（戻り値は解決済み Promise で包む）・`await`（Promise は解決値に展開） | `async function f(){ return await Promise.resolve(10)*2; }` | `.then` で `20` |
 | BigInt `123n`（10/16/2/8 進・区切り可）。64bit 符号付き範囲内 | `9007199254740993n + 1n` | `9007199254740994`（i64 正確） |
 | BigInt 演算 `+ - * / %`（同士は i64 正確・0 除算は RangeError）・比較・`==`（10n==10 は true）・`===`（10n===10 は false）・`typeof` | `10n / 3n` | `3n` |
+| generator `function*` / `yield`（next() で `{value, done}` を返す。全同期実行で yield 値を蓄積する近似） | `function* g(){yield 1; yield 2;} var it=g(); it.next().value` | `1` |
 | 文頭 `{a:1}` の曖昧性 | ブロック文 + ラベル + 式文として解釈（JS 準拠） | `1` |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
@@ -98,6 +99,9 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | 関数外の `arguments` | ReferenceError（JS の module スコープでは undefined だが、簡易近似として明白にエラー） |
 | pending の Promise に対する `then` / `await` | コールバックは呼ばれず undefined Promise / undefined を返す（同期近似。setTimeout 等の非同期基盤が無いため） |
 | 64bit 符号付き範囲を超える BigInt リテラル（`9223372036854775808n` 等） | SyntaxError（akl は 64bit 近似のため黙って wrap せず明白に失敗。JS は任意精度） |
+| generator の遅延評価（next() ごとの中断/再開） | 非対応。呼び出し時に本体を全同期実行して yield 値を蓄積し、next() はそれを順に返す（副作用は 1 回だけ実行され正しいが、無限ループを含む generator は budget で停止） |
+| `next(arg)` の引数（yield 式の値への反映） | 無視（yield 式の値は undefined。`var x = yield 5` の x は undefined） |
+| `for...of` での generator 反復 | 非対応（配列・文字列の for-of は対応済み） |
 | BigInt と Number の混合演算 | Number に変換して実行（精度落ち。`10n + 5` は 15） |
 | 2^53 を超える BigInt の `akl_to_number` / `akl_as_num` 経由 | double 化で精度落ち（文字列化 `'' + 9007199254740993n` は正確） |
 | アロー関数での `arguments` | 呼び出し側の arguments（生成時でなく呼び出しフレームの。JS はレキシカル） |
@@ -150,6 +154,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 18. ✅ arguments（2026-08-09: AklFrame に argc 記録（16B→24B）。超過引数はローカル領域の後ろに逆順コピーで保護（順方向だと値が伝播するバグを実測で特定・修正））
 19. ✅ アロー関数・Promise・async/await（2026-08-09: 同期解決近似。AklObj 64B 化（thisv + PROMISE kind）。lexer の TK_KW str_p 未設定バグを修正（.catch 等のプロパティ名が旧トークンを指していた））
 19b. ✅ BigInt（2026-08-10: AKL_OK_BIGINT + OP_CONST_BIG。スキャン時に u64 蓄積で 2^53 超も正確。akl_bin_add 等の融合命令経由でも i64 正確を保証）
+19c. ✅ generator（2026-08-10: AKL_OK_GEN + OP_YIELD。akl_call 再入機構で本体を実行して yield 値を蓄積。AklFuncEnt に is_gen 追加。an_* に N_YIELD 追跡を追加（クロージャ capture 漏れ修正））
 
 ## V8 との位置づけ
 

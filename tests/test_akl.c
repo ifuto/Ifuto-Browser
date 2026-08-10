@@ -890,6 +890,7 @@ static void t_v04_labels(void);
 static void t_v04_arguments(void);
 static void t_v04_arrow_promise_async(void);
 static void t_v04_bigint(void);
+static void t_v04_generator(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -953,6 +954,8 @@ void test_akl(void) {
     t_v04_arrow_promise_async();
     fprintf(stderr, "  %-40s", "t_v04_bigint");
     t_v04_bigint();
+    fprintf(stderr, "  %-40s", "t_v04_generator");
+    t_v04_generator();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1784,4 +1787,32 @@ static void t_v04_bigint(void) {
     want_err("0xFFFFFFFFFFFFFFFFn", "lex error");
     want_err("10n % 0n", "RangeError");
     want_err("1n / 0n", "RangeError");
+}
+
+/* ================= v0.4: generator ================= */
+static void t_v04_generator(void) {
+    /* 基本 next() */
+    want_num("function* g() { yield 1; yield 2; } var it = g(); it.next().value", 1);
+    want_num("function* g() { yield 1; yield 2; } var it = g(); var ga = it.next(); var gb = it.next(); var gc = it.next(); ga.value + gb.value + (gc.done ? 10 : 0)", 13);
+    want_num("function* g() { yield 10; yield 20; yield 30; } var it = g(); it.next().value + it.next().value + it.next().value", 60);
+    want_str("function* g() { yield 'a'; yield 'b'; } var it = g(); it.next().value + it.next().value", "ab");
+    /* 空 generator */
+    want_bool("function* g() { } var it = g(); it.next().done", true);
+    /* done/value プロパティ */
+    want_str("function* g() { yield 1; yield 2; } var it = g(); var r = it.next(); r.done + ':' + r.value", "false:1");
+    want_str("function* g() { yield 1; yield 2; } var it = g(); it.next(); var r = it.next(); r.done + ':' + r.value", "false:2");
+    want_str("function* g() { yield 1; } var it = g(); it.next(); var r = it.next(); r.done + ':' + r.value", "true:undefined");
+    /* ループ内 yield */
+    want_num("function* g() { var n = 0; while (n < 3) { yield n; n = n + 1; } } var it = g(); it.next().value + it.next().value + it.next().value", 3);
+    /* yield 式の値（近似: undefined） */
+    want_num("function* g() { var x = yield 5; return x + 1; } var it = g(); it.next().value", 5);
+    want_str("function* g() { var x = yield 5; return x + 1; } var it = g(); it.next(); var r = it.next(); r.done + ':' + r.value", "true:undefined");
+    /* yield の式としての値 */
+    want_num("function* g() { var a = yield 2; return a; } var it = g(); var r = it.next(); r.value * 21", 42);
+    /* 複数インスタンス */
+    want_num("function* g() { yield 1; yield 2; } var ga = g(); var gb = g(); ga.next().value + gb.next().value", 2);
+    /* クロージャ + generator */
+    want_num("function make() { var n = 10; return function*() { yield n; yield n + 1; }; } var g = make(); var it = g(); it.next().value + it.next().value", 21);
+    /* エラー: generator 外の yield */
+    want_err("yield 1;", "yield");
 }

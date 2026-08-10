@@ -390,7 +390,32 @@ static void test_script_bigint(void) {
     tscr_end(&t);
 }
 
+
+static void test_script_generator(void) {
+    TScr t;
+    tscr_begin(&t, "<!DOCTYPE html><title>W0</title><div id=a>start</div>"
+                   "<script>"
+                   "function* nums() { yield 3; yield 1; yield 4; }"
+                   "var it = nums();"
+                   "var total = it.next().value + it.next().value + it.next().value;"
+                   "console.log('gn1', total);"
+                   "var done2 = it.next().done;"
+                   "console.log('gn2', done2 ? 'end' : 'more');"
+                   "document.getElementById('a').textContent = total + ':' + (done2 ? 'e' : 'm');"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
+    CHECK(strstr(t.logbuf, "[script:console] gn1 8\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] gn2 end\n") != NULL);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    CHECK(d != NULL);
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 3 && memcmp(txt.p, "8:e", 3) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
+    test_script_generator();
     test_script_bigint();
     test_script_arrow_promise_async();
     test_script_objlit_ext();

@@ -90,7 +90,7 @@ static bool akl_numv(AklVal v, double *out) {
 /* ============================== ヒープオブジェクト ============================== */
 
 enum { AKL_OK_STR = 1, AKL_OK_FUNC = 2, AKL_OK_ROPE = 3, AKL_OK_NATIVE = 4, AKL_OK_OBJ = 5, AKL_OK_HANDLE = 6,
-       AKL_OK_ARR = 7, AKL_OK_ENV = 8, AKL_OK_REGEX = 9, AKL_OK_PROMISE = 10, AKL_OK_BIGINT = 11 };
+       AKL_OK_ARR = 7, AKL_OK_ENV = 8, AKL_OK_REGEX = 9, AKL_OK_PROMISE = 10, AKL_OK_BIGINT = 11, AKL_OK_GEN = 12 };
 /* ROPE: code_off=左 obj idx, name=右 obj idx, n_params=深さ(最大4096), len=全長。
  * 不変条件: 子の index は親より小さい必要は「ない」（free-list 再利用で逆転し得る）。
  * よって GC の伝播は添字順に依らない明示ワークリストで行う。文字列は不変。
@@ -130,13 +130,14 @@ typedef struct {
         struct { AklRex *rx; u32 flags; i32 last_index; } rex; /* REGEX（16B） */
         struct { u8 state; u8 pad[3]; AklVal value; } pr; /* PROMISE: 0=pending 1=resolved 2=rejected */
         i64 big;                                          /* BIGINT: 64bit 整数値 */
+        struct { u32 arr; u32 pos; } gen;                 /* GEN: yield 蓄積配列 obj idx + 次位置 */
     } u;
 } AklObj; /* 64B（v0.4: FUNC.thisv + PROMISE 追加で 56B から +8B。ARCH 台帳記録） */
 
 /* ============================== runtime ============================== */
 
 typedef struct { u32 name; AklVal v; u8 is_const; u8 _p[3]; } AklGlobal;
-typedef struct { u32 code_off, code_end; u32 name; u16 n_params, n_locals; u16 n_env; u16 n_cap; } AklFuncEnt;
+typedef struct { u32 code_off, code_end; u32 name; u16 n_params, n_locals; u16 n_env; u16 n_cap; u8 is_gen; u8 pad; } AklFuncEnt; /* 24B（is_gen: generator 関数） */
 
 enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させること） */
     OP_CONST_I = 0, OP_CONST_D, OP_CONST_STR,
@@ -219,6 +220,7 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_OBJSPREAD,           /* pop src → TOS の OBJ に全 props コピー（オブジェクト spread） */
     OP_ARGS,                /* imm なし : 現在関数の引数配列を push（arguments） */
     OP_CONST_BIG,           /* i64 imm（8B）: BigInt オブジェクト生成 */
+    OP_YIELD,               /* imm なし : TOS を generator 蓄積配列へ push（中断しない） */
     OP_ARROWTHIS,           /* pop fn → fn.thisv = 現在フレーム this（アロー関数生成） */
     OP_AWAIT,               /* pop v → Promise なら解決値（簡易同期）、非 Promise はそのまま */
     OP_PROMISE_RESOLVE,     /* pop v → 解決済み Promise（state=1）を push（async 戻り値） */
@@ -240,6 +242,7 @@ enum { AKL_TE_TRY = 0, AKL_TE_FIN = 1 };
 #define AKL_ARR_METH_N 20u    /* v0.3 組込: 配列メソッド数（v0.4: 高階 8 種追加） */
 #define AKL_REGEX_METH_N 3u    /* v0.4: 正規表現メソッド数（test/exec/toString） */
 #define AKL_PROMISE_METH_N 3u   /* v0.4: Promise メソッド数（then/catch/finally） */
+#define AKL_GEN_METH_N 1u      /* v0.4: generator メソッド数（next） */
 
 typedef struct {
     AklVal pending;
@@ -271,6 +274,7 @@ struct AklRT {
     u32 gc_next_objs; /* 同上（オブジェクト数。スロット配列の高水位を live 漸近に） */
     u32 gc_sp;      /* VM が alloc サイト直前に同期するスタック深さスナップショット */
     u32 nury[AKL_NURY_CAP]; u32 n_nury; /* C 側一時ルート（concat 一時 obj / eq・rel の flatten 対象ピン） */
+    u32 cur_gen_arr; /* generator 実行中の yield 蓄積配列 obj idx（UINT32_MAX=無し） */
     bool gc_live;   /* vm_exec 実行中のみ true（GC はこの時だけ発火） */
     /* GLOAD/GSTORE の O(1) 化: name(u32 intern id) -> global slot の脱 Salt ハッシュ
      * （globals は append-only。n_globals 変化検知でのみ全再構築） */
@@ -298,6 +302,7 @@ struct AklRT {
     AklVal arr_meth_vals[AKL_ARR_METH_N];
     AklVal regex_meth_vals[AKL_REGEX_METH_N];
     AklVal promise_meth_vals[AKL_PROMISE_METH_N];
+    AklVal gen_meth_vals[AKL_GEN_METH_N];
     char err[256];
     bool native_err;    /* native が akl_native_throw した（VM はこれを見て eval を失敗に） */
     /* 定数除数の剰余を magic-multiply に強度削減する直写メモ（8 エントリ）。
@@ -365,6 +370,7 @@ static u32 akl_gc(AklRT *rt) {
     for (u32 i = 0; i < rt->n_tries; i++)
         if (rt->tries[i].kind == AKL_TE_FIN) akl_gc_mark_val(rt, rt->tries[i].pending, mk);
     for (u32 i = 0; i < rt->n_globals; i++) akl_gc_mark_val(rt, rt->globals[i].v, mk);
+    if (rt->cur_gen_arr != UINT32_MAX) akl_gc_mark_val(rt, AKL_MK_OBJ(rt->cur_gen_arr), mk);
     for (u32 i = 0; i < rt->n_nury; i++) {
         u32 oi = rt->nury[i];
         if (oi >= rt->pin_mark && oi < rt->n_objs) mk[oi - rt->pin_mark] = 1;
@@ -442,6 +448,14 @@ static u32 akl_gc(AklRT *rt) {
                     }
                     if (akl_is_objv(ro->thisv)) {
                         u32 ci = akl_get_obj(ro->thisv);
+                        if (ci >= rt->pin_mark && ci < rt->n_objs && !mk[ci - rt->pin_mark]) {
+                            mk[ci - rt->pin_mark] = 1;
+                            if (akl_gc_kind_children(rt->objs[ci].kind) && wn < span) wl[wn++] = ci;
+                        }
+                    }
+                } else if (ro->kind == AKL_OK_GEN) { /* GEN: 蓄積配列 */
+                    if (ro->u.gen.arr != UINT32_MAX) {
+                        u32 ci = ro->u.gen.arr;
                         if (ci >= rt->pin_mark && ci < rt->n_objs && !mk[ci - rt->pin_mark]) {
                             mk[ci - rt->pin_mark] = 1;
                             if (akl_gc_kind_children(rt->objs[ci].kind) && wn < span) wl[wn++] = ci;
@@ -755,7 +769,7 @@ enum { KW_VAR, KW_LET, KW_CONST, KW_FUNCTION, KW_RETURN, KW_IF, KW_ELSE, KW_WHIL
        KW_DO, KW_SWITCH, KW_CASE, KW_DEFAULT, KW_THIS,
        KW_VOID, KW_DELETE, KW_IN, KW_NEW, KW_OF, KW_INSTANCEOF,
        KW_CLASS, KW_EXTENDS, KW_STATIC, KW_SUPER,
-       KW_DEBUGGER, KW_ASYNC, KW_AWAIT,
+       KW_DEBUGGER, KW_ASYNC, KW_AWAIT, KW_YIELD,
        KW_N };
 static const char *const AKL_KWS[KW_N] = {
     "var", "let", "const", "function", "return", "if", "else", "while",
@@ -763,7 +777,7 @@ static const char *const AKL_KWS[KW_N] = {
     "throw", "try", "catch", "finally",
     "do", "switch", "case", "default", "this",
     "void", "delete", "in", "new", "of", "instanceof",
-    "class", "extends", "static", "super", "debugger", "async", "await"
+    "class", "extends", "static", "super", "debugger", "async", "await", "yield"
 };
 
 enum { P_LP, P_RP, P_LC, P_RC, P_SEMI, P_COMMA, P_ASSIGN, P_PLUS, P_MINUS, P_STAR,
@@ -1218,6 +1232,7 @@ enum {
     N_SWITCH,   /* a=disc node, b=case list first, c=count */
     N_CASE,     /* a=expr（N_NONE=default）, b=body stmt */
     N_FUNCEXPR, /* 関数式: N_FUNC と同形（d=body）。a=name idx（無名は UINT32_MAX） */
+    N_YIELD,    /* yield: a=式（generator 内のみ。値を蓄積して続行） */
     N_BIGINT,   /* BigInt リテラル: a=lo32, b=hi32（u64 値） */
     N_AWAIT,    /* await: a=式（async 関数内のみ。Promise は解決値を展開） */
     N_ARGS,     /* arguments: 現在関数の引数配列（関数本体のみ。main は実行時エラー） */
@@ -1259,6 +1274,7 @@ typedef struct {
     u32 super_ctx;                       /* class メソッド body のパース中 > 0（super 許可） */
     u32 fn_body;                         /* 関数本体のパース中 > 0（arguments 識別子の解決） */
     u32 in_async;                        /* async 関数本体のパース中 > 0（await 許可） */
+    u32 gen_body;                        /* generator 関数本体のパース中 > 0（yield 許可） */
     u32 super_name;                      /* 親クラス保持ローカルの疑似名（intern id） */
     u32 super_prop;                      /* クラスオブジェクトの親参照プロパティ名（intern id） */
 } P;
@@ -1958,6 +1974,23 @@ static u32 p_primary(P *p) {
         p->depth--;
         return ni;
     }
+    if (p_is_kw(p, KW_YIELD)) { /* yield expr（generator 内のみ） */
+        if (!(p->fn_body && p->gen_body)) { p->fail = "yield is only allowed in generator functions"; p->depth--; return N_NONE; }
+        lex_next(&p->lx);
+        u32 e = N_NONE;
+        if (!p_is_punct(p, P_SEMI) && !p_is_punct(p, P_RP) && !p_is_punct(p, P_RC) &&
+            !p_is_punct(p, P_COMMA) && p->lx.kind != TK_EOF) {
+            e = p_expr(p);
+            if (e == N_NONE) { p->depth--; return N_NONE; }
+        } else {
+            e = p_node(p, N_UNDEF);
+            if (e == N_NONE) { p->depth--; return N_NONE; }
+        }
+        u32 ni = p_node(p, N_YIELD);
+        if (ni != N_NONE) p->nodes[ni].a = e;
+        p->depth--;
+        return ni;
+    }
     if (p_is_kw(p, KW_AWAIT)) { /* await expr（async 関数内のみ） */
         if (!p->in_async) { p->fail = "await is only allowed in async functions"; p->depth--; return N_NONE; }
         lex_next(&p->lx);
@@ -2006,6 +2039,8 @@ static u32 p_primary(P *p) {
     }
     if (p_is_kw(p, KW_FUNCTION)) { /* 関数式: function [name] (params) { body }（名前は省略可） */
         lex_next(&p->lx);
+        bool is_gen = false;
+        if (p_is_punct(p, P_STAR)) { is_gen = true; lex_next(&p->lx); }
         u32 name = UINT32_MAX;
         if (p->lx.kind == TK_IDENT) {
             name = p_intern(p, p->lx.str_p, p->lx.str_len);
@@ -2018,7 +2053,9 @@ static u32 p_primary(P *p) {
         if (p->fail) { p->depth--; return N_NONE; }
         if (!p_expect_punct(p, P_LC, "expected '{'")) { p->depth--; return N_NONE; }
         p->fn_body++;
+        if (is_gen) p->gen_body++;
         u32 body = p_block_tail(p);
+        if (is_gen) p->gen_body--;
         p->fn_body--;
         if (body == N_NONE) { p->depth--; return N_NONE; }
         u32 ni = p_node(p, N_FUNCEXPR);
@@ -2027,6 +2064,7 @@ static u32 p_primary(P *p) {
         p->nodes[ni].b = pf;
         p->nodes[ni].c = pc2;
         p->nodes[ni].d = body;
+        if (is_gen) p->nodes[ni].flags |= 32;
         ni = p_postfix(p, ni);
         p->depth--;
         return ni;
@@ -3010,6 +3048,8 @@ static u32 p_stmt(P *p) {
     }
     if (p_is_kw(p, KW_FUNCTION)) {
         lex_next(&p->lx);
+        bool is_gen = false;
+        if (p_is_punct(p, P_STAR)) { is_gen = true; lex_next(&p->lx); }
         if (p->lx.kind != TK_IDENT) { p->fail = "expected function name"; goto out; }
         u32 name = p_intern(p, p->lx.str_p, p->lx.str_len);
         if (name == UINT32_MAX) goto out;
@@ -3020,7 +3060,9 @@ static u32 p_stmt(P *p) {
         if (p->fail) goto out;
         if (!p_expect_punct(p, P_LC, "expected '{'")) goto out;
         p->fn_body++;
+        if (is_gen) p->gen_body++;
         u32 body = p_block_tail(p);
+        if (is_gen) p->gen_body--;
         p->fn_body--;
         if (body == N_NONE) goto out;
         ni = p_node(p, N_FUNC);
@@ -3029,6 +3071,7 @@ static u32 p_stmt(P *p) {
         p->nodes[ni].b = pf;
         p->nodes[ni].c = pc2;
         p->nodes[ni].d = body;
+        if (is_gen) p->nodes[ni].flags |= 32; /* bit5: generator */
         goto out;
     }
     if (p_is_kw(p, KW_RETURN)) {
@@ -3395,6 +3438,7 @@ static void an_refs(P *p, u32 ni, U32Vec *out) {
     case N_OBJLIT: for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->b + i], out); break;
     case N_LABEL: an_refs(p, n->b, out); break;
     case N_OBJKEY: an_refs(p, n->a, out); an_refs(p, n->b, out); break;
+    case N_YIELD: an_refs(p, n->a, out); break;
     case N_LOGASSIGN: an_refs(p, n->a, out); an_refs(p, n->b, out); break;
     case N_SPREAD: an_refs(p, n->a, out); break;
     case N_SUPERMCALL:
@@ -3463,6 +3507,9 @@ static void an_decls(P *p, u32 ni, U32Vec *out) {
     case N_OBJKEY:
         an_decls(p, n->a, out);
         an_decls(p, n->b, out);
+        break;
+    case N_YIELD:
+        an_decls(p, n->a, out);
         break;
     case N_LOGASSIGN:
         an_decls(p, n->a, out);
@@ -3556,6 +3603,9 @@ static void an_walk(P *p, u32 ni, u32 *anc, u32 anc_n) {
     case N_OBJKEY:
         an_walk(p, n->a, anc, anc_n);
         an_walk(p, n->b, anc, anc_n);
+        return;
+    case N_YIELD:
+        an_walk(p, n->a, anc, anc_n);
         return;
     case N_LOGASSIGN:
         an_walk(p, n->a, anc, anc_n);
@@ -3676,6 +3726,9 @@ static void an_main_decls(P *p, u32 ni, U32Vec *out) {
     case N_OBJKEY:
         an_main_decls(p, n->a, out);
         an_main_decls(p, n->b, out);
+        break;
+    case N_YIELD:
+        an_main_decls(p, n->a, out);
         break;
     case N_LOGASSIGN:
         an_main_decls(p, n->a, out);
@@ -4175,6 +4228,13 @@ static void cg_expr(Cg *cg, u32 ni) {
     case N_STR:   cg_op(cg, OP_CONST_STR); cg_u32(cg, n->a); break;
     case N_ARGS:  cg_op(cg, OP_ARGS); break;
     case N_AWAIT: cg_expr(cg, n->a); cg_op(cg, OP_AWAIT); break;
+    case N_YIELD:
+        /* yield expr: 値を蓄積（YIELD が pop）しつつ、式の値としてスタックに残す（DUP）。
+         * 式文の POPV が残りを捨てる。var x = yield 5 は x = 式の値（近似: undefined）。 */
+        cg_expr(cg, n->a);
+        cg_op(cg, OP_DUP);
+        cg_op(cg, OP_YIELD);
+        break;
     case N_BIGINT: {
         cg_op(cg, OP_CONST_BIG);
         u64 bv = ((u64)n->b << 32) | n->a;
@@ -4907,6 +4967,7 @@ static void cg_fn(Cg *cg, u32 ni) {
         rt->funcs[fidx].code_off = cg_target_here(cg);
         rt->funcs[fidx].name = n->a;
         rt->funcs[fidx].n_params = (u16)n->c;
+        rt->funcs[fidx].is_gen = ((n->flags & 32) != 0) ? 1 : 0;
         /* 新しい codegen スコープ（解析結果 fi を参照。無ければ capture なし） */
         const AklFnInfo *fi = (cg->p->fninfo && ni < cg->p->fninfo_n) ? &cg->p->fninfo[ni] : NULL;
         if (cg->n_outer >= AKL_MAX_DEPTH) { akl_errf(rt, "function nesting budget exhausted"); cg->fail = true; return; }
@@ -9115,6 +9176,37 @@ static AklVal akl_m_promise_reject_static(AklRT *rt, AklVal self, int argc, cons
     return akl_promise_make(rt, 2, v);
 }
 
+/* GEN.next(): 蓄積配列から順に {value, done} を返す（全同期実行方式） */
+static AklVal akl_m_gen_next(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)udata; (void)argc; (void)argv;
+    if (!akl_is_objv(self) || rt->objs[akl_get_obj(self)].kind != AKL_OK_GEN)
+        return akl_native_typeerr(rt, "TypeError: not a generator");
+    AklObj *g = &rt->objs[akl_get_obj(self)];
+    u32 oi = akl_obj_new(rt);
+    if (oi == UINT32_MAX) return akl_mkundefined();
+    rt->objs[oi].kind = AKL_OK_OBJ;
+    AklVal res = AKL_MK_OBJ(oi);
+    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = oi;
+    AklVal val = akl_mkundefined();
+    bool done = true;
+    if (g->u.gen.arr != UINT32_MAX && g->u.gen.arr < rt->n_objs &&
+        rt->objs[g->u.gen.arr].kind == AKL_OK_ARR) {
+        AklObj *ga = &rt->objs[g->u.gen.arr];
+        if (g->u.gen.pos < ga->u.arr.n) {
+            val = ga->u.arr.v[g->u.gen.pos++];
+            done = false;
+        }
+    }
+    if (akl_is_objv(val) && rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_get_obj(val);
+    if (!obj_prop_set(rt, &rt->objs[oi], akl_intern(rt, (const u8 *)"value", 5, NULL), val)) return akl_mkundefined();
+    if (!obj_prop_set(rt, &rt->objs[oi], akl_intern(rt, (const u8 *)"done", 4, NULL), akl_mkbool(done))) return akl_mkundefined();
+    return res;
+}
+
+static const AklMethEntry AKL_GEN_METHODS[AKL_GEN_METH_N] = {
+    {"next", akl_m_gen_next}
+};
+
 static const AklMethEntry AKL_PROMISE_METHODS[AKL_PROMISE_METH_N] = {
     {"then", akl_m_promise_then}, {"catch", akl_m_promise_catch},
     {"finally", akl_m_promise_finally}
@@ -9255,6 +9347,10 @@ static bool akl_builtins_install(AklRT *rt) {
     for (u32 i = 0; i < AKL_PROMISE_METH_N; i++) {
         rt->promise_meth_vals[i] = akl_mknative(rt, AKL_PROMISE_METHODS[i].fn, NULL);
         if (akl_is_undefined(rt->promise_meth_vals[i])) return false;
+    }
+    for (u32 i = 0; i < AKL_GEN_METH_N; i++) {
+        rt->gen_meth_vals[i] = akl_mknative(rt, AKL_GEN_METHODS[i].fn, NULL);
+        if (akl_is_undefined(rt->gen_meth_vals[i])) return false;
     }
     return true;
 }
@@ -9621,6 +9717,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_OBJSPREAD] = &&l_OBJSPREAD,
         [OP_ARGS] = &&l_ARGS,
         [OP_CONST_BIG] = &&l_CONST_BIG,
+        [OP_YIELD] = &&l_YIELD,
         [OP_ARROWTHIS] = &&l_ARROWTHIS,
         [OP_AWAIT] = &&l_AWAIT,
         [OP_PROMISE_RESOLVE] = &&l_PROMISE_RESOLVE,
@@ -9965,6 +10062,32 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         nframes++;
         base = win;
         cur = fe_i;
+        if (fe->is_gen) {
+            /* generator 関数の呼び出し: GEN オブジェクトを作成し、yield 蓄積配列を
+             * rt->cur_gen_arr にセットして、本体を akl_call の再入機構で実行する
+             * （outer スタックは root_stks に退避され GC から保護される）。
+             * 本体完了（HALT）で cur_gen_arr はクリアされる。GEN をスタックへ置く。 */
+            rt->gc_sp = sp;
+            u32 go = akl_obj_new(rt);
+            if (go == UINT32_MAX) { free(frames); return false; }
+            u32 ga = akl_obj_new(rt);
+            if (ga == UINT32_MAX) { free(frames); return false; }
+            rt->objs[go].kind = AKL_OK_GEN;
+            rt->objs[go].u.gen.arr = ga;
+            rt->objs[go].u.gen.pos = 0;
+            rt->objs[ga].kind = AKL_OK_ARR;
+            if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = go;
+            if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ga;
+            u32 pre_gen = rt->cur_gen_arr;
+            rt->cur_gen_arr = ga;
+            AklVal gout;
+            bool gok = akl_call(rt, fv, argc, stk + sp - argc, &gout);
+            rt->cur_gen_arr = pre_gen; /* ネスト時は元の蓄積先へ戻す */
+            if (!gok) { free(frames); return false; }
+            sp -= argc;
+            stk[sp - 1] = AKL_MK_OBJ(go);
+            AKL_NEXT();
+        }
         pc = code + rt->funcs[cur].code_off;
         AKL_NEXT();
     }
@@ -10242,6 +10365,18 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                     if (hit_r != UINT32_MAX) { AKL_PUSH(rt->regex_meth_vals[hit_r]); AKL_NEXT(); }
                 }
                 AKL_PUSH(out);
+                AKL_NEXT();
+            }
+            if (oo->kind == AKL_OK_GEN) {
+                u32 nl;
+                const u8 *nb = akl_str(rt, name, &nl);
+                if (!nb) { free(frames); return false; }
+                u32 hit_g = UINT32_MAX;
+                for (u32 i = 0; i < AKL_GEN_METH_N; i++)
+                    if (strlen(AKL_GEN_METHODS[i].name) == nl &&
+                        memcmp(AKL_GEN_METHODS[i].name, nb, nl) == 0) { hit_g = i; break; }
+                if (hit_g != UINT32_MAX) { AKL_PUSH(rt->gen_meth_vals[hit_g]); AKL_NEXT(); }
+                AKL_PUSH(AKL_VAL_UNDEF);
                 AKL_NEXT();
             }
             if (oo->kind == AKL_OK_PROMISE) {
@@ -10539,6 +10674,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 tbl = AKL_REGEX_METHODS; tn = AKL_REGEX_METH_N;
             } else if (oo->kind == AKL_OK_PROMISE) {
                 tbl = AKL_PROMISE_METHODS; tn = AKL_PROMISE_METH_N;
+            } else if (oo->kind == AKL_OK_GEN) {
+                tbl = AKL_GEN_METHODS; tn = AKL_GEN_METH_N;
             }
             if (tbl) {
                 u32 nl;
@@ -12020,6 +12157,24 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AKL_PUSH(AKL_MK_OBJ(oi));
         AKL_NEXT();
     }
+    AKL_L(YIELD): {
+        /* TOS を generator 蓄積配列へ push（中断しない。全同期実行方式） */
+        AklVal yv = AKL_POP();
+        if (rt->cur_gen_arr == UINT32_MAX) {
+            akl_errf(rt, "internal: yield outside generator");
+            free(frames);
+            return false;
+        }
+        if (rt->cur_gen_arr >= rt->n_objs || rt->objs[rt->cur_gen_arr].kind != AKL_OK_ARR) {
+            akl_errf(rt, "internal: gen arr broken");
+            free(frames);
+            return false;
+        }
+        AklObj *ga = &rt->objs[rt->cur_gen_arr];
+        if (!akl_arr_grow(rt, ga, ga->u.arr.n + 1)) { free(frames); return false; }
+        ga->u.arr.v[ga->u.arr.n++] = yv;
+        AKL_NEXT();
+    }
     AKL_L(ARROWTHIS): {
         /* pop fn → fn.thisv = 現在フレームの this（base+0）。アロー関数の this 固定 */
         AklVal fv = AKL_POP();
@@ -12155,6 +12310,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
     AKL_L(HALT): {
         if (rt->n_tries) { /* 防御層: main 正常終了で try が残るのは内部不整合 */
             akl_errf(rt, "internal: try/frame skew at halt"); free(frames); return false; }
+        rt->cur_gen_arr = UINT32_MAX; /* generator 実行完了 */
         free(frames);
         return true;
     }
@@ -12489,6 +12645,7 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
             "OBJSPREAD",
             "ARGS",
             "CONST_BIG",
+            "YIELD",
             "ARROWTHIS",
             "AWAIT",
             "PROMISE_RESOLVE",
