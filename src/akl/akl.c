@@ -11131,6 +11131,14 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
 
     AKL_L(ADD): {
         AklVal vb = AKL_POP(), va = AKL_POP();
+        /* int32 fast path（SUB/MUL/MOD と同型のインライン化。fib 等の数値再帰の
+         * ホット路で akl_bin_add 呼び出しを消す — gprof 実測: fib30 の 16.7% が呼出費） */
+        if (akl_is_intv(va) && akl_is_intv(vb)) {
+            i64 r = (i64)akl_get_int(va) + (i64)akl_get_int(vb);
+            if (r >= -2147483648ll && r <= 2147483647ll) { AKL_PUSH(AKL_MK_INT((i32)r)); AKL_NEXT(); }
+            AKL_PUSH(akl_num((double)r));
+            AKL_NEXT();
+        }
         i64 ba, bb;
         if (akl_is_big(rt, va, &ba) && akl_is_big(rt, vb, &bb)) {
             /* BigInt + BigInt: i64 正確（溢出は wrap。AKL_COMPAT） */
@@ -11387,8 +11395,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             free(frames);
             return false;
         }
-        u32 fidx = akl_get_obj(fv);
-        u32 fe_i = rt->objs[fidx].code_off; /* FUNC obj の code_off は funcs[] の index */
+        /* fo は既に取得済み（akl_get_obj + rt->objs の 2 回目参照を回避） */
+        u32 fe_i = fo->code_off; /* FUNC obj の code_off は funcs[] の index */
         if (fe_i >= rt->n_funcs) { akl_errf(rt, "internal: bad func ref"); free(frames); return false; }
         AklFuncEnt *fe = &rt->funcs[fe_i];
         if (nframes >= AKL_MAX_DEPTH) { akl_errf(rt, "call depth budget exhausted"); free(frames); return false; }

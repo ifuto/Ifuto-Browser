@@ -7,10 +7,10 @@
 #include "common.h"
 #include <string.h>
 
-typedef struct {
-    const char *p;
-    u32 n;
-} IfStr;
+typedef struct __attribute__((packed)) {
+    const char *p;   /* 8B（packed で 8B アライン保証なし — x86-64/ARMv7+ は unaligned ネイティブ） */
+    u32 n;           /* 4B */
+} IfStr; /* 12B（通常 align なら 16B。IfNode 80→72B / IfAttr 32→24B の省メモリ。2026-08-10 実測で採用判断） */
 
 #define IF_S(lit) ((IfStr){ (lit), (u32)(sizeof(lit) - 1) })
 

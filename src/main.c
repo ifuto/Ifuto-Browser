@@ -213,7 +213,7 @@ int main(int argc, char **argv) {
 
     double t0 = now_ms();
     IfArena a;
-    if_arena_init(&a, 1 << 23) /* ブロック数半減で THP 同期コンパクション stall 削減（paired +2.6ms。reserved +~7MB と引き換え、BENCH 台帳） */; /* CLI: 4MB ブロック→THP 直取り（マイナーフォールト税の構造除去。GUI/テストは従来のまま） */
+    if_arena_init(&a, 2 << 20) /* 省メモリ（2026-08-10）: 8MB 初期は reserved 過剰（big 2MB doc でも used 3.4MB）。2MB ブロックは THP 1 枚にアラインされ、4KB fault の THP 化は 8MB と同効。速度影響は paired 検証（BENCH 台帳） */;
     IfStr ctype = if_str(NULL, 0);
     IfStr input = read_all(&a, path, &ctype);
     bool md_doc = force_md || if_path_is_md(path);
@@ -281,6 +281,7 @@ int main(int argc, char **argv) {
     }
 
     double arena_after_parse = (double)if_arena_reserved(&a);
+    double arena_used_parse = (double)if_arena_used(&a);
 
     /* v0.3: <script> akl 実行（凍結正本: docs/SCRIPTING.md）。
      * dump 系モード（wptdom/tokens/dom）は上流で return 済み = 文字列観測系オラクル不変。
@@ -302,6 +303,7 @@ int main(int argc, char **argv) {
     }
     double t3 = now_ms();
     double arena_after_style = (double)if_arena_reserved(&a);
+    double arena_used_style = (double)if_arena_used(&a);
     /* style 段の正直な帰属: script 実行（style 適用前の本家順序）を差引く。
      * script 非含有文書は has_script 早期リターンで script_ms≈0 = 既存計測不変 */
     double style_ms = (t3 - t2) - script_ms;
@@ -325,6 +327,7 @@ int main(int argc, char **argv) {
     }
     double t4 = now_ms();
     double arena_after_layout = (double)if_arena_reserved(&a);
+    double arena_used_layout = (double)if_arena_used(&a);
 
     /* v0.3: 行スイープ直接発行（グリッド全面充填を消す。op が触るセルだけを再利用
      * 行バッファに構成する。発行バイト列は従来と完全一致 = tests/test_layout.c の
@@ -367,6 +370,10 @@ int main(int argc, char **argv) {
             acc_grid, acc_emit,
             arena_after_parse / 1024.0, arena_after_style / 1024.0,
             arena_after_layout / 1024.0, (double)if_arena_reserved(&a) / 1024.0);
+        fprintf(stderr,
+            "  arena_used_kb: parse=%.1f style=%.1f layout=%.1f render=%.1f (reserved 比で無駄の監視)\n",
+            arena_used_parse / 1024.0, arena_used_style / 1024.0,
+            arena_used_layout / 1024.0, (double)if_arena_used(&a) / 1024.0);
     }
     if_arena_destroy(&a);
     return 0;

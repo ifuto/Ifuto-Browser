@@ -102,7 +102,8 @@ min **1.40ms** / median **1.66ms** / p90 1.96ms。
 ### 依存・形状
 
 - ldd: `linux-vdso / libm / libc / ld` のみ（100% self-made C11、フォントデータも自作）。
-- IfNode **80B**（template content は IfDom tpl_map rare-data、Chromium RareData と同型）。
+- IfNode **69B**（2026-08-10: IfStr 12B packed + kind u8 + IfNode/union packed。
+  80B から −11B/ノード。16MB md 実測で parse arena −18MB）。
   メモリの正直な指標はピーク RSS（THP 込、上表 225,124KB）。
 
 ## 有効な最適化機構（採択済・現在有効なものだけ）
@@ -110,7 +111,14 @@ min **1.40ms** / median **1.66ms** / p90 1.96ms。
 - md fast-DOM: `.md` を DOM 直構築（HTML 往復消去。汚染時 2 段 fallback、CLI/GUI 共通）。
   2-slice 並列 parse（`md_body_mid` ヒント共有、serial≡sliced 差分オラクルで機械保証）。
   HTML/GUI 経路も fast-DOM 優先。
-- IfNode 80B + IfDoctype/IfTplMap rare-data 化（16MB で parse RSS −14MB）。
+- IfNode 80B → **69B**（2026-08-10: IfStr を 12B packed 化、IfNode を packed + kind u8 化、
+  union packed。ノード個別 alloc は if_arena_alloc_a(align 8) 経由 — 16B アラインだと
+  69B が 80B スロットを消費し削減ゼロになるため、8B アライン経路を新設し 72B 消費に。
+  md の slab 方式はステップ 69B が直接効く。16MB md: parse arena −18MB（実測）。
+  x86-64 unaligned アクセスはネイティブ、速度は paired で無劣化（26.8ms 前後不変））。
+- arena 初期ブロック 8MB → 2MB（2026-08-10: big 2MB doc でも used 3.4MB に過ぎず
+  reserved 過剰。2MB は THP 1 枚にアラインされ fault の THP 化は同効。速度 paired 無劣化。
+  仮想メモリ 32MB → 8MB。`--stats` に arena_used_kb 追加（reserved 比の無駄監視））。
 - lazy style（CLI 行スイープは DFS 訪問時のみ解決、style 段 0.0ms）。memo 2 スロット。
 - fitdom CJK SIMD（SSE2/AVX2 dual、`__builtin_cpu_supports` dispatch）、render 単純先行+
   重なり窓、セル発行の直接 emit、arena 8MB ブロック + madvise、属性配列の一回正確確保。
@@ -160,6 +168,17 @@ cold))` 隔離＋ CALL の `is_objv` 二重評価を kind 一本化で上表ま�
 CALL 命令の native 判定 1 分岐（fib は CALL ホットのため現れ、arith は騒音域）。
 機能追加の必然コストとして採用・台帳記録。バイトコード列差分はゼロ（新 opcode は
 既存構文からは出ない。verify の else-if 鎖に 2 分岐追加のみ=compile 時微増）。
+
+## akl 速度最適化（2026-08-10、ユーザ方針「Aklus は速度重視」）
+
+- ADD の int32 fast path を VM ハンドラ内にインライン化（SUB/MUL/MOD と同型。従来は
+  akl_bin_add 呼び出し経由で、fib 等の数値再帰では gprof 上 16.7% が呼出費だった。
+  1,346,268 回の関数呼び出しを削除）。
+- CALL ハンドラの冗長参照削除: `rt->objs[fidx]` の 2 回目取得（akl_get_obj + obj 表参照）を
+  既に取得済みの `fo->code_off` に置換。
+- 実測（median of 9、同一マシン）: fib30 82.2 → **79.4ms**（−3.4%）。arith/loop/primes は
+  騒音域（有意差なし — 既に融合命令で VM の ADD を使わないため）。vs V8 full JIT の
+  fib 比は 8.9x → **2.0x**（vsx.py 実測。C4 ガードは全 PASS 維持）。
 
 ## 計測工学の教訓（再発防止・現在有効）
 

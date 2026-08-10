@@ -31,6 +31,14 @@ void *if_arena_alloc(IfArena *a, u64 size);            /* 未初期化, 16B alig
 void *if_arena_calloc(IfArena *a, u64 size);           /* ゼロ初期化 */
 void  if_arena_destroy(IfArena *a);
 u64   if_arena_reserved(const IfArena *a);
+/* 実際に使用中の合計バイト（ブロック used の総和。reserved と併せて
+ * 「予約は多いが使っていない」の監視に使う。省メモリ台帳の計測点） */
+u64   if_arena_used(const IfArena *a);
+/* 指定アライン（2 のべき乗 ≤ 16）で確保。デフォルト 16B 保証を崩さず、
+ * odd サイズ構造体（IfNode 69B 等）を 16B に切り上げないための 8B 経路
+ * （2026-08-10 省メモリ: 16B アラインでは 69B→80B 消費。8B なら 72B） */
+void *if_arena_alloc_a(IfArena *a, u64 size, u64 align);
+void *if_arena_calloc_a(IfArena *a, u64 size, u64 align); /* ゼロ初期化 + align */
 /* src の全ブロックを dst の解放チェーンへ寄贈（src は空に。dst の bump 現端は不変）。
  * 並列 parse のスレッド別 arena を join 時に主 arena へ畳み込み、
  * 「if_arena_destroy で一括解放」の寿命規約を維持する。 */

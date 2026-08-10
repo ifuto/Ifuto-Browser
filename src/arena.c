@@ -13,7 +13,7 @@
 #define MADV_HUGEPAGE 14
 #endif
 
-#define IF_ARENA_ALIGN 16u
+#define IF_ARENA_ALIGN 16u /* デフォルト 16B 保証（test_arena）。8B 経路は if_arena_alloc_a */
 /* 大ブロックは malloc を通さず mmap 直取り + MADV_HUGEPAGE。
  * 巨大文書の初回タッチは「新規 4KB ページのマイナーフォールト 9 万回≒60-180ms」（実測
  * 2026-08-01）で、THP 化は fault を 1/512 に減らす唯一の構造策（prefault でも fault は消えない）。
@@ -76,26 +76,37 @@ static IfArenaBlock *if_arena_new_block(IfArena *a, u64 need) {
     return b;
 }
 
-void *if_arena_alloc(IfArena *a, u64 size) {
+void *if_arena_alloc_a(IfArena *a, u64 size, u64 align) {
+    if (align < 8 || align > 16 || (align & (align - 1)) != 0) align = IF_ARENA_ALIGN;
     if (size == 0) size = 1;
     if (size > IF_MAX_ARENA_ALLOC) if_fatal("arena: alloc too large (hostile input?)");
     IfArenaBlock *b = a->head;
     u64 off;
     if (b) {
         /* (used + align-1) & ~(align-1) — used < cap ≤ 256MB なので加算オーバーフローは不可 */
-        off = (b->used + (IF_ARENA_ALIGN - 1)) & ~(u64)(IF_ARENA_ALIGN - 1);
+        off = (b->used + (align - 1)) & ~(align - 1);
         if (off > b->cap || size > b->cap - off) b = NULL; /* 収まらない */
     }
     if (!b) {
-        b = if_arena_new_block(a, size + IF_ARENA_ALIGN);
+        b = if_arena_new_block(a, size + align);
         off = 0;
     }
     b->used = off + size;
     return (u8 *)b + sizeof(IfArenaBlock) + off;
 }
 
+void *if_arena_alloc(IfArena *a, u64 size) {
+    return if_arena_alloc_a(a, size, IF_ARENA_ALIGN);
+}
+
 void *if_arena_calloc(IfArena *a, u64 size) {
     void *p = if_arena_alloc(a, size);
+    memset(p, 0, size ? size : 1);
+    return p;
+}
+
+void *if_arena_calloc_a(IfArena *a, u64 size, u64 align) {
+    void *p = if_arena_alloc_a(a, size, align);
     memset(p, 0, size ? size : 1);
     return p;
 }
@@ -114,6 +125,12 @@ void if_arena_destroy(IfArena *a) {
 
 u64 if_arena_reserved(const IfArena *a) {
     return a->total_reserved;
+}
+
+u64 if_arena_used(const IfArena *a) {
+    u64 sum = 0;
+    for (const IfArenaBlock *b = a->head; b; b = b->next) sum += b->used;
+    return sum;
 }
 
 void *if_arena_grow(IfArena *a, void *ptr, u64 *cap, u64 need, u64 esz) {

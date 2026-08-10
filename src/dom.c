@@ -169,7 +169,7 @@ IfNode *if_dom_find_by_id(const IfDom *d, IfStr id) {
 }
 
 static IfNode *dom_new_node(IfArena *a, IfNodeKind kind) {
-    IfNode *n = (IfNode *)if_arena_alloc(a, sizeof(IfNode));
+    IfNode *n = (IfNode *)if_arena_alloc_a(a, sizeof(IfNode), 8); /* 8B: 69B を 80B に切り上げない（省メモリ） */
     memset(n, 0, sizeof *n);
     n->kind = kind;
     return n;
@@ -208,7 +208,7 @@ bool if_dom_attr_set(IfArena *a, IfNode *n, IfStr name, IfStr value) {
         }
     }
     /* 追加: 既存配列 + 1 を arena に複製 */
-    IfAttr *na = (IfAttr *)if_arena_alloc(a, (u64)(n->n_attrs + 1) * sizeof(IfAttr));
+    IfAttr *na = (IfAttr *)if_arena_alloc_a(a, (u64)(n->n_attrs + 1) * sizeof(IfAttr), 8);
     if (!na) return false;
     if (n->n_attrs) memcpy(na, n->attrs, (u64)n->n_attrs * sizeof(IfAttr));
     char *np = (char *)if_arena_alloc(a, (u64)name.n + 1);

@@ -83,15 +83,17 @@ typedef struct IfDoctype {
  * style は cascade が本文を読むため残す（描画に関係する）。 */
 extern bool if_dom_slim;
 
-typedef struct IfNode {
-    IfNodeKind kind;
+typedef struct __attribute__((packed)) IfNode {
+    u8 kind;             /* IfNodeKind（5 値。u8 で 3B 節約 — 2026-08-10 省メモリ） */
     u16 tag;             /* ELEMENT のみ有意 */
     u8 ns;               /* ELEMENT: IF_NS_* */
     u8 flags;            /* IF_NF_* */
     /* tag_name(ELEMENT) / text(TEXT,COMMENT) / dtype(DOCTYPE) は kind で排他 → union 化
      * （メモリ則: 112B→88B。PI は COMMENT で target+data を同時保持する必要があるため、
-     *   target は attrs[0].name に入れる＝COMMENT は attrs を使わない規約）。 */
-    union { IfStr tag_name; IfStr text; IfDoctype *dtype; } u;
+     *   target は attrs[0].name に入れる＝COMMENT は attrs を使わない規約）。
+     * packed + IfStr 12B 化で union は 12B（80B→68B の省メモリ。x86-64/ARMv7+ は
+     * unaligned アクセスがネイティブ。速度影響は実測で判断: BENCH 台帳） */
+    union __attribute__((packed)) { IfStr tag_name; IfStr text; IfDoctype *dtype; } u;
     IfAttr *attrs;
     u32 n_attrs;
     const struct IfStyle *style; /* カスケード後に付与（intern 所有・不変。監査: 全消費者 read-only） */

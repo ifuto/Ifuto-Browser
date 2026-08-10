@@ -369,7 +369,7 @@ static IfTok if_raw_token(IfHtmlTok *t) {
 static IfAttr *attrs_finish(IfHtmlTok *t, const IfAttr *attrs, u32 n, bool spilled) {
     if (spilled) return (IfAttr *)attrs; /* 稀な巨大属性タグの grow 路はそのまま所有 */
     if (!n) return NULL;
-    IfAttr *fin = (IfAttr *)if_arena_alloc(t->arena, (u64)n * sizeof(IfAttr));
+    IfAttr *fin = (IfAttr *)if_arena_alloc_a(t->arena, (u64)n * sizeof(IfAttr), 8); /* 24B 要素は 8B 倍数ステップ */
     memcpy(fin, attrs, (u64)n * sizeof(IfAttr));
     return fin;
 }
@@ -473,7 +473,7 @@ static IfTok if_tag_token(IfHtmlTok *t, bool is_end) {
                  * （中間ブロックは残留するが、攻撃者も属性バイトを支払うため増幅は線形に閉じる） */
                 spilled = true;
                 acap = 64;
-                IfAttr *na = (IfAttr *)if_arena_alloc(t->arena, acap * sizeof(IfAttr));
+                IfAttr *na = (IfAttr *)if_arena_alloc_a(t->arena, acap * sizeof(IfAttr), 8);
                 memcpy(na, attrs, (u64)n_attrs * sizeof(IfAttr));
                 attrs = na;
                 cap = 64;

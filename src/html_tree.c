@@ -65,7 +65,7 @@ typedef struct {
 } IfTB;
 
 static IfNode *new_node(IfTB *b, IfNodeKind kind) {
-    IfNode *n = (IfNode *)if_arena_calloc(b->arena, sizeof(IfNode));
+    IfNode *n = (IfNode *)if_arena_calloc_a(b->arena, sizeof(IfNode), 8); /* 8B アライン（69B 節約経路） */
     n->kind = kind;
     b->dom->n_nodes++;
     return n;
