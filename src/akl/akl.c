@@ -90,7 +90,7 @@ static bool akl_numv(AklVal v, double *out) {
 /* ============================== ヒープオブジェクト ============================== */
 
 enum { AKL_OK_STR = 1, AKL_OK_FUNC = 2, AKL_OK_ROPE = 3, AKL_OK_NATIVE = 4, AKL_OK_OBJ = 5, AKL_OK_HANDLE = 6,
-       AKL_OK_ARR = 7, AKL_OK_ENV = 8, AKL_OK_REGEX = 9, AKL_OK_PROMISE = 10 };
+       AKL_OK_ARR = 7, AKL_OK_ENV = 8, AKL_OK_REGEX = 9, AKL_OK_PROMISE = 10, AKL_OK_BIGINT = 11 };
 /* ROPE: code_off=左 obj idx, name=右 obj idx, n_params=深さ(最大4096), len=全長。
  * 不変条件: 子の index は親より小さい必要は「ない」（free-list 再利用で逆転し得る）。
  * よって GC の伝播は添字順に依らない明示ワークリストで行う。文字列は不変。
@@ -129,6 +129,7 @@ typedef struct {
         struct { AklVal *vals; u32 n; u32 parent; } env; /* ENV */
         struct { AklRex *rx; u32 flags; i32 last_index; } rex; /* REGEX（16B） */
         struct { u8 state; u8 pad[3]; AklVal value; } pr; /* PROMISE: 0=pending 1=resolved 2=rejected */
+        i64 big;                                          /* BIGINT: 64bit 整数値 */
     } u;
 } AklObj; /* 64B（v0.4: FUNC.thisv + PROMISE 追加で 56B から +8B。ARCH 台帳記録） */
 
@@ -217,6 +218,7 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_SUPERGET,            /* name u32 : 親クラス（関数 env の vals[0]）の name を push */
     OP_OBJSPREAD,           /* pop src → TOS の OBJ に全 props コピー（オブジェクト spread） */
     OP_ARGS,                /* imm なし : 現在関数の引数配列を push（arguments） */
+    OP_CONST_BIG,           /* i64 imm（8B）: BigInt オブジェクト生成 */
     OP_ARROWTHIS,           /* pop fn → fn.thisv = 現在フレーム this（アロー関数生成） */
     OP_AWAIT,               /* pop v → Promise なら解決値（簡易同期）、非 Promise はそのまま */
     OP_PROMISE_RESOLVE,     /* pop v → 解決済み Promise（state=1）を push（async 戻り値） */
@@ -739,7 +741,9 @@ typedef struct {
     const u8 *s; u32 n, pos, line;
     /* 現在トークン */
     u8 kind; u8 pk; /* KW: kw id / PUNCT: punct id */
-    double num; bool num_is_int; i32 num_i;
+    double num; bool num_is_int; bool num_is_big; i32 num_i;
+    i64 big_i; /* BigInt リテラル値（num_is_big 時） */
+    bool num_big_toobig; /* BigInt リテラルが 64bit 符号付き範囲を超えた */
     u32 str_len; const u8 *str_p; /* デコード済みは decode バッファに */
     u8 *esc; u32 esc_n, esc_cap;  /* 文字列デコード用（rt 外で確保） */
     u8 tpl_mid;   /* TK_TPL が ${...} の前（= 式が続く）か */
@@ -991,6 +995,7 @@ static int lex_next(Lex *lx) {
             lx->pos += 2;
             if (hex_dig(lex_cur(lx)) < 0) return -1;
             double hv = 0;
+            u64 hv64 = 0;
             u32 guard = 0;
             while (hex_dig(lex_cur(lx)) >= 0 || lex_cur(lx) == '_') {
                 if (lex_cur(lx) == '_') {
@@ -999,14 +1004,18 @@ static int lex_next(Lex *lx) {
                     continue;
                 }
                 hv = hv * 16 + (double)hex_dig(lex_cur(lx));
+                hv64 = hv64 * 16 + (u32)hex_dig(lex_cur(lx));
                 lx->pos++;
                 if (++guard > 16) return -1; /* 実効桁上限（巨大 16 進は拒否） */
+                if (guard == 16 && hv64 > 0x7FFFFFFFFFFFFFFFull) return -1; /* 符号付き 64bit 超は拒否 */
             }
             lx->num = hv;
+            lx->big_i = (i64)hv64;
         } else if (c == '0' && (lex_at(lx, 1) == 'b' || lex_at(lx, 1) == 'B')) {
             lx->pos += 2;
             if (lex_cur(lx) != '0' && lex_cur(lx) != '1') return -1;
             double bv = 0;
+            u64 bv64 = 0;
             u32 guard = 0;
             while (lex_cur(lx) == '0' || lex_cur(lx) == '1' || lex_cur(lx) == '_') {
                 if (lex_cur(lx) == '_') {
@@ -1016,14 +1025,18 @@ static int lex_next(Lex *lx) {
                     continue;
                 }
                 bv = bv * 2 + (double)(lex_cur(lx) - '0');
+                bv64 = (bv64 << 1) | (u64)(lex_cur(lx) - '0');
                 lx->pos++;
-                if (++guard > 48) return -1; /* 2^48 まで double で正確 */
+                if (++guard > 64) return -1; /* 64bit 上限（BigInt リテラル対応で拡張） */
+                if (guard == 64 && bv64 > 0x7FFFFFFFFFFFFFFFull) return -1; /* 符号付き 64bit 超は拒否 */
             }
             lx->num = bv;
+            lx->big_i = (i64)bv64;
         } else if (c == '0' && (lex_at(lx, 1) == 'o' || lex_at(lx, 1) == 'O')) {
             lx->pos += 2;
             if (lex_cur(lx) < '0' || lex_cur(lx) > '7') return -1;
             double ov = 0;
+            u64 ov64 = 0;
             u32 guard = 0;
             while ((lex_cur(lx) >= '0' && lex_cur(lx) <= '7') || lex_cur(lx) == '_') {
                 if (lex_cur(lx) == '_') {
@@ -1033,26 +1046,43 @@ static int lex_next(Lex *lx) {
                     continue;
                 }
                 ov = ov * 8 + (double)(lex_cur(lx) - '0');
+                ov64 = ov64 * 8 + (u64)(lex_cur(lx) - '0');
                 lx->pos++;
-                if (++guard > 16) return -1; /* 8^16 = 2^48 まで正確 */
+                if (++guard > 22) return -1; /* 8^22 > 2^64 */
+                if (guard == 22 && ov64 > 0x7FFFFFFFFFFFFFFFull) return -1; /* 符号付き 64bit 超は拒否 */
             }
             lx->num = ov;
+            lx->big_i = (i64)ov64;
         } else {
             {
                 u32 dpos0 = lx->pos;
                 if (!lex_digits(lx)) return -1;
                 lx->pos = dpos0;
+                u64 dv64 = 0;
+                bool toobig = false;
                 while (lex_cur(lx) >= '0' && lex_cur(lx) <= '9') {
                     v = v * 10 + (double)(lex_cur(lx) - '0');
+                    if (!toobig) {
+                        u64 digit = (u64)(lex_cur(lx) - '0');
+                        if (dv64 > ((u64)0x7FFFFFFFFFFFFFFFull - digit) / 10) toobig = true;
+                        else dv64 = dv64 * 10 + digit;
+                    }
                     lx->pos++;
                 }
                 while (lex_cur(lx) == '_') { /* 区切りは数値計算では無視 */
                     lx->pos++;
                     while (lex_cur(lx) >= '0' && lex_cur(lx) <= '9') {
                         v = v * 10 + (double)(lex_cur(lx) - '0');
+                        if (!toobig) {
+                            u64 digit = (u64)(lex_cur(lx) - '0');
+                            if (dv64 > ((u64)0x7FFFFFFFFFFFFFFFull - digit) / 10) toobig = true;
+                            else dv64 = dv64 * 10 + digit;
+                        }
                         lx->pos++;
                     }
                 }
+                lx->big_i = (i64)dv64;
+                lx->num_big_toobig = toobig;
             }
             if (lex_cur(lx) == '.') {
                 is_int = false;
@@ -1085,6 +1115,20 @@ static int lex_next(Lex *lx) {
             if (ad <= 2147483647.0) { lx->num_is_int = true; lx->num_i = (i32)lx->num; }
             else lx->num_is_int = false;
         } else lx->num_is_int = false;
+        /* BigInt リテラル: 数字列の直後に 'n'（0n / 10n / 0xFFn / 0b101n / 0o77n） */
+        if (is_int && lex_cur(lx) == 'n') {
+            /* 値は lx->num から再構築（16/2/8 進は double 精度で十分 — 64bit に収まる桁なら
+             * 正確。u64 として読むためにスキャン位置を戻して再計算する） */
+            lx->pos++; /* 'n' を消費 */
+            if (lx->num_big_toobig) return -1; /* 64bit 符号付き範囲超は SyntaxError（lex error 経由） */
+            lx->num_is_big = true;
+            /* big_i はスキャン時に u64 蓄積済み（double 精度 2^53 を超えても正確）。
+             * 64bit 符号付き範囲を超えるリテラルは拒否（JS は任意精度だが akl は
+             * 64bit 近似 — 黙って wrap せず明白に失敗させる。AKL_COMPAT に明記） */
+            lx->kind = TK_NUM;
+            return 0;
+        }
+        lx->num_is_big = false;
         lx->kind = TK_NUM;
         return 0;
     }
@@ -1174,6 +1218,7 @@ enum {
     N_SWITCH,   /* a=disc node, b=case list first, c=count */
     N_CASE,     /* a=expr（N_NONE=default）, b=body stmt */
     N_FUNCEXPR, /* 関数式: N_FUNC と同形（d=body）。a=name idx（無名は UINT32_MAX） */
+    N_BIGINT,   /* BigInt リテラル: a=lo32, b=hi32（u64 値） */
     N_AWAIT,    /* await: a=式（async 関数内のみ。Promise は解決値を展開） */
     N_ARGS,     /* arguments: 現在関数の引数配列（関数本体のみ。main は実行時エラー） */
     N_LABEL,    /* ラベル文: a=ラベル名 idx, b=本体文, flags bit0=本体がループ */
@@ -1775,16 +1820,26 @@ static u32 p_primary(P *p) {
     if (++p->depth > AKL_PARSE_DEPTH) { p->depth--; p->fail = "parse depth exhausted"; return N_NONE; }
     Lex *lx = &p->lx;
     if (lx->kind == TK_NUM) {
-        u32 ni = p_node(p, N_NUM);
-        if (ni != N_NONE) {
-            p->nodes[ni].op = lx->num_is_int ? 1 : 0;
-            if (lx->num_is_int) p->nodes[ni].a = (u32)lx->num_i;
-            else {
-                AklVal bits;
-                double d = lx->num;
-                memcpy(&bits, &d, 8);
-                p->nodes[ni].b = (u32)(bits >> 32);
-                p->nodes[ni].a = (u32)bits;
+        u32 ni;
+        if (lx->num_is_big) {
+            ni = p_node(p, N_BIGINT);
+            if (ni != N_NONE) {
+                u64 bv = (u64)lx->big_i;
+                p->nodes[ni].a = (u32)bv;
+                p->nodes[ni].b = (u32)(bv >> 32);
+            }
+        } else {
+            ni = p_node(p, N_NUM);
+            if (ni != N_NONE) {
+                p->nodes[ni].op = lx->num_is_int ? 1 : 0;
+                if (lx->num_is_int) p->nodes[ni].a = (u32)lx->num_i;
+                else {
+                    AklVal bits;
+                    double d = lx->num;
+                    memcpy(&bits, &d, 8);
+                    p->nodes[ni].b = (u32)(bits >> 32);
+                    p->nodes[ni].a = (u32)bits;
+                }
             }
         }
         lex_next(lx);
@@ -4120,6 +4175,12 @@ static void cg_expr(Cg *cg, u32 ni) {
     case N_STR:   cg_op(cg, OP_CONST_STR); cg_u32(cg, n->a); break;
     case N_ARGS:  cg_op(cg, OP_ARGS); break;
     case N_AWAIT: cg_expr(cg, n->a); cg_op(cg, OP_AWAIT); break;
+    case N_BIGINT: {
+        cg_op(cg, OP_CONST_BIG);
+        u64 bv = ((u64)n->b << 32) | n->a;
+        for (int i = 0; i < 8; i++) cg_push_byte(cg, (u8)(bv >> (8 * i)));
+        break;
+    }
     case N_REGEX: cg_op(cg, OP_NEWREGEX); cg_u32(cg, n->a); cg_u32(cg, n->b); break;
     case N_SUPERGET: /* super.name → 親クラス（関数 env の vals[0]）の name */
         cg_op(cg, OP_SUPERGET);
@@ -5803,6 +5864,8 @@ static u32 akl_op_imm_len(u8 op) {
         return 4;
     case OP_MCALLN:
         return 8;   /* slot u32 | name u32 */
+    case OP_CONST_BIG:
+        return 8;   /* i64 */
     case OP_PSETDYN:
         return 0;
     case OP_ELOAD: case OP_ESTORE:
@@ -6270,6 +6333,8 @@ static double akl_to_number(AklRT *rt, AklVal v) {
     if (v == AKL_VAL_NULL) return 0.0;
     if (v == AKL_VAL_UNDEF) return akl_canon(0.0 / 0.0);
     if (akl_is_objv(v)) {
+        if (rt->objs[akl_get_obj(v)].kind == AKL_OK_BIGINT)
+            return (double)rt->objs[akl_get_obj(v)].u.big; /* 精度落ち（AKL_COMPAT） */
         if (akl_is_strly(rt, v)) {
             u32 sl;
             const u8 *sb = akl_str(rt, akl_get_obj(v), &sl); /* ROPE は初回のみ平坦化 */
@@ -6381,6 +6446,12 @@ static u32 akl_to_string(AklRT *rt, AklVal v) {
     if (akl_is_objv(v)) {
         AklObj *o = &rt->objs[akl_get_obj(v)];
         if (o->kind == AKL_OK_STR || o->kind == AKL_OK_ROPE) return akl_get_obj(v); /* ROPE は文字列そのもの。flatten は読み出し時に遅延 */
+        if (o->kind == AKL_OK_BIGINT) {
+            char buf[32];
+            int n = snprintf(buf, sizeof buf, "%lld", (long long)o->u.big);
+            if (n < 0) return akl_mkstr(rt, (const u8 *)"0", 1);
+            return akl_mkstr(rt, (const u8 *)buf, (u32)n);
+        }
         if (o->kind == AKL_OK_FUNC || o->kind == AKL_OK_NATIVE) return akl_mkstr(rt, (const u8 *)"function", 8);
         if (o->kind == AKL_OK_PROMISE) return akl_mkstr(rt, (const u8 *)"[object Promise]", 16);
         if (o->kind == AKL_OK_OBJ) return akl_mkstr(rt, (const u8 *)"[object Object]", 15);
@@ -6434,7 +6505,26 @@ static u32 akl_to_string(AklRT *rt, AklVal v) {
     return akl_mkstr(rt, (const u8 *)"[unknown]", 9);
 }
 
+static bool akl_is_big(AklRT *rt, AklVal v, i64 *out) {
+    if (!akl_is_objv(v)) return false;
+    u32 oi = akl_get_obj(v);
+    if (oi >= rt->n_objs || rt->objs[oi].kind != AKL_OK_BIGINT) return false;
+    if (out) *out = rt->objs[oi].u.big;
+    return true;
+}
+static AklVal akl_mkbigint(AklRT *rt, i64 v) {
+    rt->gc_sp = rt->gc_sp; /* 呼出側が同期済み */
+    u32 oi = akl_obj_new(rt);
+    if (oi == UINT32_MAX) return akl_mkundefined();
+    rt->objs[oi].kind = AKL_OK_BIGINT;
+    rt->objs[oi].u.big = v;
+    return AKL_MK_OBJ(oi);
+}
+
 static bool akl_strict_eq(AklRT *rt, AklVal a, AklVal b) {
+    i64 sba, sbb;
+    if (akl_is_big(rt, a, &sba) && akl_is_big(rt, b, &sbb)) return sba == sbb;
+    if (akl_is_big(rt, a, NULL) || akl_is_big(rt, b, NULL)) return false; /* 10n === 10 は false */
     double da, db;
     bool na = akl_numv(a, &da), nb = akl_numv(b, &db);
     if (na && nb) return da == db;
@@ -6462,7 +6552,12 @@ static bool akl_loose_eq(AklRT *rt, AklVal a, AklVal b) {
     if (akl_is_objv(a) && rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_get_obj(a);
     if (akl_is_objv(b) && rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_get_obj(b);
     bool r = false;
-    if (akl_strict_eq(rt, a, b)) r = true;
+    i64 ba, bb;
+    bool ab = akl_is_big(rt, a, &ba), bbb = akl_is_big(rt, b, &bb);
+    if (ab && bbb) r = ba == bb;
+    else if (ab && akl_numv(b, &(double){0})) r = akl_to_number(rt, a) == akl_to_number(rt, b);
+    else if (bbb && akl_numv(a, &(double){0})) r = akl_to_number(rt, a) == akl_to_number(rt, b);
+    else if (akl_strict_eq(rt, a, b)) r = true;
     else if ((a == AKL_VAL_NULL && b == AKL_VAL_UNDEF) || (a == AKL_VAL_UNDEF && b == AKL_VAL_NULL)) r = true;
     else if (akl_is_strly(rt, a)) {
         double db;
@@ -6487,6 +6582,12 @@ static bool akl_loose_eq(AklRT *rt, AklVal a, AklVal b) {
  * ADD 命令と LINC 非 int フォールバックで共有するため分離。
  * sp は GC ルート深さ（文字列経路のみ使用）。失敗時 false（rt->err 設定済み）。 */
 static bool akl_bin_add(AklRT *rt, AklVal va, AklVal vb, u32 sp, AklVal *out) {
+    i64 bba, bbb;
+    if (akl_is_big(rt, va, &bba) && akl_is_big(rt, vb, &bbb)) {
+        rt->gc_sp = sp;
+        *out = akl_mkbigint(rt, bba + bbb); /* i64 正確（溢出は wrap。AKL_COMPAT） */
+        return true;
+    }
     if (akl_is_intv(va) && akl_is_intv(vb)) {
         i64 r = (i64)akl_get_int(va) + (i64)akl_get_int(vb);
         if (r >= -2147483648ll && r <= 2147483647ll) { *out = AKL_MK_INT((i32)r); return true; }
@@ -9519,6 +9620,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_SUPERGET] = &&l_SUPERGET,
         [OP_OBJSPREAD] = &&l_OBJSPREAD,
         [OP_ARGS] = &&l_ARGS,
+        [OP_CONST_BIG] = &&l_CONST_BIG,
         [OP_ARROWTHIS] = &&l_ARROWTHIS,
         [OP_AWAIT] = &&l_AWAIT,
         [OP_PROMISE_RESOLVE] = &&l_PROMISE_RESOLVE,
@@ -9564,6 +9666,13 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
 
     AKL_L(ADD): {
         AklVal vb = AKL_POP(), va = AKL_POP();
+        i64 ba, bb;
+        if (akl_is_big(rt, va, &ba) && akl_is_big(rt, vb, &bb)) {
+            /* BigInt + BigInt: i64 正確（溢出は wrap。AKL_COMPAT） */
+            rt->gc_sp = sp;
+            AKL_PUSH(akl_mkbigint(rt, ba + bb));
+            AKL_NEXT();
+        }
         AklVal out;
         if (!akl_bin_add(rt, va, vb, sp, &out)) { free(frames); return false; }
         AKL_PUSH(out);
@@ -9571,6 +9680,12 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
     }
     AKL_L(SUB): {
         AklVal vb = AKL_POP(), va = AKL_POP();
+        i64 ba, bb;
+        if (akl_is_big(rt, va, &ba) && akl_is_big(rt, vb, &bb)) {
+            rt->gc_sp = sp;
+            AKL_PUSH(akl_mkbigint(rt, ba - bb));
+            AKL_NEXT();
+        }
         if (akl_is_intv(va) && akl_is_intv(vb)) {
             i64 r = (i64)akl_get_int(va) - (i64)akl_get_int(vb);
             if (r >= -2147483648ll && r <= 2147483647ll) { AKL_PUSH(AKL_MK_INT((i32)r)); AKL_NEXT(); }
@@ -9585,6 +9700,12 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
     }
     AKL_L(MUL): {
         AklVal vb = AKL_POP(), va = AKL_POP();
+        i64 ba, bb;
+        if (akl_is_big(rt, va, &ba) && akl_is_big(rt, vb, &bb)) {
+            rt->gc_sp = sp;
+            AKL_PUSH(akl_mkbigint(rt, ba * bb));
+            AKL_NEXT();
+        }
         if (akl_is_intv(va) && akl_is_intv(vb)) {
             i64 r = (i64)akl_get_int(va) * (i64)akl_get_int(vb);
             if (r >= -2147483648ll && r <= 2147483647ll) { AKL_PUSH(AKL_MK_INT((i32)r)); AKL_NEXT(); }
@@ -9597,9 +9718,30 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AKL_PUSH(akl_num(akl_canon(da_ * db_)));
         AKL_NEXT();
     }
-    AKL_L(DIV): { AKL_BINOP_NUM(da_ / db_); AKL_NEXT(); }
+    AKL_L(DIV): {
+        AklVal vb = AKL_POP(), va = AKL_POP();
+        i64 ba, bb;
+        if (akl_is_big(rt, va, &ba) && akl_is_big(rt, vb, &bb)) {
+            if (bb == 0) { akl_errf(rt, "RangeError: BigInt division by zero"); free(frames); return false; }
+            rt->gc_sp = sp;
+            AKL_PUSH(akl_mkbigint(rt, ba / bb)); /* 切り捨て（JS BigInt は 0 方向 trunc） */
+            AKL_NEXT();
+        }
+        rt->gc_sp = sp;
+        double da_, db_;
+        akl_to_number2(rt, va, vb, &da_, &db_);
+        AKL_PUSH(akl_num(akl_canon(da_ / db_)));
+        AKL_NEXT();
+    }
     AKL_L(MOD): {
         AklVal vb = AKL_POP(), va = AKL_POP();
+        i64 ba, bb;
+        if (akl_is_big(rt, va, &ba) && akl_is_big(rt, vb, &bb)) {
+            if (bb == 0) { akl_errf(rt, "RangeError: BigInt division by zero"); free(frames); return false; }
+            rt->gc_sp = sp;
+            AKL_PUSH(akl_mkbigint(rt, ba % bb));
+            AKL_NEXT();
+        }
         if (akl_is_intv(va) && akl_is_intv(vb)) {
             i32 ia = akl_get_int(va), ib = akl_get_int(vb);
             if (ib != 0 && !(ia == INT32_MIN && ib == -1)) { AKL_PUSH(AKL_MK_INT(ia % ib)); AKL_NEXT(); }
@@ -9611,8 +9753,14 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AKL_NEXT();
     }
     /* 比較 4 命令は独立本体（dispatch 両モードで壊れないマクロ展開。文字列辞書式は両辺 string のみ） */
-#define AKL_REL(NUMCMP, STRCMP, INTCMP) { \
+#define AKL_REL(NUMCMP, STRCMP, INTCMP, BIGCMP) { \
         AklVal rb_ = AKL_POP(), ra_ = AKL_POP(); \
+        i64 rba_, rbb_; \
+        if (akl_is_big(rt, ra_, &rba_) && akl_is_big(rt, rb_, &rbb_)) { \
+            bool rb_ = (BIGCMP); \
+            AKL_PUSH(rb_ ? AKL_VAL_TRUE : AKL_VAL_FALSE); \
+            AKL_NEXT(); \
+        } \
         if (akl_is_intv(ra_) && akl_is_intv(rb_)) { \
             i32 ia_ = akl_get_int(ra_), ib_ = akl_get_int(rb_); \
             AKL_PUSH((INTCMP) ? AKL_VAL_TRUE : AKL_VAL_FALSE); \
@@ -9640,10 +9788,10 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             AKL_PUSH(r_ ? AKL_VAL_TRUE : AKL_VAL_FALSE); \
         } \
         AKL_NEXT(); }
-    AKL_L(LT): { AKL_REL(da_ <  db_, cmp_ <  0, ia_ <  ib_); }
-    AKL_L(LE): { AKL_REL(da_ <= db_, cmp_ <= 0, ia_ <= ib_); }
-    AKL_L(GT): { AKL_REL(da_ >  db_, cmp_ >  0, ia_ >  ib_); }
-    AKL_L(GE): { AKL_REL(da_ >= db_, cmp_ >= 0, ia_ >= ib_); }
+    AKL_L(LT): { AKL_REL(da_ <  db_, cmp_ <  0, ia_ <  ib_, rba_ <  rbb_); }
+    AKL_L(LE): { AKL_REL(da_ <= db_, cmp_ <= 0, ia_ <= ib_, rba_ <= rbb_); }
+    AKL_L(GT): { AKL_REL(da_ >  db_, cmp_ >  0, ia_ >  ib_, rba_ >  rbb_); }
+    AKL_L(GE): { AKL_REL(da_ >= db_, cmp_ >= 0, ia_ >= ib_, rba_ >= rbb_); }
 #undef AKL_REL
     AKL_L(EQ):  { AklVal vb = AKL_POP(), va = AKL_POP(); rt->gc_sp = sp; bool r_ = akl_loose_eq(rt, va, vb);   if (rt->err[0]) { free(frames); return false; } AKL_PUSH(r_  ? AKL_VAL_TRUE : AKL_VAL_FALSE); AKL_NEXT(); }
     AKL_L(NE):  { AklVal vb = AKL_POP(), va = AKL_POP(); rt->gc_sp = sp; bool r_ = akl_loose_eq(rt, va, vb);   if (rt->err[0]) { free(frames); return false; } AKL_PUSH(!r_ ? AKL_VAL_TRUE : AKL_VAL_FALSE); AKL_NEXT(); }
@@ -9675,6 +9823,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             s = (ok_ == AKL_OK_STR || ok_ == AKL_OK_ROPE) ? "string"
               : (ok_ == AKL_OK_OBJ || ok_ == AKL_OK_HANDLE || ok_ == AKL_OK_ARR ||
                  ok_ == AKL_OK_PROMISE || ok_ == AKL_OK_REGEX) ? "object"
+              : (ok_ == AKL_OK_BIGINT) ? "bigint"
               : "function"; /* FUNC / NATIVE */
         }
         else s = "undefined";
@@ -11860,6 +12009,17 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AKL_PUSH(AKL_MK_OBJ(oi));
         AKL_NEXT();
     }
+    AKL_L(CONST_BIG): {
+        u64 bv = 0;
+        for (int i = 0; i < 8; i++) bv |= (u64)*pc++ << (8 * i);
+        rt->gc_sp = sp;
+        u32 oi = akl_obj_new(rt);
+        if (oi == UINT32_MAX) { free(frames); return false; }
+        rt->objs[oi].kind = AKL_OK_BIGINT;
+        rt->objs[oi].u.big = (i64)bv;
+        AKL_PUSH(AKL_MK_OBJ(oi));
+        AKL_NEXT();
+    }
     AKL_L(ARROWTHIS): {
         /* pop fn → fn.thisv = 現在フレームの this（base+0）。アロー関数の this 固定 */
         AklVal fv = AKL_POP();
@@ -12328,6 +12488,7 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
             "SUPERGET",
             "OBJSPREAD",
             "ARGS",
+            "CONST_BIG",
             "ARROWTHIS",
             "AWAIT",
             "PROMISE_RESOLVE",
@@ -12510,6 +12671,16 @@ const char *akl_as_str(AklRT *rt, AklVal v, uint32_t *len) {
     if (!rt || !akl_is_objv(v)) return NULL;
     u32 oi = akl_get_obj(v);
     if (oi >= rt->n_objs) return NULL;
+    if (rt->objs[oi].kind == AKL_OK_BIGINT) {
+        /* BigInt は文字列化して返す（即束縛規約。GC で消える前にコピーすること） */
+        u32 si = akl_to_string(rt, v);
+        if (si == UINT32_MAX) return NULL;
+        u32 sl;
+        const u8 *sb = akl_str(rt, si, &sl);
+        if (!sb) return NULL;
+        if (len) *len = sl;
+        return (const char *)sb;
+    }
     if (rt->objs[oi].kind != AKL_OK_STR && rt->objs[oi].kind != AKL_OK_ROPE) return NULL;
     /* NUL 終端を API として約束するための 1 バイト余裕は mkstr で確保していない。
      * len 参照 API なので NUL は返さない（bytes は len まで有効）。ROPE はここで平坦化。

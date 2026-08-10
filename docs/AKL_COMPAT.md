@@ -82,6 +82,8 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | アロー関数 `(x) => expr` / `x => expr` / `() => { ... }`（this は生成時点に固定） | `[1,2,3].map(x => x*2)` | `[2,4,6]` |
 | `Promise`（new Promise(executor)・resolve/reject・then/catch/finally・Promise.resolve/reject。同期解決近似） | `new Promise(res=>res(5)).then(v=>v*2)` | 同期コールバックで `10` |
 | `async function`（戻り値は解決済み Promise で包む）・`await`（Promise は解決値に展開） | `async function f(){ return await Promise.resolve(10)*2; }` | `.then` で `20` |
+| BigInt `123n`（10/16/2/8 進・区切り可）。64bit 符号付き範囲内 | `9007199254740993n + 1n` | `9007199254740994`（i64 正確） |
+| BigInt 演算 `+ - * / %`（同士は i64 正確・0 除算は RangeError）・比較・`==`（10n==10 は true）・`===`（10n===10 は false）・`typeof` | `10n / 3n` | `3n` |
 | 文頭 `{a:1}` の曖昧性 | ブロック文 + ラベル + 式文として解釈（JS 準拠） | `1` |
 
 意味の精度はテスト固定: `0.1+0.2 === 0.30000000000000004`、`1/0 = Infinity`、
@@ -95,6 +97,9 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 | `with` 文・ラベルなしの非ループ break（`foo: { break; }` の無名 break） | SyntaxError / break outside loop（ラベル付きは対応） |
 | 関数外の `arguments` | ReferenceError（JS の module スコープでは undefined だが、簡易近似として明白にエラー） |
 | pending の Promise に対する `then` / `await` | コールバックは呼ばれず undefined Promise / undefined を返す（同期近似。setTimeout 等の非同期基盤が無いため） |
+| 64bit 符号付き範囲を超える BigInt リテラル（`9223372036854775808n` 等） | SyntaxError（akl は 64bit 近似のため黙って wrap せず明白に失敗。JS は任意精度） |
+| BigInt と Number の混合演算 | Number に変換して実行（精度落ち。`10n + 5` は 15） |
+| 2^53 を超える BigInt の `akl_to_number` / `akl_as_num` 経由 | double 化で精度落ち（文字列化 `'' + 9007199254740993n` は正確） |
 | アロー関数での `arguments` | 呼び出し側の arguments（生成時でなく呼び出しフレームの。JS はレキシカル） |
 | `async` を識別子として使用 | `var async = 1` は async function として解釈され得る（キーワード優先。`async: 1` 等のプロパティは通常動作） |
 | `var arguments = ...` によるシャドウ | 非対応（関数内の arguments は常に引数配列） |
@@ -144,6 +149,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 17. ✅ ラベル break/continue・debugger・eval 間 last_val 残留修正（2026-08-09）
 18. ✅ arguments（2026-08-09: AklFrame に argc 記録（16B→24B）。超過引数はローカル領域の後ろに逆順コピーで保護（順方向だと値が伝播するバグを実測で特定・修正））
 19. ✅ アロー関数・Promise・async/await（2026-08-09: 同期解決近似。AklObj 64B 化（thisv + PROMISE kind）。lexer の TK_KW str_p 未設定バグを修正（.catch 等のプロパティ名が旧トークンを指していた））
+19b. ✅ BigInt（2026-08-10: AKL_OK_BIGINT + OP_CONST_BIG。スキャン時に u64 蓄積で 2^53 超も正確。akl_bin_add 等の融合命令経由でも i64 正確を保証）
 
 ## V8 との位置づけ
 

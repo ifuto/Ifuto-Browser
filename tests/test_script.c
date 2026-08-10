@@ -364,7 +364,34 @@ static void test_script_arrow_promise_async(void) {
     tscr_end(&t);
 }
 
+
+static void test_script_bigint(void) {
+    TScr t;
+    tscr_begin(&t, "<!DOCTYPE html><title>Z0</title><div id=a>start</div>"
+                   "<script>"
+                   "var big = 9007199254740993n;"
+                   "var sum = big + 1n;"
+                   "console.log('bg1', '' + sum);"
+                   "var n = 10n;"
+                   "console.log('bg2', '' + (n * 3n));"
+                   "console.log('bg3', typeof n);"
+                   "var ok2 = (10n == 10) ? 'yes' : 'no';"
+                   "document.getElementById('a').textContent = '' + sum + ':' + ok2;"
+                   "</script>");
+    tscr_run(&t);
+    CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
+    CHECK(strstr(t.logbuf, "[script:console] bg1 9007199254740994\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] bg2 30\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] bg3 bigint\n") != NULL);
+    IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
+    CHECK(d != NULL);
+    IfStr txt = if_dom_text_content(&t.a, d);
+    CHECK(txt.n == 20 && memcmp(txt.p, "9007199254740994:yes", 20) == 0);
+    tscr_end(&t);
+}
+
 void test_script(void) {
+    test_script_bigint();
     test_script_arrow_promise_async();
     test_script_objlit_ext();
     test_script_fields_length();

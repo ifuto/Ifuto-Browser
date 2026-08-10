@@ -889,6 +889,7 @@ static void t_v04_objlit_ext(void);
 static void t_v04_labels(void);
 static void t_v04_arguments(void);
 static void t_v04_arrow_promise_async(void);
+static void t_v04_bigint(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -950,6 +951,8 @@ void test_akl(void) {
     t_v04_arguments();
     fprintf(stderr, "  %-40s", "t_v04_arrow_promise_async");
     t_v04_arrow_promise_async();
+    fprintf(stderr, "  %-40s", "t_v04_bigint");
+    t_v04_bigint();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -1738,4 +1741,47 @@ static void t_v04_arrow_promise_async(void) {
     /* エラー */
     want_err("await 5", "await");
     want_err("var f = () => { return 1; }; f(); break", "break");
+}
+
+/* ================= v0.4: BigInt ================= */
+static void t_v04_bigint(void) {
+    /* リテラル */
+    want_num("10n + 0", 10); /* CLI 表示用に number 化するが値は正しい */
+    want_str("'' + 10n", "10");
+    want_str("'' + 0xFFn", "255");
+    want_str("'' + 0b101n", "5");
+    want_str("'' + 0o77n", "63");
+    want_str("'' + 0n", "0");
+    want_str("'' + 123456789012345678n", "123456789012345678");
+    /* 64bit 正確演算（2^53 超） */
+    want_str("'' + (9007199254740993n + 1n)", "9007199254740994");
+    want_str("'' + 9223372036854775807n", "9223372036854775807");
+    want_str("'' + (0x7FFFFFFFFFFFFFFFn)", "9223372036854775807");
+    /* 演算 */
+    want_str("'' + (10n + 5n)", "15");
+    want_str("'' + (10n - 3n)", "7");
+    want_str("'' + (10n * 3n)", "30");
+    want_str("'' + (10n / 3n)", "3");
+    want_str("'' + (10n % 3n)", "1");
+    want_str("'' + (10n * 2n + 1n)", "21");
+    /* 比較 */
+    want_bool("10n > 5n", true);
+    want_bool("10n < 5n", false);
+    want_bool("10n == 10n", true);
+    want_bool("10n === 10n", true);
+    want_bool("10n == 10", true);
+    want_bool("10n === 10", false);
+    /* typeof・文字列化 */
+    want_str("typeof 10n", "bigint");
+    want_str("'' + 10n", "10");
+    /* 変数・関数 */
+    want_str("var x = 10n; '' + (x * 2n)", "20");
+    want_str("function f(x) { return '' + (x + 1n); } f(41n)", "42");
+    want_str("var a = [1n, 2n, 3n]; '' + (a[0] + a[1] + a[2])", "6");
+    /* エラー */
+    want_err("123456789012345678901234567890n", "lex error");
+    want_err("9223372036854775808n", "lex error");
+    want_err("0xFFFFFFFFFFFFFFFFn", "lex error");
+    want_err("10n % 0n", "RangeError");
+    want_err("1n / 0n", "RangeError");
 }
