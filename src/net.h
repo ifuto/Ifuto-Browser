@@ -11,6 +11,7 @@
 #include "common.h"
 #include "strutil.h"
 #include "arena.h"
+#include <sys/socket.h> /* struct sockaddr（if_addr_is_private の引数型） */
 
 #define IF_HTTP_MAX_BYTES (32u * 1024u * 1024u) /* 応答全体の上限 */
 #define IF_HTTP_MAX_REDIRECTS 5
@@ -27,6 +28,8 @@ typedef struct {
  * 受理しないもの: http/https 以外の scheme、userinfo('@')、IPv6 bracket、
  * 空 host、port 0/非数/桁溢れ、host/path の長さ溢れ。 */
 bool if_http_parse_url(const char *url, IfHttpUrl *out);
+/* v0.5: アドレスが private/loopback/link-local/CGNAT か（DNS rebinding / SSRF 対策の判定） */
+bool if_addr_is_private(const struct sockaddr *sa);
 
 /* base（現在の絶対 URL）に対して Location 値 loc を解決して out(cap) へ。
  * absolute / "//host" scheme-relative / "/abs" / 相対 / "?q" を受理。

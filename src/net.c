@@ -23,6 +23,8 @@ static const char *E_BIG = "too large";
 static const char *E_RESP = "bad response";
 static const char *E_TRUNC = "truncated";
 static const char *E_LOOP = "redirect loop";
+static const char *E_PRIV = "private redirect blocked"; /* DNS rebinding / SSRF 対策（v0.5） */
+static const char *E_DOWNGRADE = "https downgrade blocked"; /* https→http 降格（v0.5） */
 static const char *E_TLS = "tls";
 static const char *E_CERT = "cert";
 static const char *E_CA = "ca";
@@ -314,8 +316,34 @@ bad:
 
 /* ---- ソケット ---- */
 
-/* 0 以上 = fd、-1 = connect 失敗、-2 = DNS 失敗 */
-static int connect_one(const char *host, u16 port) {
+/* リダイレクト経由の接続では private/loopback/link-local を拒否（DNS rebinding / SSRF 対策。
+ * トップレベル（ユーザ直接入力）は allow_private=true — ローカル開発サーバ等を壊さない。
+ * 公開: tests/test_http.c がユニット検査する。 */
+bool if_addr_is_private(const struct sockaddr *sa) {
+    if (sa->sa_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+        uint32_t a = ntohl(sin->sin_addr.s_addr);
+        if ((a >> 24) == 127) return true;          /* 127.0.0.0/8 */
+        if ((a >> 24) == 10) return true;           /* 10.0.0.0/8 */
+        if ((a >> 24) == 169 && (a >> 16) == 0xA9FE) return true; /* 169.254.0.0/16 */
+        if ((a >> 24) == 172) { /* 172.16.0.0/12: 第 2 オクテット 16..31 */
+            u32 o2 = (a >> 16) & 0xFF;
+            if (o2 >= 16 && o2 <= 31) return true;
+        }
+        if ((a >> 24) == 192 && (a >> 16) == 0xC0A8) return true; /* 192.168.0.0/16 */
+        if ((a >> 24) == 100) { /* 100.64.0.0/10 CGNAT: 第 2 オクテット 64..127 */
+            u32 o2 = (a >> 16) & 0xFF;
+            if (o2 >= 64 && o2 <= 127) return true;
+        }
+        if (a == 0) return true;                    /* 0.0.0.0/8 */
+        return false;
+    }
+    return false; /* AF_INET のみ使用中。他は許可しない判定不要 */
+}
+
+/* 0 以上 = fd、-1 = connect 失敗、-2 = DNS 失敗。
+ * out_private（NULL 可）: 接続成功したアドレスが private か（チェーン追跡用） */
+static int connect_one(const char *host, u16 port, bool allow_private, bool *out_private) {
     char ps[8];
     snprintf(ps, sizeof ps, "%u", (unsigned)port);
     struct addrinfo hints;
@@ -326,6 +354,7 @@ static int connect_one(const char *host, u16 port) {
     if (getaddrinfo(host, ps, &hints, &res) != 0) return -2;
     int fd = -1;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        if (!allow_private && if_addr_is_private(ai->ai_addr)) continue; /* private は試さない */
         fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
         int fl = fcntl(fd, F_GETFL, 0);
@@ -350,6 +379,7 @@ static int connect_one(const char *host, u16 port) {
             }
         }
         if (rc == 0) {
+            if (out_private) *out_private = if_addr_is_private(ai->ai_addr);
             /* ブロッキングに戻し、送受信は SO_*TIMEO で縛る（10s/回） */
             fcntl(fd, F_SETFL, fl);
             struct timeval tv;
@@ -382,10 +412,14 @@ static bool send_all(int fd, const u8 *p, size_t n) {
 /* 1 回分の GET（redirect は追わない）。成功で body（デコード済）を返す */
 static bool fetch_once(IfArena *a, const IfHttpUrl *u, IfStr *out_body,
                        u32 *out_status, IfStr *out_loc, IfStr *out_ctype,
-                       const char **err) {
-    int fd = connect_one(u->host, u->port);
+                       const char **err, bool allow_private, bool *out_conn_private) {
+    /* connect_one が allow_private=false で private アドレスをスキップするため、
+     * 解決は 1 回（判定と接続の分離による DNS rebinding の窓を広げない） */
+    bool conn_priv = false;
+    int fd = connect_one(u->host, u->port, allow_private, &conn_priv);
+    if (out_conn_private) *out_conn_private = conn_priv;
     if (fd == -2) { *err = E_DNS; return false; }
-    if (fd < 0) { *err = E_CONN; return false; }
+    if (fd < 0) { *err = allow_private ? E_CONN : E_PRIV; return false; }
     /* https: TLS 1.2 ハンドシェイク（CA 検証 + サーバ名照合は BearSSL が実施） */
     IfTls *tls = NULL;
     if (u->tls) {
@@ -505,11 +539,18 @@ bool if_http_get_ex(IfArena *a, const char *url, IfStr *out_body, u32 *out_statu
     char cur[1024];
     if (strlen(url) >= sizeof cur) { *err = E_URL; return false; }
     snprintf(cur, sizeof cur, "%s", url);
+    bool chain_tls = strncmp(cur, "https://", 8) == 0; /* チェーンが https で始まったか（降格防止） */
+    bool chain_private = false; /* 最初の接続が private ならローカルチェーン（リダイレクトも private 許可）。
+                                 * public 開始チェーンは private へのリダイレクトを拒否（DNS rebinding/SSRF） */
     for (u32 depth = 0;; depth++) {
         IfHttpUrl u;
         if (!if_http_parse_url(cur, &u)) { *err = E_URL; return false; }
         IfStr loc = if_str(NULL, 0);
-        if (!fetch_once(a, &u, out_body, out_status, &loc, out_content_type, err)) return false;
+        /* トップレベルは private 許可（ユーザ直接入力）。以後は chain_private に従う */
+        bool allow_priv = depth == 0 || chain_private;
+        bool conn_priv = false;
+        if (!fetch_once(a, &u, out_body, out_status, &loc, out_content_type, err, allow_priv, &conn_priv)) return false;
+        if (depth == 0 && conn_priv) chain_private = true;
         bool redir = (*out_status == 301 || *out_status == 302 ||
                       *out_status == 303 || *out_status == 307 ||
                       *out_status == 308) && loc.p && loc.n;
@@ -522,6 +563,11 @@ bool if_http_get_ex(IfArena *a, const char *url, IfStr *out_body, u32 *out_statu
         locbuf[loc.n] = 0;
         if (!if_http_resolve_url(cur, locbuf, nxt, sizeof nxt))
             return true; /* 解決不能（https 等）は最後の応答を返す */
+        /* https で始まったチェーンが http へ降格するのを拒否（mixed 降格の構造的防止） */
+        if (chain_tls && strncmp(nxt, "http://", 7) == 0 && strncmp(nxt, "https://", 8) != 0) {
+            *err = E_DOWNGRADE;
+            return false;
+        }
         snprintf(cur, sizeof cur, "%s", nxt);
     }
 }

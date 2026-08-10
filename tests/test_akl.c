@@ -1901,6 +1901,18 @@ static void t_v04_map_set(void) {
     want_str("var m = new Map(); m.set('z', 1); m.set('a', 2); m.set('m', 3); m.keys().join(',')", "z,a,m");
     /* オブジェクトキーは同一性 */
     want_str("var m = new Map(); var o = {id: 1}; m.set(o, 'obj'); m.get(o) + ':' + m.get({id: 1})", "obj:undefined");
+    /* v0.5 セキュリティ回帰: obj 配列 realloc 後の dangling ポインタ（UAF）クラス。
+     * 各操作が「ToString/obj 生成で配列 realloc を起こす量」を超えても正しく動くこと
+     * （ASan ビルドでなければ検出されないが、値の整合性はここで担保）。 */
+    want_num("var a = []; for (var i = 0; i < 2000; i++) a.push({x: i}); ('' + a).length > 0 ? 1 : 0", 1);
+    want_num("var a = []; for (var i = 0; i < 2000; i++) a.push('v' + i); a.slice(100, 1900).length", 1800);
+    want_num("var o = {}; for (var i = 0; i < 50; i++) o['k' + i] = i; Object.entries(o).length", 50);
+    want_num("var m = new Map(); for (var i = 0; i < 1500; i++) m.set('k' + i, i); m.keys().length + m.values().length", 3000);
+    want_num("var s = new Set(); for (var i = 0; i < 1500; i++) s.add('v' + i); s.values().length", 1500);
+    want_num("var re = /x/; var o = {toString: undefined}; re.test(o) ? 1 : 0", 0);
+    want_num("var a = []; for (var i = 0; i < 1500; i++) a.push('s' + i); var f = [[1, 2], [3]]; f.flat(1).length + a.concat(a).length", 3003);
+    want_num("class C { constructor() { this.a = 1; } get v() { return this.a; } } var n = 0; for (var i = 0; i < 300; i++) { n += new C().v; } n", 300);
+    want_num("var d = {p1: 1, p2: 2}; Object.keys(d).length + (d['p2']) + ('p1' in d ? 10 : 0)", 14);
 }
 
 /* ================= v0.5: import / export（モジュール） ================= */

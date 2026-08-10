@@ -2,6 +2,7 @@
  * chunked 復号。実ソケット経路は gui_smoke が loopback サーバで黒盒検査する） */
 #include "tests.h"
 #include "../src/net.h"
+#include <netinet/in.h> /* struct sockaddr_in（if_addr_is_private のユニット検査） */
 #include <string.h>
 #include <stdint.h>
 
@@ -170,9 +171,47 @@ static void test_http_dechunk(void) {
     if_arena_destroy(&a);
 }
 
+static void test_private_addr(void);
+
 void test_http(void) {
     test_http_parse();
     test_http_resolve();
     test_http_head();
     test_http_dechunk();
+    test_private_addr();
 }
+
+/* v0.5: リダイレクト経由 private 接続のブロック判定（DNS rebinding / SSRF 対策） */
+static void test_private_addr(void) {
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof sin);
+    sin.sin_family = AF_INET;
+    #define PRIV(ip, want) do { \
+        sin.sin_addr.s_addr = htonl(ip); \
+        CHECK(if_addr_is_private((const struct sockaddr *)&sin) == want); \
+    } while (0)
+    PRIV(0x7F000001u, true);   /* 127.0.0.1 loopback */
+    PRIV(0x7F0000FFu, true);   /* 127.0.0.255 */
+    PRIV(0x0A000001u, true);   /* 10.0.0.1 */
+    PRIV(0x0AFFFFFFu, true);   /* 10.255.255.255 */
+    PRIV(0xAC100001u, true);   /* 172.16.0.1 */
+    PRIV(0xAC1F0001u, true);   /* 172.31.0.1 */
+    PRIV(0xAC1F0001u, true);
+    PRIV(0xAC100001u, true);
+    PRIV(0xAC1F0001u, true);
+    PRIV(0xC0A80001u, true);   /* 192.168.0.1 */
+    PRIV(0xC0A8FFFEu, true);   /* 192.168.255.254 */
+    PRIV(0xA9FE0001u, true);   /* 169.254.0.1 link-local */
+    PRIV(0x64400001u, true);   /* 100.64.0.1 CGNAT */
+    PRIV(0x647FFFFEu, true);   /* 100.127.255.254 */
+    PRIV(0x00000000u, true);   /* 0.0.0.0 */
+    PRIV(0x08080808u, false);  /* 8.8.8.8 public */
+    PRIV(0x0A0A0A0Au, true);   /* 10.10.10.10 は 10/8 なので private */
+    PRIV(0xC0000201u, false);  /* 192.0.2.1 documentation (public 扱い) */
+    PRIV(0xAC100000u, true);   /* 172.16.0.0 */
+    PRIV(0xAC0F0001u, false);  /* 172.15.0.1 public */
+    PRIV(0xAC200001u, false);  /* 172.32.0.1 public */
+    #undef PRIV
+}
+
+

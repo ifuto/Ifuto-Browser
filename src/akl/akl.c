@@ -7172,7 +7172,10 @@ static u32 akl_to_string(AklRT *rt, AklVal v) {
                     }
                     buf[bl++] = ',';
                 }
-                AklVal ev = o->u.arr.v[i];
+                /* 要素読取の直前に obj 配列を再取得: 前の反復の akl_to_string（再帰）が
+                 * 新規 STR を生成して obj 配列を realloc し得る（UAF 構造的排除 —
+                 * 実測: オブジェクト要素 5000 個の配列 ToString で dangling） */
+                AklVal ev = rt->objs[akl_get_obj(v)].u.arr.v[i];
                 u32 si = akl_to_string(rt, ev);
                 if (si == UINT32_MAX) { ok_ = false; break; }
                 if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = si;
@@ -8284,7 +8287,8 @@ static AklVal akl_regex_result_arr(AklRT *rt, const u8 *bp, u32 *cap_beg, u32 *c
 static AklVal akl_m_regex_exec(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     (void)udata;
     if (!akl_is_objv(self)) return akl_native_typeerr(rt, "TypeError: not a RegExp");
-    AklObj *o = &rt->objs[akl_get_obj(self)];
+    u32 oi0 = akl_get_obj(self);
+    AklObj *o = &rt->objs[oi0];
     if (o->kind != AKL_OK_REGEX) return akl_native_typeerr(rt, "TypeError: not a RegExp");
     u32 sidx = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
     if (sidx == UINT32_MAX) return akl_mkundefined();
@@ -8292,6 +8296,7 @@ static AklVal akl_m_regex_exec(AklRT *rt, AklVal self, int argc, const AklVal *a
     u32 sl;
     const u8 *sp = akl_str(rt, sidx, &sl);
     if (rt->err[0]) return akl_mkundefined();
+    o = &rt->objs[oi0]; /* akl_to_string が新規 STR で obj 配列を realloc し得る（UAF 修正） */
     u32 ncap = akl_rex_ncap(o->u.rex.rx);
     if (ncap > 32) ncap = 32;
     u32 cap_beg[33], cap_end[33];
@@ -8304,7 +8309,8 @@ static AklVal akl_m_regex_exec(AklRT *rt, AklVal self, int argc, const AklVal *a
 static AklVal akl_m_regex_test(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     (void)udata;
     if (!akl_is_objv(self)) return akl_native_typeerr(rt, "TypeError: not a RegExp");
-    AklObj *o = &rt->objs[akl_get_obj(self)];
+    u32 oi1 = akl_get_obj(self);
+    AklObj *o = &rt->objs[oi1];
     if (o->kind != AKL_OK_REGEX) return akl_native_typeerr(rt, "TypeError: not a RegExp");
     u32 sidx = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
     if (sidx == UINT32_MAX) return akl_mkundefined();
@@ -8312,6 +8318,7 @@ static AklVal akl_m_regex_test(AklRT *rt, AklVal self, int argc, const AklVal *a
     u32 sl;
     const u8 *sp = akl_str(rt, sidx, &sl);
     if (rt->err[0]) return akl_mkundefined();
+    o = &rt->objs[oi1]; /* akl_to_string が新規 STR で obj 配列を realloc し得る（UAF 修正） */
     u32 ncap = akl_rex_ncap(o->u.rex.rx);
     if (ncap > 32) ncap = 32;
     u32 cap_beg[33], cap_end[33];
@@ -8538,7 +8545,8 @@ static AklVal akl_m_arr_flat(AklRT *rt, AklVal self, int argc, const AklVal *arg
     (void)udata;
     i32 ai = akl_self_arr(rt, self);
     if (ai < 0) return akl_native_typeerr(rt, "TypeError: not an array");
-    AklObj *a = &rt->objs[(u32)ai];
+    u32 ai_f = (u32)ai; /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *a = &rt->objs[ai_f];
     u32 depth = 1;
     if (argc > 0) {
         double d = akl_to_integer(rt, argv[0]);
@@ -8549,11 +8557,11 @@ static AklVal akl_m_arr_flat(AklRT *rt, AklVal self, int argc, const AklVal *arg
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
     rt->objs[oi].kind = AKL_OK_ARR;
-    u32 cap0 = a->u.arr.n + 1;
+    u32 cap0 = rt->objs[ai_f].u.arr.n + 1;
     AklVal *stk = (AklVal *)malloc((u64)cap0 * sizeof(AklVal));
     if (!stk) { akl_errf(rt, "oom: flat"); return akl_mkundefined(); }
     u32 sn = 0;
-    for (u32 i = a->u.arr.n; i-- > 0;) stk[sn++] = a->u.arr.v[i]; /* 逆順に積む（LIFO 補正） */
+    for (u32 i = rt->objs[ai_f].u.arr.n; i-- > 0;) stk[sn++] = rt->objs[ai_f].u.arr.v[i]; /* 逆順に積む（LIFO 補正） */
     u32 cnt = 0;
     while (sn > 0) {
         AklVal v = stk[--sn];
@@ -8695,7 +8703,8 @@ static AklVal akl_m_arr_slice(AklRT *rt, AklVal self, int argc, const AklVal *ar
     (void)udata;
     i32 ai = akl_self_arr(rt, self);
     if (ai < 0) return akl_native_typeerr(rt, "TypeError: not an array");
-    AklObj *o = &rt->objs[(u32)ai];
+    u32 ai0s = (u32)ai; /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *o = &rt->objs[ai0s];
     double nc = (double)o->u.arr.n;
     double s = argc > 0 ? akl_to_integer(rt, argv[0]) : 0.0;
     if (rt->err[0]) return akl_mkundefined();
@@ -8718,7 +8727,8 @@ static AklVal akl_m_arr_slice(AklRT *rt, AklVal self, int argc, const AklVal *ar
     if (cnt) {
         rt->objs[oi].u.arr.v = (AklVal *)malloc((u64)cnt * sizeof(AklVal));
         if (!rt->objs[oi].u.arr.v) { rt->objs[oi].kind = 0; akl_errf(rt, "oom: slice"); return akl_mkundefined(); }
-        for (u32 i = 0; i < cnt; i++) rt->objs[oi].u.arr.v[i] = o->u.arr.v[(u32)s + i];
+        /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+        for (u32 i = 0; i < cnt; i++) rt->objs[oi].u.arr.v[i] = rt->objs[ai0s].u.arr.v[(u32)s + i];
         rt->objs[oi].u.arr.n = rt->objs[oi].u.arr.cap = cnt;
         rt->heap_bytes += (u64)cnt * sizeof(AklVal);
     }
@@ -9701,16 +9711,19 @@ static AklVal akl_m_obj_entries(AklRT *rt, AklVal self, int argc, const AklVal *
     rt->objs[oi].kind = AKL_OK_ARR;
     u32 cnt = 0;
     if (akl_is_objv(tgt)) {
-        AklObj *o = &rt->objs[akl_get_obj(tgt)];
+        u32 tgt_i = akl_get_obj(tgt);
+        AklObj *o = &rt->objs[tgt_i];
         if (o->kind == AKL_OK_OBJ) {
-            for (u32 i = 0; i < o->u.po.n; i++) {
+            u32 po_n = o->u.po.n;
+            for (u32 i = 0; i < po_n; i++) {
                 if (!akl_arr_grow(rt, &rt->objs[oi], cnt + 1)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
                 u32 po = akl_obj_new(rt);
                 if (po == UINT32_MAX) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
                 rt->objs[po].kind = AKL_OK_ARR;
                 if (!akl_arr_grow(rt, &rt->objs[po], 2)) { rt->objs[oi].kind = 0; rt->objs[po].kind = 0; return akl_mkundefined(); }
-                rt->objs[po].u.arr.v[0] = AKL_MK_OBJ(o->u.po.props[i].name);
-                rt->objs[po].u.arr.v[1] = o->u.po.props[i].v;
+                /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+                rt->objs[po].u.arr.v[0] = AKL_MK_OBJ(rt->objs[tgt_i].u.po.props[i].name);
+                rt->objs[po].u.arr.v[1] = rt->objs[tgt_i].u.po.props[i].v;
                 rt->objs[po].u.arr.n = 2;
                 rt->objs[oi].u.arr.v[cnt++] = AKL_MK_OBJ(po);
             }
@@ -10030,9 +10043,11 @@ static AklVal akl_m_gen_next(AklRT *rt, AklVal self, int argc, const AklVal *arg
     (void)udata; (void)argc; (void)argv;
     if (!akl_is_objv(self) || rt->objs[akl_get_obj(self)].kind != AKL_OK_GEN)
         return akl_native_typeerr(rt, "TypeError: not a generator");
-    AklObj *g = &rt->objs[akl_get_obj(self)];
+    u32 g_idx = akl_get_obj(self); /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *g = &rt->objs[g_idx];
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
+    g = &rt->objs[g_idx]; /* 再取得（UAF 修正） */
     rt->objs[oi].kind = AKL_OK_OBJ;
     AklVal res = AKL_MK_OBJ(oi);
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = oi;
@@ -10310,10 +10325,12 @@ static AklVal akl_m_map_keys(AklRT *rt, AklVal self, int argc, const AklVal *arg
     (void)udata; (void)argc; (void)argv;
     if (!akl_is_objv(self) || rt->objs[akl_get_obj(self)].kind != AKL_OK_MAP)
         return akl_native_typeerr(rt, "TypeError: not a Map");
-    AklObj *o = &rt->objs[akl_get_obj(self)];
+    u32 o_idx = akl_get_obj(self); /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *o = &rt->objs[o_idx];
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
     rt->objs[oi].kind = AKL_OK_ARR;
+    o = &rt->objs[o_idx]; /* 再取得（UAF 修正） */
     if (o->u.mp.n > 0) {
         if (!akl_arr_grow(rt, &rt->objs[oi], o->u.mp.n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
         AklVal *kvp = AKL_MAP_KV(&o->u.mp);
@@ -10326,10 +10343,12 @@ static AklVal akl_m_map_values(AklRT *rt, AklVal self, int argc, const AklVal *a
     (void)udata; (void)argc; (void)argv;
     if (!akl_is_objv(self) || rt->objs[akl_get_obj(self)].kind != AKL_OK_MAP)
         return akl_native_typeerr(rt, "TypeError: not a Map");
-    AklObj *o = &rt->objs[akl_get_obj(self)];
+    u32 o_idx = akl_get_obj(self); /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *o = &rt->objs[o_idx];
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
     rt->objs[oi].kind = AKL_OK_ARR;
+    o = &rt->objs[o_idx]; /* 再取得（UAF 修正） */
     if (o->u.mp.n > 0) {
         if (!akl_arr_grow(rt, &rt->objs[oi], o->u.mp.n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
         AklVal *kvp = AKL_MAP_KV(&o->u.mp);
@@ -10400,10 +10419,12 @@ static AklVal akl_m_set_values(AklRT *rt, AklVal self, int argc, const AklVal *a
     (void)udata; (void)argc; (void)argv;
     if (!akl_is_objv(self) || rt->objs[akl_get_obj(self)].kind != AKL_OK_SET)
         return akl_native_typeerr(rt, "TypeError: not a Set");
-    AklObj *o = &rt->objs[akl_get_obj(self)];
+    u32 o_idx = akl_get_obj(self); /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *o = &rt->objs[o_idx];
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
     rt->objs[oi].kind = AKL_OK_ARR;
+    o = &rt->objs[o_idx]; /* 再取得（UAF 修正） */
     if (o->u.st.n > 0) {
         if (!akl_arr_grow(rt, &rt->objs[oi], o->u.st.n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
         memcpy(rt->objs[oi].u.arr.v, AKL_SET_V(&o->u.st), (u64)o->u.st.n * sizeof(AklVal));
@@ -11785,6 +11806,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         if (!en->u.env.vals) { akl_errf(rt, "oom: makefs env"); free(frames); return false; }
         en->u.env.vals[0] = parent;
         en->u.env.n = 1;
+        o = &rt->objs[oi]; /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
         en->u.env.parent = o->env;
         rt->heap_bytes += sizeof(AklVal);
         o->env = eo;
@@ -11954,25 +11976,27 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             akl_errf(rt, "TypeError: property access on non-object value");
             free(frames); return false;
         }
-        AklObj *o = &rt->objs[akl_get_obj(ov)];
+        u32 o_i3 = akl_get_obj(ov); /* akl_intern / akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+        AklObj *o = &rt->objs[o_i3];
         i32 pi = obj_prop_find(o, name);
         if (pi < 0 && o->kind == AKL_OK_OBJ) {
             /* クラス継承の static: __super チェーンを辿って解決（深さ制限） */
             u32 sup_name = akl_intern(rt, (const u8 *)"\x00super", 7, NULL);
-            AklObj *co = o;
+            u32 co_i = o_i3; /* index でチェーンを追う（realloc 安全） */
             u32 cdepth = 0;
-            while (pi < 0 && co->kind == AKL_OK_OBJ && cdepth++ < 64) {
-                i32 spi = obj_prop_find(co, sup_name);
+            while (pi < 0 && rt->objs[co_i].kind == AKL_OK_OBJ && cdepth++ < 64) {
+                i32 spi = obj_prop_find(&rt->objs[co_i], sup_name);
                 if (spi < 0) break;
-                AklVal pv = co->u.po.props[spi].v;
+                AklVal pv = rt->objs[co_i].u.po.props[spi].v;
                 if (!akl_is_objv(pv)) break;
-                co = &rt->objs[akl_get_obj(pv)];
-                pi = obj_prop_find(co, name);
+                co_i = akl_get_obj(pv);
+                pi = obj_prop_find(&rt->objs[co_i], name);
             }
-            if (pi >= 0) { AKL_PUSH(co->u.po.props[pi].v); AKL_NEXT(); }
+            if (pi >= 0) { AKL_PUSH(rt->objs[co_i].u.po.props[pi].v); AKL_NEXT(); }
         }
-        if (pi >= 0) { AKL_PUSH(o->u.po.props[pi].v); AKL_NEXT(); }
+        if (pi >= 0) { AKL_PUSH(rt->objs[o_i3].u.po.props[pi].v); AKL_NEXT(); }
         /* hasOwnProperty: obj.hasOwnProperty(k)（VM 実行中に native を直接生成） */
+        o = &rt->objs[o_i3]; /* 再取得（直前の分岐で realloc 済みの可能性） */
         if (o->kind == AKL_OK_OBJ) {
             u32 nl4;
             const u8 *nb4 = akl_str(rt, name, &nl4);
@@ -11990,6 +12014,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 AKL_NEXT();
             }
         }
+        o = &rt->objs[o_i3]; /* akl_obj_new 後の再取得 */
         /* getter 自動呼び出し: 通常 prop が無ければ "get:\x01name" を探して this=obj で呼ぶ */
         if (o->kind == AKL_OK_OBJ) {
             u32 o_idx2 = akl_get_obj(ov);
@@ -12284,7 +12309,9 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         }
         AklVal fv = AKL_VAL_UNDEF;
         if (akl_is_objv(ov)) {
-            AklObj *o = &rt->objs[akl_get_obj(ov)];
+            /* akl_obj_new / akl_intern が obj 配列を realloc し得る → index 経由（UAF 修正） */
+            u32 ov_i = akl_get_obj(ov);
+            AklObj *o = &rt->objs[ov_i];
             if (o->kind == AKL_OK_OBJ) {
                 i32 pi = obj_prop_find(o, name);
                 /* hasOwnProperty: 組み込みメソッド（VM 実行中に native を直接生成） */
@@ -12301,24 +12328,25 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                         rt->objs[no].u.nat.udata = NULL;
                         if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = no;
                         fv = AKL_MK_OBJ(no);
+                        o = &rt->objs[ov_i]; /* akl_obj_new 後の再取得 */
                     }
                 }
                 if (pi < 0 && o->kind == AKL_OK_OBJ) {
                     /* クラス継承の static: __super チェーンを辿って解決（深さ制限） */
                     u32 sup_name = akl_intern(rt, (const u8 *)"\x00super", 7, NULL);
-                    AklObj *co = o;
+                    u32 co_i = ov_i; /* index でチェーンを追う（akl_intern 後の realloc 安全） */
                     u32 cdepth = 0;
-                    while (pi < 0 && co->kind == AKL_OK_OBJ && cdepth++ < 64) {
-                        i32 spi = obj_prop_find(co, sup_name);
+                    while (pi < 0 && rt->objs[co_i].kind == AKL_OK_OBJ && cdepth++ < 64) {
+                        i32 spi = obj_prop_find(&rt->objs[co_i], sup_name);
                         if (spi < 0) break;
-                        AklVal pv = co->u.po.props[spi].v;
+                        AklVal pv = rt->objs[co_i].u.po.props[spi].v;
                         if (!akl_is_objv(pv)) break;
-                        co = &rt->objs[akl_get_obj(pv)];
-                        pi = obj_prop_find(co, name);
+                        co_i = akl_get_obj(pv);
+                        pi = obj_prop_find(&rt->objs[co_i], name);
                     }
-                    if (pi >= 0) fv = co->u.po.props[pi].v;
+                    if (pi >= 0) fv = rt->objs[co_i].u.po.props[pi].v;
                 } else if (pi >= 0) {
-                    fv = o->u.po.props[pi].v;
+                    fv = rt->objs[ov_i].u.po.props[pi].v;
                 }
             }
         }
@@ -13140,6 +13168,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 AKL_NEXT();
             }
             if (ao->kind == AKL_OK_OBJ) { /* o["k"]: 実行時 intern + prop 検索 */
+                u32 av_i = akl_get_obj(av); /* akl_to_string/intern が obj 配列を realloc し得る（UAF 修正） */
                 rt->gc_sp = sp + 2;
                 u32 si = akl_to_string(rt, iv);
                 if (si == UINT32_MAX) { free(frames); return false; }
@@ -13151,9 +13180,9 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 u32 ni2 = akl_intern(rt, ep, el, NULL);
                 if (ni2 == UINT32_MAX) { rt->n_nury = nur0; free(frames); return false; }
                 if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ni2;
-                i32 pi = obj_prop_find(ao, ni2);
+                i32 pi = obj_prop_find(&rt->objs[av_i], ni2);
                 rt->n_nury = nur0;
-                AKL_PUSH(pi >= 0 ? ao->u.po.props[pi].v : AKL_VAL_UNDEF);
+                AKL_PUSH(pi >= 0 ? rt->objs[av_i].u.po.props[pi].v : AKL_VAL_UNDEF);
                 AKL_NEXT();
             }
             if (ao->kind == AKL_OK_STR || ao->kind == AKL_OK_ROPE) { /* s[i]: コードポイント単位 */
@@ -13279,7 +13308,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AklVal obj = AKL_POP();
         AklVal key = AKL_POP();
         if (akl_is_objv(obj)) {
-            AklObj *o = &rt->objs[akl_get_obj(obj)];
+            u32 obj_i = akl_get_obj(obj); /* akl_to_string/intern が obj 配列を realloc し得る（UAF 修正） */
+            AklObj *o = &rt->objs[obj_i];
             if (o->kind == AKL_OK_OBJ) {
                 rt->gc_sp = sp + 2;
                 u32 si = akl_to_string(rt, key);
@@ -13290,7 +13320,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 if (rt->err[0]) { free(frames); return false; }
                 u32 ni2 = akl_intern(rt, ep, el, NULL);
                 if (ni2 == UINT32_MAX) { free(frames); return false; }
-                AKL_PUSH(obj_prop_find(o, ni2) >= 0 ? AKL_VAL_TRUE : AKL_VAL_FALSE);
+                AKL_PUSH(obj_prop_find(&rt->objs[obj_i], ni2) >= 0 ? AKL_VAL_TRUE : AKL_VAL_FALSE);
                 AKL_NEXT();
             }
             if (o->kind == AKL_OK_ARR) {
@@ -13386,23 +13416,25 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         }
         if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = oi;
         if (akl_is_objv(ov)) {
-            AklObj *o = &rt->objs[akl_get_obj(ov)];
+            /* akl_mkstr が obj 配列を realloc し得るため、o は index 経由で毎回再取得（UAF 修正） */
+            u32 ov_i = akl_get_obj(ov);
+            AklObj *o = &rt->objs[ov_i];
             if (o->kind == AKL_OK_OBJ) {
                 for (u32 i = 0; i < cnt; i++) {
                     u32 kl;
-                    const u8 *kp = akl_str(rt, o->u.po.props[i].name, &kl);
+                    const u8 *kp = akl_str(rt, rt->objs[ov_i].u.po.props[i].name, &kl);
                     if (rt->err[0]) { free(frames); return false; }
                     u32 ks = akl_mkstr(rt, kp, kl);
                     if (ks == UINT32_MAX) { free(frames); return false; }
                     rt->objs[oi].u.arr.v[i] = AKL_MK_OBJ(ks);
                     rt->objs[oi].u.arr.n = i + 1;
                 }
-            } else if (o->kind == AKL_OK_ARR) {
+            } else if (rt->objs[ov_i].kind == AKL_OK_ARR) {
                 for (u32 i = 0; i < cnt; i++) {
                     rt->objs[oi].u.arr.v[i] = akl_mknum((double)i);
                     rt->objs[oi].u.arr.n = i + 1;
                 }
-            } else if (o->kind == AKL_OK_STR || o->kind == AKL_OK_ROPE) {
+            } else if (rt->objs[ov_i].kind == AKL_OK_STR || rt->objs[ov_i].kind == AKL_OK_ROPE) {
                 for (u32 i = 0; i < cnt; i++) {
                     rt->objs[oi].u.arr.v[i] = akl_mknum((double)i);
                     rt->objs[oi].u.arr.n = i + 1;
@@ -13593,23 +13625,29 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         if (argc > 250 || sp < base + argc + 1) { akl_errf(rt, "stack underflow: new"); free(frames); return false; }
         AklVal fv = stk[sp - argc - 1];
         if (!akl_is_objv(fv)) { akl_errf(rt, "TypeError: not a constructor"); free(frames); return false; }
-        AklObj *fo = &rt->objs[akl_get_obj(fv)];
+        /* UAF 構造的排除: ハンドラ内で akl_obj_new / akl_intern が obj 配列を realloc
+         * し得るため、fo は index 経由で使用直前に再取得する（V8 type confusion 系の
+         * 生ポインタ dangling と同型の欠陥クラス） */
+        u32 fv_i = akl_get_obj(fv);
+        AklObj *fo = &rt->objs[fv_i];
         AklVal ctor = fv;
-        /* class オブジェクト（AKL_OK_OBJ）: constructor プロパティを関数として使用。
-         * メソッド（constructor 以外）は new 時にインスタンスへコピーする（後段） */
         AklVal cls_obj = AKL_VAL_UNDEF;
+        u32 ctor_i = fv_i;
         if (fo->kind == AKL_OK_OBJ) {
             cls_obj = fv;
-            i32 pi = obj_prop_find(fo, akl_intern(rt, (const u8 *)"constructor", 11, NULL));
+            u32 ci = akl_intern(rt, (const u8 *)"constructor", 11, NULL);
+            if (ci == UINT32_MAX) { free(frames); return false; }
+            i32 pi = obj_prop_find(&rt->objs[fv_i], ci);
             if (pi < 0) { akl_errf(rt, "TypeError: not a constructor"); free(frames); return false; }
-            ctor = fo->u.po.props[pi].v;
+            ctor = rt->objs[fv_i].u.po.props[pi].v;
             /* constructor は FUNC または NATIVE（Promise 等の組込コンストラクタ） */
             if (!akl_is_objv(ctor) ||
                 (rt->objs[akl_get_obj(ctor)].kind != AKL_OK_FUNC &&
                  rt->objs[akl_get_obj(ctor)].kind != AKL_OK_NATIVE)) {
                 akl_errf(rt, "TypeError: not a constructor"); free(frames); return false;
             }
-            fo = &rt->objs[akl_get_obj(ctor)];
+            ctor_i = akl_get_obj(ctor);
+            fo = &rt->objs[ctor_i];
         }
         if (fo->kind == AKL_OK_NATIVE) {
             if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
@@ -13619,6 +13657,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             u32 oi = akl_obj_new(rt);
             if (oi == UINT32_MAX) { free(frames); return false; }
             rt->objs[oi].kind = AKL_OK_OBJ;
+            fo = &rt->objs[ctor_i]; /* akl_obj_new 後の再取得（UAF 修正） */
             u32 nur0 = rt->n_nury;
             AklVal r;
             if (!akl_vm_native_call(rt, fo, AKL_MK_OBJ(oi), argc, stk + sp - argc, &r)) { free(frames); return false; }
@@ -13629,8 +13668,9 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             stk[sp - 1] = akl_is_objv(r) ? r : AKL_MK_OBJ(oi);
             AKL_NEXT();
         }
+        fo = &rt->objs[ctor_i]; /* 再取得（native パスの akl_obj_new 後） */
         if (fo->kind != AKL_OK_FUNC) { akl_errf(rt, "TypeError: not a constructor"); free(frames); return false; }
-        u32 fidx = akl_get_obj(ctor);
+        u32 fidx = ctor_i;
         u32 fe_i = rt->objs[fidx].code_off;
         if (fe_i >= rt->n_funcs) { akl_errf(rt, "internal: bad func ref"); free(frames); return false; }
         AklFuncEnt *fe = &rt->funcs[fe_i];
@@ -13651,6 +13691,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         AklVal thisv = AKL_MK_OBJ(no);
         u32 nur0 = rt->n_nury;
         if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = no;
+        fo = &rt->objs[ctor_i]; /* akl_obj_new 後の再取得（UAF 修正） */
         if (nh > 1) {
             if (!akl_vm_frame_hidden(rt, stk, win, nloc, fe, thisv,
                                      fo->env == UINT32_MAX ? AKL_VAL_UNDEF : AKL_MK_OBJ(fo->env))) {
