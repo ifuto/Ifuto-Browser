@@ -132,7 +132,8 @@ typedef struct {
         struct { u8 state; u8 pad[3]; AklVal value; } pr; /* PROMISE: 0=pending 1=resolved 2=rejected */
         i64 big;                                          /* BIGINT: 64bit 整数値 */
         struct { u32 arr; u32 pos; } gen;                 /* GEN: yield 蓄積配列 obj idx + 次位置 */
-        struct { AklVal *keys; AklVal *vals; u32 n, cap; } mp; /* MAP: キー/値ペア配列 */
+        struct { AklVal *kv; u32 n, cap; } mp; /* MAP: キー/値の交互ペア配列（[k0,v0,...]）。
+                                                    * 2 本配列より 8B 小さく AklObj 64→56B（v0.5 省メモリ） */
         struct { AklVal *v; u32 n, cap; } st;             /* SET: 値配列（重複なし） */
     } u;
 } AklObj; /* 64B（v0.4: FUNC.thisv + PROMISE 追加で 56B から +8B。ARCH 台帳記録） */
@@ -511,9 +512,9 @@ static u32 akl_gc(AklRT *rt) {
                             if (akl_gc_kind_children(rt->objs[ci].kind) && wn < span) wl[wn++] = ci;
                         }
                     }
-                } else if (ro->kind == AKL_OK_MAP) { /* MAP: keys + vals */
+                } else if (ro->kind == AKL_OK_MAP) { /* MAP: 交互ペア配列 */
                     for (u32 k = 0; k < ro->u.mp.n; k++) {
-                        AklVal kv2[2] = { ro->u.mp.keys[k], ro->u.mp.vals[k] };
+                        AklVal kv2[2] = { ro->u.mp.kv[2 * k], ro->u.mp.kv[2 * k + 1] };
                         for (int j = 0; j < 2; j++) {
                             if (!akl_is_objv(kv2[j])) continue;
                             u32 ci = akl_get_obj(kv2[j]);
@@ -578,10 +579,9 @@ static u32 akl_gc(AklRT *rt) {
             akl_rex_free(o->u.rex.rx);
             rt->heap_bytes -= o->len; /* len = コンパイル済みサイズ概算 */
         }
-        if (o->kind == AKL_OK_MAP && o->u.mp.keys) {
+        if (o->kind == AKL_OK_MAP && o->u.mp.kv) {
             rt->heap_bytes -= (u64)o->u.mp.cap * sizeof(AklVal) * 2;
-            free(o->u.mp.keys);
-            free(o->u.mp.vals);
+            free(o->u.mp.kv);
         }
         if (o->kind == AKL_OK_SET && o->u.st.v) {
             rt->heap_bytes -= (u64)o->u.st.cap * sizeof(AklVal);
@@ -10055,8 +10055,7 @@ static AklVal akl_map_make(AklRT *rt) {
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
     rt->objs[oi].kind = AKL_OK_MAP;
-    rt->objs[oi].u.mp.keys = NULL;
-    rt->objs[oi].u.mp.vals = NULL;
+    rt->objs[oi].u.mp.kv = NULL;
     rt->objs[oi].u.mp.n = rt->objs[oi].u.mp.cap = 0;
     return AKL_MK_OBJ(oi);
 }
@@ -10075,13 +10074,11 @@ static bool akl_map_grow(AklRT *rt, AklObj *o, u32 need) {
     if (need <= o->u.mp.cap) return true;
     u32 nc = o->u.mp.cap ? o->u.mp.cap * 2 : 4;
     if (nc > AKL_MAP_MAX) nc = AKL_MAP_MAX;
-    AklVal *nk = (AklVal *)realloc(o->u.mp.keys, (u64)nc * sizeof(AklVal));
+    /* 交互ペア配列 [k0,v0,...]: 長さ 2*nc。realloc 1 本（2 本管理より 8B/Map 小さい） */
+    AklVal *nk = (AklVal *)realloc(o->u.mp.kv, (u64)nc * 2 * sizeof(AklVal));
     if (!nk) { akl_errf(rt, "oom: map grow"); return false; }
-    AklVal *nv = (AklVal *)realloc(o->u.mp.vals, (u64)nc * sizeof(AklVal));
-    if (!nv) { free(nk); akl_errf(rt, "oom: map grow"); return false; }
     rt->heap_bytes += (u64)(nc - o->u.mp.cap) * sizeof(AklVal) * 2;
-    o->u.mp.keys = nk;
-    o->u.mp.vals = nv;
+    o->u.mp.kv = nk;
     o->u.mp.cap = nc;
     return true;
 }
@@ -10117,14 +10114,14 @@ static AklVal akl_m_map_set(AklRT *rt, AklVal self, int argc, const AklVal *argv
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_is_objv(k) ? akl_get_obj(k) : rt->n_objs;
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_is_objv(v) ? akl_get_obj(v) : rt->n_objs;
     for (u32 i = 0; i < o->u.mp.n; i++)
-        if (akl_same_value_zero(rt, o->u.mp.keys[i], k)) { o->u.mp.vals[i] = v; return self; }
+        if (akl_same_value_zero(rt, o->u.mp.kv[2 * i], k)) { o->u.mp.kv[2 * i + 1] = v; return self; }
     if (!akl_map_grow(rt, o, o->u.mp.n + 1)) {
         /* 上限超過は「黙って無視」でなく明白失敗（grow が err 設定済み。native_err を立てる） */
         akl_native_throw(rt, rt->err[0] ? rt->err : "RangeError: Map/Set size limit exceeded");
         return akl_mkundefined();
     }
-    o->u.mp.keys[o->u.mp.n] = k;
-    o->u.mp.vals[o->u.mp.n] = v;
+    o->u.mp.kv[2 * o->u.mp.n] = k;
+    o->u.mp.kv[2 * o->u.mp.n + 1] = v;
     o->u.mp.n++;
     return self;
 }
@@ -10135,7 +10132,7 @@ static AklVal akl_m_map_get(AklRT *rt, AklVal self, int argc, const AklVal *argv
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal k = argc > 0 ? argv[0] : akl_mkundefined();
     for (u32 i = 0; i < o->u.mp.n; i++)
-        if (akl_same_value_zero(rt, o->u.mp.keys[i], k)) return o->u.mp.vals[i];
+        if (akl_same_value_zero(rt, o->u.mp.kv[2 * i], k)) return o->u.mp.kv[2 * i + 1];
     return akl_mkundefined();
 }
 static AklVal akl_m_map_has(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10145,7 +10142,7 @@ static AklVal akl_m_map_has(AklRT *rt, AklVal self, int argc, const AklVal *argv
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal k = argc > 0 ? argv[0] : akl_mkundefined();
     for (u32 i = 0; i < o->u.mp.n; i++)
-        if (akl_same_value_zero(rt, o->u.mp.keys[i], k)) return AKL_VAL_TRUE;
+        if (akl_same_value_zero(rt, o->u.mp.kv[2 * i], k)) return AKL_VAL_TRUE;
     return AKL_VAL_FALSE;
 }
 static AklVal akl_m_map_delete(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10155,9 +10152,9 @@ static AklVal akl_m_map_delete(AklRT *rt, AklVal self, int argc, const AklVal *a
     AklObj *o = &rt->objs[akl_get_obj(self)];
     AklVal k = argc > 0 ? argv[0] : akl_mkundefined();
     for (u32 i = 0; i < o->u.mp.n; i++) {
-        if (akl_same_value_zero(rt, o->u.mp.keys[i], k)) {
-            o->u.mp.keys[i] = o->u.mp.keys[o->u.mp.n - 1];
-            o->u.mp.vals[i] = o->u.mp.vals[o->u.mp.n - 1];
+        if (akl_same_value_zero(rt, o->u.mp.kv[2 * i], k)) {
+            o->u.mp.kv[2 * i] = o->u.mp.kv[2 * (o->u.mp.n - 1)];
+            o->u.mp.kv[2 * i + 1] = o->u.mp.kv[2 * (o->u.mp.n - 1) + 1];
             o->u.mp.n--;
             return AKL_VAL_TRUE;
         }
@@ -10181,7 +10178,7 @@ static AklVal akl_m_map_keys(AklRT *rt, AklVal self, int argc, const AklVal *arg
     rt->objs[oi].kind = AKL_OK_ARR;
     if (o->u.mp.n > 0) {
         if (!akl_arr_grow(rt, &rt->objs[oi], o->u.mp.n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
-        memcpy(rt->objs[oi].u.arr.v, o->u.mp.keys, (u64)o->u.mp.n * sizeof(AklVal));
+        for (u32 k = 0; k < o->u.mp.n; k++) rt->objs[oi].u.arr.v[k] = o->u.mp.kv[2 * k];
     }
     rt->objs[oi].u.arr.n = o->u.mp.n;
     return AKL_MK_OBJ(oi);
@@ -10196,7 +10193,7 @@ static AklVal akl_m_map_values(AklRT *rt, AklVal self, int argc, const AklVal *a
     rt->objs[oi].kind = AKL_OK_ARR;
     if (o->u.mp.n > 0) {
         if (!akl_arr_grow(rt, &rt->objs[oi], o->u.mp.n)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
-        memcpy(rt->objs[oi].u.arr.v, o->u.mp.vals, (u64)o->u.mp.n * sizeof(AklVal));
+        for (u32 k = 0; k < o->u.mp.n; k++) rt->objs[oi].u.arr.v[k] = o->u.mp.kv[2 * k + 1];
     }
     rt->objs[oi].u.arr.n = o->u.mp.n;
     return AKL_MK_OBJ(oi);
@@ -13836,7 +13833,7 @@ void akl_free(AklRT *rt) {
         if (rt->objs[i].kind == AKL_OK_REGEX) akl_rex_free(rt->objs[i].u.rex.rx);
         /* v0.4 組込 Map/Set の配列（GC スイープと同単位。生存値が globals 等に
          * 残る場合の teardown リークを塞ぐ — 実測: script テストで 33 件検出） */
-        if (rt->objs[i].kind == AKL_OK_MAP) { free(rt->objs[i].u.mp.keys); free(rt->objs[i].u.mp.vals); }
+        if (rt->objs[i].kind == AKL_OK_MAP) free(rt->objs[i].u.mp.kv);
         if (rt->objs[i].kind == AKL_OK_SET) free(rt->objs[i].u.st.v);
     }
     free(rt->objs);
