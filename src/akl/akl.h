@@ -37,6 +37,8 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out);
  * FUNC は VM を再入実行（outer スタックは GC ルートとして退避）。コールバック内の
  * 例外・budget 枯渇は false で rt->err に倒れる。再入深さ上限 AKL_MAX_REENTRY。 */
 bool akl_call(AklRT *rt, AklVal fn, int argc, const AklVal *argv, AklVal *out);
+/* v0.5: this 指定の再入呼び出し（Function.prototype.call/apply/bind 用） */
+bool akl_call_this(AklRT *rt, AklVal fn, AklVal thisv, int argc, const AklVal *argv, AklVal *out);
 
 /* 1 回の eval で許す命令数の上限（既定 10,000,000）。0 にすると呼び出し側責任で
  * 「全命令即枯渇」になるので 1 以上を渡すこと。ブラウザ統合時はタブ経路ごとに設定する。 */

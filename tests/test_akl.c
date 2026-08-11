@@ -592,8 +592,8 @@ static void t_objects(void) {
     want_bool("var a = {}; var b = {}; a === b", false);  /* identity（同形でも別物） */
     want_bool("var a = {}; var b = a; a !== b", false);
     /* 明白失敗系（黙った誤答を作らない） */
-    want_err("var o = 5; o.x = 1", "TypeError");       /* 非 object store */
-    want_err("var o = 5; o.x", "TypeError");           /* 非 object load */
+    want_err("var o = 5; o.x = 1", "TypeError");       /* 非 object store（代入は TypeError が正しい） */
+    want_undef("var o = 5; o.x");                      /* 非 object load は undefined（V8 準拠。v0.5 で修正） */
     want_err("var o = {}; o.f()", "not a function");   /* 無い/非関数メソッド */
     want_num("var o = {a}; o.a == undefined ? 1 : 0", 0); /* shorthand: a 未定義 → o.a は undefined */
     want_num("var x = 9; var o = {a:1, b: x}; o.b", 9);  /* b: x は通常プロパティ */

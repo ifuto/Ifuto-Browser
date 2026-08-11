@@ -22,10 +22,17 @@ static void print_val(AklRT *rt, AklVal v) {
     if (akl_as_num(v, &d)) {
         if (isnan(d)) { printf("NaN\n"); return; }
         if (isinf(d)) { printf("%sInfinity\n", d > 0 ? "" : "-"); return; }
-        if (d == (double)(long long)d && fabs(d) < 9007199254740992.0)
+        if (d == (double)(long long)d && fabs(d) < 9007199254740992.0) {
             printf("%.0f\n", d);
-        else
+        } else {
+            /* V8 と同じ最短表現（akl_to_string の Grisu-lite と同一ロジック） */
+            for (int prec = 15; prec <= 17; prec++) {
+                char tmp[40];
+                snprintf(tmp, sizeof tmp, "%.*g", prec, d);
+                if (strtod(tmp, NULL) == d) { printf("%s\n", tmp); return; }
+            }
             printf("%.17g\n", d);
+        }
         return;
     }
     if (akl_as_bool(v, &b)) { printf("%s\n", b ? "true" : "false"); return; }
