@@ -811,6 +811,7 @@ static u32 akl_str_flatten(AklRT *rt, u32 idx, u8 **out_bytes) {
         akl_errf(rt, "heap bytes budget exhausted");
         return UINT32_MAX;
     }
+    o = &rt->objs[idx]; /* GC ループ後の再取得（UAF 構造的排除） */
     /* 反復 DFS: 訪問順にセグメント逆順スタックを積む。最大深さ 4096 で有界。 */
     typedef struct { u32 idx; u32 pos; } Seg;
     Seg *stk = (Seg *)malloc(sizeof(Seg) * 8192 + 64);
@@ -7198,6 +7199,7 @@ static u32 akl_to_string(AklRT *rt, AklVal v) {
             free(buf);
             return ridx;
         }
+        o = &rt->objs[akl_get_obj(v)]; /* ARR パス内の再帰生成後の再取得（UAF 構造的排除） */
         if (o->kind == AKL_OK_HANDLE) {
             char hbuf[64];
             int hn_ = snprintf(hbuf, sizeof hbuf, "[object %s]",
@@ -8627,7 +8629,8 @@ static AklVal akl_m_arr_join(AklRT *rt, AklVal self, int argc, const AklVal *arg
     (void)udata;
     i32 ai = akl_self_arr(rt, self);
     if (ai < 0) return akl_native_typeerr(rt, "TypeError: not an array");
-    AklObj *o = &rt->objs[(u32)ai];
+    u32 ai_j = (u32)ai; /* akl_to_string が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *o = &rt->objs[ai_j];
     u32 sep_len = 0;
     const u8 *sep = (const u8 *)",";
     if (argc > 0 && !akl_is_undefined(argv[0])) {
@@ -8638,11 +8641,12 @@ static AklVal akl_m_arr_join(AklRT *rt, AklVal self, int argc, const AklVal *arg
         if (rt->err[0]) return akl_mkundefined();
     } else sep_len = 1;
     u64 total = 0;
-    u32 n = o->u.arr.n;
+    u32 n = rt->objs[ai_j].u.arr.n;
     u32 *parts = (u32 *)malloc((u64)(n ? n : 1) * sizeof(u32));
     if (!parts) { akl_errf(rt, "oom: join"); return akl_mkundefined(); }
     for (u32 i = 0; i < n; i++) {
-        u32 si = akl_to_string(rt, o->u.arr.v[i]);
+        /* 前の反復の akl_to_string が新規 STR で obj 配列を realloc し得る（UAF 修正） */
+        u32 si = akl_to_string(rt, rt->objs[ai_j].u.arr.v[i]);
         if (si == UINT32_MAX) { free(parts); return akl_mkundefined(); }
         if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = si;
         parts[i] = si;
@@ -8671,7 +8675,8 @@ static AklVal akl_m_arr_concat(AklRT *rt, AklVal self, int argc, const AklVal *a
     (void)udata;
     i32 ai = akl_self_arr(rt, self);
     if (ai < 0) return akl_native_typeerr(rt, "TypeError: not an array");
-    AklObj *o = &rt->objs[(u32)ai];
+    u32 ai_c = (u32)ai; /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *o = &rt->objs[ai_c];
     u64 need = o->u.arr.n;
     for (int i = 0; i < argc; i++) {
         if (akl_self_arr(rt, argv[i]) >= 0) need += rt->objs[akl_get_obj(argv[i])].u.arr.n;
@@ -8687,12 +8692,13 @@ static AklVal akl_m_arr_concat(AklRT *rt, AklVal self, int argc, const AklVal *a
     rt->objs[oi].u.arr.cap = (u32)need;
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = oi;
     u32 w = 0;
-    for (u32 i = 0; i < o->u.arr.n; i++) rt->objs[oi].u.arr.v[w++] = o->u.arr.v[i];
+    for (u32 i = 0; i < rt->objs[ai_c].u.arr.n; i++) rt->objs[oi].u.arr.v[w++] = rt->objs[ai_c].u.arr.v[i];
     for (int i = 0; i < argc; i++) {
         i32 x = akl_self_arr(rt, argv[i]);
         if (x >= 0) {
-            AklObj *xo = &rt->objs[(u32)x];
-            for (u32 k = 0; k < xo->u.arr.n; k++) rt->objs[oi].u.arr.v[w++] = xo->u.arr.v[k];
+            /* akl_obj_new が obj 配列を realloc し得る → xo は index 経由で毎回再取得（UAF 修正） */
+            u32 x_i = (u32)x;
+            for (u32 k = 0; k < rt->objs[x_i].u.arr.n; k++) rt->objs[oi].u.arr.v[w++] = rt->objs[x_i].u.arr.v[k];
         } else rt->objs[oi].u.arr.v[w++] = argv[i];
     }
     rt->objs[oi].u.arr.n = w;
@@ -11560,7 +11566,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             free(frames);
             return false;
         }
-        AklObj *fo = &rt->objs[akl_get_obj(fv)];
+        u32 fv_i = akl_get_obj(fv); /* frame_hidden（ENV 生成）が obj 配列を realloc し得る（UAF 修正） */
+        AklObj *fo = &rt->objs[fv_i];
         if (fo->kind == AKL_OK_NATIVE) { /* is_objv 二重評価を避けるため kind 一本化（fib 実測 +2.8% の退行を解消） */
             if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
             budget -= AKL_NATIVE_COST;
@@ -11603,6 +11610,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 return false;
             }
         } else {
+            fo = &rt->objs[fv_i]; /* 再取得（nh>1 分岐の frame_hidden が realloc し得る。排他だが明示） */
             stk[win] = fo->thisv; /* this（アローは固定 this。通常関数は undefined） */
         }
         u32 keep = argc < npar ? argc : npar;
@@ -11662,7 +11670,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             free(frames);
             return false;
         }
-        AklObj *fo = &rt->objs[akl_get_obj(fv)];
+        u32 fv_ct = akl_get_obj(fv); /* frame_hidden が obj 配列を realloc し得る（UAF 修正） */
+        AklObj *fo = &rt->objs[fv_ct];
         if (fo->kind == AKL_OK_NATIVE) {
             if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
             budget -= AKL_NATIVE_COST;
@@ -11706,6 +11715,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 return false;
             }
         } else {
+            fo = &rt->objs[fv_ct]; /* 再取得（nh>1 分岐の frame_hidden が realloc し得る。排他だが明示） */
             stk[win] = akl_is_undefined(fo->thisv) ? thisv : fo->thisv;
         }
         u32 keep = argc < npar ? argc : npar;
@@ -11888,6 +11898,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 if (!nb) { free(frames); return false; }
                 AklRex *rx = oo->u.rex.rx;
                 u32 rf = oo->u.rex.flags;
+                i32 li = oo->u.rex.last_index; /* 以降 akl_mkstring が obj 配列を realloc するため先読み（UAF 修正） */
                 AklVal out = AKL_VAL_UNDEF;
                 if (nl == 6 && memcmp(nb, "source", 6) == 0) {
                     u32 pl = 0;
@@ -11916,7 +11927,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                 } else if (nl == 7 && memcmp(nb, "unicode", 7) == 0) {
                     out = akl_mkbool((rf & AKL_RX_F_UNICODE) != 0);
                 } else if (nl == 9 && memcmp(nb, "lastIndex", 9) == 0) {
-                    out = AKL_MK_INT(oo->u.rex.last_index);
+                    out = AKL_MK_INT(li);
                 } else {
                     u32 hit_r = UINT32_MAX;
                     for (u32 i = 0; i < AKL_REGEX_METH_N; i++)
@@ -12351,7 +12362,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
             }
         }
         if (!akl_is_objv(fv)) { akl_errf(rt, "TypeError: not a function"); free(frames); return false; }
-        AklObj *fo = &rt->objs[akl_get_obj(fv)];
+        u32 fv_m = akl_get_obj(fv); /* frame_hidden が obj 配列を realloc し得る（UAF 修正） */
+        AklObj *fo = &rt->objs[fv_m];
         if (fo->kind == AKL_OK_NATIVE) {
             if (budget < AKL_NATIVE_COST) { akl_errf(rt, "instruction budget exhausted"); free(frames); return false; }
             budget -= AKL_NATIVE_COST;
@@ -12389,6 +12401,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                     return false;
                 }
             } else {
+                fo = &rt->objs[fv_m]; /* 再取得（nh>1 分岐の frame_hidden が realloc し得る。排他だが明示） */
                 /* アロー関数はレシーバでなく固定 this（undefined ならレシーバ） */
                 stk[win] = akl_is_undefined(fo->thisv) ? ov : fo->thisv;
             }

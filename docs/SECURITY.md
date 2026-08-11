@@ -87,10 +87,33 @@ Ifuto / AKL が同じクラスの問題を**構造的に**持たないことを�
 - tree-construction 1922/1922（100%）・fuzz 5 標的 500 iters 0 crash
 - 性能不変（paired）: fib30 75.9 / arith 82.4 / strcat 4.3 / callseq 11.3ms
 
+## UAF 機械検出ツール（tools/check_uaf.py、2026-08-10）
+
+「使用直前再取得」規約の機械検出をゲート化した。`make test` の一部として常時実行される。
+
+- 検出: `AklObj *NAME = &rt->objs[...]` で取得した一時ポインタを保持したまま、
+  obj 配列を realloc し得る関数（akl_obj_new / akl_mkstr / akl_intern /
+  akl_to_string / akl_mkarray / akl_mkobject / akl_mkstring / akl_promise_make /
+  akl_map_make / akl_set_make / akl_gc / akl_vm_frame_hidden / akl_mkhandle）を
+  呼び、その後に NAME-> を使用している箇所。
+- 安全と判定してスキップするパターン:
+  - 使用直前の再取得（`NAME = &rt->objs[...]`）がある
+  - realloc が return 文内（return で関数終了）
+  - realloc の後、AKL_NEXT()（VM ハンドラの無条件終了）までに使用がない（到達不能）
+  - 関数呼び出しの引数内の使用（呼び出し前に評価。**ただしループ本体内は除く** —
+    2 回目以降の反復では前回の realloc が済んでいるため危険。join 型 UAF で実証）
+- 条件付き return は到達不能判定に使わない（保守側: 条件が偽なら後続に到達し得る）。
+- 自己テスト `--self-test` 付き（検出 2 パターン / 許容 4 パターン）。
+
+**ツール導入時の成果**: 導入初回で `akl_m_arr_join`（ループ内の要素読取が前回反復の
+ToString 生成で dangling）と `akl_m_arr_concat`（akl_obj_new 後の o 使用）の
+**実 UAF 2 件を再発見・修正**。前ターンの手動監査で見落としていた（join は separator
+経由・concat は未修正のまま残っていた）。CALLT / MCALLN の排他分岐、PLOAD の REGEX
+lastIndex は値の先読み・再取得で明示的に安全化。
+
 ## 既知の残課題（正直な開示）
 - ページ内スクリプトの `fetch()` / `XMLHttpRequest` は非対応（v1 対象）— 実装時に
   CORS / Private Network Access 相当を設計する必要がある。
 - 外部 `<script src>` 取得も v1 対象（現在は明示スキップ）— 取得時に同一の
   private チェーン規則を適用すること。
-- AKL の obj 配列 realloc 後の一時ポインタ規約は「使用直前再取得」をコードレビュー
-  規約として継続する（static 解析スクリプトで機械検出する仕組みは未整備）。
+- ツールは関数呼び出しをまたぐ解析をしない（単純保守）。警告が出たら人間が確認する。

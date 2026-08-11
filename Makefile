@@ -80,9 +80,15 @@ $(BUILD)/fuzz_ext: fuzz/fuzz_ext.c src/ext_manifest.c src/ext_manifest.h | $(BUI
 
 .PHONY: test golden fuzz bench clean size conformance guard vsx aklbench gui guismoke akltest
 
-test: $(BUILD)/run_tests $(BUILD)/run_tests_switch cxxtest
+test: $(BUILD)/run_tests $(BUILD)/run_tests_switch cxxtest check-uaf
 	./$(BUILD)/run_tests
 	./$(BUILD)/run_tests_switch
+
+# v0.5: obj 配列 realloc 後の一時ポインタ使用（UAF）の機械検出 + 自己テスト。
+# docs/SECURITY.md の監査規約。akl.c を変更したら必ず通す。
+check-uaf:
+	python3 tools/check_uaf.py --self-test
+	python3 tools/check_uaf.py
 
 # C++ V8 API ファサード（src/akl/v8.h）の実動証明。
 # 製品法則の検査を兼ねる: このテストバイナリは libstdc++ を動的リンクしないこと。
