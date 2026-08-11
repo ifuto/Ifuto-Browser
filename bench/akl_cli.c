@@ -40,6 +40,12 @@ static void print_val(AklRT *rt, AklVal v) {
     if (akl_is_undefined(v)) { printf("undefined\n"); return; }
     const char *s = akl_as_str(rt, v, &len);
     if (s) { fwrite(s, 1, len, stdout); fputc('\n', stdout); return; }
+    /* オブジェクトは JS ToString で表示（V8 の console.log に近い。旧フォールバックの
+     * "[function]" は関数でないオブジェクトにも出て紛らわしかった — JSON.parse の
+     * 捕捉エラーが "[function]" 表示になる実害があった） */
+    AklVal sv = akl_tostring(rt, v);
+    const char *s2 = akl_as_str(rt, sv, &len);
+    if (s2) { fwrite(s2, 1, len, stdout); fputc('\n', stdout); return; }
     printf("[function]\n");
 }
 

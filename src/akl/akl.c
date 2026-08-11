@@ -329,6 +329,13 @@ struct AklRT {
     bool cojit_off;     /* CoJIT（検証駆動 AOT 特化）の kill-switch。既定 ON */
     u32 cojit_applied;  /* S1 回転の累積適用数（観測用） */
     AklVal last_val;
+    /* v0.5 例外の値伝搬（try/catch で捕捉可能な native 例外の実装に伴い追加。GC ルート）:
+     *   pending_exc — akl_vm_unwind が未捕捉と判定した投げ値（再入の内側で発生）。
+     *   reentry_exc — akl_call_this が inner の未捕捉値を退避したもの（native が再 throw）。
+     *   native_exc   — akl_native_throw が値ごと再 throw したもの（AKL_NATIVE_CATCH が使用）。
+     * 文字列化でなく値のまま伝搬することで、`a.map(function(){ throw 42 })` の catch が
+     * V8 と同じ「元の値」を受け取る（"uncaught exception: 42" の二重文字列化を排除）。 */
+    AklVal pending_exc, reentry_exc, native_exc;
     /* v0.3 再入（高階関数）: akl_call 用 */
     AklRootStk *root_stks;  /* 退避済み outer スタックの GC ルート（連結リスト） */
     u32 call_depth;         /* akl_call の再入深さ（上限 AKL_MAX_REENTRY） */
@@ -422,6 +429,9 @@ static u32 akl_gc(AklRT *rt) {
     for (const AklRootStk *rs = rt->root_stks; rs; rs = rs->next)
         for (u32 i = 0; i < rs->sp; i++) akl_gc_mark_val(rt, rs->stk[i], mk);
     akl_gc_mark_val(rt, rt->last_val, mk);
+    akl_gc_mark_val(rt, rt->pending_exc, mk); /* 例外値伝搬（未捕捉値・再 throw 値） */
+    akl_gc_mark_val(rt, rt->reentry_exc, mk);
+    akl_gc_mark_val(rt, rt->native_exc, mk);
     for (u32 i = 0; i < rt->n_tries; i++)
         if (rt->tries[i].kind == AKL_TE_FIN) akl_gc_mark_val(rt, rt->tries[i].pending, mk);
     for (u32 i = 0; i < rt->n_globals; i++) akl_gc_mark_val(rt, rt->globals[i].v, mk);
@@ -625,6 +635,7 @@ static u32 akl_gc(AklRT *rt) {
 
 static i32 obj_prop_find(const AklObj *o, u32 name);
 static const u8 *akl_str(AklRT *rt, u32 idx, u32 *len);
+static u32 akl_to_string(AklRT *rt, AklVal v); /* 前方宣言（akl_to_number の ToPrimitive 経路で使用） */
 static bool obj_prop_set(AklRT *rt, AklObj *o, u32 name, AklVal v);
 /* クラス継承のメソッドコピー: __super チェーンを親 → 子の順で辿り、constructor 以外の
  * メソッド/static をインスタンスにコピーする（子が親を上書き）。深さ制限 64。 */
@@ -3906,6 +3917,12 @@ out:
  * 「外側関数のローカルが後で宣言される」順序問題を解決できないため）。 */
 
 /* ノード部分木の識別子参照を収集（ネストした関数本体はスキップ）。 */
+/* U32Vec 線形所属検査（capture 解析の shadowing 判定用。decls は小規模） */
+static bool an_vec_has(const U32Vec *v, u32 name) {
+    for (u32 i = 0; i < v->n; i++) if (v->v[i] == name) return true;
+    return false;
+}
+
 static bool an_add(U32Vec *v, u32 name) {
     for (u32 i = 0; i < v->n; i++) if (v->v[i] == name) return true;
     if (v->n == v->cap) {
@@ -4119,10 +4136,15 @@ static void an_fn(P *p, u32 ni, u32 *anc, u32 anc_n) {
     U32Vec refs = { NULL, 0, 0 };
     an_refs(p, n->d, &refs);
     anc[anc_n] = ni;
-    /* free(F) ∩ decls(G): 祖先を innermost から走査し capture / needs_cap を marking */
+    /* free(F) ∩ decls(G): 祖先を innermost から走査し capture / needs_cap を marking。
+     * v0.5 修正: 自関数の decls に含まれる ref は祖先の同名宣言にマッチさせない。
+     * シャドーイングの欠落により `try{...}catch(e){...}` を内包する関数が、祖先の
+     * 同名 catch 束縛（main の decls に載る）を誤 capture し、catch 束縛がローカル
+     * slot に書かれるのに CELOAD（ENV）で読まれて値が undefined になる実バグを塞ぐ。 */
     for (u32 a = anc_n; a-- > 0;) {
         AklFnInfo *gfi = (anc[a] == N_NONE) ? &p->main_fi : &p->fninfo[anc[a]];
         for (u32 i = 0; i < refs.n; i++) {
+            if (fi->decls.n && an_vec_has(&fi->decls, refs.v[i])) continue; /* 自関数の束縛が勝つ */
             /* SUPER_NAME は祖先のローカルではなく「関数自身の cap env 先頭」
              * （OP_MAKEFS がバインド）。cap env slot を確保するため needs_cap を立てる。 */
             if (refs.v[i] == p->super_name) {
@@ -4343,6 +4365,29 @@ static bool akl_analyze(P *p, u32 prog) {
     }
     memset(&p->main_fi, 0, sizeof p->main_fi);
     an_main_decls(p, prog, &p->main_fi.decls);
+    if (getenv("AKL_TRACE_CAP")) {
+        fprintf(stderr, "[decls] main n=%u:", p->main_fi.decls.n);
+        for (u32 i = 0; i < p->main_fi.decls.n; i++) {
+            u32 di = p->main_fi.decls.v[i];
+            fprintf(stderr, " [%u]%.*s", di, (int)p->rt->objs[di].len, (const char *)p->rt->objs[di].bytes);
+        }
+        {
+            for (u32 i = 0; i < p->n_nodes; i++) {
+                if (p->nodes[i].kind == N_TRY)
+                    fprintf(stderr, "\n[try node %u] b=%u (%.*s) a=%u c=%u d=%u", i, p->nodes[i].b,
+                            (int)p->rt->objs[p->nodes[i].b].len, (const char *)p->rt->objs[p->nodes[i].b].bytes,
+                            p->nodes[i].a, p->nodes[i].c, p->nodes[i].d);
+            }
+        }
+        fprintf(stderr, "\n[prog] stmts=%u:", prog < p->n_nodes ? p->nodes[prog].c : 0);
+        if (prog < p->n_nodes && p->nodes[prog].a != N_NONE) {
+            for (u32 i = 0; i < p->nodes[prog].c; i++) {
+                u32 si = p->list[p->nodes[prog].a + i];
+                fprintf(stderr, " %u(k%u)", si, p->nodes[si].kind);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
     {
         U32Vec hv = { NULL, 0, 0 };
         an_collect_hoist(p, prog, &hv);
@@ -4571,11 +4616,21 @@ static u32 cg_global_add(AklRT *rt, u32 name, u8 is_const) {
  * depth = 現在関数と祖先 a の間で自前 ENV を持つ関数の数（= ENV チェーンの parent ホップ数）。
  * 発行される cap slot は現在関数の frame 隠し slot（codegen 時に確定）。 */
 static bool cg_captured(Cg *cg, u32 name, bool store, u32 *env_idx_out) {
+    if (getenv("AKL_TRACE_CAP")) {
+        u32 nl_ = name < cg->rt->n_objs ? cg->rt->objs[name].len : 0;
+        const u8 *np = name < cg->rt->n_objs ? cg->rt->objs[name].bytes : NULL;
+        fprintf(stderr, "[cap] outer=%u name=%.*s\n", cg->n_outer, (int)nl_, np ? (const char *)np : "?");
+        for (u32 a = cg->n_outer; a-- > 0;) {
+            const CgScope *os = &cg->outer[a];
+            if (os->fi) fprintf(stderr, "[cap]   outer[%u] n_cap=%u\n", a, os->fi->n_cap);
+        }
+    }
     for (u32 a = cg->n_outer; a-- > 0;) {
         const CgScope *os = &cg->outer[a];
         if (os->fi) {
             for (u16 k = 0; k < os->fi->n_cap; k++) {
                 if (os->fi->cap_names[k] == name) {
+                    if (getenv("AKL_TRACE_CAP")) fprintf(stderr, "[cap]   MATCH outer[%u] k=%u\n", a, k);
                     u32 depth = 0;
                     for (u32 m = a + 1; m < cg->n_outer; m++)
                         if (cg->outer[m].n_env) depth++;
@@ -7130,6 +7185,25 @@ static double akl_canon(double d) {
 }
 
 /* ToNumber 近似（v0.0 のプリミティブ集合で JS 整合） */
+/* JS ToNumber の文字列ステップ（前後空白許容・空文字=0・非数=NaN）。 */
+static double akl_str_to_number(const u8 *sb, u32 sl) {
+    u32 i = 0;
+    while (i < sl && (sb[i] == ' ' || sb[i] == '\t' || sb[i] == '\n' ||
+                      sb[i] == '\r' || sb[i] == '\f')) i++;
+    u32 e = sl;
+    while (e > i && (sb[e - 1] == ' ' || sb[e - 1] == '\t' || sb[e - 1] == '\n' ||
+                     sb[e - 1] == '\r' || sb[e - 1] == '\f')) e--;
+    if (i == e) return 0.0;
+    char tmp[64];
+    u32 m = e - i < 63 ? e - i : 63;
+    memcpy(tmp, sb + i, m);
+    tmp[m] = 0;
+    char *endp = NULL;
+    double dv = strtod(tmp, &endp);
+    if (endp == tmp || *endp != 0) return akl_canon(0.0 / 0.0);
+    return dv;
+}
+
 static double akl_to_number(AklRT *rt, AklVal v) {
     double d;
     if (akl_numv(v, &d)) return d;
@@ -7144,22 +7218,18 @@ static double akl_to_number(AklRT *rt, AklVal v) {
             u32 sl;
             const u8 *sb = akl_str(rt, akl_get_obj(v), &sl); /* ROPE は初回のみ平坦化 */
             if (rt->err[0]) return akl_canon(0.0 / 0.0);
-            u32 i = 0;
-            while (i < sl && (sb[i] == ' ' || sb[i] == '\t' || sb[i] == '\n' ||
-                              sb[i] == '\r' || sb[i] == '\f')) i++;
-            u32 e = sl;
-            while (e > i && (sb[e - 1] == ' ' || sb[e - 1] == '\t' || sb[e - 1] == '\n' ||
-                             sb[e - 1] == '\r' || sb[e - 1] == '\f')) e--;
-            if (i == e) return 0.0;
-            char tmp[64];
-            u32 m = e - i < 63 ? e - i : 63;
-            memcpy(tmp, sb + i, m);
-            tmp[m] = 0;
-            char *endp = NULL;
-            double dv = strtod(tmp, &endp);
-            if (endp == tmp || *endp != 0) return akl_canon(0.0 / 0.0);
-            return dv;
+            return akl_str_to_number(sb, sl);
         }
+        /* v0.5 V8 準拠: オブジェクトは ToPrimitive → ToString → ToNumber の順に変換。
+         * これが無いと +[] が NaN になり、文頭の `{} + []` が V8(0) と食い違う。
+         * （例: [] → "" → 0、[1,2] → "1,2" → NaN、{} → "[object Object]" → NaN）
+         * Number/String/Boolean ラッパー等も toString 経由になる（近似。JS_PARITY 台帳） */
+        u32 si = akl_to_string(rt, v);
+        if (si == UINT32_MAX) return akl_canon(0.0 / 0.0);
+        u32 sl2;
+        const u8 *sb2 = akl_str(rt, si, &sl2);
+        if (rt->err[0]) return akl_canon(0.0 / 0.0);
+        return akl_str_to_number(sb2, sl2);
     }
     return akl_canon(0.0 / 0.0);
 }
@@ -11961,17 +12031,70 @@ static AKL_COLDFN void akl_vm_teardown_to(AklVmSt *st, u32 fdepth) {
 /* 例外の巻き戻し: FIN(top) → pop して継続。TRY: catch があれば束縛代入して捕捉、
  * 無ければ finally があれば FIN(mode=1) に化けて実行、両方無ければ pop。
  * true なら pc_off 確定済み（捕捉 or finally 突入）、false なら uncaught/異常（err 設定済） */
+/* エラー OBJ（name/message props を持つ OBJ）を "Name: message" に整形する
+ * （Error.prototype.toString の近似。V8 の uncaught 表示に合わせる）。
+ * 非エラーは NULL を返す（呼出側は akl_to_string に倒す）。 */
+static AKL_COLDFN const char *akl_error_describe(AklRT *rt, AklVal uv, char *buf, u32 buflen) {
+    if (!akl_is_objv(uv)) return NULL;
+    u32 oi = akl_get_obj(uv);
+    if (oi >= rt->n_objs || rt->objs[oi].kind != AKL_OK_OBJ) return NULL;
+    u32 nname = akl_intern(rt, (const u8 *)"name", 4, NULL);
+    u32 nmsg = akl_intern(rt, (const u8 *)"message", 7, NULL);
+    if (nname == UINT32_MAX || nmsg == UINT32_MAX) return NULL;
+    /* intern の新規 STR で obj 配列が realloc され得る → index 経由で再取得（UAF 構造的排除） */
+    const char *name = "Error";
+    const char *msg = "";
+    char namebuf[64], msgbuf[256];
+    i32 pi = obj_prop_find(&rt->objs[oi], nname);
+    if (pi >= 0) {
+        AklVal pv = rt->objs[oi].u.po.props[pi].v;
+        u32 sl = 0;
+        const u8 *sp = akl_is_strly(rt, pv) ? akl_str(rt, akl_get_obj(pv), &sl) : NULL;
+        if (rt->err[0]) return NULL;
+        if (sp && sl) {
+            u32 cl = sl < sizeof namebuf - 1 ? sl : sizeof namebuf - 1;
+            memcpy(namebuf, sp, cl);
+            namebuf[cl] = 0;
+            name = namebuf;
+        }
+    }
+    pi = obj_prop_find(&rt->objs[oi], nmsg);
+    if (pi >= 0) {
+        AklVal pv = rt->objs[oi].u.po.props[pi].v;
+        u32 sl = 0;
+        const u8 *sp = akl_is_strly(rt, pv) ? akl_str(rt, akl_get_obj(pv), &sl) : NULL;
+        if (rt->err[0]) return NULL;
+        if (sp && sl) {
+            u32 cl = sl < sizeof msgbuf - 1 ? sl : sizeof msgbuf - 1;
+            memcpy(msgbuf, sp, cl);
+            msgbuf[cl] = 0;
+            msg = msgbuf;
+        }
+    }
+    if (!name[0]) { snprintf(buf, buflen, "%s", msg); return buf; }
+    if (!msg[0]) { snprintf(buf, buflen, "%s", name); return buf; }
+    snprintf(buf, buflen, "%s: %s", name, msg);
+    return buf;
+}
+
 static AKL_COLDFN bool akl_vm_unwind(AklRT *rt, AklVmSt *st, AklVal uv) {
     for (;;) {
         if (!rt->n_tries) {
             if (!akl_vm_stk_grow1(rt, st)) return false; /* OOM 系は err 設定済 */
             (*st->pstk)[st->sp++] = uv;
             rt->gc_sp = st->sp; /* 文字列化の GC から値を保護 */
-            u32 s_ = akl_to_string(rt, uv);
-            u32 sl_ = 0;
-            const u8 *bp_ = s_ != UINT32_MAX ? akl_str(rt, s_, &sl_) : NULL;
-            if (bp_) akl_errf(rt, "uncaught exception: %.*s", sl_ > 96 ? 96 : (int)sl_, (const char *)bp_);
-            else akl_errf(rt, "uncaught exception");
+            rt->pending_exc = uv; /* 値伝搬（akl_call_this が reentry_exc へ退避） */
+            char dbuf[300];
+            const char *desc = akl_error_describe(rt, uv, dbuf, sizeof dbuf);
+            if (desc) {
+                akl_errf(rt, "uncaught exception: %s", desc);
+            } else {
+                u32 s_ = akl_to_string(rt, uv);
+                u32 sl_ = 0;
+                const u8 *bp_ = s_ != UINT32_MAX ? akl_str(rt, s_, &sl_) : NULL;
+                if (bp_) akl_errf(rt, "uncaught exception: %.*s", sl_ > 96 ? 96 : (int)sl_, (const char *)bp_);
+                else akl_errf(rt, "uncaught exception");
+            }
             return false;
         }
         AklTryEnt *te_ = &rt->tries[rt->n_tries - 1];
@@ -12119,6 +12242,50 @@ static AKL_COLDFN bool akl_vm_frame_hidden(AklRT *rt, AklVal *stk, u32 base, u32
 
 /* init_args/init_argc/init_this: 再入呼び出し（akl_call）のための最初のフレーム引数。
  * akl_eval は NULL/0/UNDEF を渡す（従来どおり引数なし）。 */
+/* VM 実行中の native 例外（akl_native_throw）を JS Error OBJ に変換する。
+ * rt->err の "Name: message" 形式を分解し、既知エラー名（TypeError 等）を .name に採用する
+ * （V8 準拠: JSON.parse('{') の例外は catch で e.name == "SyntaxError"）。
+ * 失敗時は AKL_VAL_UNDEF を返し rt->err を再設定（呼出側は致命的失敗として扱う）。 */
+static AklVal akl_native_err_to_js(AklRT *rt) {
+    char nb[256];
+    snprintf(nb, sizeof nb, "%s", rt->err[0] ? rt->err : "Error");
+    rt->err[0] = 0;
+    static const char *const NMS[7] = { "TypeError", "RangeError", "SyntaxError",
+                                        "ReferenceError", "EvalError", "URIError", "Error" };
+    /* "Name: message" の先頭分解。v0.5: 既知エラー名を「先頭から走査して最初の既知名」で
+     * 選ぶ（"uncaught exception: Error: boom" のような wrap 文字列でも .name/.message を
+     * 正しく復元する。最初の区分が未知でも次区分が既知ならそちらを採用）。 */
+    const char *start = nb;
+    const char *nm = "Error";
+    const char *ms = nb;
+    u32 msl = (u32)strlen(nb);
+    bool found = false;
+    for (int pass = 0; pass < 3 && !found; pass++) {
+        const char *col = strstr(start, ": ");
+        if (!col) break;
+        u32 nlen = (u32)(col - start);
+        for (int k = 0; k < 7; k++) {
+            if (strlen(NMS[k]) == nlen && memcmp(start, NMS[k], nlen) == 0) {
+                nm = NMS[k];
+                ms = col + 2;
+                msl = (u32)(strlen(start) - nlen - 2);
+                found = true;
+                break;
+            }
+        }
+        if (!found) start = col + 2; /* 未知区分は読み飛ばして次を試す */
+    }
+    if (!found) {
+        const char *col = strstr(nb, ": ");
+        if (col) { ms = col + 2; msl = (u32)(strlen(nb) - (u32)(col - nb) - 2); }
+    }
+    AklVal msv = akl_mkstring(rt, ms, msl);
+    if (rt->err[0]) return AKL_VAL_UNDEF;
+    AklVal ev = akl_error_ctor(rt, AKL_VAL_UNDEF, 1, &msv, NULL, nm);
+    if (rt->err[0]) return AKL_VAL_UNDEF;
+    return ev;
+}
+
 static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc,
                     AklVal init_this, AklVal init_capenv, bool top_ret_ok) {
     if (entry >= rt->n_funcs) { akl_errf(rt, "internal: bad entry"); return false; }
@@ -12281,6 +12448,32 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
 #define AKL_L(name) case OP_##name
     for (;;) switch (*pc++) {
 #endif
+
+/* v0.5 V8 準拠: native 例外（akl_native_throw）を JS Error OBJ に変換して try/catch で
+ * 捕捉可能にする。呼出側は `if (rt->native_err) { AKL_NATIVE_CATCH(); }` の形で使い、
+ * 捕捉時は pc が catch/finally 先へ更新された状態で VM を続行する（未捕捉は致命的失敗）。 */
+#define AKL_NATIVE_CATCH() do { \
+    rt->native_err = false; \
+    AklVal errv_; \
+    if (rt->native_exc != AKL_VAL_UNDEF) { /* 値ごと再 throw（HOF コールバック例外）: 変換しない */ \
+        errv_ = rt->native_exc; \
+        rt->native_exc = AKL_VAL_UNDEF; \
+    } else { \
+        errv_ = akl_native_err_to_js(rt); \
+        if (rt->err[0]) { free(frames); return false; } \
+    } \
+    /* 消費済みの例外文字列を消す: 再入（akl_call）内の未捕捉メッセージが rt->err に残ると、 \
+     * 以後の `if (rt->err[0]) return false` 系検査（concat/eq の akl_str 後検査等）が \
+     * 誤発火して正常な実行が失敗する（実測: `[1,2].map(...)` の catch 内の + 連結で再現） */ \
+    rt->err[0] = 0; \
+    u32 nur2_ = rt->n_nury; \
+    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = akl_get_obj(errv_); \
+    AKL_VMST_OUT(); \
+    bool ok_ = akl_vm_unwind(rt, &vmst_, errv_); \
+    rt->n_nury = nur2_; \
+    AKL_VMST_IN(); \
+    if (!ok_) { free(frames); return false; } \
+    AKL_NEXT(); } while (0)
 
     AKL_L(CONST_I): {
         u32 imm;
@@ -12577,7 +12770,10 @@ typeof_done:
             rt->gc_sp = sp; /* native 内の mkstring 等が GC 発火し得る → ルート同期（MAKEF 同型） */
             u32 nur0 = rt->n_nury;
             AklVal r;
-            if (!akl_vm_native_call(rt, fo, AKL_VAL_UNDEF, argc, stk + sp - argc, &r)) { free(frames); return false; }
+            if (!akl_vm_native_call(rt, fo, AKL_VAL_UNDEF, argc, stk + sp - argc, &r)) {
+                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                free(frames); return false;
+            }
             rt->n_nury = nur0; /* 返り値 r は直後にスタックへ根付く（復元〜書込の間に GC 契機なし） */
             sp -= argc;
             stk[sp - 1] = r;   /* 関数値スロットを結果で潰す（pop argc+1 / push r 等価） */
@@ -12624,7 +12820,10 @@ typeof_done:
             rt->gc_sp = sp;
             u32 nur0 = rt->n_nury;
             AklVal r;
-            if (!akl_vm_native_call(rt, fo, this_for_call, argc, stk + sp - argc, &r)) { free(frames); return false; }
+            if (!akl_vm_native_call(rt, fo, this_for_call, argc, stk + sp - argc, &r)) {
+                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                free(frames); return false;
+            }
             rt->n_nury = nur0;
             sp -= argc;
             stk[sp - 1] = r;
@@ -12728,7 +12927,10 @@ typeof_done:
             rt->gc_sp = sp;
             u32 nur0 = rt->n_nury;
             AklVal r;
-            if (!akl_vm_native_call(rt, fo, thisv, argc, stk + sp - argc, &r)) { free(frames); return false; }
+            if (!akl_vm_native_call(rt, fo, thisv, argc, stk + sp - argc, &r)) {
+                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                free(frames); return false;
+            }
             rt->n_nury = nur0;
             sp -= argc + 1; /* fn + args を潰す */
             stk[sp - 1] = r;
@@ -12913,7 +13115,7 @@ typeof_done:
                 rt->gc_sp = sp + 1; /* pop 後でも ov は stk[sp] に残存値として mark されるよう同期 */
                 u32 nur0 = rt->n_nury;
                 bool ok_h = ho->u.hd.vt->get(rt, ho->u.hd.ptr, (const char *)nb, nl, &out);
-                if (rt->native_err) { free(frames); return false; }
+                if (rt->native_err) { AKL_NATIVE_CATCH(); }
                 rt->n_nury = nur0; /* out は直後 PUSH で根付く（間に GC 契機なし） */
                 if (!ok_h) out = AKL_VAL_UNDEF;
             }
@@ -13144,7 +13346,10 @@ typeof_done:
                                 budget -= AKL_NATIVE_COST;
                                 u32 nur0 = rt->n_nury;
                                 AklVal gout;
-                                if (!akl_vm_native_call(rt, gfo, ov, 0, NULL, &gout)) { free(frames); return false; }
+                                if (!akl_vm_native_call(rt, gfo, ov, 0, NULL, &gout)) {
+                                    if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                                    free(frames); return false;
+                                }
                                 rt->n_nury = nur0;
                                 AKL_PUSH(gout);
                                 AKL_NEXT();
@@ -13207,7 +13412,7 @@ typeof_done:
             rt->gc_sp = sp + 2; /* pop 済み ov/v も stk 残存値として mark（set 内 GC 発火対策） */
             u32 nur0 = rt->n_nury;
             bool ok_h = ho->u.hd.vt->set(rt, ho->u.hd.ptr, (const char *)nb, nl, v);
-            if (rt->native_err) { free(frames); return false; }
+            if (rt->native_err) { AKL_NATIVE_CATCH(); }
             rt->n_nury = nur0;
             if (!ok_h) { akl_errf(rt, "TypeError: property store rejected"); free(frames); return false; }
             AKL_PUSH(v); /* 代入式の値は右辺（JS 同様） */
@@ -13283,7 +13488,10 @@ typeof_done:
                                 budget -= AKL_NATIVE_COST;
                                 u32 nur0 = rt->n_nury;
                                 AklVal sout;
-                                if (!akl_vm_native_call(rt, sfo, ov, 1, &v, &sout)) { free(frames); return false; }
+                                if (!akl_vm_native_call(rt, sfo, ov, 1, &v, &sout)) {
+                                    if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                                    free(frames); return false;
+                                }
                                 rt->n_nury = nur0;
                                 AKL_PUSH(v); /* 代入式の値は右辺 */
                                 AKL_NEXT();
@@ -13372,7 +13580,10 @@ typeof_done:
                     rt->gc_sp = sp;
                     u32 nur0 = rt->n_nury;
                     AklVal r;
-                    if (!akl_vm_native_call(rt, mfo2, ov, argc, stk + sp - argc, &r)) { free(frames); return false; }
+                    if (!akl_vm_native_call(rt, mfo2, ov, argc, stk + sp - argc, &r)) {
+                        if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                        free(frames); return false;
+                    }
                     rt->n_nury = nur0;
                     sp -= argc;
                     stk[sp - 1] = r;
@@ -13405,7 +13616,10 @@ typeof_done:
                 rt->gc_sp = sp;
                 u32 nur0 = rt->n_nury;
                 AklVal r;
-                if (!akl_vm_native_call(rt, mfo, ov, argc, stk + sp - argc, &r)) { free(frames); return false; } /* this=レシーバ（V8 準拠） */
+                if (!akl_vm_native_call(rt, mfo, ov, argc, stk + sp - argc, &r)) { /* this=レシーバ（V8 準拠） */
+                    if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                    free(frames); return false;
+                }
                 rt->n_nury = nur0;
                 sp -= argc;
                 stk[sp - 1] = r;
@@ -13424,7 +13638,7 @@ typeof_done:
             u32 nur0 = rt->n_nury;
             AklVal out = AKL_VAL_UNDEF;
             bool ok_h = ho->u.hd.vt->call(rt, ho->u.hd.ptr, (const char *)nb, nl, (int)argc, stk + sp - argc, &out);
-            if (rt->native_err) { free(frames); return false; }
+            if (rt->native_err) { AKL_NATIVE_CATCH(); }
             rt->n_nury = nur0;
             if (!ok_h) { akl_errf(rt, "TypeError: not a function"); free(frames); return false; }
             sp -= argc;
@@ -13463,7 +13677,7 @@ typeof_done:
                     rt->gc_sp = sp; /* argv/ov は stk 上 = mark 済み */
                     u32 nur0 = rt->n_nury;
                     AklVal r = tbl[hit].fn(rt, ov, (int)argc, stk + sp - argc, (void *)(uintptr_t)hit);
-                    if (rt->native_err) { free(frames); return false; }
+                    if (rt->native_err) { AKL_NATIVE_CATCH(); }
                     rt->n_nury = nur0;
                     sp -= argc;
                     stk[sp - 1] = r;
@@ -13523,7 +13737,10 @@ typeof_done:
             rt->gc_sp = sp;
             u32 nur0 = rt->n_nury;
             AklVal r;
-            if (!akl_vm_native_call(rt, fo, ov, argc, stk + sp - argc, &r)) { free(frames); return false; }
+            if (!akl_vm_native_call(rt, fo, ov, argc, stk + sp - argc, &r)) {
+                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                free(frames); return false;
+            }
             rt->n_nury = nur0;
             sp -= argc;
             stk[sp - 1] = r;
@@ -14736,7 +14953,10 @@ typeof_done:
             rt->gc_sp = sp;
             u32 nur0 = rt->n_nury;
             AklVal r;
-            if (!akl_vm_native_call(rt, fo, AKL_VAL_UNDEF, (u8)argc, stk + sp - argc, &r)) { free(frames); return false; }
+            if (!akl_vm_native_call(rt, fo, AKL_VAL_UNDEF, (u8)argc, stk + sp - argc, &r)) {
+                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                free(frames); return false;
+            }
             rt->n_nury = nur0;
             sp -= argc;
             stk[sp - 1] = r;
@@ -14826,7 +15046,10 @@ typeof_done:
             fo = &rt->objs[ctor_i]; /* akl_obj_new 後の再取得（UAF 修正） */
             u32 nur0 = rt->n_nury;
             AklVal r;
-            if (!akl_vm_native_call(rt, fo, AKL_MK_OBJ(oi), argc, stk + sp - argc, &r)) { free(frames); return false; }
+            if (!akl_vm_native_call(rt, fo, AKL_MK_OBJ(oi), argc, stk + sp - argc, &r)) {
+                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                free(frames); return false;
+            }
             rt->n_nury = nur0;
             sp -= argc;
             /* native コンストラクタ: 戻りがオブジェクトならそれを返す（JS 仕様）。
@@ -15378,6 +15601,7 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
     rt->n_nury = 0; /* 同上（C 側一時ルートの残留棄却。内部規律は各使用者復元） */
     rt->native_err = false;
     rt->last_val = AKL_VAL_UNDEF; /* 前回 eval の最後の式文の値が残留しないようリセット */
+    rt->pending_exc = rt->reentry_exc = rt->native_exc = AKL_VAL_UNDEF; /* 例外値伝搬の残留棄却 */
     if (rt->gc_live) { akl_errf(rt, "recursive akl_eval is not supported"); return false; }
     u32 main_idx;
     if (!akl_compile_src(rt, src, false, &main_idx, NULL)) return false;
@@ -15526,8 +15750,13 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
         u32 rem = rt->code_len - code_from;
         while (rem) {
             u8 op = *cp;
-            fprintf(stderr, "  %04u: %s\n", (u32)(cp - (rt->code + code_from)),
+            fprintf(stderr, "  %04u: %s", (u32)(cp - (rt->code + code_from)),
                     op < (sizeof ON / sizeof ON[0]) ? ON[op] : "??");
+            if (op == OP_LLOAD) { u32 sl_; memcpy(&sl_, cp + 1, 4); fprintf(stderr, " slot=%u", sl_); }
+            if (op == OP_CELOAD) { fprintf(stderr, " cap=%u depth=%u idx=%u", cp[1], cp[2], *(u32 *)(cp + 3)); }
+            if (op == OP_ELOAD) { fprintf(stderr, " idx=%u", *(u32 *)(cp + 1)); }
+            if (op == OP_TRY_PUSH) { u32 a_, b_, c_; memcpy(&a_, cp + 1, 4); memcpy(&b_, cp + 5, 4); memcpy(&c_, cp + 9, 4); fprintf(stderr, " cpc=%u fpc=%u cslot=%u", a_, b_, c_); }
+            fprintf(stderr, "\n");
             cp += 1 + akl_op_imm_len(op);
             rem -= 1 + akl_op_imm_len(op);
         }
@@ -15557,6 +15786,7 @@ bool akl_eval_module(AklRT *rt, const char *src, const char *base, AklVal *out) 
     rt->n_nury = 0;
     rt->native_err = false;
     rt->last_val = AKL_VAL_UNDEF;
+    rt->pending_exc = rt->reentry_exc = rt->native_exc = AKL_VAL_UNDEF; /* 例外値伝搬の残留棄却 */
     if (rt->gc_live) { akl_errf(rt, "recursive akl_eval is not supported"); return false; }
     u32 main_idx;
     if (!akl_compile_src(rt, src, true, &main_idx, NULL)) return false;
@@ -15675,7 +15905,16 @@ bool akl_call_this(AklRT *rt, AklVal fn, AklVal thisv, int argc, const AklVal *a
     rt->gc_sp = old_gc_sp;
     rt->root_stks = rs.next;
 
-    if (!ok) return false;
+    if (!ok) {
+        /* v0.5: inner の未捕捉投げ値を値のまま native 側へ引き継ぐ（文字列化を経ない）。
+         * これにより `a.map(function(){ throw 42 })` の catch は V8 同様 42 を受け取り、
+         * 再 throw でも Error OBJ の identity が保たれる。 */
+        if (rt->pending_exc != AKL_VAL_UNDEF) {
+            rt->reentry_exc = rt->pending_exc;
+            rt->pending_exc = AKL_VAL_UNDEF;
+        }
+        return false;
+    }
     if (out) *out = rt->last_val;
     return true;
 }
@@ -15937,6 +16176,14 @@ bool akl_native_register(AklRT *rt, const char *name, AklNativeFn fn, void *udat
 
 void akl_native_throw(AklRT *rt, const char *msg) {
     if (!rt) return;
+    /* v0.5: 直前の再入呼出（akl_call_this）が未捕捉例外で失敗していたら、文字列でなく
+     * 元の値を投げる（`a.map(function(){ throw 42 })` 等の HOF 経路。二重文字列化の排除） */
+    if (rt->reentry_exc != AKL_VAL_UNDEF) {
+        rt->native_exc = rt->reentry_exc;
+        rt->reentry_exc = AKL_VAL_UNDEF;
+        rt->native_err = true;
+        return;
+    }
     if (msg == rt->err) {
         /* msg が rt->err 自身を指すケース（native が rt->err をそのまま渡す）:
          * errf の %s は src/dst エイリアスでバッファを壊し、エラーメッセージが

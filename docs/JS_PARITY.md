@@ -9,9 +9,9 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 
 ## 現状サマリ（parity.py 実測: 69 スニペット）
 
-- 一致: **60**（2026-08-10 の一斉実装で 37 → 60）
-- 不一致（誤った結果を返す）: 9 → 残課題（下表）
-- 未実装（ReferenceError / 明白失敗）: 0（下表の 4 項目はすべて大規模実装待ち）
+- 一致: **62**（2026-08-12 の native 例外捕捉化 + ToNumber 修正で 60 → 62）
+- 不一致（誤った結果を返す）: 7 → 残課題（下表）
+- 未実装（ReferenceError / 明白失敗）: 0（下表の 3 項目はすべて大規模実装待ち）
 
 ## 残課題（誤った結果 or 未実装）— 次ターン以降
 
@@ -19,7 +19,6 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 |---|---|---|---|
 | let/const のブロックスコープ `{ let a = 1; } a` | 1（漏れる） | ReferenceError | 大（スコープ管理 + TDZ） |
 | `let a = 1; { let a = 2; } a` | 2 | 1 | 同上 |
-| `{} + []`（文頭） | NaN | 0 | 小（文 vs 式の曖昧さ） |
 | Promise のマイクロタスク `Promise.resolve().then(f); x` | 同期実行 | 非同期（x は 0） | 大（マイクロタスクキュー） |
 | `typeof Symbol` / `typeof Proxy` | ReferenceError | function | 大（キー体系 / トラップ） |
 | `Object.getPrototypeOf({}) === Object.prototype` | ReferenceError | true | 大（継承モデル） |
@@ -40,6 +39,12 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 | globalThis | `globalThis` | **修正済み（2026-08-10）** |
 | eval | `eval('1+2')`（グローバル近似） | **修正済み（2026-08-10）** |
 | クラス | `typeof class` は function、new なし呼び出しは TypeError | **修正済み（2026-08-10）** |
+| 数値変換 | ToNumber のオブジェクト経路（`+[]` = 0、`+[1]` = 1、`+{}` = NaN、`{} + []` 文頭 = 0） | **修正済み（2026-08-12）** |
+| native 例外 | `JSON.parse('{')` 等の例外が try/catch で捕捉可能（`e.name` = "SyntaxError"） | **修正済み（2026-08-12）** |
+| 例外の値伝搬 | `a.map(function(){ throw 42 })` の catch は元の値 42（HOF 再入経由でも Error OBJ の identity 保持） | **修正済み（2026-08-12）** |
+| 捕捉シャドーイング | `function g(){ try{...}catch(e){ throw e } }` が祖先の同名 catch 束縛を誤 capture しない | **修正済み（2026-08-12）** |
+| uncaught 表示 | 未捕捉の Error OBJ は `uncaught exception: Error: boom` 形式（toString 近似） | **修正済み（2026-08-12）** |
+| CLI 表示 | オブジェクト完了値は JS ToString で表示（旧フォールバックは "[function]" で紛らわしかった） | **修正済み（2026-08-12）** |
 | Symbol | `Symbol()` / `Symbol.iterator` | 未（大規模: キー体系拡張） |
 | Proxy | `Proxy` / `Reflect` | 未（大規模: トラップ dispatch） |
 | プロトタイプ | `Object.getPrototypeOf` / `Object.prototype` / `instanceof` チェーン | 未（大規模: 継承モデル） |
@@ -52,6 +57,8 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 - Date のローカル系メソッドは UTC として扱う（TZ 非依存。TZ=UTC 環境なら V8 と一致）
 - eval はグローバル近似（直接 eval のローカルスコープ参照は非対応）
 - BigInt は 64bit 符号付き整数（任意精度は将来）。BigInt + Number は Number 変換（V8 は TypeError）
+- `new Number(5)` 等のラッパー OBJ は数値変換されない（`+new Number(5)` は NaN。V8 は 5。ラッパー種別を持たないため）
+- catch 束縛は関数スコープ近似（V8 の catch ブロックスコープは let/const スコープ実装と共に将来対応。捕捉値は正しく catch 本体に届く）
 - generator は全同期実行 + yield 値蓄積（遅延評価は将来）
 - モジュール export はスナップショット（live binding は将来）
 - `with` / `import.meta` / トップレベル await / `new.target` は明示拒否

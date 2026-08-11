@@ -449,6 +449,23 @@ static void t_exceptions(void) {
     /* カンマ宣言の保持（旧バグ: 2 個目以降しか残らなかった。CoJIT 検証中に同定） */
     want_num("var ca=1,cb=2; ca*10+cb", 12);
     want_num("var cc=1,cd2=2,ce=3; cc*100+cd2*10+ce", 123);
+    /* v0.5: native 例外（JSON.parse 等）は JS の try/catch で捕捉可能（V8 準拠）。
+     * 以前は native_err 経由で eval 全体が失敗していた。e.name も "SyntaxError" になる。 */
+    want_str("try { JSON.parse('{') } catch (e) { e.name }", "SyntaxError");
+    want_str("try { JSON.parse('[') } catch (e) { 'caught:' + e.name }", "caught:SyntaxError");
+    want_str("function g() { try { JSON.parse('[') } catch (e) { throw e; } }"
+             " try { g() } catch (e2) { e2.name }", "SyntaxError"); /* rethrow 跨フレーム */
+    /* v0.5: HOF コールバック（再入 akl_call）の例外は「元の値」のまま伝搬する
+     * （文字列化されない。V8 と同一）。Error OBJ の identity も保持。 */
+    want_str("try { [1,2].map(function(x){ throw 42; }) } catch (e) { typeof e + ':' + e }", "number:42");
+    want_str("try { [1,2].map(function(x){ throw new TypeError('boom'); }) } catch (e) { e.name + ':' + e.message }",
+             "TypeError:boom");
+    /* v0.5: catch 束縛のシャドーイング（自関数の catch 変数が祖先の同名 catch 変数と
+     * 衝突して誤 capture され、CELOAD が ENV から undefined を読む実バグの回帰防止） */
+    want_str("function g() { try { JSON.parse('[') } catch (e) { throw e; } }"
+             " try { g() } catch (e) { e.name }", "SyntaxError");
+    want_num("function g2() { try { throw 7; } catch (e) { return e; } }"
+             " try { throw 1; } catch (e) { g2() }", 7);
 }
 
 /* ---- CoJIT（検証駆動 AOT 特化）の差分オラクル。
