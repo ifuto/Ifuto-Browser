@@ -4118,6 +4118,10 @@ static void an_refs(P *p, u32 ni, U32Vec *out) {
         an_add(out, p->super_name);
         break;
     /* N_FUNC / N_FUNCEXPR / N_CLASSMETH: 本体は別関数（スキップ）。N_THIS 等: なし */
+    case N_NEW:
+        an_refs(p, n->a, out);
+        for (u32 i = 0; i < n->c; i++) an_refs(p, p->list[n->b + i], out);
+        break;
     default: break;
     }
 }
@@ -4506,29 +4510,7 @@ static bool akl_analyze(P *p, u32 prog) {
     }
     memset(&p->main_fi, 0, sizeof p->main_fi);
     an_main_decls(p, prog, &p->main_fi.decls);
-    if (getenv("AKL_TRACE_CAP")) {
-        fprintf(stderr, "[decls] main n=%u:", p->main_fi.decls.n);
-        for (u32 i = 0; i < p->main_fi.decls.n; i++) {
-            u32 di = p->main_fi.decls.v[i];
-            fprintf(stderr, " [%u]%.*s", di, (int)p->rt->objs[di].len, (const char *)p->rt->objs[di].bytes);
-        }
-        {
-            for (u32 i = 0; i < p->n_nodes; i++) {
-                if (p->nodes[i].kind == N_TRY)
-                    fprintf(stderr, "\n[try node %u] b=%u (%.*s) a=%u c=%u d=%u", i, p->nodes[i].b,
-                            (int)p->rt->objs[p->nodes[i].b].len, (const char *)p->rt->objs[p->nodes[i].b].bytes,
-                            p->nodes[i].a, p->nodes[i].c, p->nodes[i].d);
-            }
-        }
-        fprintf(stderr, "\n[prog] stmts=%u:", prog < p->n_nodes ? p->nodes[prog].c : 0);
-        if (prog < p->n_nodes && p->nodes[prog].a != N_NONE) {
-            for (u32 i = 0; i < p->nodes[prog].c; i++) {
-                u32 si = p->list[p->nodes[prog].a + i];
-                fprintf(stderr, " %u(k%u)", si, p->nodes[si].kind);
-            }
-        }
-        fprintf(stderr, "\n");
-    }
+
     {
         U32Vec hv = { NULL, 0, 0 };
         an_collect_hoist(p, prog, &hv);
@@ -4913,21 +4895,11 @@ static u32 cg_global_add(AklRT *rt, u32 name, u8 is_const) {
  * depth = 現在関数と祖先 a の間で自前 ENV を持つ関数の数（= ENV チェーンの parent ホップ数）。
  * 発行される cap slot は現在関数の frame 隠し slot（codegen 時に確定）。 */
 static bool cg_captured(Cg *cg, u32 name, bool store, u32 *env_idx_out) {
-    if (getenv("AKL_TRACE_CAP")) {
-        u32 nl_ = name < cg->rt->n_objs ? cg->rt->objs[name].len : 0;
-        const u8 *np = name < cg->rt->n_objs ? cg->rt->objs[name].bytes : NULL;
-        fprintf(stderr, "[cap] outer=%u name=%.*s\n", cg->n_outer, (int)nl_, np ? (const char *)np : "?");
-        for (u32 a = cg->n_outer; a-- > 0;) {
-            const CgScope *os = &cg->outer[a];
-            if (os->fi) fprintf(stderr, "[cap]   outer[%u] n_cap=%u\n", a, os->fi->n_cap);
-        }
-    }
     for (u32 a = cg->n_outer; a-- > 0;) {
         const CgScope *os = &cg->outer[a];
         if (os->fi) {
             for (u16 k = 0; k < os->fi->n_cap; k++) {
                 if (os->fi->cap_names[k] == name) {
-                    if (getenv("AKL_TRACE_CAP")) fprintf(stderr, "[cap]   MATCH outer[%u] k=%u\n", a, k);
                     u32 depth = 0;
                     for (u32 m = a + 1; m < cg->n_outer; m++)
                         if (cg->outer[m].n_env) depth++;
