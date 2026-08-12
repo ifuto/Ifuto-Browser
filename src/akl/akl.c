@@ -344,6 +344,15 @@ struct AklRT {
      * 文字列化でなく値のまま伝搬することで、`a.map(function(){ throw 42 })` の catch が
      * V8 と同じ「元の値」を受け取る（"uncaught exception: 42" の二重文字列化を排除）。 */
     AklVal pending_exc, reentry_exc, native_exc;
+    /* v0.6 マイクロタスクキュー（V8 準拠の Promise 遅延実行）:
+     *   mtq — {fn, value, result_promise} の 3 連（then コールバックの待ち行列）。
+     *   pwait — {promise, onF, onR, result} の 4 連（pending Promise の待機登録）。
+     * どちらも GC ルート（akl_gc で mark）。評価終了時に akl_microtask_drain が
+     * FIFO で消化し、callback の戻り値で result promise を解決、その waiters を
+     * 再キューする。これにより `Promise.resolve().then(f); x` は x が f 実行前の
+     * 値になる（V8 と一致。旧実装は同期実行で x が f 後の値だった）。 */
+    AklVal *mtq; u32 mt_n, mt_cap, mt_head;
+    AklVal *pwait; u32 pw_n, pw_cap;
     /* v0.3 再入（高階関数）: akl_call 用 */
     AklRootStk *root_stks;  /* 退避済み outer スタックの GC ルート（連結リスト） */
     u32 call_depth;         /* akl_call の再入深さ（上限 AKL_MAX_REENTRY） */
@@ -440,6 +449,18 @@ static u32 akl_gc(AklRT *rt) {
     akl_gc_mark_val(rt, rt->pending_exc, mk); /* 例外値伝搬（未捕捉値・再 throw 値） */
     akl_gc_mark_val(rt, rt->reentry_exc, mk);
     akl_gc_mark_val(rt, rt->native_exc, mk);
+    /* v0.6: マイクロタスクキューと Promise 待機リスト（fn/値/result promise を根に） */
+    for (u32 i = rt->mt_head; i + 2 < rt->mt_n; i += 3) {
+        akl_gc_mark_val(rt, rt->mtq[i], mk);
+        akl_gc_mark_val(rt, rt->mtq[i + 1], mk);
+        akl_gc_mark_val(rt, rt->mtq[i + 2], mk);
+    }
+    for (u32 i = 0; i + 3 < rt->pw_n; i += 4) {
+        akl_gc_mark_val(rt, rt->pwait[i], mk);
+        akl_gc_mark_val(rt, rt->pwait[i + 1], mk);
+        akl_gc_mark_val(rt, rt->pwait[i + 2], mk);
+        akl_gc_mark_val(rt, rt->pwait[i + 3], mk);
+    }
     for (u32 i = 0; i < rt->n_tries; i++)
         if (rt->tries[i].kind == AKL_TE_FIN) akl_gc_mark_val(rt, rt->tries[i].pending, mk);
     for (u32 i = 0; i < rt->n_globals; i++) akl_gc_mark_val(rt, rt->globals[i].v, mk);
@@ -10592,6 +10613,7 @@ static AklVal akl_promise_make(AklRT *rt, u8 state, AklVal value) {
     return AKL_MK_OBJ(oi);
 }
 
+static void akl_promise_settle(AklRT *rt, u32 res_idx, u8 state, AklVal out); /* 前方宣言（resolve/reject fn が使用） */
 /* executor に渡す resolve / reject（udata = promise obj idx。GC は idx を動かさない） */
 static AklVal akl_m_promise_resolve_fn(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     (void)self;
@@ -10600,8 +10622,7 @@ static AklVal akl_m_promise_resolve_fn(AklRT *rt, AklVal self, int argc, const A
         akl_native_throw(rt, "TypeError: promise executor resolve on invalid promise");
         return akl_mkundefined();
     }
-    rt->objs[oi].u.pr.state = 1;
-    rt->objs[oi].u.pr.value = argc > 0 ? argv[0] : akl_mkundefined();
+    akl_promise_settle(rt, oi, 1, argc > 0 ? argv[0] : akl_mkundefined()); /* v0.6: waiters をキューへ */
     return akl_mkundefined();
 }
 static AklVal akl_m_promise_reject_fn(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10611,8 +10632,7 @@ static AklVal akl_m_promise_reject_fn(AklRT *rt, AklVal self, int argc, const Ak
         akl_native_throw(rt, "TypeError: promise executor reject on invalid promise");
         return akl_mkundefined();
     }
-    rt->objs[oi].u.pr.state = 2;
-    rt->objs[oi].u.pr.value = argc > 0 ? argv[0] : akl_mkundefined();
+    akl_promise_settle(rt, oi, 2, argc > 0 ? argv[0] : akl_mkundefined()); /* v0.6: waiters をキューへ */
     return akl_mkundefined();
 }
 
@@ -10661,34 +10681,141 @@ static AklVal akl_m_promise_ctor(AklRT *rt, AklVal self, int argc, const AklVal 
     return pv;
 }
 
-/* Promise.prototype.then(onFulfilled, onRejected): 解決済みなら即時同期コールバック */
+/* マイクロタスクキューへの push（{fn, value, result_promise} 3 連。失敗時 false） */
+static bool akl_mtq_push(AklRT *rt, AklVal fn, AklVal val, u32 result_promise) {
+    if (rt->mt_n + 3 > rt->mt_cap) {
+        u32 nc = rt->mt_cap ? rt->mt_cap * 2 : 24;
+        AklVal *nq = (AklVal *)realloc(rt->mtq, (u64)nc * sizeof(AklVal));
+        if (!nq) { akl_errf(rt, "oom: microtask queue"); return false; }
+        rt->mtq = nq; rt->mt_cap = nc;
+    }
+    rt->mtq[rt->mt_n++] = fn;
+    rt->mtq[rt->mt_n++] = val;
+    rt->mtq[rt->mt_n++] = AKL_MK_OBJ(result_promise);
+    return true;
+}
+/* pending Promise への待機登録（{promise, onF, onR, result} 4 連。失敗時 false） */
+static bool akl_pwait_push(AklRT *rt, AklVal promise, AklVal onF, AklVal onR, u32 result_promise) {
+    if (rt->pw_n + 4 > rt->pw_cap) {
+        u32 nc = rt->pw_cap ? rt->pw_cap * 2 : 16;
+        AklVal *nq = (AklVal *)realloc(rt->pwait, (u64)nc * sizeof(AklVal));
+        if (!nq) { akl_errf(rt, "oom: promise wait list"); return false; }
+        rt->pwait = nq; rt->pw_cap = nc;
+    }
+    rt->pwait[rt->pw_n++] = promise;
+    rt->pwait[rt->pw_n++] = onF;
+    rt->pwait[rt->pw_n++] = onR;
+    rt->pwait[rt->pw_n++] = AKL_MK_OBJ(result_promise);
+    return true;
+}
+/* result promise を解決し、その waiters をマイクロタスクへ移す。
+ * state 1 → onF、state 2 → onR（無ければ値を引き継ぐ）。 */
+static void akl_promise_settle(AklRT *rt, u32 res_idx, u8 state, AklVal out) {
+    if (res_idx < rt->n_objs && rt->objs[res_idx].kind == AKL_OK_PROMISE) {
+        rt->objs[res_idx].u.pr.state = state;
+        rt->objs[res_idx].u.pr.value = out;
+    } else {
+        return; /* 壊れた参照は無視（防御層） */
+    }
+    /* waiters（この promise に .then で登録された pending 待機）をキューへ移す */
+    u32 i = 0;
+    while (i + 3 < rt->pw_n) {
+        u32 pidx = akl_get_obj(rt->pwait[i]);
+        if (pidx == res_idx) {
+            AklVal onF = rt->pwait[i + 1], onR = rt->pwait[i + 2];
+            u32 res2 = akl_get_obj(rt->pwait[i + 3]);
+            AklVal fn = state == 2 ? onR : onF;
+            (void)akl_mtq_push(rt, fn, out, res2);
+            memmove(&rt->pwait[i], &rt->pwait[i + 4], (rt->pw_n - i - 4) * sizeof(AklVal));
+            rt->pw_n -= 4;
+        } else {
+            i += 4;
+        }
+    }
+}
+
+/* マイクロタスク消化（akl_eval / akl_eval_module の終了時に呼ぶ。ホスト停止状態）。
+ * FIFO で callback を実行し、戻り値で result promise を解決、その waiters を再キュー。
+ * コールバックの例外は reject 相当に丸める（未捕捉で eval を失敗させない — V8 は
+ * unhandled rejection を出すが同期近似のためメッセージのみ）。 */
+static void akl_microtask_drain(AklRT *rt) {
+    bool old_live = rt->gc_live;
+    rt->gc_live = true; /* コールバック実行中の GC を有効化（HOF 再入と同一条件） */
+    u32 guard = 0;
+    while (rt->mt_head + 2 < rt->mt_n && guard++ < 100000) {
+        AklVal fn = rt->mtq[rt->mt_head];
+        AklVal val = rt->mtq[rt->mt_head + 1];
+        u32 res_idx = akl_get_obj(rt->mtq[rt->mt_head + 2]);
+        /* コールバック実行中はキューに残したまま（fn/val が GC ルートのまま） */
+        AklVal out = val;
+        if (akl_is_objv(fn)) {
+            u32 fi = akl_get_obj(fn);
+            if (fi < rt->n_objs &&
+                (rt->objs[fi].kind == AKL_OK_FUNC || rt->objs[fi].kind == AKL_OK_NATIVE)) {
+                AklVal r = AKL_VAL_UNDEF;
+                rt->err[0] = 0;
+                rt->native_err = false;
+                if (akl_call_this(rt, fn, AKL_VAL_UNDEF, 1, &val, &r)) {
+                    out = r;
+                } else {
+                    /* 例外は reject 相当（メッセージを文字列化して解決値に） */
+                    u32 es = akl_to_string(rt, rt->pending_exc != AKL_VAL_UNDEF ? rt->pending_exc
+                                 : rt->reentry_exc != AKL_VAL_UNDEF ? rt->reentry_exc
+                                 : rt->native_exc != AKL_VAL_UNDEF ? rt->native_exc
+                                 : rt->err[0] ? akl_mkstring(rt, rt->err, (u32)strlen(rt->err)) : AKL_VAL_UNDEF);
+                    rt->err[0] = 0;
+                    rt->native_err = false;
+                    rt->pending_exc = rt->reentry_exc = rt->native_exc = AKL_VAL_UNDEF;
+                    out = es != UINT32_MAX ? AKL_MK_OBJ(es) : AKL_VAL_UNDEF;
+                }
+            }
+        }
+        rt->mt_head += 3;
+        if (rt->mt_head > 4096 && rt->mt_head >= rt->mt_n) { /* 先頭が進みすぎたら圧縮 */
+            rt->mt_n = 0; rt->mt_head = 0;
+        } else if (rt->mt_head >= rt->mt_n) {
+            rt->mt_n = 0; rt->mt_head = 0;
+        }
+        akl_promise_settle(rt, res_idx, 1, out);
+    }
+    rt->mt_n = rt->mt_head = 0; /* 残骸クリア（上限到達時も安全側で捨てる） */
+    rt->pw_n = 0;
+    rt->gc_live = old_live;
+}
+
+/* Promise.prototype.then(onFulfilled, onRejected): v0.6 マイクロタスク化。
+ * 解決済みでもコールバックは同期実行せずキューへ（V8 準拠）。戻り値は新しい
+ * pending Promise で、drain 時にコールバックの戻り値で解決される。 */
 static AklVal akl_m_promise_then(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     (void)udata;
     if (!akl_is_objv(self) || rt->objs[akl_get_obj(self)].kind != AKL_OK_PROMISE)
         return akl_native_typeerr(rt, "TypeError: not a Promise");
-    AklObj *po = &rt->objs[akl_get_obj(self)];
+    u32 poi = akl_get_obj(self); /* akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
+    AklObj *po = &rt->objs[poi];
     u8 st = po->u.pr.state;
     AklVal val = po->u.pr.value;
     AklVal onF = argc > 0 ? argv[0] : akl_mkundefined();
     AklVal onR = argc > 1 ? argv[1] : akl_mkundefined();
-    if (st == 1 && akl_is_objv(onF) &&
-        (rt->objs[akl_get_obj(onF)].kind == AKL_OK_FUNC ||
-         rt->objs[akl_get_obj(onF)].kind == AKL_OK_NATIVE)) {
-        AklVal out;
-        if (!akl_call(rt, onF, 1, &val, &out)) return akl_mkundefined();
-        return akl_promise_make(rt, 1, out);
+    /* 新しい result promise（pending）を生成 */
+    u32 ro = akl_obj_new(rt);
+    if (ro == UINT32_MAX) return akl_mkundefined();
+    rt->objs[ro].kind = AKL_OK_PROMISE;
+    rt->objs[ro].u.pr.state = 0;
+    rt->objs[ro].u.pr.value = akl_mkundefined();
+    AklVal rv = AKL_MK_OBJ(ro);
+    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ro;
+    po = &rt->objs[poi]; /* akl_obj_new 後の再取得（UAF 修正） */
+    st = po->u.pr.state;
+    val = po->u.pr.value;
+    if (st == 0) {
+        /* pending: 待機リストに登録（解決時に drain がキューへ移す） */
+        if (!akl_pwait_push(rt, self, onF, onR, ro)) return akl_mkundefined();
+        return rv;
     }
-    if (st == 2 && akl_is_objv(onR) &&
-        (rt->objs[akl_get_obj(onR)].kind == AKL_OK_FUNC ||
-         rt->objs[akl_get_obj(onR)].kind == AKL_OK_NATIVE)) {
-        AklVal out;
-        if (!akl_call(rt, onR, 1, &val, &out)) return akl_mkundefined();
-        return akl_promise_make(rt, 1, out);
-    }
-    /* pending: 解決済み undefined Promise を返す（同期近似。AKL_COMPAT）
-     * ハンドラ非関数: 値を引き継ぐ */
-    if (st == 0) return akl_promise_make(rt, 0, akl_mkundefined());
-    return akl_promise_make(rt, st, val);
+    /* resolved/rejected: マイクロタスクキューへ */
+    AklVal fn = st == 2 ? onR : onF;
+    if (!akl_mtq_push(rt, fn, val, ro)) return akl_mkundefined();
+    return rv;
 }
 
 static AklVal akl_m_promise_catch(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -10698,21 +10825,35 @@ static AklVal akl_m_promise_catch(AklRT *rt, AklVal self, int argc, const AklVal
     return akl_m_promise_then(rt, self, 2, args, udata);
 }
 
-/* finally: コールバックを呼ぶが値はそのまま通す（Promise 戻り値は待たない近似） */
+/* finally: コールバックをマイクロタスクで呼ぶが値はそのまま通す（Promise 戻り値は待たない近似） */
 static AklVal akl_m_promise_finally(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     (void)udata;
     if (!akl_is_objv(self) || rt->objs[akl_get_obj(self)].kind != AKL_OK_PROMISE)
         return akl_native_typeerr(rt, "TypeError: not a Promise");
-    AklObj *po = &rt->objs[akl_get_obj(self)];
+    u32 poi = akl_get_obj(self);
+    AklObj *po = &rt->objs[poi];
+    u8 st = po->u.pr.state;
     AklVal val = po->u.pr.value;
     AklVal onF = argc > 0 ? argv[0] : akl_mkundefined();
-    if (akl_is_objv(onF) &&
-        (rt->objs[akl_get_obj(onF)].kind == AKL_OK_FUNC ||
-         rt->objs[akl_get_obj(onF)].kind == AKL_OK_NATIVE)) {
-        AklVal out;
-        if (!akl_call(rt, onF, 0, NULL, &out)) return akl_mkundefined();
+    if (st == 0) {
+        /* pending: 解決時に onF を呼ぶ（値は通す） */
+        u32 ro = akl_obj_new(rt);
+        if (ro == UINT32_MAX) return akl_mkundefined();
+        rt->objs[ro].kind = AKL_OK_PROMISE;
+        rt->objs[ro].u.pr.state = 0;
+        rt->objs[ro].u.pr.value = akl_mkundefined();
+        if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ro;
+        if (!akl_pwait_push(rt, self, onF, onF, ro)) return akl_mkundefined();
+        return AKL_MK_OBJ(ro);
     }
-    return akl_promise_make(rt, po->u.pr.state, val);
+    u32 ro = akl_obj_new(rt);
+    if (ro == UINT32_MAX) return akl_mkundefined();
+    rt->objs[ro].kind = AKL_OK_PROMISE;
+    rt->objs[ro].u.pr.state = 0;
+    rt->objs[ro].u.pr.value = akl_mkundefined();
+    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ro;
+    if (!akl_mtq_push(rt, onF, val, ro)) return akl_mkundefined();
+    return AKL_MK_OBJ(ro);
 }
 
 /* Promise.resolve / Promise.reject 静的メソッド */
@@ -15686,6 +15827,8 @@ void akl_free(AklRT *rt) {
     free(rt->globals);
     free(rt->stk);
     free(rt->tries);
+    free(rt->mtq);
+    free(rt->pwait);
     free(rt);
 }
 
@@ -15868,6 +16011,7 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
     rt->native_err = false;
     rt->last_val = AKL_VAL_UNDEF; /* 前回 eval の最後の式文の値が残留しないようリセット */
     rt->pending_exc = rt->reentry_exc = rt->native_exc = AKL_VAL_UNDEF; /* 例外値伝搬の残留棄却 */
+    rt->mt_n = rt->mt_head = rt->pw_n = 0; /* マイクロタスク/待機リストの残留棄却（drain 済みのはずだが安全側） */
     if (rt->gc_live) { akl_errf(rt, "recursive akl_eval is not supported"); return false; }
     u32 main_idx;
     if (!akl_compile_src(rt, src, false, &main_idx, NULL)) return false;
@@ -16041,6 +16185,14 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
     rt->gc_live = false;
     if (!vm_ok) return false;
 
+    /* v0.6: マイクロタスク消化（Promise の then コールバック）。スクリプト全体の
+     * 実行後に FIFO で実行され、callback の戻り値で result promise が解決される
+     * （V8 の microtask checkpoint 相当）。last_val は eval の結果を保持する。 */
+    {
+        AklVal saved = rt->last_val;
+        akl_microtask_drain(rt);
+        rt->last_val = saved;
+    }
     if (out) *out = rt->last_val;
     return true;
 }
@@ -16056,6 +16208,7 @@ bool akl_eval_module(AklRT *rt, const char *src, const char *base, AklVal *out) 
     rt->native_err = false;
     rt->last_val = AKL_VAL_UNDEF;
     rt->pending_exc = rt->reentry_exc = rt->native_exc = AKL_VAL_UNDEF; /* 例外値伝搬の残留棄却 */
+    rt->mt_n = rt->mt_head = rt->pw_n = 0;
     if (rt->gc_live) { akl_errf(rt, "recursive akl_eval is not supported"); return false; }
     u32 main_idx;
     if (!akl_compile_src(rt, src, true, &main_idx, NULL)) return false;
@@ -16091,6 +16244,11 @@ bool akl_eval_module(AklRT *rt, const char *src, const char *base, AklVal *out) 
     rt->gc_live = false;
     if (!vm_ok) return false;
 
+    {
+        AklVal saved = rt->last_val;
+        akl_microtask_drain(rt);
+        rt->last_val = saved;
+    }
     if (out) *out = rt->last_val;
     return true;
 }

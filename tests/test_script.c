@@ -356,12 +356,14 @@ static void test_script_arrow_promise_async(void) {
     tscr_run(&t);
     CHECK(t.rep.n_run == 1 && t.rep.n_errors == 0 && t.rep.n_skipped == 0);
     CHECK(strstr(t.logbuf, "[script:console] ap1 2,4,6,8\n") != NULL);
-    CHECK(strstr(t.logbuf, "[script:console] ap2 50\n") != NULL);
-    CHECK(strstr(t.logbuf, "[script:console] ap3 21\n") != NULL);
+    /* v0.6: Promise はマイクロタスク化（V8 準拠）。then コールバックはスクリプト
+     * 実行後に消化されるため、スクリプト本体内で読む total/r はまだ 0。 */
+    CHECK(strstr(t.logbuf, "[script:console] ap2 0\n") != NULL);
+    CHECK(strstr(t.logbuf, "[script:console] ap3 0\n") != NULL);
     IfNode *d = if_dom_find_by_id(t.dom, if_str("a", 1));
     CHECK(d != NULL);
     IfStr txt = if_dom_text_content(&t.a, d);
-    CHECK(txt.n == 7 && memcmp(txt.p, "8:50:21", 7) == 0);
+    CHECK(txt.n == 5 && memcmp(txt.p, "8:0:0", 5) == 0);
     tscr_end(&t);
 }
 

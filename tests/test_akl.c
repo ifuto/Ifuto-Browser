@@ -1756,21 +1756,108 @@ static void t_v04_arrow_promise_async(void) {
     want_num("var o = { v: 7, get: function() { return () => this.v; } }; var g = o.get(); g()", 7);
     want_num("var o = { v: 7, m: function() { return () => this.v; } }; o.m()()", 7);
     want_num("var o = { v: 3, m: function() { var f = () => this.v; return f(); } }; o.m()", 3);
-    /* Promise（同期解決近似） */
-    want_num("var r = 0; var p = new Promise(function(res) { res(5); }); p.then(function(v) { r = v * 2; }); r", 10);
-    want_num("var r = 0; Promise.resolve(42).then(function(v) { r = v + 1; }); r", 43);
-    want_str("var r = ''; var p = new Promise(function(res, rej) { rej('err'); }); p.catch(function(e) { r = 'caught:' + e; }); r", "caught:err");
-    want_num("var r = 0; var p = new Promise(function(res) { res(7); }); p.then(function(v) { return v; }).then(function(v) { r = v * 2; }); r", 14);
-    want_str("var r = ''; Promise.reject('x').catch(function(e) { r = e + '!'; }); r", "x!");
-    want_num("var r = 0; var p = new Promise(function(res) { res(10); }); p.finally(function() { r = 1; }); r", 1);
-    /* async/await */
-    want_num("var r = 0; async function f() { return 42; } f().then(function(v) { r = v; }); r", 42);
-    want_num("var r = 0; async function f() { return await Promise.resolve(10) * 2; } f().then(function(v) { r = v; }); r", 20);
-    want_num("var r = 0; async function f() { var a = await 5; return a * 2; } f().then(function(v) { r = v; }); r", 10);
-    want_str("var r = ''; async function f() { return 'hello'; } f().then(function(v) { r = v; }); r", "hello");
-    want_num("var r = 0; async function f() { var p = new Promise(function(res) { res(21); }); return await p * 2; } f().then(function(v) { r = v; }); r", 42);
-    want_num("var r = 0; var f = async function() { return 99; }; f().then(function(v) { r = v; }); r", 99);
-    want_num("var r = 0; async function f() { return 1 + await 2; } f().then(function(v) { r = v; }); r", 3);
+    /* Promise（v0.6: マイクロタスク化 = V8 準拠。then コールバックは eval 終了時に消化される。
+     * 同一 eval 内の最後の式からは「まだ実行前」（V8 と同じ 0）。drain 後に読むと実行後。
+     * g_rt は複数 eval で共有されるため、2 フェーズで検証する。 */
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; var p = new Promise(function(res) { res(5); }); p.then(function(v) { r = v * 2; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v)); /* drain 済み → 10 */
+        CHECK(akl_as_num(v, &d) && d == 10);
+    }
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; Promise.resolve(42).then(function(v) { r = v + 1; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 43);
+    }
+    {
+        AklVal v; const char *s; uint32_t ln;
+        CHECK(akl_eval(g_rt, "var r = ''; var p = new Promise(function(res, rej) { rej('err'); }); p.catch(function(e) { r = 'caught:' + e; }); r", &v));
+        CHECK(akl_is_string(g_rt, v) && (s = akl_as_str(g_rt, v, &ln)) && ln == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_is_string(g_rt, v) && (s = akl_as_str(g_rt, v, &ln)) && ln == 10 && memcmp(s, "caught:err", 10) == 0);
+    }
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; var p = new Promise(function(res) { res(7); }); p.then(function(v) { return v; }).then(function(v) { r = v * 2; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0); /* チェーンは 2 段とも drain 時 */
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 14);
+    }
+    {
+        AklVal v; const char *s; uint32_t ln;
+        CHECK(akl_eval(g_rt, "var r = ''; Promise.reject('x').catch(function(e) { r = e + '!'; }); r", &v));
+        CHECK(akl_is_string(g_rt, v) && (s = akl_as_str(g_rt, v, &ln)) && ln == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_is_string(g_rt, v) && (s = akl_as_str(g_rt, v, &ln)) && ln == 2 && memcmp(s, "x!", 2) == 0);
+    }
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; var p = new Promise(function(res) { res(10); }); p.finally(function() { r = 1; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 1);
+    }
+    /* async/await: f() の Promise は解決済みだが then はマイクロタスク（V8 準拠） */
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; async function f() { return 42; } f().then(function(v) { r = v; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 42);
+    }
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; async function f() { return await Promise.resolve(10) * 2; } f().then(function(v) { r = v; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 20);
+    }
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; async function f() { var a = await 5; return a * 2; } f().then(function(v) { r = v; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 10);
+    }
+    {
+        AklVal v; const char *s; uint32_t ln;
+        CHECK(akl_eval(g_rt, "var r = ''; async function f() { return 'hello'; } f().then(function(v) { r = v; }); r", &v));
+        CHECK(akl_is_string(g_rt, v) && (s = akl_as_str(g_rt, v, &ln)) && ln == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_is_string(g_rt, v) && (s = akl_as_str(g_rt, v, &ln)) && ln == 5 && memcmp(s, "hello", 5) == 0);
+    }
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; async function f() { var p = new Promise(function(res) { res(21); }); return await p * 2; } f().then(function(v) { r = v; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 42);
+    }
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; var f = async function() { return 99; }; f().then(function(v) { r = v; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 99);
+    }
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0; async function f() { return 1 + await 2; } f().then(function(v) { r = v; }); r", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 3);
+    }
+    /* pending Promise への then（解決は drain 時。new Promise の executor は同期実行） */
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var resf; var p = new Promise(function(res) { resf = res; }); var q = p.then(function(v) { r = v + 100; }); resf(1); r", &v));
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 101);
+    }
     /* エラー */
     want_err("await 5", "await");
     want_err("var f = () => { return 1; }; f(); break", "break");
@@ -2068,9 +2155,24 @@ static void t_v05_import_export(void) {
     /* モジュール最上位の this / arguments は undefined 系 */
     mod_str("import { t } from 'test:usethis';\nt", "undefined");
     /* 動的 import（同期解決近似の Promise） */
-    mod_num("var r = 0;\nimport('test:m1').then(function(ns) { r = ns.x; });\nr", 42);
+    /* v0.6: import() の then はマイクロタスク（eval 終了時に消化）— 2 フェーズで検証。
+     * モジュールの top-level var はモジュールローカルなので、コールバックは未宣言代入で
+     * グローバルへ書く（非 strict のグローバル生成）。 */
+    {
+        AklVal v; double d;
+        CHECK(akl_eval_module(g_rt, "import('test:m1').then(function(ns) { r = ns.x; });\n0", "test:entry", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 42);
+    }
     /* 動的 import は classic スクリプトでも使用可 */
-    want_num("var r = 0;\nimport('test:m1').then(function(ns) { r = ns.x; });\nr", 42);
+    {
+        AklVal v; double d;
+        CHECK(akl_eval(g_rt, "var r = 0;\nimport('test:m1').then(function(ns) { r = ns.x; });\nr", &v));
+        CHECK(akl_as_num(v, &d) && d == 0);
+        CHECK(akl_eval(g_rt, "r", &v));
+        CHECK(akl_as_num(v, &d) && d == 42);
+    }
 
     /* export default: 式 / 無名関数 / 名前付き関数 / 無名クラス / 名前付きクラス */
     mod_num("import v from 'test:dfltexpr';\nv", 7);
