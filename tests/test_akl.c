@@ -913,6 +913,7 @@ static void t_v04_map_set(void);
 static void t_v05_import_export(void);
 static void t_v05_class_accessors(void);
 static void t_v06_lex_scope(void);
+static void t_v07_proto_chain(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -986,6 +987,8 @@ void test_akl(void) {
     t_v05_class_accessors();
     fprintf(stderr, "  %-40s", "t_v06_lex_scope");
     t_v06_lex_scope();
+    fprintf(stderr, "  %-40s", "t_v07_proto_chain");
+    t_v07_proto_chain();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -2271,4 +2274,29 @@ static void t_v06_lex_scope(void) {
     /* 複数宣言のカンマ・初期化なし let は undefined */
     want_undef("let t6ua, t6ub; t6ua");
     want_num("let t6ma = 1, t6mb = 2; t6ma * 10 + t6mb", 12);
+}
+
+/* ================= v0.6: プロトタイプチェーン + Symbol/Proxy ================= */
+
+static void t_v07_proto_chain(void) {
+    /* Object.getPrototypeOf / Object.prototype（V8 一致） */
+    want_bool("Object.getPrototypeOf({}) === Object.prototype", 1);
+    want_bool("Object.getPrototypeOf({a: 1}) === Object.prototype", 1);
+    want_str("'' + Object.getPrototypeOf(Object.prototype)", "null"); /* 末端は null */
+    /* Object.create の proto チェーン（プロパティ解決が proto を辿る） */
+    want_num("var t7p = {x: 5}; var o = Object.create(t7p); o.x", 5);
+    want_undef("var t7p = {x: 5}; var o = Object.create(t7p); o.y");
+    want_num("var t7p = {x: 5}; var o = Object.create(t7p); o.x = 9; o.x + t7p.x", 14); /* own が勝つ */
+    want_bool("var t7p = {x: 5}; var o = Object.create(t7p); 'x' in o", 1);
+    /* proto は列挙・JSON に混ざらない */
+    want_str("Object.keys({a: 1, b: 2}).join(',')", "a,b");
+    want_str("JSON.stringify({a: 1, b: [1, 2]})", "{\"a\":1,\"b\":[1,2]}");
+    want_str("var o = {a: 1}; JSON.stringify(o)", "{\"a\":1}");
+    /* Symbol / Proxy の typeof（V8 一致） */
+    want_str("typeof Symbol", "function");
+    want_str("typeof Symbol()", "symbol");
+    want_str("typeof Proxy", "function");
+    want_bool("Symbol() === Symbol()", 0); /* 毎回新しい symbol */
+    /* Proxy はトラップ未実装を明白失敗（黙って無効な値を返さない） */
+    want_err("Proxy({}, {})", "Proxy");
 }

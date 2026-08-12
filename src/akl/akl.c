@@ -95,7 +95,7 @@ static bool akl_numv(AklVal v, double *out) {
 
 enum { AKL_OK_STR = 1, AKL_OK_FUNC = 2, AKL_OK_ROPE = 3, AKL_OK_NATIVE = 4, AKL_OK_OBJ = 5, AKL_OK_HANDLE = 6,
        AKL_OK_ARR = 7, AKL_OK_ENV = 8, AKL_OK_REGEX = 9, AKL_OK_PROMISE = 10, AKL_OK_BIGINT = 11, AKL_OK_GEN = 12,
-       AKL_OK_MAP = 13, AKL_OK_SET = 14 };
+       AKL_OK_MAP = 13, AKL_OK_SET = 14, AKL_OK_SYMBOL = 15 };
 /* ROPE: code_off=左 obj idx, name=右 obj idx, n_params=深さ(最大4096), len=全長。
  * 不変条件: 子の index は親より小さい必要は「ない」（free-list 再利用で逆転し得る）。
  * よって GC の伝播は添字順に依らない明示ワークリストで行う。文字列は不変。
@@ -109,7 +109,8 @@ enum { AKL_OK_STR = 1, AKL_OK_FUNC = 2, AKL_OK_ROPE = 3, AKL_OK_NATIVE = 4, AKL_
  * FUNC:  env フィールド = クロージャ生成時に捕捉した環境 obj index（無ければ UINT32_MAX）。 */
 
 typedef struct { u32 name; AklVal v; } AklProp;
-#define AKL_OBJ_MAX_PROPS 64u /* 1 オブジェクトの prop 数上限（線形走査の有界化） */
+#define AKL_OBJ_MAX_PROPS 65u /* 1 オブジェクトの prop 数上限（線形走査の有界化）。
+                               * v0.6: 内部の \x00proto 1 個を含むため 64+1（ユーザーは 64 個まで） */
 
 /* nursery（C 側一時ルート）容量。最大同時ピンは eq/rel 系の入れ子で
  * 2(ハンドラ) + 2(loose/strict) + 1(flatten) = 5。余裕を見て 8。 */
@@ -353,6 +354,11 @@ struct AklRT {
      * 値になる（V8 と一致。旧実装は同期実行で x が f 後の値だった）。 */
     AklVal *mtq; u32 mt_n, mt_cap, mt_head;
     AklVal *pwait; u32 pw_n, pw_cap;
+    /* v0.6: プロトタイプチェーン。\x00proto 特殊 prop（長さ 6）で OBJ の [[Prototype]] を
+     * 持ち、obj_proto_find が own → チェーンの順に解決する。obj_proto は Object.prototype
+     * の obj index（builtins install 時に確定。Object グローバル生成前は UINT32_MAX）。 */
+    u32 proto_name;  /* \x00proto の intern id */
+    u32 obj_proto;   /* Object.prototype の obj index */
     /* v0.3 再入（高階関数）: akl_call 用 */
     AklRootStk *root_stks;  /* 退避済み outer スタックの GC ルート（連結リスト） */
     u32 call_depth;         /* akl_call の再入深さ（上限 AKL_MAX_REENTRY） */
@@ -666,6 +672,39 @@ static i32 obj_prop_find(const AklObj *o, u32 name);
 static const u8 *akl_str(AklRT *rt, u32 idx, u32 *len);
 static u32 akl_to_string(AklRT *rt, AklVal v); /* 前方宣言（akl_to_number の ToPrimitive 経路で使用） */
 static bool obj_prop_set(AklRT *rt, AklObj *o, u32 name, AklVal v);
+
+/* v0.6: プロトタイプチェーン支援。
+ * - akl_obj_set_proto(rt, idx): OBJ の [[Prototype]] を Object.prototype に設定
+ *   （\x00proto 特殊 prop。obj_proto が未確定なら何もしない）。
+ * - obj_proto_find(rt, oi, name, *out_oi): own → proto チェーンの順で検索。
+ *   見つかれば prop index、*out_oi に所有 OBJ index を返す（無ければ -1）。
+ *   深さ 64 で有界（循環 proto は構造的に作れないが防御）。 */
+static void akl_obj_set_proto(AklRT *rt, u32 oi) {
+    if (oi >= rt->n_objs || rt->obj_proto == UINT32_MAX || rt->obj_proto >= rt->n_objs) return;
+    AklObj *o = &rt->objs[oi];
+    if (o->kind != AKL_OK_OBJ) return;
+    if (rt->proto_name == UINT32_MAX) return;
+    obj_prop_set(rt, o, rt->proto_name, AKL_MK_OBJ(rt->obj_proto));
+}
+static i32 obj_proto_find(AklRT *rt, u32 oi, u32 name, u32 *out_oi) {
+    u32 cur = oi;
+    for (u32 depth = 0; depth < 64; depth++) {
+        if (cur >= rt->n_objs || rt->objs[cur].kind != AKL_OK_OBJ) break;
+        i32 pi = obj_prop_find(&rt->objs[cur], name);
+        if (pi >= 0) { if (out_oi) *out_oi = cur; return pi; }
+        if (rt->proto_name == UINT32_MAX) break;
+        i32 pp = obj_prop_find(&rt->objs[cur], rt->proto_name);
+        if (pp < 0) break;
+        AklVal pv = rt->objs[cur].u.po.props[pp].v;
+        if (!akl_is_objv(pv)) break;
+        cur = akl_get_obj(pv);
+    }
+    return -1;
+}
+/* \x00proto 名か（props 列挙からの除外用） */
+static bool obj_prop_is_proto(AklRT *rt, u32 name) {
+    return rt->proto_name != UINT32_MAX && name == rt->proto_name;
+}
 /* クラス継承のメソッドコピー: __super チェーンを親 → 子の順で辿り、constructor 以外の
  * メソッド/static をインスタンスにコピーする（子が親を上書き）。深さ制限 64。 */
 static bool akl_new_copy_chain(AklRT *rt, AklObj *cls, AklObj *inst, u32 sup_name, u32 depth) {
@@ -683,6 +722,7 @@ static bool akl_new_copy_chain(AklRT *rt, AklObj *cls, AklObj *inst, u32 sup_nam
     for (u32 i = 0; i < cls->u.po.n; i++) {
         u32 pname = cls->u.po.props[i].name;
         if (pname == sup_name) continue;
+        if (obj_prop_is_proto(rt, pname)) continue; /* \x00proto はインスタンスにコピーしない */
         u32 kl;
         const u8 *kp = akl_str(rt, pname, &kl);
         if (rt->err[0]) return false;
@@ -9795,8 +9835,11 @@ static bool jb_value(JsonBuf *b, AklVal v, u32 depth) {
     if (k == AKL_OK_OBJ) {
         AklObj *o = &b->rt->objs[oi];
         if (!jb_put(b, "{")) return false;
+        bool first = true;
         for (u32 i = 0; i < o->u.po.n; i++) {
-            if (i) if (!jb_put(b, ",")) return false;
+            if (obj_prop_is_proto(b->rt, o->u.po.props[i].name)) continue; /* \x00proto は非列挙 */
+            if (!first) if (!jb_put(b, ",")) return false;
+            first = false;
             u32 kl;
             const u8 *kp = akl_str(b->rt, o->u.po.props[i].name, &kl);
             if (b->rt->err[0]) return false;
@@ -10352,6 +10395,7 @@ static AklVal akl_m_obj_keys(AklRT *rt, AklVal self, int argc, const AklVal *arg
         AklObj *o = &rt->objs[akl_get_obj(tgt)];
         if (o->kind == AKL_OK_OBJ) {
             for (u32 i = 0; i < o->u.po.n; i++) {
+                if (obj_prop_is_proto(rt, o->u.po.props[i].name)) continue; /* \x00proto は非列挙 */
                 if (!akl_arr_grow(rt, &rt->objs[oi], cnt + 1)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
                 rt->objs[oi].u.arr.v[cnt++] = AKL_MK_OBJ(o->u.po.props[i].name);
             }
@@ -10373,6 +10417,7 @@ static AklVal akl_m_obj_values(AklRT *rt, AklVal self, int argc, const AklVal *a
         AklObj *o = &rt->objs[akl_get_obj(tgt)];
         if (o->kind == AKL_OK_OBJ) {
             for (u32 i = 0; i < o->u.po.n; i++) {
+                if (obj_prop_is_proto(rt, o->u.po.props[i].name)) continue; /* \x00proto は非列挙 */
                 if (!akl_arr_grow(rt, &rt->objs[oi], cnt + 1)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
                 rt->objs[oi].u.arr.v[cnt++] = o->u.po.props[i].v;
             }
@@ -10396,6 +10441,7 @@ static AklVal akl_m_obj_entries(AklRT *rt, AklVal self, int argc, const AklVal *
         if (o->kind == AKL_OK_OBJ) {
             u32 po_n = o->u.po.n;
             for (u32 i = 0; i < po_n; i++) {
+                if (obj_prop_is_proto(rt, rt->objs[tgt_i].u.po.props[i].name)) continue; /* \x00proto は非列挙 */
                 if (!akl_arr_grow(rt, &rt->objs[oi], cnt + 1)) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
                 u32 po = akl_obj_new(rt);
                 if (po == UINT32_MAX) { rt->objs[oi].kind = 0; return akl_mkundefined(); }
@@ -10496,8 +10542,48 @@ static AklVal akl_m_obj_create(AklRT *rt, AklVal self, int argc, const AklVal *a
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return akl_mkundefined();
     rt->objs[oi].kind = AKL_OK_OBJ;
+    /* v0.6: 指定 proto を \x00proto 特殊 prop に設定（null なら proto なし） */
+    if (akl_is_objv(proto) && rt->proto_name != UINT32_MAX) {
+        if (!obj_prop_set(rt, &rt->objs[oi], rt->proto_name, proto)) return akl_mkundefined();
+    }
     return AKL_MK_OBJ(oi);
 }
+
+/* Object.getPrototypeOf(v): [[Prototype]] を返す（\x00proto 特殊 prop。無ければ null）。
+ * primitive は明白失敗（V8 はラッパーの prototype を返すが、ラッパー種別を持たないため
+ * TypeError — AKL_COMPAT に明記）。 */
+static AklVal akl_m_obj_getPrototypeOf(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)udata; (void)self;
+    AklVal tgt = argc > 0 ? argv[0] : akl_mkundefined();
+    if (!akl_is_objv(tgt) || rt->objs[akl_get_obj(tgt)].kind != AKL_OK_OBJ)
+        return akl_native_typeerr(rt, "TypeError: Object.getPrototypeOf requires an object");
+    u32 oi = akl_get_obj(tgt);
+    if (rt->proto_name == UINT32_MAX) return akl_mknull();
+    i32 pi = obj_prop_find(&rt->objs[oi], rt->proto_name);
+    if (pi < 0) return akl_mknull();
+    AklVal pv = rt->objs[oi].u.po.props[pi].v;
+    return akl_is_objv(pv) ? pv : akl_mknull();
+}
+
+/* Symbol(): 新規 symbol を返す（description は保持しない近似。AKL_COMPAT）。
+ * Symbol.iterator 等の well-known symbol は Proxy/iterator 実装と共に将来対応。 */
+static AklVal akl_m_Symbol(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)argc; (void)argv; (void)udata;
+    u32 oi = akl_obj_new(rt);
+    if (oi == UINT32_MAX) return akl_mkundefined();
+    rt->objs[oi].kind = AKL_OK_SYMBOL;
+    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = oi;
+    return AKL_MK_OBJ(oi);
+}
+/* Proxy(): 呼び出しは TypeError（new 必須）。new Proxy もトラップ未実装のため
+ * 明白に失敗する（黙って無効なプロキシを返さない。AKL_COMPAT に明記）。 */
+static AklVal akl_m_Proxy(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)argc; (void)argv; (void)udata;
+    akl_native_throw(rt, "TypeError: Proxy traps are not supported in this build");
+    return akl_mkundefined();
+}
+
+
 
 /* Array.of(...items) */
 static AklVal akl_m_arr_of(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
@@ -12106,23 +12192,52 @@ static bool akl_builtins_install(AklRT *rt) {
         free(buf);
         if (!ok) return false;
     }
-    /* Object オブジェクト（keys/values/entries/assign/create） */
+    /* Symbol / Proxy グローバル（typeof = "function" のため native 登録。
+     * Proxy はトラップ未実装 = 呼び出しで明白失敗） */
+    {
+        char *b1 = (char *)malloc(7);
+        if (!b1) { akl_errf(rt, "oom: builtins"); return false; }
+        memcpy(b1, "Symbol", 6); b1[6] = 0;
+        bool ok1 = akl_native_register(rt, b1, akl_m_Symbol, NULL);
+        free(b1);
+        char *b2 = (char *)malloc(6);
+        if (!b2) { akl_errf(rt, "oom: builtins"); return false; }
+        memcpy(b2, "Proxy", 5); b2[5] = 0;
+        bool ok2 = akl_native_register(rt, b2, akl_m_Proxy, NULL);
+        free(b2);
+        if (!ok1 || !ok2) return false;
+    }
+    /* Object オブジェクト（keys/values/entries/assign/create/getPrototypeOf/prototype）。
+     * v0.6: prototype プロパティ（Object.prototype OBJ）と \x00proto 特殊名を確定し、
+     * 以後に生成される OBJ の既定 [[Prototype]] にする。 */
     {
         u32 oo = akl_obj_new(rt);
         if (oo == UINT32_MAX) return false;
         rt->objs[oo].kind = AKL_OK_OBJ;
         AklVal ov = AKL_MK_OBJ(oo);
         if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = oo;
+        rt->proto_name = akl_intern(rt, (const u8 *)"\x00proto", 6, NULL);
+        if (rt->proto_name == UINT32_MAX) return false;
         struct { const char *n; AklNativeFn f; } of[] = {
             {"keys", akl_m_obj_keys}, {"values", akl_m_obj_values},
             {"entries", akl_m_obj_entries}, {"assign", akl_m_obj_assign},
-            {"create", akl_m_obj_create}, {"fromEntries", akl_m_obj_fromEntries}
+            {"create", akl_m_obj_create}, {"fromEntries", akl_m_obj_fromEntries},
+            {"getPrototypeOf", akl_m_obj_getPrototypeOf}
         };
         for (u32 i = 0; i < sizeof of / sizeof of[0]; i++) {
             u32 nm = akl_intern(rt, (const u8 *)of[i].n, (u32)strlen(of[i].n), NULL);
             if (nm == UINT32_MAX) return false;
             if (!obj_prop_set(rt, &rt->objs[oo], nm, akl_mknative(rt, of[i].f, NULL))) return false;
         }
+        /* Object.prototype: 空 OBJ。自身の proto は設定しない（getPrototypeOf が null を返す）。 */
+        u32 po = akl_obj_new(rt);
+        if (po == UINT32_MAX) return false;
+        rt->objs[po].kind = AKL_OK_OBJ;
+        rt->obj_proto = po;
+        u32 pn = akl_intern(rt, (const u8 *)"prototype", 9, NULL);
+        if (pn == UINT32_MAX) return false;
+        if (!obj_prop_set(rt, &rt->objs[oo], pn, AKL_MK_OBJ(po))) return false;
+        if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = po;
         if (!akl_global_set(rt, "Object", ov)) return false;
     }
     /* Array オブジェクト（isArray） */
@@ -13051,6 +13166,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
                   : (ok_ == AKL_OK_HANDLE || ok_ == AKL_OK_ARR ||
                      ok_ == AKL_OK_PROMISE || ok_ == AKL_OK_REGEX) ? "object"
                   : (ok_ == AKL_OK_BIGINT) ? "bigint"
+                  : (ok_ == AKL_OK_SYMBOL) ? "symbol"
                   : "function"; /* FUNC / NATIVE */
             }
         }
@@ -13488,6 +13604,7 @@ typeof_done:
         u32 oi = akl_obj_new(rt);
         if (oi == UINT32_MAX) { free(frames); return false; }
         rt->objs[oi].kind = AKL_OK_OBJ;
+        akl_obj_set_proto(rt, oi); /* v0.6: [[Prototype]] = Object.prototype */
         AKL_PUSH(AKL_MK_OBJ(oi));
         AKL_NEXT();
     }
@@ -13689,7 +13806,8 @@ typeof_done:
         }
         u32 o_i3 = akl_get_obj(ov); /* akl_intern / akl_obj_new が obj 配列を realloc し得る（UAF 修正） */
         AklObj *o = &rt->objs[o_i3];
-        i32 pi = obj_prop_find(o, name);
+        u32 pf_oi = o_i3;
+        i32 pi = obj_proto_find(rt, o_i3, name, &pf_oi); /* v0.6: own → proto チェーン */
         if (pi < 0 && o->kind == AKL_OK_OBJ) {
             /* クラス継承の static: __super チェーンを辿って解決（深さ制限） */
             u32 sup_name = akl_intern(rt, (const u8 *)"\x00super", 6, NULL);
@@ -13705,7 +13823,7 @@ typeof_done:
             }
             if (pi >= 0) { AKL_PUSH(rt->objs[co_i].u.po.props[pi].v); AKL_NEXT(); }
         }
-        if (pi >= 0) { AKL_PUSH(rt->objs[o_i3].u.po.props[pi].v); AKL_NEXT(); }
+        if (pi >= 0) { AKL_PUSH(rt->objs[pf_oi].u.po.props[pi].v); AKL_NEXT(); } /* proto チェーン経由（pf_oi が所有） */
         /* hasOwnProperty: obj.hasOwnProperty(k)（VM 実行中に native を直接生成） */
         o = &rt->objs[o_i3]; /* 再取得（直前の分岐で realloc 済みの可能性） */
         if (o->kind == AKL_OK_OBJ) {
@@ -14095,8 +14213,9 @@ typeof_done:
             /* akl_obj_new / akl_intern が obj 配列を realloc し得る → index 経由（UAF 修正） */
             u32 ov_i = akl_get_obj(ov);
             AklObj *o = &rt->objs[ov_i];
+            u32 pf_oi2 = ov_i;
             if (o->kind == AKL_OK_OBJ) {
-                i32 pi = obj_prop_find(o, name);
+                i32 pi = obj_proto_find(rt, ov_i, name, &pf_oi2); /* v0.6: own → proto チェーン */
                 /* hasOwnProperty: 組み込みメソッド（VM 実行中に native を直接生成） */
                 if (pi < 0 && o->kind == AKL_OK_OBJ) {
                     u32 nl5;
@@ -14129,7 +14248,7 @@ typeof_done:
                     }
                     if (pi >= 0) fv = rt->objs[co_i].u.po.props[pi].v;
                 } else if (pi >= 0) {
-                    fv = rt->objs[ov_i].u.po.props[pi].v;
+                    fv = rt->objs[pf_oi2].u.po.props[pi].v; /* proto チェーン経由 */
                 }
             }
         }
@@ -14968,9 +15087,10 @@ typeof_done:
                 u32 ni2 = akl_intern(rt, ep, el, NULL);
                 if (ni2 == UINT32_MAX) { rt->n_nury = nur0; free(frames); return false; }
                 if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ni2;
-                i32 pi = obj_prop_find(&rt->objs[av_i], ni2);
+                u32 ag_oi = av_i;
+                i32 pi = obj_proto_find(rt, av_i, ni2, &ag_oi); /* v0.6: own → proto チェーン */
                 rt->n_nury = nur0;
-                AKL_PUSH(pi >= 0 ? rt->objs[av_i].u.po.props[pi].v : AKL_VAL_UNDEF);
+                AKL_PUSH(pi >= 0 ? rt->objs[ag_oi].u.po.props[pi].v : AKL_VAL_UNDEF);
                 AKL_NEXT();
             }
             if (ao->kind == AKL_OK_STR || ao->kind == AKL_OK_ROPE) { /* s[i]: コードポイント単位 */
@@ -15108,7 +15228,8 @@ typeof_done:
                 if (rt->err[0]) { free(frames); return false; }
                 u32 ni2 = akl_intern(rt, ep, el, NULL);
                 if (ni2 == UINT32_MAX) { free(frames); return false; }
-                AKL_PUSH(obj_prop_find(&rt->objs[obj_i], ni2) >= 0 ? AKL_VAL_TRUE : AKL_VAL_FALSE);
+                u32 in_oi = obj_i;
+                AKL_PUSH(obj_proto_find(rt, obj_i, ni2, &in_oi) >= 0 ? AKL_VAL_TRUE : AKL_VAL_FALSE);
                 AKL_NEXT();
             }
             if (o->kind == AKL_OK_ARR) {
@@ -15209,13 +15330,13 @@ typeof_done:
             AklObj *o = &rt->objs[ov_i];
             if (o->kind == AKL_OK_OBJ) {
                 for (u32 i = 0; i < cnt; i++) {
+                    if (obj_prop_is_proto(rt, rt->objs[ov_i].u.po.props[i].name)) continue; /* \x00proto は非列挙 */
                     u32 kl;
                     const u8 *kp = akl_str(rt, rt->objs[ov_i].u.po.props[i].name, &kl);
                     if (rt->err[0]) { free(frames); return false; }
                     u32 ks = akl_mkstr(rt, kp, kl);
                     if (ks == UINT32_MAX) { free(frames); return false; }
-                    rt->objs[oi].u.arr.v[i] = AKL_MK_OBJ(ks);
-                    rt->objs[oi].u.arr.n = i + 1;
+                    rt->objs[oi].u.arr.v[rt->objs[oi].u.arr.n++] = AKL_MK_OBJ(ks);
                 }
             } else if (rt->objs[ov_i].kind == AKL_OK_ARR) {
                 for (u32 i = 0; i < cnt; i++) {
@@ -15227,9 +15348,12 @@ typeof_done:
                     rt->objs[oi].u.arr.v[i] = akl_mknum((double)i);
                     rt->objs[oi].u.arr.n = i + 1;
                 }
+            } else {
+                rt->objs[oi].u.arr.n = cnt;
             }
+        } else {
+            rt->objs[oi].u.arr.n = cnt;
         }
-        rt->objs[oi].u.arr.n = cnt;
         AKL_PUSH(AKL_MK_OBJ(oi));
         AKL_NEXT();
     }
@@ -15482,6 +15606,7 @@ typeof_done:
         u32 no = akl_obj_new(rt);
         if (no == UINT32_MAX) { free(frames); return false; }
         rt->objs[no].kind = AKL_OK_OBJ;
+        akl_obj_set_proto(rt, no); /* v0.6: [[Prototype]] = Object.prototype */
         AklVal thisv = AKL_MK_OBJ(no);
         u32 nur0 = rt->n_nury;
         if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = no;
@@ -15659,6 +15784,7 @@ typeof_done:
         AklObj *do2 = &rt->objs[akl_get_obj(dstv)];
         if (so->kind != AKL_OK_OBJ || do2->kind != AKL_OK_OBJ) { AKL_NEXT(); }
         for (u32 i = 0; i < so->u.po.n; i++) {
+            if (obj_prop_is_proto(rt, so->u.po.props[i].name)) continue; /* \x00proto はコピーしない */
             if (do2->u.po.n >= AKL_OBJ_MAX_PROPS) {
                 akl_errf(rt, "object property limit exceeded");
                 free(frames);
@@ -15706,6 +15832,7 @@ typeof_done:
             AklObj *so = &rt->objs[akl_get_obj(srcv)];
             AklObj *no = &rt->objs[oi];
             for (u32 i = 0; i < so->u.po.n; i++) {
+                if (obj_prop_is_proto(rt, so->u.po.props[i].name)) continue; /* \x00proto はコピーしない */
                 if (no->u.po.n >= AKL_OBJ_MAX_PROPS) {
                     akl_errf(rt, "object property limit exceeded");
                     free(frames);
@@ -16520,6 +16647,7 @@ AklVal akl_mkobject(AklRT *rt) {
     u32 oi = akl_obj_new(rt);
     if (oi == UINT32_MAX) return AKL_VAL_UNDEF;
     rt->objs[oi].kind = AKL_OK_OBJ;
+    akl_obj_set_proto(rt, oi); /* v0.6: 既定 [[Prototype]] */
     return AKL_MK_OBJ(oi);
 }
 

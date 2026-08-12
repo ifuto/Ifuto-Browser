@@ -9,16 +9,14 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 
 ## 現状サマリ（parity.py 実測: 69 スニペット）
 
-- 一致: **66**（2026-08-12 の Promise マイクロタスク化で 65 → 66）
-- 不一致（誤った結果を返す）: 3 → 残課題（下表）
-- 未実装（ReferenceError / 明白失敗）: 0（下表の 2 項目はすべて大規模実装待ち）
+- 一致: **69/69（全一致）**（2026-08-12: プロトタイプチェーン + Symbol/Proxy 実装で 66 → 69）
+- 不一致: 0
+- 未実装（ReferenceError / 明白失敗）: 0
 
-## 残課題（誤った結果 or 未実装）— 次ターン以降
+## 残課題
 
-| 項目 | AKL | V8 | 規模 |
-|---|---|---|---|
-| `typeof Symbol` / `typeof Proxy` | ReferenceError | function | 大（キー体系 / トラップ） |
-| `Object.getPrototypeOf({}) === Object.prototype` | ReferenceError | true | 大（継承モデル） |
+なし（parity.py の 69 スニペットは全て V8 と同一結果）。次の拡張は実用レベルの
+ライブラリ互換（Promise チェーン/Map 詳細/Symbol.iterator 等）へ。
 
 ## 未実装（取りこぼし）— 実装順
 
@@ -45,6 +43,8 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 | for の let | `for (let i=0;...)` はループ全体をスコープ化、`for (let k in/of ...)` も対応 | **修正済み（2026-08-12）** |
 | トップレベル let | クロージャが ENV capture で捕捉（`let x=10; function g(){ return x; }` → 10） | **修正済み（2026-08-12）** |
 | Promise マイクロタスク | `Promise.resolve().then(f); x` は f 実行前の x（V8 と一致。旧実装は同期実行） | **修正済み（2026-08-12）** |
+| プロトタイプチェーン | `Object.getPrototypeOf({}) === Object.prototype` → true。`\x00proto` 特殊 prop で [[Prototype]] を持ち、PLOAD/MCALL/AGET/`in` が own → proto の順に解決。Object.create(p) のチェーン継承、getPrototypeOf(Object.prototype) → null | **修正済み（2026-08-12）** |
+| Symbol / Proxy | `typeof Symbol` / `typeof Proxy` → function。Symbol() は新規 symbol（typeof = "symbol"、毎回異なる）。Proxy はトラップ未実装を明白失敗（TypeError） | **修正済み（2026-08-12）** |
 | uncaught 表示 | 未捕捉の Error OBJ は `uncaught exception: Error: boom` 形式（toString 近似） | **修正済み（2026-08-12）** |
 | CLI 表示 | オブジェクト完了値は JS ToString で表示（旧フォールバックは "[function]" で紛らわしかった） | **修正済み（2026-08-12）** |
 | Symbol | `Symbol()` / `Symbol.iterator` | 未（大規模: キー体系拡張） |
