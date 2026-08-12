@@ -10,13 +10,13 @@
  * する（末尾追加だけでは a?b が "b" にマッチしない誤りになるため）。
  *
  * 対応構文:
- *   リテラル文字（UTF-8）、. ^ $ [class] [^class] [a-z]
+ *   リテラル文字（UTF-8）、. ^ $ [class] [^class] [a-z] [\uD800-\uDFFF]（非 ASCII 範囲）
  *   (group) (?:non-capt)  * + ? {n} {n,} {n,m}（+ 非貪欲 ?? *? +? {..}?）
  *   |  \d \D \w \W \s \S \b \B \n \t \r \f \v \0 \xHH \uHHHH \cX
  *   メタ文字エスケープ
  * 非対応（コンパイル時エラー・明白な失敗）:
- *   (?=..) (?!..) (?<=..) (?<!..) (?<name>..) \1..（バックリファレンス）
- *   文字クラス内の非 ASCII 文字・範囲、\D \W \S、\u{...}
+ *   (?<=..) (?<!..) (?<name>..)
+ *   文字クラス内の非 ASCII 文字・範囲、\u{...}
  * フラグ: i（ASCII のみ）g m s y（u は受け付け、\u{...} のみ非対応）
  */
 #include <stdlib.h>
@@ -50,6 +50,9 @@ enum {
     RI_SPLIT,      /* u32v = alt。次命令を優先し、失敗で alt（貪欲） */
     RI_SPLIT_L,    /* u32v = alt。alt を優先し、失敗で次命令（非貪欲） */
     RI_JMP,        /* u32v = ターゲット */
+    RI_LOOKAHEAD,  /* u32v = sub 開始 ip、u64v bit0 = neg（(?=..) / (?!..)） */
+    RI_LA_END,     /* サブプログラムの正常終端（lookahead 内部のみ） */
+    RI_BACKREF,    /* u32v = キャプチャ番号。該当キャプチャの内容と現在位置を比較 */
     RI_MATCH
 };
 
@@ -60,14 +63,21 @@ typedef struct {
     u64 u64v;
 } RexIns; /* 24B */
 
+typedef struct { u32 lo, hi; } CpRange;
+
 struct AklRex {
     u8 *pat;
     u32 pat_len;
     u32 flags;
     RexIns *ins;
     u32 n_ins;
-    u8 *classes;   /* 32B × n_classes のビットセット配列 */
+    u8 *classes;   /* 32B × n_classes のビットセット配列（ASCII 部） */
     u32 n_classes;
+    /* v0.6: 非 ASCII クラス要素（cp 範囲リスト）。cls_range_off[i] = クラス i の
+     * 範囲開始、cls_range_off[i+1] - cls_range_off[i] = 個数（末尾に合計を置く） */
+    CpRange *cls_ranges;
+    u32 *cls_range_off;
+    u32 n_cls_ranges;
     u32 n_cap;
 };
 
@@ -81,6 +91,9 @@ typedef struct {
     u32 n_ins, cap_ins;
     u8 *classes;
     u32 n_classes, cap_classes;
+    CpRange *cls_ranges;    /* 非 ASCII 範囲（フラット） */
+    u32 n_cls_ranges, cap_cls_ranges;
+    u32 *cls_range_off;     /* 各クラスの範囲開始（n_classes+1 個） */
     u32 n_cap;
     u32 depth;
     char *err;
@@ -204,17 +217,45 @@ static bool rc_ins_insert(RexC *rc, u32 pos, RexIns in) {
 }
 
 /* ビットセット（256 ビット = 32B）を取得。既存を探し、無ければ追加 */
-static u32 rc_class_get(RexC *rc, const u8 *bits) {
-    for (u32 i = 0; i < rc->n_classes; i++)
-        if (memcmp(rc->classes + i * 32, bits, 32) == 0) return i;
+/* ビットセット + 非 ASCII 範囲リストでクラスレコードを取得（既存一致 or 新規）。
+ * 返り値: クラス index（失敗 0 — 0 は「空クラス」としても安全側で動く）。 */
+static u32 rc_class_get(RexC *rc, const u8 *bits, const CpRange *ranges, u32 n_ranges) {
+    for (u32 i = 0; i < rc->n_classes; i++) {
+        if (memcmp(rc->classes + i * 32, bits, 32) != 0) continue;
+        u32 off = rc->cls_range_off[i];
+        u32 cnt = rc->cls_range_off[i + 1] - off;
+        if (cnt != n_ranges) continue;
+        bool same = true;
+        for (u32 j = 0; j < cnt; j++)
+            if (rc->cls_ranges[off + j].lo != ranges[j].lo ||
+                rc->cls_ranges[off + j].hi != ranges[j].hi) { same = false; break; }
+        if (same) return i;
+    }
     if (rc->n_classes == rc->cap_classes) {
         u32 nc = rc->cap_classes ? rc->cap_classes * 2 : 8;
         u8 *nb = (u8 *)realloc(rc->classes, (u64)nc * 32);
         if (!nb) { rc_fail(rc, "out of memory"); return 0; }
         rc->classes = nb; rc->cap_classes = nc;
+        u32 *no = (u32 *)realloc(rc->cls_range_off, (u64)(nc + 1) * sizeof(u32));
+        if (!no) { rc_fail(rc, "out of memory"); return 0; }
+        rc->cls_range_off = no;
     }
-    memcpy(rc->classes + rc->n_classes * 32, bits, 32);
-    return rc->n_classes++;
+    memcpy(rc->classes + rc->n_classes * 32, bits, 32); /* ビットセット本体（v0.6 で抜けていた実バグ） */
+    if (n_ranges) {
+        if (rc->n_cls_ranges + n_ranges > rc->cap_cls_ranges) {
+            u32 nc2 = rc->cap_cls_ranges ? rc->cap_cls_ranges * 2 : 16;
+            while (nc2 < rc->n_cls_ranges + n_ranges) nc2 *= 2;
+            CpRange *nr = (CpRange *)realloc(rc->cls_ranges, (u64)nc2 * sizeof(CpRange));
+            if (!nr) { rc_fail(rc, "out of memory"); return 0; }
+            rc->cls_ranges = nr; rc->cap_cls_ranges = nc2;
+        }
+        memcpy(rc->cls_ranges + rc->n_cls_ranges, ranges, (u64)n_ranges * sizeof(CpRange));
+    }
+    rc->cls_range_off[rc->n_classes] = rc->n_cls_ranges;
+    rc->n_classes++;
+    rc->n_cls_ranges += n_ranges;
+    rc->cls_range_off[rc->n_classes] = rc->n_cls_ranges; /* 末尾哨兵 */
+    return rc->n_classes - 1;
 }
 
 static void bits_set(u8 *bits, u8 c) { bits[c >> 3] |= (u8)(1u << (c & 7)); }
@@ -249,7 +290,7 @@ static void bits_ci_expand(u8 *bits) {
 /* エスケープ \x を 1 つ処理。
  * kind: ESC_CHAR（cp にコードポイント）/ ESC_CLASS（cp = クラス index, neg）
  *      / ESC_SPACE（\s \S。neg で判定）/ ESC_ANCHOR（cp = アンカー種別） */
-enum { ESC_CHAR = 0, ESC_CLASS, ESC_SPACE, ESC_ANCHOR };
+enum { ESC_CHAR = 0, ESC_CLASS, ESC_SPACE, ESC_ANCHOR, ESC_BACKREF };
 
 static bool rc_escape(RexC *rc, u32 *cp, int *kind, bool *neg) {
     rc->pos++; /* '\' を越える */
@@ -260,7 +301,7 @@ static bool rc_escape(RexC *rc, u32 *cp, int *kind, bool *neg) {
         u8 bits[32]; bits_clr_all(bits); bits_add_digit(bits);
         if (c == 'D') bits_neg(bits);
         if (rc->flags & AKL_RX_F_IGNORE) bits_ci_expand(bits);
-        u32 ci = rc_class_get(rc, bits);
+        u32 ci = rc_class_get(rc, bits, NULL, 0);
         rc->pos++;
         *cp = ci; *kind = ESC_CLASS; *neg = false;
         return true;
@@ -269,7 +310,7 @@ static bool rc_escape(RexC *rc, u32 *cp, int *kind, bool *neg) {
         u8 bits[32]; bits_clr_all(bits); bits_add_word(bits);
         if (c == 'W') bits_neg(bits);
         if (rc->flags & AKL_RX_F_IGNORE) bits_ci_expand(bits);
-        u32 ci = rc_class_get(rc, bits);
+        u32 ci = rc_class_get(rc, bits, NULL, 0);
         rc->pos++;
         *cp = ci; *kind = ESC_CLASS; *neg = false;
         return true;
@@ -294,6 +335,23 @@ static bool rc_escape(RexC *rc, u32 *cp, int *kind, bool *neg) {
             return false;
         }
         rc->pos++; *cp = 0; *kind = ESC_CHAR; *neg = false;
+        return true;
+    }
+    case '1': case '2': case '3': case '4':
+    case '5': case '6': case '7': case '8': case '9': {
+        /* v0.6: バックリファレンス \1..\9（\10 等は 2 桁を試し、グループ数以下なら
+         * 採用。無ければ 1 桁 + 残り文字列） */
+        u32 g = (u32)(c - '0');
+        rc->pos++;
+        if (rc->pos < rc->len && rc->pat[rc->pos] >= '0' && rc->pat[rc->pos] <= '9') {
+            u32 g2 = g * 10 + (u32)(rc->pat[rc->pos] - '0');
+            if (g2 <= rc->n_cap) { g = g2; rc->pos++; }
+        }
+        if (g == 0 || g > rc->n_cap) {
+            rc_fail(rc, "backreference to undefined group");
+            return false;
+        }
+        *cp = g; *kind = ESC_BACKREF; *neg = false;
         return true;
     }
     case 'x': {
@@ -422,11 +480,43 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
             if (rc->pat[rc->pos + 1] == ':') {
                 cap = false;
                 rc->pos += 2;
-            } else if (rc->pat[rc->pos + 1] == '=' || rc->pat[rc->pos + 1] == '!' ||
-                       rc->pat[rc->pos + 1] == '<') {
-                rc_fail(rc, "lookahead/lookbehind not supported");
+            } else if (rc->pat[rc->pos + 1] == '<') {
+                rc_fail(rc, "lookbehind not supported");
                 rc->depth--;
                 return false;
+            } else if (rc->pat[rc->pos + 1] == '=' || rc->pat[rc->pos + 1] == '!') {
+                /* v0.6: 先読み (?=..) / (?!..)。レイアウト:
+                 *   [LOOKAHEAD sub neg][JMP skip][sub 命令列][LA_END][skip: 続き]
+                 * サブは位置を消費せず成功/失敗のみ判定する。 */
+                bool la_neg = rc->pat[rc->pos + 1] == '!';
+                rc->pos += 2;
+                u32 la_idx = rc->n_ins;
+                RexIns in2;
+                memset(&in2, 0, sizeof in2);
+                in2.op = RI_LOOKAHEAD; in2.u32v = 0; in2.u64v = la_neg ? 1u : 0u;
+                if (!rc_emit(rc, in2)) { rc->depth--; return false; }
+                u32 jmp_idx = rc->n_ins;
+                RexIns j2;
+                memset(&j2, 0, sizeof j2);
+                j2.op = RI_JMP; j2.u32v = 0;
+                if (!rc_emit(rc, j2)) { rc->depth--; return false; }
+                u32 sub = rc->n_ins;
+                if (!rc_compile_alt(rc)) { rc->depth--; return false; }
+                if (rc->pos >= rc->len || rc->pat[rc->pos] != ')') {
+                    rc_fail(rc, "missing ')'");
+                    rc->depth--;
+                    return false;
+                }
+                rc->pos++;
+                RexIns e2;
+                memset(&e2, 0, sizeof e2);
+                e2.op = RI_LA_END;
+                if (!rc_emit(rc, e2)) { rc->depth--; return false; }
+                u32 skip = rc->n_ins;
+                rc->ins[la_idx].u32v = sub;
+                rc->ins[jmp_idx].u32v = skip;
+                rc->depth--; *e0 = rc->n_ins;
+                return true;
             } else {
                 rc_fail(rc, "unknown group syntax");
                 rc->depth--;
@@ -468,6 +558,8 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
         if (rc->pos < rc->len && rc->pat[rc->pos] == '^') { neg = true; rc->pos++; }
         u8 bits[32];
         bits_clr_all(bits);
+        CpRange ranges[64];
+        u32 n_ranges = 0;
         bool first = true;
         u32 prev_lo = 0;
         bool in_range = false;
@@ -483,24 +575,31 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
                 bool eneg;
                 if (!rc_escape(rc, &esc_cp, &kind, &eneg)) { rc->depth--; return false; }
                 if (kind == ESC_CLASS) {
-                    if (eneg) {
-                        rc_fail(rc, "\\D \\W inside class not supported");
-                        rc->depth--; return false;
-                    }
+                    /* v0.6: \D \W のクラス内補集合（lodash 等の実ライブラリで使用。
+                     * 空セットに合成してから補集合を OR — 既存要素を壊さない） */
+                    u8 nb[32];
+                    bits_clr_all(nb);
                     const u8 *cb = rc->classes + esc_cp * 32;
-                    for (u32 b = 0; b < 32; b++) bits[b] |= cb[b];
+                    if (eneg) { for (u32 b = 0; b < 32; b++) nb[b] = (u8)~cb[b]; }
+                    else      { for (u32 b = 0; b < 32; b++) nb[b] = cb[b]; }
+                    for (u32 b = 0; b < 32; b++) bits[b] |= nb[b];
                     continue;
                 }
                 if (kind == ESC_SPACE) {
-                    if (eneg) {
-                        rc_fail(rc, "\\S inside class not supported");
-                        rc->depth--; return false;
-                    }
-                    bits_add_ascii_space(bits);
+                    /* v0.6: \S のクラス内補集合（同上） */
+                    u8 nb[32];
+                    bits_clr_all(nb);
+                    bits_add_ascii_space(nb);
+                    if (eneg) { for (u32 b = 0; b < 32; b++) nb[b] = (u8)~nb[b]; }
+                    for (u32 b = 0; b < 32; b++) bits[b] |= nb[b];
                     continue;
                 }
                 if (kind == ESC_ANCHOR) {
                     rc_fail(rc, "\\b inside class not supported");
+                    rc->depth--; return false;
+                }
+                if (kind == ESC_BACKREF) {
+                    rc_fail(rc, "backreference inside class not supported");
                     rc->depth--; return false;
                 }
                 cp = esc_cp;
@@ -508,8 +607,8 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
                 u32 clen;
                 if (cc >= 0x80) {
                     u32 pcp;
-                    if (!rx_utf8_get(rc->pat, rc->len, rc->pos, &pcp, &clen) || pcp >= 0x80) {
-                        rc_fail(rc, "non-ASCII char in class not supported");
+                    if (!rx_utf8_get(rc->pat, rc->len, rc->pos, &pcp, &clen)) {
+                        rc_fail(rc, "bad UTF-8 in class");
                         rc->depth--; return false;
                     }
                     cp = pcp;
@@ -520,11 +619,17 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
                 for (u32 i = 0; i < clen; i++) rc->pos++;
             }
             if (in_range) {
-                if (prev_lo > cp || prev_lo >= 0x80 || cp >= 0x80) {
+                if (prev_lo > cp) {
                     rc_fail(rc, "bad range in class");
                     rc->depth--; return false;
                 }
-                for (u32 v = prev_lo; v <= cp; v++) bits_set(bits, (u8)v);
+                /* v0.6: 非 ASCII 範囲は ranges へ（[\uD800-\uDFFF] 等） */
+                if (prev_lo < 0x80 && cp < 0x80) {
+                    for (u32 v = prev_lo; v <= cp; v++) bits_set(bits, (u8)v);
+                } else {
+                    if (n_ranges < 64) { ranges[n_ranges].lo = prev_lo; ranges[n_ranges].hi = cp; n_ranges++; }
+                    else { rc_fail(rc, "too many ranges in class"); rc->depth--; return false; }
+                }
                 in_range = false;
             } else if (cp < 0x80) {
                 if (rc->pos + 1 < rc->len && rc->pat[rc->pos] == '-' &&
@@ -536,17 +641,25 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
                     bits_set(bits, (u8)cp);
                 }
             } else {
-                rc_fail(rc, "non-ASCII char in class not supported");
-                rc->depth--; return false;
+                /* v0.6: 非 ASCII 単一要素（\uD800 等）は ranges へ */
+                if (rc->pos + 1 < rc->len && rc->pat[rc->pos] == '-' &&
+                    rc->pat[rc->pos + 1] != ']') {
+                    rc->pos++;
+                    prev_lo = cp;
+                    in_range = true;
+                } else {
+                    if (n_ranges < 64) { ranges[n_ranges].lo = cp; ranges[n_ranges].hi = cp; n_ranges++; }
+                    else { rc_fail(rc, "too many ranges in class"); rc->depth--; return false; }
+                }
             }
         }
         if (in_range) { rc_fail(rc, "bad range in class"); rc->depth--; return false; }
-        if (neg) bits_neg(bits);
         if (rc->flags & AKL_RX_F_IGNORE) bits_ci_expand(bits);
-        u32 ci = rc_class_get(rc, bits);
+        u32 ci = rc_class_get(rc, bits, ranges, n_ranges);
         RexIns in;
         memset(&in, 0, sizeof in);
         in.op = RI_CLASS; in.u32v = ci;
+        in.u64v = neg ? 1u : 0u; /* v0.6: 否定は実行時判定（非 ASCII 範囲と整合） */
         if (!rc_emit(rc, in)) { rc->depth--; return false; }
         rc->depth--; *e0 = rc->n_ins;
         return true;
@@ -588,6 +701,14 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
             RexIns in;
             memset(&in, 0, sizeof in);
             in.op = RI_ANCHOR; in.u32v = cp;
+            if (!rc_emit(rc, in)) { rc->depth--; return false; }
+            rc->depth--; *e0 = rc->n_ins;
+            return true;
+        }
+        if (kind == ESC_BACKREF) {
+            RexIns in;
+            memset(&in, 0, sizeof in);
+            in.op = RI_BACKREF; in.u32v = cp;
             if (!rc_emit(rc, in)) { rc->depth--; return false; }
             rc->depth--; *e0 = rc->n_ins;
             return true;
@@ -938,10 +1059,25 @@ static bool rx_run(RxRun *rr, u32 pos, u32 ip, u32 depth) {
             break;
         }
         case RI_CLASS: {
-            if (pos >= rr->s_len) return false;
-            u8 c = rr->s[pos];
-            if (!bits_has(rr->rx->classes + in->u32v * 32, c)) return false;
-            pos++;
+            /* v0.6: cp 単位判定。ASCII はビットセット、非 ASCII は範囲リスト、
+             * クラス全体の否定（u64v bit0）は実行時に反転。 */
+            u32 cp, clen;
+            if (!rx_utf8_get(rr->s, rr->s_len, pos, &cp, &clen)) return false;
+            bool hit;
+            if (cp < 0x80) {
+                hit = bits_has(rr->rx->classes + in->u32v * 32, (u8)cp);
+            } else {
+                hit = false;
+                u32 off = rr->rx->cls_range_off[in->u32v];
+                u32 cnt = rr->rx->cls_range_off[in->u32v + 1] - off;
+                for (u32 i = 0; i < cnt; i++) {
+                    const CpRange *r = &rr->rx->cls_ranges[off + i];
+                    if (cp >= r->lo && cp <= r->hi) { hit = true; break; }
+                }
+            }
+            if (in->u64v & 1u) hit = !hit;
+            if (!hit) return false;
+            pos += clen;
             ip++;
             break;
         }
@@ -1048,6 +1184,38 @@ static bool rx_run(RxRun *rr, u32 pos, u32 ip, u32 depth) {
         case RI_JMP:
             ip = in->u32v;
             break;
+        case RI_LOOKAHEAD: {
+            /* 位置とキャプチャを退避し、サブを試す。成功/失敗のみを使い、
+             * 位置・キャプチャは元に戻す（先読みは消費しない）。 */
+            u32 save_pos = pos;
+            u32 nc2 = rr->ncap < RX_MAX_CAP ? rr->ncap : RX_MAX_CAP;
+            u32 save_beg[RX_MAX_CAP + 1], save_end[RX_MAX_CAP + 1];
+            memcpy(save_beg, rr->cap_beg, (u64)(nc2 + 1) * sizeof(u32));
+            memcpy(save_end, rr->cap_end, (u64)(nc2 + 1) * sizeof(u32));
+            bool ok = rx_run(rr, pos, (u32)in->u32v, depth + 1);
+            memcpy(rr->cap_beg, save_beg, (u64)(nc2 + 1) * sizeof(u32));
+            memcpy(rr->cap_end, save_end, (u64)(nc2 + 1) * sizeof(u32));
+            pos = save_pos;
+            bool neg = (in->u64v & 1u) != 0;
+            if (ok == neg) return false; /* 肯定: 失敗は失敗 / 否定: 成功は失敗 */
+            ip++;
+            break;
+        }
+        case RI_LA_END:
+            if (getenv("AKL_TRACE_RX")) fprintf(stderr, "[rx] LA_END\n");
+            return true; /* サブ正常終了（キャプチャは呼出側が退避済み） */
+        case RI_BACKREF: {
+            u32 g = in->u32v;
+            if (g > rr->ncap) return false;
+            u32 b = rr->cap_beg[g], e = rr->cap_end[g];
+            if (e < b) return false; /* 未確定キャプチャの参照は失敗 */
+            u32 len = e - b;
+            if (pos + len > rr->s_len) return false;
+            if (len && memcmp(rr->s + pos, rr->s + b, len) != 0) return false;
+            pos += len;
+            ip++;
+            break;
+        }
         default:
             return false;
         }
@@ -1075,6 +1243,8 @@ AklRex *akl_rex_compile(const uint8_t *pat, uint32_t pat_len, uint32_t flags,
     if (!ok || rc.failed) {
         free(rc.ins);
         free(rc.classes);
+        free(rc.cls_ranges);
+        free(rc.cls_range_off);
         return NULL;
     }
     RexIns m;
@@ -1082,9 +1252,9 @@ AklRex *akl_rex_compile(const uint8_t *pat, uint32_t pat_len, uint32_t flags,
     m.op = RI_MATCH;
     rc_emit(&rc, m);
     AklRex *rx = (AklRex *)malloc(sizeof(AklRex));
-    if (!rx) { free(rc.ins); free(rc.classes); return NULL; }
+    if (!rx) { free(rc.ins); free(rc.classes); free(rc.cls_ranges); free(rc.cls_range_off); return NULL; }
     rx->pat = (u8 *)malloc(pat_len ? pat_len : 1);
-    if (!rx->pat) { free(rx); free(rc.ins); free(rc.classes); return NULL; }
+    if (!rx->pat) { free(rx); free(rc.ins); free(rc.classes); free(rc.cls_ranges); free(rc.cls_range_off); return NULL; }
     memcpy(rx->pat, pat, pat_len);
     rx->pat_len = pat_len;
     rx->flags = flags;
@@ -1092,6 +1262,10 @@ AklRex *akl_rex_compile(const uint8_t *pat, uint32_t pat_len, uint32_t flags,
     rx->n_ins = rc.n_ins;
     rx->classes = rc.classes;
     rx->n_classes = rc.n_classes;
+    /* v0.6: 非 ASCII 範囲テーブルを rx へ移管 */
+    rx->cls_ranges = rc.cls_ranges;
+    rx->cls_range_off = rc.cls_range_off;
+    rx->n_cls_ranges = rc.n_cls_ranges;
     rx->n_cap = rc.n_cap;
     return rx;
 }
@@ -1101,6 +1275,8 @@ void akl_rex_free(AklRex *rx) {
     free(rx->pat);
     free(rx->ins);
     free(rx->classes);
+    free(rx->cls_ranges);
+    free(rx->cls_range_off);
     free(rx);
 }
 

@@ -609,23 +609,24 @@ static void t_objects(void) {
     want_bool("var a = {}; var b = {}; a === b", false);  /* identity（同形でも別物） */
     want_bool("var a = {}; var b = a; a !== b", false);
     /* 明白失敗系（黙った誤答を作らない） */
-    want_err("var o = 5; o.x = 1", "TypeError");       /* 非 object store（代入は TypeError が正しい） */
+    want_num("var o = 5; o.x = 1; o + 1", 6);          /* v0.6 V8 準拠: プリミティブへの代入は非 strict で無視 */
     want_undef("var o = 5; o.x");                      /* 非 object load は undefined（V8 準拠。v0.5 で修正） */
     want_err("var o = {}; o.f()", "not a function");   /* 無い/非関数メソッド */
     want_num("var o = {a}; o.a == undefined ? 1 : 0", 0); /* shorthand: a 未定義 → o.a は undefined */
     want_num("var x = 9; var o = {a:1, b: x}; o.b", 9);  /* b: x は通常プロパティ */
     want_num("{a:1}", 1);                              /* 文頭 { はブロック文。a:1 はラベル+式文（JS 準拠） */
-    /* prop 数天井 64（1 obj あたり）: 65 個目で明白に失敗 */
+    /* prop 数天井 256（v0.6 拡張。内部 \x00proto 1 個分含む = ユーザー 255 個まで）:
+     * 256 個目で明白に失敗 */
     {
-        char src[4200];
+        char src[22000];
         int n = snprintf(src, sizeof src, "var o = {}; ");
-        for (int i = 0; i <= 64; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = 0; ", i);
+        for (int i = 0; i <= 256; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = 0; ", i);
         want_err(src, "property budget");
         src[0] = 0;
         n = snprintf(src, sizeof src, "var o = {}; ");
-        for (int i = 0; i < 64; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = %d; ", i, i);
-        n += snprintf(src + n, sizeof src - (size_t)n, "o.k63");
-        want_num(src, 63);                             /* 64 個ちょうどは成功 */
+        for (int i = 0; i < 255; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = %d; ", i, i);
+        n += snprintf(src + n, sizeof src - (size_t)n, "o.k254");
+        want_num(src, 254);                            /* 255 個ちょうどは成功（v0.6） */
     }
 }
 
@@ -730,8 +731,8 @@ static void t_native(void) {
     /* プログラム的な temp budget: 8 個は成功（GC 発火帯）・9 個目で明白に失敗 */
     AklVal tfn = akl_mknative(g_rt, n_temps, NULL);
     CHECK(akl_global_set(g_rt, "temps", tfn));
-    want_num("temps(8)", 8.0 * 70000.0);
-    want_err("temps(9)", "temp budget");
+    want_num("temps(64)", 64.0 * 70000.0); /* v0.6: nursery 64 に拡張 */
+    want_err("temps(65)", "temp budget");
     /* 登録拒否（native コールバック内からの登録は構造的に拒否） */
     g_reg_rejected = 0;
     CHECK(akl_global_set(g_rt, "reginside", akl_mknative(g_rt, n_reg_inside, NULL)));
@@ -1498,7 +1499,7 @@ static void t_v04_regex(void) {
     want_str("'axxbayyb'.match(/a.*?b/)[0]", "axxb");
     want_str("'axxbayyb'.match(/a.*b/)[0]", "axxbayyb");
     /* エラー（非対応構文は明白に失敗） */
-    want_err("/(?=a)/", "invalid regexp");
+    want_num("/(?=a)/.test('a') ? 1 : 0", 1); /* v0.6: lookahead は実装済み */
     want_err("/(?<n>a)/", "invalid regexp");
     want_err("/\\1/", "invalid regexp");
     want_err("/a{1001}/", "invalid regexp");
