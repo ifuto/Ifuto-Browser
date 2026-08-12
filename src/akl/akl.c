@@ -44,6 +44,10 @@
 #define AKL_VAL_NULL  (AKL_TAG_MASK | 1u)
 #define AKL_VAL_FALSE (AKL_TAG_MASK | 2u)
 #define AKL_VAL_TRUE  (AKL_TAG_MASK | 3u)
+/* v0.6: let/const の TDZ マーカ。ブロック入口で束縛 slot に置かれ、LLOAD_TDZ が
+ * 参照時に ReferenceError を投げる（`{ a; let a; }` の V8 準拠）。タグ空間 4 は
+ * 通常の値と衝突しない（int/obj/double のタグ帯とは排他）。 */
+#define AKL_VAL_TDZ   (AKL_TAG_MASK | 4u)
 #define AKL_MK_INT(i) ((AKL_TAG_MASK | (1ull << 32)) | (uint32_t)(i))
 #define AKL_MK_OBJ(i) ((AKL_TAG_MASK | (2ull << 32)) | (uint32_t)(i))
 
@@ -241,6 +245,10 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_MCALLN,              /* slot u32 | name u32 : argc = locals[slot] の動的 MCALL（メソッド spread） */
     OP_ARRREST,             /* pop start, pop arr → 新規配列 [start..n)（分割 rest） */
     OP_OBJREST,             /* pop src_obj → 新規 OBJ（全 props コピー。除外は PDEL で） */
+    /* v0.6: let/const ブロックスコープ + TDZ */
+    OP_TDZ_INIT,            /* slot u32 : stk[base+slot] = TDZ マーカ（ブロック入口で束縛初期化） */
+    OP_LLOAD_TDZ,           /* slot u32 : LLOAD + マーカ検査（TDZ 参照は ReferenceError） */
+    OP_LSTORE_TDZ,          /* slot u32 : LSTORE + マーカ検査（TDZ 中の代入も ReferenceError） */
     OP_HALT,
     OP_COUNT
 };
@@ -3487,6 +3495,7 @@ static u32 p_stmt(P *p) {
     }
     if (p_is_kw(p, KW_VAR) || p_is_kw(p, KW_LET) || p_is_kw(p, KW_CONST)) {
         u8 is_const = p->lx.pk == KW_CONST;
+        u8 is_lex = (p->lx.pk == KW_LET || p->lx.pk == KW_CONST); /* v0.6: ブロックスコープ */
         lex_next(&p->lx);
         /* カンマ宣言は全宣言を保持する（旧実装は最後の宣言しか返さず、
          * `var a=0,b=0; a` が ReferenceError になる実在バグだった。テストで同定） */
@@ -3503,7 +3512,7 @@ static u32 p_stmt(P *p) {
                 } else if (is_const) { p->fail = "const declaration requires initializer"; goto out_fail; }
                 u32 vn = p_node(p, N_VAR);
                 if (vn == N_NONE) goto out_fail;
-                p->nodes[vn].flags = is_const;
+                p->nodes[vn].flags = (u8)(is_const | (is_lex << 1));
                 p->nodes[vn].a = name;
                 p->nodes[vn].b = init;
                 if (p_scratch(p, &sc, vn) < 0) goto out_fail;
@@ -3515,6 +3524,7 @@ static u32 p_stmt(P *p) {
                 u32 init = p_expr(p);
                 if (init == N_NONE) goto out_fail;
                 p->nodes[dest].b = init;
+                p->nodes[dest].flags = (u8)(is_const | (is_lex << 1)); /* v0.6: let/const 束縛 */
                 if (p_scratch(p, &sc, dest) < 0) goto out_fail;
             } else { p->fail = "expected variable name"; goto out_fail; }
             if (!p_eat_punct(p, P_COMMA)) break;
@@ -3528,7 +3538,7 @@ static u32 p_stmt(P *p) {
         } else {
             u32 first = p_list_commit(p, &sc);
             ni = p_node(p, N_BLOCK);
-            if (ni != N_NONE && first != N_NONE) { p->nodes[ni].a = first; p->nodes[ni].c = sc.n; }
+            if (ni != N_NONE && first != N_NONE) { p->nodes[ni].a = first; p->nodes[ni].c = sc.n; p->nodes[ni].flags = 1; /* 多変数 wrapper（prescan 再帰用） */ }
             else { free(sc.v); goto out; }
         }
         free(sc.v);
@@ -3712,6 +3722,7 @@ static u32 p_stmt(P *p) {
          * var 宣言後に in/of が直接来る場合のみ。それ以外は通常の for へ。 */
         if (p_is_kw(p, KW_VAR) || p_is_kw(p, KW_LET) || p_is_kw(p, KW_CONST)) {
             u8 is_const = p->lx.pk == KW_CONST;
+            u8 is_lex = (p->lx.pk == KW_LET || p->lx.pk == KW_CONST);
             lex_next(&p->lx);
             if (p->lx.kind != TK_IDENT) { p->fail = "expected variable name"; goto out; }
             u32 name = p_intern(p, p->lx.str_p, p->lx.str_len);
@@ -3730,7 +3741,7 @@ static u32 p_stmt(P *p) {
                     p->nodes[ni].b = obj;
                     p->nodes[ni].c = body;
                     p->nodes[ni].flags = is_in ? 0 : 1; /* 0=in 1=of */
-                    p->nodes[ni].d = is_const;
+                    p->nodes[ni].d = (u8)(is_const | (is_lex << 1)); /* bit0=const bit1=lex */
                 }
                 goto out;
             }
@@ -3745,7 +3756,7 @@ static u32 p_stmt(P *p) {
             if (p_eat_punct(p, P_ASSIGN)) { iv2 = p_expr_comma(p); if (iv2 == N_NONE) goto out; }
             else if (is_const) { p->fail = "const declaration requires initializer"; goto out; }
             init = p_node(p, N_VAR);
-            if (init != N_NONE) { p->nodes[init].flags = is_const; p->nodes[init].a = name; p->nodes[init].b = iv2; }
+            if (init != N_NONE) { p->nodes[init].flags = (u8)(is_const | (is_lex << 1)); p->nodes[init].a = name; p->nodes[init].b = iv2; }
             /* 残りは通常の for へ（init は確定済み） */
             if (!p_expect_punct(p, P_SEMI, "expected ';'")) goto out;
             if (!p_is_punct(p, P_SEMI)) { cond = p_expr(p); if (cond == N_NONE) goto out; }
@@ -3765,6 +3776,7 @@ static u32 p_stmt(P *p) {
             if (p_is_kw(p, KW_VAR) || p_is_kw(p, KW_LET) || p_is_kw(p, KW_CONST)) {
                 /* for 内の var 宣言: カンマ区切り複数（JS 準拠） */
                 u8 is_const = p->lx.pk == KW_CONST;
+                u8 is_lex = (p->lx.pk == KW_LET || p->lx.pk == KW_CONST);
                 lex_next(&p->lx);
                 U32Vec vd = { NULL, 0, 0 };
                 for (;;) {
@@ -3777,7 +3789,7 @@ static u32 p_stmt(P *p) {
                     else if (is_const) { p->fail = "const declaration requires initializer"; free(vd.v); goto out; }
                     u32 vn = p_node(p, N_VAR);
                     if (vn == N_NONE) { free(vd.v); goto out; }
-                    p->nodes[vn].flags = is_const;
+                    p->nodes[vn].flags = (u8)(is_const | (is_lex << 1));
                     p->nodes[vn].a = name;
                     p->nodes[vn].b = iv;
                     if (p_scratch(p, &vd, vn) < 0) { free(vd.v); goto out; }
@@ -3788,7 +3800,7 @@ static u32 p_stmt(P *p) {
                 } else {
                     u32 first = p_list_commit(p, &vd);
                     init = p_node(p, N_BLOCK);
-                    if (init != N_NONE && first != N_NONE) { p->nodes[init].a = first; p->nodes[init].c = vd.n; }
+                    if (init != N_NONE && first != N_NONE) { p->nodes[init].a = first; p->nodes[init].c = vd.n; p->nodes[init].flags = 1; /* 多変数 wrapper */ }
                     else { free(vd.v); goto out; }
                 }
                 free(vd.v);
@@ -4283,6 +4295,17 @@ static void an_main_decls(P *p, u32 ni, U32Vec *out) {
         default: break;
         }
     }
+    /* v0.6: classic でも let/const（lex）束縛は main のローカルとして宣言扱いにする。
+     * ネスト関数がトップレベル/ブロックの let を参照するとき、グローバルでなく ENV
+     * capture で解決するため（`let x = 10; function g(){ return x; } g()` は V8 で 10）。
+     * var は従来通りグローバルのみ（capture 対象にしない）。 */
+    if (!p->is_module && n->kind == N_VAR && (n->flags & 2u)) an_add(out, n->a);
+    if (!p->is_module && n->kind == N_DESTR && (n->flags & 2u)) {
+        for (u32 i = 0; i < n->c; i++) {
+            u32 el = p->list[n->a + i];
+            if (el < p->n_nodes && p->nodes[el].kind == N_DSTR_EL) an_add(out, p->nodes[el].a);
+        }
+    }
     switch (n->kind) {
     case N_TRY:
         if (n->b != UINT32_MAX) an_add(out, n->b);
@@ -4409,7 +4432,7 @@ static bool akl_analyze(P *p, u32 prog) {
 
 /* ============================== codegen ============================== */
 
-typedef struct { u32 name; u8 is_const; u8 captured; u8 env_idx; u8 _p; } LocalEnt;
+typedef struct { u32 name; u8 is_const; u8 captured; u8 env_idx; u8 lex; } LocalEnt; /* v0.6: lex=let/const 束縛 */
 
 /* 祖先関数の codegen 状態（ネスト関数 compile 中の退避先）。
  * 現在関数の scope は Cg 直持ち（locals/n_locals/cap_locals/cur_n_env/cur_needs_cap/
@@ -4421,7 +4444,15 @@ typedef struct {
     i32 fn_idx;            /* funcs 表 index（main=0） */
     const AklFnInfo *fi;   /* 解析結果（無ければ NULL） */
     const u32 *hoist; u32 n_hoist; /* v0.5: 関数宣言（hoist 対象） */
+    /* v0.6: ブロックスコープ（let/const）スタックの退避（ネスト関数 codegen 中に親を保持） */
+    struct CgLexScope *lex; u32 n_lex; u32 lex_cap;
 } CgScope;
+
+/* v0.6: let/const のブロックスコープ束縛（コード生成時のみ）。names→slots/is_const。
+ * ブロック入口でスコープに積み、出口で忘れる（slot は保持。関数ローカル窓は単調）。 */
+typedef struct CgLexScope {
+    u32 *names; u32 *slots; u8 *is_const; u32 n, cap;
+} CgLexScope;
 
 typedef struct {
     AklRT *rt;
@@ -4450,6 +4481,8 @@ typedef struct {
     u16 try_depth;              /* lex 上の try 領域の深さ（catch 本体含む） */
     u8 try_at_loop[64];         /* 各 loop 開設時の try_depth（try 越境 brk/cont の検出用） */
     u32 m_load, m_export, m_rexport, m_import; /* v0.5 モジュール native の intern 名 */
+    /* v0.6: 現在関数のブロックスコープスタック（innermost が最後。上限 128 ネスト） */
+    CgLexScope lex[128]; u32 n_lex;
     bool fail;
 } Cg;
 
@@ -4480,6 +4513,11 @@ static void cg_patch_u32(Cg *cg, u32 at, u32 v) {
  * capture 済み（解析で確定）なら captured/env_idx を付与（frame の dummies 分は
  * 含まれない: dummies は関数 scope 開設時に予約されるため実ローカルはその後ろ）。 */
 static i32 cg_local_find(Cg *cg, u32 name) {
+    /* v0.6: ブロックスコープ（let/const）の束縛が最優先（シャドーイング）。
+     * innermost から外へ。pop 済みスコープの slot は名前が消えているので一致しない。 */
+    for (u32 s = cg->n_lex; s-- > 0;)
+        for (u32 i = 0; i < cg->lex[s].n; i++)
+            if (cg->lex[s].names[i] == name) return (i32)cg->lex[s].slots[i];
     for (u32 i = 0; i < cg->n_locals; i++)
         if (cg->locals[i].name == name) return (i32)i;
     return -1;
@@ -4487,10 +4525,12 @@ static i32 cg_local_find(Cg *cg, u32 name) {
 static i32 cg_local_add(Cg *cg, u32 name, u8 is_const) {
     i32 at = cg_local_find(cg, name);
     if (at >= 0) {
-        if (cg->locals[at].is_const) {
+        /* v0.6: ブロックスコープ（lex）の slot は再利用しない（スコープ外からは見えない） */
+        if (cg->locals[at].lex) at = -1;
+        else if (cg->locals[at].is_const) {
             akl_errf(cg->rt, "reassignment of const binding"); cg->fail = true; return -1;
         }
-        return at;
+        if (at >= 0) return at;
     }
     if (cg->n_locals >= AKL_MAX_LOCALS) { akl_errf(cg->rt, "too many locals"); cg->fail = true; return -1; }
     if (cg->n_locals == cg->cap_locals) {
@@ -4503,6 +4543,7 @@ static i32 cg_local_add(Cg *cg, u32 name, u8 is_const) {
     cg->locals[cg->n_locals].is_const = is_const;
     cg->locals[cg->n_locals].captured = 0;
     cg->locals[cg->n_locals].env_idx = 0xFF;
+    cg->locals[cg->n_locals].lex = 0;
     /* 解析済み capture 名と突合（名前 → ENV idx = cap_names 内位置） */
     if (cg->cur_fi && name != UINT32_MAX) {
         for (u16 k = 0; k < cg->cur_fi->n_cap; k++) {
@@ -4514,6 +4555,142 @@ static i32 cg_local_add(Cg *cg, u32 name, u8 is_const) {
         }
     }
     return (i32)cg->n_locals++;
+}
+
+/* v0.6: let/const 束縛 slot の追加。シャドーイングは常に新スロット（既存の同名
+ * ローカル/グローバルを再利用しない）。lex フラグで TDZ 検査付き load/store に切替わる。 */
+static i32 cg_local_add_lex(Cg *cg, u32 name, u8 is_const) {
+    i32 at = cg_local_add(cg, name, is_const);
+    if (at < 0) return at;
+    cg->locals[at].lex = 1;
+    return at;
+}
+
+/* ---- v0.6: ブロックスコープ（let/const）のコード生成ヘルパ ---- */
+
+/* スコープを 1 段積む（中身は空。配列バッファは保持して n だけリセット）。 */
+static bool cg_lex_push(Cg *cg) {
+    if (cg->n_lex >= 128) { akl_errf(cg->rt, "lex scope nesting budget exhausted"); cg->fail = true; return false; }
+    CgLexScope *sc = &cg->lex[cg->n_lex++];
+    sc->n = 0;
+    return true;
+}
+/* innermost スコープの束縛をすべて忘れる（slot の名前を消し、以後の解決から外す）。
+ * slot 自体は関数ローカル窓に残る（フレームサイズは単調）。
+ * v0.6: captured も解除する。クロージャの実行時 ENV は残るため閉包からの読み出しは
+ * 影響しないが、main 自身がスコープ外から同名を参照したとき（V8 では ReferenceError）
+ * に古い ENV 値を読む事故を防ぐ（ENV 値は残骸として無害）。 */
+static void cg_lex_pop(Cg *cg) {
+    if (!cg->n_lex) return;
+    CgLexScope *sc = &cg->lex[--cg->n_lex];
+    for (u32 i = 0; i < sc->n; i++) {
+        u32 s = sc->slots[i];
+        if (s < cg->n_locals) {
+            cg->locals[s].name = UINT32_MAX;
+            cg->locals[s].lex = 0;
+            cg->locals[s].captured = 0;
+            cg->locals[s].env_idx = 0xFF;
+        }
+    }
+    sc->n = 0;
+}
+/* Cg 内のブロックスコープ配列を解放（akl_compile_src の全経路で呼ぶ）。
+ * スコープは push/pop で再利用されるため、解放時は n_lex でなく固定配列全スロットを
+ * 走査する（pop 済みスロットにも cap>0 の配列が残り得る — 実測: ASan 24 件リーク）。 */
+static void cg_lex_free_all(Cg *cg) {
+    for (u32 s = 0; s < 128; s++) {
+        free(cg->lex[s].names);
+        free(cg->lex[s].slots);
+        free(cg->lex[s].is_const);
+        cg->lex[s].names = NULL; cg->lex[s].slots = NULL; cg->lex[s].is_const = NULL;
+        cg->lex[s].n = cg->lex[s].cap = 0;
+    }
+    cg->n_lex = 0;
+}
+/* innermost スコープに name を追加（slot 確保 + TDZ_INIT 発行 + 重複宣言は SyntaxError）。 */
+static bool cg_lex_declare(Cg *cg, u32 name, u8 is_const) {
+    if (!cg->n_lex) { akl_errf(cg->rt, "internal: lex declare without scope"); cg->fail = true; return false; }
+    CgLexScope *sc = &cg->lex[cg->n_lex - 1];
+    for (u32 i = 0; i < sc->n; i++) {
+        if (sc->names[i] == name) { /* 同ブロック内の重複宣言（let a; let a;）は V8 で SyntaxError */
+            akl_errf(cg->rt, "SyntaxError: redeclaration of lexical binding");
+            cg->fail = true;
+            return false;
+        }
+    }
+    if (sc->n == sc->cap) {
+        u32 nc = sc->cap ? sc->cap * 2 : 8;
+        u32 *nn = (u32 *)realloc(sc->names, (u64)nc * sizeof(u32));
+        u32 *ns = (u32 *)realloc(sc->slots, (u64)nc * sizeof(u32));
+        u8 *nc8 = (u8 *)realloc(sc->is_const, nc);
+        if (!nn || !ns || !nc8) { free(nn); free(ns); free(nc8); akl_errf(cg->rt, "oom: lex scope"); cg->fail = true; return false; }
+        sc->names = nn; sc->slots = ns; sc->is_const = nc8; sc->cap = nc;
+    }
+    i32 slot = cg_local_add_lex(cg, name, is_const);
+    if (slot < 0) return false;
+    cg_op(cg, OP_TDZ_INIT);
+    cg_u32(cg, (u32)slot);
+    sc->names[sc->n] = name;
+    sc->slots[sc->n] = (u32)slot;
+    sc->is_const[sc->n] = is_const;
+    sc->n++;
+    return true;
+}
+/* ノードが lex 宣言（N_VAR flags bit1 / N_DESTR flags bit1）を直接含むか。
+ * 多変数宣言の wrapper N_BLOCK（flags bit0）は再帰して調べる。 */
+static bool cg_node_is_lex_decl(Cg *cg, u32 ni) {
+    if (ni == N_NONE || ni >= cg->p->n_nodes) return false;
+    AklNode *n = &cg->p->nodes[ni];
+    if (n->kind == N_VAR) return (n->flags & 2u) != 0;
+    if (n->kind == N_DESTR) return (n->flags & 2u) != 0;
+    if (n->kind == N_BLOCK && (n->flags & 1u) && n->a != N_NONE) {
+        for (u32 i = 0; i < n->c; i++)
+            if (cg_node_is_lex_decl(cg, cg->p->list[n->a + i])) return true;
+    }
+    return false;
+}
+/* 現在の innermost スコープに、ni（N_VAR / N_DESTR / wrapper N_BLOCK）の lex 束縛を
+ * すべて宣言する（ブロック入口の prescan と for-init で使用）。 */
+static bool cg_lex_collect(Cg *cg, u32 ni) {
+    if (ni == N_NONE || ni >= cg->p->n_nodes) return true;
+    AklNode *n = &cg->p->nodes[ni];
+    if (n->kind == N_VAR) {
+        if ((n->flags & 2u) && !cg_lex_declare(cg, n->a, n->flags & 1u)) return false;
+        return true;
+    }
+    if (n->kind == N_DESTR) {
+        if (n->flags & 2u) { /* 分割束縛: 各要素名を宣言 */
+            for (u32 i = 0; i < n->c; i++) {
+                u32 el = cg->p->list[n->a + i];
+                if (el < cg->p->n_nodes && cg->p->nodes[el].kind == N_DSTR_EL)
+                    if (!cg_lex_declare(cg, cg->p->nodes[el].a, n->flags & 1u)) return false;
+            }
+        }
+        return true;
+    }
+    if (n->kind == N_BLOCK && (n->flags & 1u) && n->a != N_NONE) { /* 多変数 wrapper */
+        for (u32 i = 0; i < n->c; i++)
+            if (!cg_lex_collect(cg, cg->p->list[n->a + i])) return false;
+    }
+    return true;
+}
+/* N_BLOCK 本体の prescan: 直下の lex 宣言（wrapper 経由含む）を収集して TDZ_INIT する。 */
+static bool cg_lex_prescan_block(Cg *cg, u32 ni) {
+    if (ni == N_NONE || ni >= cg->p->n_nodes) return true;
+    AklNode *n = &cg->p->nodes[ni];
+    if (n->kind != N_BLOCK || n->a == N_NONE) return true;
+    for (u32 i = 0; i < n->c; i++) {
+        u32 st = cg->p->list[n->a + i];
+        if (st >= cg->p->n_nodes) continue;
+        u8 k = cg->p->nodes[st].kind;
+        if (k == N_VAR || k == N_DESTR) {
+            if (!cg_lex_collect(cg, st)) return false;
+        } else if (k == N_BLOCK && (cg->p->nodes[st].flags & 1u)) {
+            if (!cg_lex_collect(cg, st)) return false;
+        }
+        /* 通常の N_BLOCK（実ブロック）・for/switch 等は自分自身のスコープを持つので触らない */
+    }
+    return true;
 }
 /* 隠し slot（this / 自前 ENV / cap ENV）のダミー予約。同名 UINT32_MAX を複数回
  * 追加するため cg_local_add（find 経由・const 衝突検査）は使えない。 */
@@ -4551,7 +4728,9 @@ static bool cg_tgt_is_captured(Cg *cg, u32 ni) {
 /* 融合命令の対象として「素のローカル（capture されていない）」か。capture 済み
  * ローカルは実体が ENV にあるため、slot 直接アクセス系の融合は全て不適格。 */
 static bool cg_local_plain(Cg *cg, i32 slot) {
-    return slot >= 0 && (u32)slot < cg->n_locals && !cg->locals[slot].captured;
+    /* v0.6: lex 束縛は融合（LINC/RET_L/LADD_LL/CJMPF_L 等）の対象外。
+     * 汎用経路（LLOAD_TDZ / LSTORE_TDZ）で TDZ 検査を確実に通すため。 */
+    return slot >= 0 && (u32)slot < cg->n_locals && !cg->locals[slot].captured && !cg->locals[slot].lex;
 }
 /* 現在関数の隠し slot 数（this + 自前 env + cap env の順で固定） */
 static u32 cg_hidden(const Cg *cg) {
@@ -4661,26 +4840,36 @@ static void cg_load_global_native(Cg *cg, u32 name) {
 }
 
 static bool cg_store(Cg *cg, u32 name, u8 decl_const, bool decl) {
+    u8 is_const = decl_const & 1u;
+    u8 is_lex = (decl_const >> 1) & 1u; /* v0.6: let/const 束縛 */
     /* capture 解決が先（関数内からの代入は全て CESTORE 経由。const は解析対象外:
      * 解析は名前ベースなので const ローカルも capture され得る — const は不変なので
      * 代入はそもそも compile 時エラーになる（外側の const への代入も同様に拒否） */
     if (cg->in_func_depth > 0 && !decl && cg_captured(cg, name, true, NULL))
         return !cg->fail;
     if (cg->in_func_depth == 0) {
-        /* main 固有ローカル（catch 束縛）があればローカルを優先。var 宣言は従来通りグローバル */
-        i32 lslot = decl ? -1 : cg_local_find(cg, name);
+        /* main 固有ローカル（catch 束縛・ブロックスコープ let/const）があれば優先。
+         * var 宣言は従来通りグローバル。 */
+        i32 lslot;
+        if (decl && is_lex) lslot = cg_local_find(cg, name); /* ブロック prescan 済み slot を再利用 */
+        else lslot = decl ? -1 : cg_local_find(cg, name);
         if (lslot >= 0) {
-            if (cg->locals[lslot].is_const) { akl_errf(cg->rt, "assignment to const local"); cg->fail = true; return false; }
+            if (!decl && cg->locals[lslot].is_const) { akl_errf(cg->rt, "assignment to const local"); cg->fail = true; return false; }
             if (cg->locals[lslot].captured) { /* main の capture 済みローカル（catch 束縛） */
                 cg_op(cg, OP_ESTORE);
                 cg_u32(cg, cg->locals[lslot].env_idx);
+                return !cg->fail;
+            }
+            if (cg->locals[lslot].lex && !decl) { /* 宣言の初期化は TDZ 上書きで OK。代入は検査 */
+                cg_op(cg, OP_LSTORE_TDZ);
+                cg_u32(cg, (u32)lslot);
                 return !cg->fail;
             }
             cg_op(cg, OP_LSTORE);
             cg_u32(cg, (u32)lslot);
             return !cg->fail;
         }
-        u32 gi = cg_global_add(cg->rt, name, decl ? decl_const : 0);
+        u32 gi = cg_global_add(cg->rt, name, decl ? is_const : 0);
         if (gi == UINT32_MAX) { cg->fail = true; return false; }
         AklGlobal *g = &cg->rt->globals[gi];
         if (!decl && g->is_const) { akl_errf(cg->rt, "assignment to const global"); cg->fail = true; return false; }
@@ -4689,7 +4878,13 @@ static bool cg_store(Cg *cg, u32 name, u8 decl_const, bool decl) {
         cg_u32(cg, gi);
         return !cg->fail;
     }
-    i32 slot = decl ? cg_local_add(cg, name, decl_const) : cg_local_find(cg, name);
+    i32 slot;
+    if (decl && is_lex) {
+        slot = cg_local_find(cg, name); /* prescan / N_FORIN が確保済みなら再利用 */
+        if (slot < 0) slot = cg_local_add_lex(cg, name, is_const);
+    } else {
+        slot = decl ? cg_local_add(cg, name, is_const) : cg_local_find(cg, name);
+    }
     if (slot < 0 && !cg->fail) {
         /* 未定義への代入はグローバル生成（非 strict 近似） */
         u32 gi = cg_global_add(cg->rt, name, 0);
@@ -4703,6 +4898,11 @@ static bool cg_store(Cg *cg, u32 name, u8 decl_const, bool decl) {
     if (cg->locals[slot].captured) {
         cg_op(cg, OP_ESTORE);
         cg_u32(cg, cg->locals[slot].env_idx);
+        return !cg->fail;
+    }
+    if (cg->locals[slot].lex && !decl) { /* 代入の TDZ 検査（let 束縛への事前代入） */
+        cg_op(cg, OP_LSTORE_TDZ);
+        cg_u32(cg, (u32)slot);
         return !cg->fail;
     }
     cg_op(cg, OP_LSTORE);
@@ -4721,6 +4921,11 @@ static bool cg_load(Cg *cg, u32 name) {
             if (cg->locals[slot].captured) {
                 cg_op(cg, OP_ELOAD);
                 cg_u32(cg, cg->locals[slot].env_idx);
+                return !cg->fail;
+            }
+            if (cg->locals[slot].lex) { /* v0.6: let/const は TDZ 検査付き読み出し */
+                cg_op(cg, OP_LLOAD_TDZ);
+                cg_u32(cg, (u32)slot);
                 return !cg->fail;
             }
             cg_op(cg, OP_LLOAD);
@@ -5212,7 +5417,7 @@ static void cg_expr(Cg *cg, u32 ni) {
                         cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t2);
                         if (nfl & 1) { cg_op(cg, OP_PLOAD); cg_u32(cg, cg->p->nodes[nel].b); }
                         else { cg_op(cg, OP_CONST_I); cg_u32(cg, cg->p->nodes[nel].b); cg_op(cg, OP_AGET); }
-                        if (!cg->fail) cg_store(cg, cg->p->nodes[nel].a, 0, true);
+                        if (!cg->fail) cg_store(cg, cg->p->nodes[nel].a, n->flags, true);
                     }
                     continue;
                 }
@@ -5225,7 +5430,7 @@ static void cg_expr(Cg *cg, u32 ni) {
                     cg_op(cg, OP_AGET);
                     idx = cg->p->nodes[el].b + 1;
                 }
-                if (!cg->fail) cg_store(cg, name, 0, true);
+                if (!cg->fail) cg_store(cg, name, n->flags, true);
             } else if (ek == N_DSTR_REST) {
                 u32 rname = cg->p->nodes[el].a;
                 if (cg->p->nodes[el].flags & 1) {
@@ -5241,13 +5446,13 @@ static void cg_expr(Cg *cg, u32 ni) {
                         cg_op(cg, OP_PDEL); cg_u32(cg, cg->p->nodes[oel].b);
                         cg_op(cg, OP_POP);
                     }
-                    if (!cg->fail) cg_store(cg, rname, 0, true);
+                    if (!cg->fail) cg_store(cg, rname, n->flags, true);
                 } else {
                     /* 配列 rest: [a, b, ...rest] = arr → 現在 index から末尾までを配列化 */
                     cg_op(cg, OP_LLOAD); cg_u32(cg, (u32)t);
                     cg_op(cg, OP_CONST_I); cg_u32(cg, idx); /* 現在位置 */
                     cg_op(cg, OP_ARRREST);
-                    if (!cg->fail) cg_store(cg, rname, 0, true);
+                    if (!cg->fail) cg_store(cg, rname, n->flags, true);
                 }
             }
         }
@@ -5856,7 +6061,16 @@ static void cg_stmt(Cg *cg, u32 ni) {
     switch (n->kind) {
     case N_BLOCK:
         if (n->a == N_NONE) break; /* 空文 */
-        for (u32 i = 0; i < n->c; i++) cg_stmt(cg, cg->p->list[n->a + i]);
+        /* v0.6: let/const ブロックスコープ。入口で束縛を収集して TDZ マーカを置き、
+         * 出口でスコープを閉じる（多変数 wrapper flags=1 は親が prescan 済みなので素通し）。 */
+        if (!(n->flags & 1u)) {
+            bool sc_open = cg_lex_push(cg);
+            if (sc_open && !cg_lex_prescan_block(cg, ni)) break;
+            for (u32 i = 0; i < n->c && !cg->fail; i++) cg_stmt(cg, cg->p->list[n->a + i]);
+            if (sc_open) cg_lex_pop(cg);
+        } else {
+            for (u32 i = 0; i < n->c && !cg->fail; i++) cg_stmt(cg, cg->p->list[n->a + i]);
+        }
         break;
     case N_EXPRSTMT: {
         /* 文脈限定の LINC 融合: `x = x + 定数int;` / `x = x - 定数int;` を 1 命令化する。
@@ -6023,28 +6237,26 @@ static void cg_stmt(Cg *cg, u32 ni) {
         }
         if (!fused && !tgt_cap && e->kind == N_ASSIGN && e->b != N_NONE) {
             /* (3) 文レベル代入: rhs; STORE_PV の 2 命令化。rhs; DUP; STORE; POPV と効果同一。
-             * const 検査は cg_store の経路と同じメッセージで compile 時に行う。 */
+             * const 検査は cg_store の経路と同じメッセージで compile 時に行う。
+             * v0.6: ローカル解決（catch 束縛・ブロックスコープ let/const 含む）を両深さで先行。
+             * 従来は main 深で無条件グローバル化していたため、トップレベル const への
+             * 代入が「const global 検査をすり抜けて」新グローバルを作る実バグだった。 */
             cg_expr(cg, e->b);
             if (!cg->fail) {
-                if (cg->in_func_depth != 0) {
-                    i32 slot = cg_local_find(cg, e->a);
-                    if (slot >= 0 && cg->locals[slot].captured) {
+                i32 slot = cg_local_find(cg, e->a);
+                if (slot >= 0) {
+                    if (cg->locals[slot].is_const) { akl_errf(cg->rt, "assignment to const local"); cg->fail = true; }
+                    else if (cg->locals[slot].captured) {
                         /* capture 済みは ENV 経由（rhs; DUP; ESTORE; POPV = 値保持 + last_val 同期） */
-                        if (cg->locals[slot].is_const) { akl_errf(cg->rt, "assignment to const local"); cg->fail = true; }
-                        else {
-                            cg_op(cg, OP_DUP);
-                            cg_op(cg, OP_ESTORE); cg_u32(cg, cg->locals[slot].env_idx);
-                            cg_op(cg, OP_POPV);
-                        }
-                    } else if (slot >= 0) {
-                        if (cg->locals[slot].is_const) { akl_errf(cg->rt, "assignment to const local"); cg->fail = true; }
-                        else { cg_op(cg, OP_LSTORE_PV); cg_u32(cg, (u32)slot); }
-                    } else {
-                        u32 gi = cg_global_add(cg->rt, e->a, 0);
-                        if (gi == UINT32_MAX) cg->fail = true;
-                        else if (cg->rt->globals[gi].is_const) { akl_errf(cg->rt, "assignment to const global"); cg->fail = true; }
-                        else { cg_op(cg, OP_GSTORE_SPV); cg_u32(cg, gi); }
-                    }
+                        cg_op(cg, OP_DUP);
+                        cg_op(cg, OP_ESTORE); cg_u32(cg, cg->locals[slot].env_idx);
+                        cg_op(cg, OP_POPV);
+                    } else if (cg->locals[slot].lex) {
+                        /* TDZ 中の代入は実行時 ReferenceError（LSTORE_TDZ が検査） */
+                        cg_op(cg, OP_DUP);
+                        cg_op(cg, OP_LSTORE_TDZ); cg_u32(cg, (u32)slot);
+                        cg_op(cg, OP_POPV);
+                    } else { cg_op(cg, OP_LSTORE_PV); cg_u32(cg, (u32)slot); }
                 } else {
                     u32 gi = cg_global_add(cg->rt, e->a, 0);
                     if (gi == UINT32_MAX) cg->fail = true;
@@ -6143,8 +6355,9 @@ static void cg_stmt(Cg *cg, u32 ni) {
     }
     case N_VAR:
         /* `var t = x + y`（全ローカル）の 1 命令化。store 規約は cg_store と同一（last_val 不変、
-         * decl 経路の cg_local_add を同じ引数で呼ぶので重複登録エラー等の挙動も一致） */
-        if (cg->in_func_depth != 0 && n->b != N_NONE) {
+         * decl 経路の cg_local_add を同じ引数で呼ぶので重複登録エラー等の挙動も一致）。
+         * v0.6: lex 宣言は prescan 済み slot を使うため融合しない（汎用 cg_store 経由） */
+        if (cg->in_func_depth != 0 && n->b != N_NONE && !(n->flags & 2u)) {
             AklNode *rhs = &cg->p->nodes[n->b];
             if (rhs->kind == N_BIN && rhs->op == OP_ADD && rhs->a != N_NONE && rhs->b != N_NONE &&
                 cg->p->nodes[rhs->a].kind == N_IDENT && cg->p->nodes[rhs->b].kind == N_IDENT) {
@@ -6207,7 +6420,11 @@ static void cg_stmt(Cg *cg, u32 ni) {
     }
     case N_FORIN: {
         /* for (var k in obj): キー配列を作って index ループ。
-         * for (var v of arr): 要素を配列として同様（obj が配列でなければ要素1個） */
+         * for (var v of arr): 要素を配列として同様（obj が配列でなければ要素1個）。
+         * v0.6: let/const 束縛（n->d bit1）はループ全体をスコープにする。 */
+        bool fin_lex = ((n->d >> 1) & 1u) != 0;
+        if (fin_lex && !cg_lex_push(cg)) break;
+        if (fin_lex && !cg_lex_declare(cg, n->a, n->d & 1u)) break;
         if (cg->n_loops >= 64) { akl_errf(cg->rt, "loop nesting budget exhausted"); cg->fail = true; break; }
         i32 t_arr = cg_local_add(cg, 0xFFFFFFFEu - (u32)cg->tmp_seq++, 0);
         i32 t_i = cg_local_add(cg, 0xFFFFFFFEu - (u32)cg->tmp_seq++, 0);
@@ -6260,6 +6477,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
             s3 = nxt2;
         }
         cg->n_loops--;
+        if (fin_lex) cg_lex_pop(cg);
         break;
     }
     case N_DOWHILE: {
@@ -6345,6 +6563,10 @@ static void cg_stmt(Cg *cg, u32 ni) {
         break;
     }
     case N_FOR: {
+        /* v0.6: for (let ...) はループ全体をスコープにする（init の let/const 束縛を先頭で収集） */
+        bool for_lex = n->a != N_NONE && cg_node_is_lex_decl(cg, n->a);
+        if (for_lex && !cg_lex_push(cg)) break;
+        if (for_lex && !cg_lex_collect(cg, n->a)) break;
         if (cg->n_loops >= 64) { akl_errf(cg->rt, "loop nesting budget exhausted"); cg->fail = true; break; }
         /* ループ回転 + LOOPINC 融合の適格判定:
          *   cond = `x rel int定数`（lhs が変数側の 4 rel のみ）、step = `x = x ± int定数`
@@ -6427,6 +6649,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
                 s3 = nxt2;
             }
             cg->n_loops--;
+            if (for_lex) cg_lex_pop(cg);
             break;
         }
         u32 cond = cg_target_here(cg);
@@ -6457,6 +6680,7 @@ static void cg_stmt(Cg *cg, u32 ni) {
             s3 = nxt2;
         }
         cg->n_loops--;
+        if (for_lex) cg_lex_pop(cg);
         break;
     }
     case N_BREAK:
@@ -6679,6 +6903,7 @@ static u32 akl_op_imm_len(u8 op) {
     case OP_CONST_I: case OP_CONST_STR:
     case OP_GLOAD: case OP_GSTORE:
     case OP_LLOAD: case OP_LSTORE:
+    case OP_TDZ_INIT: case OP_LLOAD_TDZ: case OP_LSTORE_TDZ:
     case OP_JMP: case OP_JMPF: case OP_JMPT:
     case OP_MULCI: case OP_ADDCI: case OP_SUBCI: case OP_MODCI:
     case OP_GADD_P: case OP_LADD_P:
@@ -7094,7 +7319,8 @@ static bool akl_verify(AklRT *rt, u32 code_from) {
             }
         } else if (op == OP_LLOAD || op == OP_LSTORE || op == OP_LMULC ||
                    op == OP_LADD_P || op == OP_LSTORE_PV || op == OP_RET_L ||
-                   op == OP_ADDCI_L || op == OP_SUBCI_L || op == OP_MULCI_L || op == OP_MODCI_L) {
+                   op == OP_ADDCI_L || op == OP_SUBCI_L || op == OP_MULCI_L || op == OP_MODCI_L ||
+                   op == OP_TDZ_INIT || op == OP_LLOAD_TDZ || op == OP_LSTORE_TDZ) {
             u32 slot;
             memcpy(&slot, &rt->code[pc], 4);
             if (slot >= rt->funcs[cur].n_locals) {
@@ -12436,6 +12662,9 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_MCALLN] = &&l_MCALLN,
         [OP_ARRREST] = &&l_ARRREST,
         [OP_OBJREST] = &&l_OBJREST,
+        [OP_TDZ_INIT] = &&l_TDZ_INIT,
+        [OP_LLOAD_TDZ] = &&l_LLOAD_TDZ,
+        [OP_LSTORE_TDZ] = &&l_LSTORE_TDZ,
         [OP_HALT] = &&l_HALT,
     };
 #define AKL_NEXT() do { if (dead) { free(frames); return false; } AKL_BUDGET(); goto *akl_jt[*pc++]; } while (0)
@@ -12450,7 +12679,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
 #endif
 
 /* v0.5 V8 準拠: native 例外（akl_native_throw）を JS Error OBJ に変換して try/catch で
- * 捕捉可能にする。呼出側は `if (rt->native_err) { AKL_NATIVE_CATCH(); }` の形で使い、
+ * 捕捉可能にする。呼出側は `if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }` の形で使い、
  * 捕捉時は pc が catch/finally 先へ更新された状態で VM を続行する（未捕捉は致命的失敗）。 */
 #define AKL_NATIVE_CATCH() do { \
     rt->native_err = false; \
@@ -12473,7 +12702,8 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
     rt->n_nury = nur2_; \
     AKL_VMST_IN(); \
     if (!ok_) { free(frames); return false; } \
-    AKL_NEXT(); } while (0)
+} while (0) /* 注意: AKL_NEXT は呼出側で必ず直後に置くこと（switch モードで do-while の
+              * break が case 貫通事故になる既存規約 — AKL_BINOP_NUM と同型） */
 
     AKL_L(CONST_I): {
         u32 imm;
@@ -12703,6 +12933,40 @@ typeof_done:
         AKL_PUSH(stk[base + slot]);
         AKL_NEXT();
     }
+    /* v0.6: let/const 束縛の読み出し（TDZ マーカは ReferenceError）。
+     * ブロックスコープの束縛だけがこの命令を使う（ホット LLOAD は無検査のまま）。 */
+    AKL_L(LLOAD_TDZ): {
+        u32 slot;
+        memcpy(&slot, pc, 4); pc += 4;
+        if (base + slot >= sp) { akl_errf(rt, "local OOB read"); free(frames); return false; }
+        AklVal tv = stk[base + slot];
+        if (tv == AKL_VAL_TDZ) {
+            akl_errf(rt, "ReferenceError: cannot access lexical binding before initialization");
+            free(frames);
+            return false;
+        }
+        AKL_PUSH(tv);
+        AKL_NEXT();
+    }
+    AKL_L(TDZ_INIT): {
+        u32 slot;
+        memcpy(&slot, pc, 4); pc += 4;
+        if (base + slot >= sp) { akl_errf(rt, "local OOB write"); free(frames); return false; }
+        stk[base + slot] = AKL_VAL_TDZ;
+        AKL_NEXT();
+    }
+    AKL_L(LSTORE_TDZ): {
+        u32 slot;
+        memcpy(&slot, pc, 4); pc += 4;
+        if (base + slot >= sp) { akl_errf(rt, "local OOB write"); free(frames); return false; }
+        if (stk[base + slot] == AKL_VAL_TDZ) {
+            akl_errf(rt, "ReferenceError: cannot access lexical binding before initialization");
+            free(frames);
+            return false;
+        }
+        stk[base + slot] = AKL_POP();
+        AKL_NEXT();
+    }
     AKL_L(LSTORE): {
         u32 slot;
         memcpy(&slot, pc, 4); pc += 4;
@@ -12771,7 +13035,7 @@ typeof_done:
             u32 nur0 = rt->n_nury;
             AklVal r;
             if (!akl_vm_native_call(rt, fo, AKL_VAL_UNDEF, argc, stk + sp - argc, &r)) {
-                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                 free(frames); return false;
             }
             rt->n_nury = nur0; /* 返り値 r は直後にスタックへ根付く（復元〜書込の間に GC 契機なし） */
@@ -12821,7 +13085,7 @@ typeof_done:
             u32 nur0 = rt->n_nury;
             AklVal r;
             if (!akl_vm_native_call(rt, fo, this_for_call, argc, stk + sp - argc, &r)) {
-                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                 free(frames); return false;
             }
             rt->n_nury = nur0;
@@ -12928,7 +13192,7 @@ typeof_done:
             u32 nur0 = rt->n_nury;
             AklVal r;
             if (!akl_vm_native_call(rt, fo, thisv, argc, stk + sp - argc, &r)) {
-                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                 free(frames); return false;
             }
             rt->n_nury = nur0;
@@ -13115,7 +13379,7 @@ typeof_done:
                 rt->gc_sp = sp + 1; /* pop 後でも ov は stk[sp] に残存値として mark されるよう同期 */
                 u32 nur0 = rt->n_nury;
                 bool ok_h = ho->u.hd.vt->get(rt, ho->u.hd.ptr, (const char *)nb, nl, &out);
-                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                 rt->n_nury = nur0; /* out は直後 PUSH で根付く（間に GC 契機なし） */
                 if (!ok_h) out = AKL_VAL_UNDEF;
             }
@@ -13347,7 +13611,7 @@ typeof_done:
                                 u32 nur0 = rt->n_nury;
                                 AklVal gout;
                                 if (!akl_vm_native_call(rt, gfo, ov, 0, NULL, &gout)) {
-                                    if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                                    if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                                     free(frames); return false;
                                 }
                                 rt->n_nury = nur0;
@@ -13412,7 +13676,7 @@ typeof_done:
             rt->gc_sp = sp + 2; /* pop 済み ov/v も stk 残存値として mark（set 内 GC 発火対策） */
             u32 nur0 = rt->n_nury;
             bool ok_h = ho->u.hd.vt->set(rt, ho->u.hd.ptr, (const char *)nb, nl, v);
-            if (rt->native_err) { AKL_NATIVE_CATCH(); }
+            if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
             rt->n_nury = nur0;
             if (!ok_h) { akl_errf(rt, "TypeError: property store rejected"); free(frames); return false; }
             AKL_PUSH(v); /* 代入式の値は右辺（JS 同様） */
@@ -13489,7 +13753,7 @@ typeof_done:
                                 u32 nur0 = rt->n_nury;
                                 AklVal sout;
                                 if (!akl_vm_native_call(rt, sfo, ov, 1, &v, &sout)) {
-                                    if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                                    if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                                     free(frames); return false;
                                 }
                                 rt->n_nury = nur0;
@@ -13581,7 +13845,7 @@ typeof_done:
                     u32 nur0 = rt->n_nury;
                     AklVal r;
                     if (!akl_vm_native_call(rt, mfo2, ov, argc, stk + sp - argc, &r)) {
-                        if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                        if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                         free(frames); return false;
                     }
                     rt->n_nury = nur0;
@@ -13617,7 +13881,7 @@ typeof_done:
                 u32 nur0 = rt->n_nury;
                 AklVal r;
                 if (!akl_vm_native_call(rt, mfo, ov, argc, stk + sp - argc, &r)) { /* this=レシーバ（V8 準拠） */
-                    if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                    if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                     free(frames); return false;
                 }
                 rt->n_nury = nur0;
@@ -13638,7 +13902,7 @@ typeof_done:
             u32 nur0 = rt->n_nury;
             AklVal out = AKL_VAL_UNDEF;
             bool ok_h = ho->u.hd.vt->call(rt, ho->u.hd.ptr, (const char *)nb, nl, (int)argc, stk + sp - argc, &out);
-            if (rt->native_err) { AKL_NATIVE_CATCH(); }
+            if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
             rt->n_nury = nur0;
             if (!ok_h) { akl_errf(rt, "TypeError: not a function"); free(frames); return false; }
             sp -= argc;
@@ -13677,7 +13941,7 @@ typeof_done:
                     rt->gc_sp = sp; /* argv/ov は stk 上 = mark 済み */
                     u32 nur0 = rt->n_nury;
                     AklVal r = tbl[hit].fn(rt, ov, (int)argc, stk + sp - argc, (void *)(uintptr_t)hit);
-                    if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                    if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                     rt->n_nury = nur0;
                     sp -= argc;
                     stk[sp - 1] = r;
@@ -13738,7 +14002,7 @@ typeof_done:
             u32 nur0 = rt->n_nury;
             AklVal r;
             if (!akl_vm_native_call(rt, fo, ov, argc, stk + sp - argc, &r)) {
-                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                 free(frames); return false;
             }
             rt->n_nury = nur0;
@@ -14954,7 +15218,7 @@ typeof_done:
             u32 nur0 = rt->n_nury;
             AklVal r;
             if (!akl_vm_native_call(rt, fo, AKL_VAL_UNDEF, (u8)argc, stk + sp - argc, &r)) {
-                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                 free(frames); return false;
             }
             rt->n_nury = nur0;
@@ -15047,7 +15311,7 @@ typeof_done:
             u32 nur0 = rt->n_nury;
             AklVal r;
             if (!akl_vm_native_call(rt, fo, AKL_MK_OBJ(oi), argc, stk + sp - argc, &r)) {
-                if (rt->native_err) { AKL_NATIVE_CATCH(); }
+                if (rt->native_err) { AKL_NATIVE_CATCH(); AKL_NEXT(); }
                 free(frames); return false;
             }
             rt->n_nury = nur0;
@@ -15529,6 +15793,7 @@ static bool akl_compile_src(AklRT *rt, const char *src, bool is_module, u32 *out
     cg.m_import = akl_intern(rt, (const u8 *)"\x01__import", 9, NULL);
     if (cg.m_load == UINT32_MAX || cg.m_export == UINT32_MAX ||
         cg.m_rexport == UINT32_MAX || cg.m_import == UINT32_MAX) {
+        cg_lex_free_all(&cg);
         free(cg.locals);
         if (p.fninfo) {
             for (u32 i = 0; i < p.fninfo_n; i++) { free(p.fninfo[i].cap_names); free(p.fninfo[i].decls.v); free(p.fninfo[i].hoist); }
@@ -15555,6 +15820,7 @@ static bool akl_compile_src(AklRT *rt, const char *src, bool is_module, u32 *out
     rt->funcs[main_idx].n_cap = (u16)cg.cur_needs_cap;
     rt->funcs[main_idx].code_end = rt->code_len;
     f0 = &rt->funcs[main_idx];
+    cg_lex_free_all(&cg);
     free(cg.locals);
     if (p.fninfo) {
         /* fninfo は解析時サイズ（fninfo_n）。合成ノード（空コンストラクタ等）で
@@ -15743,6 +16009,9 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
             "MCALLN",
             "ARRREST",
             "OBJREST",
+            "TDZ_INIT",
+            "LLOAD_TDZ",
+            "LSTORE_TDZ",
             "HALT"
         };
         fprintf(stderr, "--- main ---\n");

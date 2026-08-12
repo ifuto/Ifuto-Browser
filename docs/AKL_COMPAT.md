@@ -178,6 +178,7 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 19d. ✅ Map / Set・Object.fromEntries・Array.from・padStart/padEnd・flat・hasOwnProperty（2026-08-10: 有界化 AKL_MAP_MAX=4096。**v0.5: ハッシュ索引化（開番地法。線形走査 O(n) を O(1) 平均に。Map.set 4,000 件 105ms→0.74ms）。SameValueZero 整合（int 5 === 5.0、NaN/±0 同値、文字列=内容、オブジェクト=同一性）。挿入順維持。GC は kv を mark。**v0.5 修正: akl_gc_kind_children に MAP/SET が欠落していた潜伏バグを修正（キー STR が GC 回収されて size が壊れる）。上限超過は RangeError で明白失敗**）
 19e. ✅ import / export（2026-08-10: 全形式 — 名前付き/default/`* as ns`/副作用のみ/re-export `{a as b} from`/`export * from`/`export default 式・関数・class`/動的 `import()`。モジュール本体は「関数スコープでコンパイルされた匿名関数」として再入 akl_call で実行（var がモジュールローカルになる構造保証）。レジストリは GC ルート、VM 中コンパイルの定数は comp_pins 区間でスイープから保護。循環 import は state==1 検出で TypeError。export は宣言時点のスナップショット近似）
 19f. ✅ クラス getter/setter 構文 `get x()` / `set x(v)`（2026-08-10: オブジェクトリテラルの "get:\x01name" 特殊名機構を class 本体に拡張。`static get`/継承/`super` 対応。setter 引数 1 個・getter 引数 0 個を強制、`get constructor()` は明白拒否）
+19g. ✅ let/const ブロックスコープ + TDZ（2026-08-12: ブロック入口 prescan で束縛を収集し OP_TDZ_INIT でマーカを設置、LLOAD_TDZ/LSTORE_TDZ が宣言前の参照/代入を ReferenceError に。シャドーイングは常に新スロット（cg_local_find が innermost 優先）。同ブロック重複宣言は SyntaxError。for(let...) / for(let k in/of...) はループ全体をスコープ化。トップレベル let は main ローカル + ENV capture（クロージャから参照可）。pop 時に slot の名前/captured を解除してスコープ外からの解決を絶つ。既知の近似: クロージャ capture 済み let を宣言前に読む経路は未検査（undefined）、トップレベル `var x` と同名ブロック let が混在する関数外クロージャは名前ベース解決のためブロック側を捕捉し得る）
 
 ## V8 との位置づけ
 

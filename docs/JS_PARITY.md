@@ -9,16 +9,14 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 
 ## 現状サマリ（parity.py 実測: 69 スニペット）
 
-- 一致: **62**（2026-08-12 の native 例外捕捉化 + ToNumber 修正で 60 → 62）
-- 不一致（誤った結果を返す）: 7 → 残課題（下表）
+- 一致: **65**（2026-08-12 の let/const ブロックスコープ + TDZ 実装で 62 → 65）
+- 不一致（誤った結果を返す）: 4 → 残課題（下表）
 - 未実装（ReferenceError / 明白失敗）: 0（下表の 3 項目はすべて大規模実装待ち）
 
 ## 残課題（誤った結果 or 未実装）— 次ターン以降
 
 | 項目 | AKL | V8 | 規模 |
 |---|---|---|---|
-| let/const のブロックスコープ `{ let a = 1; } a` | 1（漏れる） | ReferenceError | 大（スコープ管理 + TDZ） |
-| `let a = 1; { let a = 2; } a` | 2 | 1 | 同上 |
 | Promise のマイクロタスク `Promise.resolve().then(f); x` | 同期実行 | 非同期（x は 0） | 大（マイクロタスクキュー） |
 | `typeof Symbol` / `typeof Proxy` | ReferenceError | function | 大（キー体系 / トラップ） |
 | `Object.getPrototypeOf({}) === Object.prototype` | ReferenceError | true | 大（継承モデル） |
@@ -43,6 +41,10 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 | native 例外 | `JSON.parse('{')` 等の例外が try/catch で捕捉可能（`e.name` = "SyntaxError"） | **修正済み（2026-08-12）** |
 | 例外の値伝搬 | `a.map(function(){ throw 42 })` の catch は元の値 42（HOF 再入経由でも Error OBJ の identity 保持） | **修正済み（2026-08-12）** |
 | 捕捉シャドーイング | `function g(){ try{...}catch(e){ throw e } }` が祖先の同名 catch 束縛を誤 capture しない | **修正済み（2026-08-12）** |
+| let/const スコープ | ブロックスコープ分離（`{ let a = 1; } a` → ReferenceError）、シャドーイング（`let a=1; { let a=2; } a` → 1） | **修正済み（2026-08-12）** |
+| TDZ | 宣言前の参照/代入は ReferenceError（`{ a; let a; }`）、同ブロック重複宣言は SyntaxError | **修正済み（2026-08-12）** |
+| for の let | `for (let i=0;...)` はループ全体をスコープ化、`for (let k in/of ...)` も対応 | **修正済み（2026-08-12）** |
+| トップレベル let | クロージャが ENV capture で捕捉（`let x=10; function g(){ return x; }` → 10） | **修正済み（2026-08-12）** |
 | uncaught 表示 | 未捕捉の Error OBJ は `uncaught exception: Error: boom` 形式（toString 近似） | **修正済み（2026-08-12）** |
 | CLI 表示 | オブジェクト完了値は JS ToString で表示（旧フォールバックは "[function]" で紛らわしかった） | **修正済み（2026-08-12）** |
 | Symbol | `Symbol()` / `Symbol.iterator` | 未（大規模: キー体系拡張） |
@@ -58,7 +60,10 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 - eval はグローバル近似（直接 eval のローカルスコープ参照は非対応）
 - BigInt は 64bit 符号付き整数（任意精度は将来）。BigInt + Number は Number 変換（V8 は TypeError）
 - `new Number(5)` 等のラッパー OBJ は数値変換されない（`+new Number(5)` は NaN。V8 は 5。ラッパー種別を持たないため）
-- catch 束縛は関数スコープ近似（V8 の catch ブロックスコープは let/const スコープ実装と共に将来対応。捕捉値は正しく catch 本体に届く）
+- catch 束縛は関数スコープ近似（捕捉値は正しく catch 本体に届く。catch 外から同名参照は
+  関数スコープの束縛が見える点のみ V8 と異なる — let/const のブロックスコープ実装は済）
+- TDZ はブロックスコープ束縛のみ検査（クロージャ capture 済みの let を宣言前に読む経路は
+  未検査で undefined — 稀な組合せ。AKL_COMPAT に明記）
 - generator は全同期実行 + yield 値蓄積（遅延評価は将来）
 - モジュール export はスナップショット（live binding は将来）
 - `with` / `import.meta` / トップレベル await / `new.target` は明示拒否

@@ -912,6 +912,7 @@ static void t_v04_generator(void);
 static void t_v04_map_set(void);
 static void t_v05_import_export(void);
 static void t_v05_class_accessors(void);
+static void t_v06_lex_scope(void);
 
 void test_akl(void) {
     g_rt = akl_new();
@@ -983,6 +984,8 @@ void test_akl(void) {
     t_v05_import_export();
     fprintf(stderr, "  %-40s", "t_v05_class_accessors");
     t_v05_class_accessors();
+    fprintf(stderr, "  %-40s", "t_v06_lex_scope");
+    t_v06_lex_scope();
     akl_free(g_rt);
     g_rt = NULL;
 
@@ -2130,4 +2133,40 @@ static void t_v05_class_accessors(void) {
     want_err("class C { set x(a, b) { } }", "setter");
     want_err("class C { get x(a) { return 1; } }", "getter");
     want_err("class C { get constructor() { return 1; } }", "accessor");
+}
+
+/* ================= v0.6: let/const ブロックスコープ + TDZ ================= */
+
+static void t_v06_lex_scope(void) {
+    /* ブロックスコープの分離（V8 と同一: スコープ外は ReferenceError）。
+     * 名前は他テストのグローバルと衝突しない一意系（t6 接頭）を使う。 */
+    want_err("{ let t6a = 1; } t6a;", "ReferenceError");
+    want_err("{ const t6b = 1; } t6b;", "ReferenceError");
+    want_num("let t6c = 1; { let t6c = 2; } t6c", 1);          /* シャドーイング */
+    want_num("var t6q = 1; { let t6q = 2; t6q; } t6q", 1);
+    want_num("let t6d = 1; { let t6d = 2; t6d; } t6d", 1);
+    want_num("{ let t6e = 1; } { let t6e = 2; t6e; }", 2);
+    want_num("function t6f() { let t6x = 1; { let t6x = 2; return t6x; } } t6f()", 2);
+    want_err("function t6g() { { let t6x = 2; } return t6x; } t6g()", "ReferenceError");
+    /* TDZ: 宣言前の参照/代入は ReferenceError */
+    want_err("let t6h = 1; { t6h; let t6h = 2; }", "ReferenceError");
+    want_err("let t6i = 1; { t6i = 5; let t6i = 2; }", "ReferenceError");
+    /* 重複宣言は SyntaxError */
+    want_err("{ let t6j = 1; let t6j = 2; }", "SyntaxError");
+    /* for (let ...) のスコープ */
+    want_num("var t6s = 0; for (let t6k = 0; t6k < 3; t6k++) { t6s = t6s + t6k; } t6s", 3);
+    want_err("for (let t6l = 0; t6l < 3; t6l++) {} t6l;", "ReferenceError");
+    want_num("function t6m() { var r = 0; for (let t6n = 0; t6n < 4; t6n++) { r = r + t6n; } return r; } t6m()", 6);
+    /* トップレベル let をクロージャが捕捉（ENV capture 経由） */
+    want_num("let t6o = 10; function t6p() { return t6o; } t6p()", 10);
+    want_num("{ let t6r = 1; function t6s2() { return t6r; } t6s2() }", 1);
+    /* const の再代入は拒否（let/const とも） */
+    want_err("const t6t = 1; t6t = 2;", "const");
+    want_err("let t6u = 1; { const t6u = 2; t6u = 3; }", "const");
+    /* 分割代入の let 束縛 */
+    want_num("let [t6v, t6w] = [1, 2]; t6v * 10 + t6w", 12);
+    want_err("{ let [t6y] = [1]; } t6y;", "ReferenceError");
+    /* 複数宣言のカンマ・初期化なし let は undefined */
+    want_undef("let t6ua, t6ub; t6ua");
+    want_num("let t6ma = 1, t6mb = 2; t6ma * 10 + t6mb", 12);
 }
