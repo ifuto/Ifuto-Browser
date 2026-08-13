@@ -182,6 +182,9 @@ enum { /* VM 命令（追加は末尾に。verifier/jumptable も同期させる
     OP_GINC,                /* slot u32 | delta i32 : グローバル版 LINC */
     OP_GMULC,               /* gslot u32 | imm i32 : push(globals[gslot] * imm) */
     OP_LMULC,               /* lslot u32 | imm i32 : push(locals[lslot] * imm) */
+    OP_LADDC,               /* lslot u32 | imm i32 : push(locals[lslot] + imm)（式融合: LLOAD;ADDCI 相当） */
+    OP_LSUBC,               /* lslot u32 | imm i32 : push(locals[lslot] - imm)（式融合: LLOAD;SUBCI 相当） */
+    OP_LMODC,               /* lslot u32 | imm i32 : push(locals[lslot] % imm)（式融合: LLOAD;MODCI 相当） */
     OP_MULCI,               /* imm i32 : TOS = TOS * imm */
     OP_ADDCI,               /* imm i32 : TOS = TOS + imm（TOS が文字列なら imm を右辺とする連結） */
     OP_SUBCI,               /* imm i32 : TOS = TOS - imm */
@@ -5463,6 +5466,20 @@ static void cg_expr(Cg *cg, u32 ni) {
             AklNode *R = &cg->p->nodes[n->b];
             if (R->kind == N_NUM && R->op == 1) {
                 u32 imm = R->a;
+                /* 式融合: lhs が単純ローカル参照（ADD/SUB/MOD）。LLOAD を出さず
+                 * L*C 1 命令で push（LLOAD;*CI の逐語実行と一致 — akl_cist_compute 共有）。
+                 * MUL は既存の LMULC 融合ブロック（下）が処理する。 */
+                if (n->op != OP_MUL && n->a != N_NONE && cg->p->nodes[n->a].kind == N_IDENT &&
+                    cg->in_func_depth != 0) {
+                    u32 lname = cg->p->nodes[n->a].a;
+                    i32 lslot = cg_local_find(cg, lname);
+                    if (cg_local_plain(cg, lslot)) {
+                        cg_op(cg, n->op == OP_ADD ? OP_LADDC : n->op == OP_SUB ? OP_LSUBC : OP_LMODC);
+                        cg_u32(cg, (u32)lslot);
+                        cg_u32(cg, imm);
+                        break;
+                    }
+                }
                 if (n->op == OP_MUL && n->a != N_NONE && cg->p->nodes[n->a].kind == N_IDENT) {
                     u32 name = cg->p->nodes[n->a].a;
                     if (cg->in_func_depth != 0) {
@@ -6153,6 +6170,22 @@ static void cg_hoist_funcs(Cg *cg) {
      * ループ回数とリストは先にローカルへ退避（これを怠ると 1 回で終わる実バグ） */
     u32 nh = cg->n_hoist;
     const u32 *hl = cg->hoist;
+    /* v0.9 事前登録 prescan: トップレベル関数宣言の名前を本体コンパイル前に
+     * グローバル登録し、本体（および後続文）からの参照を実行時検索 GLOAD ではなく
+     * 直結 GLOAD_S にする。V8 同様スコープ冒頭バインドなので、本体から見える
+     * 宣言名は全てこの時点で解決してよい（var/関数宣言と let/const の衝突は
+     * 既存経路どおり compile 時エラー）。関数内のネスト関数宣言は an_vars/
+     * capture 解析がローカル直結済みのためここでは不要。 */
+    if (cg->in_func_depth == 0) {
+        for (u32 i = 0; i < nh; i++) {
+            u32 f = hl[i];
+            if (f >= cg->p->n_nodes) continue;
+            AklNode *fn = &cg->p->nodes[f];
+            if (fn->a != UINT32_MAX) {
+                if (cg_global_add(cg->rt, fn->a, 0) == UINT32_MAX) { cg->fail = true; return; }
+            }
+        }
+    }
     for (u32 i = 0; i < nh; i++) {
         u32 f = hl[i];
         if (f >= cg->p->n_nodes) continue;
@@ -7252,6 +7285,7 @@ static u32 akl_op_imm_len(u8 op) {
     case OP_CONST_D:
     case OP_LINC: case OP_GINC:
     case OP_GMULC: case OP_LMULC:
+    case OP_LADDC: case OP_LSUBC: case OP_LMODC:
     case OP_GADD_G:
     case OP_ADDCI_G: case OP_SUBCI_G: case OP_MULCI_G: case OP_MODCI_G:
     case OP_ADDCI_L: case OP_SUBCI_L: case OP_MULCI_L: case OP_MODCI_L:
@@ -7655,6 +7689,7 @@ static bool akl_verify(AklRT *rt, u32 code_from) {
                 goto done;
             }
         } else if (op == OP_LLOAD || op == OP_LSTORE || op == OP_LMULC ||
+                   op == OP_LADDC || op == OP_LSUBC || op == OP_LMODC ||
                    op == OP_LADD_P || op == OP_LSTORE_PV || op == OP_RET_L ||
                    op == OP_ADDCI_L || op == OP_SUBCI_L || op == OP_MULCI_L || op == OP_MODCI_L ||
                    op == OP_TDZ_INIT || op == OP_LLOAD_TDZ || op == OP_LSTORE_TDZ) {
@@ -14034,6 +14069,7 @@ static bool vm_exec(AklRT *rt, u32 entry, const AklVal *init_args, u32 init_argc
         [OP_LINC] = &&l_LINC, [OP_CJMPF_L] = &&l_CJMPF_L, [OP_CJMPF_G] = &&l_CJMPF_G,
         [OP_GLOAD_S] = &&l_GLOAD_S, [OP_GSTORE_S] = &&l_GSTORE_S, [OP_GINC] = &&l_GINC,
         [OP_GMULC] = &&l_GMULC, [OP_LMULC] = &&l_LMULC, [OP_MULCI] = &&l_MULCI,
+        [OP_LADDC] = &&l_LADDC, [OP_LSUBC] = &&l_LSUBC, [OP_LMODC] = &&l_LMODC,
         [OP_ADDCI] = &&l_ADDCI, [OP_SUBCI] = &&l_SUBCI, [OP_MODCI] = &&l_MODCI,
         [OP_GADD_P] = &&l_GADD_P, [OP_LADD_P] = &&l_LADD_P, [OP_GADD_G] = &&l_GADD_G,
         [OP_CJMPF_MODG] = &&l_CJMPF_MODG, [OP_CJMPF_MODL] = &&l_CJMPF_MODL,
@@ -15841,6 +15877,20 @@ typeof_g_done:
         if (rt->err[0]) { free(frames); return false; }
         AKL_NEXT();
     }
+    /* 式融合（LLOAD;*CI の 1 命令形）: 計算は akl_cist_compute 共有なので
+     * 「LLOAD slot; ADDCI/SUBCI/MODCI imm」の逐語実行と結果・副作用順序が一致する。
+     * int fast path は akl_cist_compute 内で共通化済み（fib 系の数値再帰のホット路）。 */
+#define AKL_XLC(BASEOP) { \
+        u32 sl_; memcpy(&sl_, pc, 4); pc += 4; \
+        if (base + sl_ >= sp) { akl_errf(rt, "local OOB read"); free(frames); return false; } \
+        i32 imm_; memcpy(&imm_, pc, 4); pc += 4; \
+        AklVal lv_ = stk[base + sl_], nv_; \
+        if (!akl_cist_compute(rt, (BASEOP), lv_, imm_, sp, &nv_)) { free(frames); return false; } \
+        AKL_PUSH(nv_); \
+        AKL_NEXT(); }
+    AKL_L(LADDC): AKL_XLC(OP_ADD)
+    AKL_L(LSUBC): AKL_XLC(OP_SUB)
+    AKL_L(LMODC): AKL_XLC(OP_MOD)
     AKL_L(MULCI): {
         i32 imm; memcpy(&imm, pc, 4); pc += 4;
         AklVal v = AKL_POP(), out;
@@ -17927,6 +17977,9 @@ bool akl_eval(AklRT *rt, const char *src, AklVal *out) {
             "GINC",
             "GMULC",
             "LMULC",
+            "LADDC",
+            "LSUBC",
+            "LMODC",
             "MULCI",
             "ADDCI",
             "SUBCI",

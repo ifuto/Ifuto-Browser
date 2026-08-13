@@ -223,6 +223,31 @@ maxrss（ピーク）と常駐を分けて測れるようにした。今後の�
   騒音域（有意差なし — 既に融合命令で VM の ADD を使わないため）。vs V8 full JIT の
   fib 比は 8.9x → **2.0x**（vsx.py 実測。C4 ガードは全 PASS 維持）。
 
+## akl 速度最適化 round 2（2026-08-13、ユーザ方針「Aklus の高速化めっちゃやる」）
+
+- **トップレベル関数宣言の事前登録 prescan**（cg_hoist_funcs 冒頭）: 関数本体の
+  コンパイル時点で宣言名が未登録のため、本体からの参照が実行時ハッシュ検索 GLOAD
+  （gprof 実測: fib30 で 53.9M 回 = 呼び出しごとに 1 回）になっていた。prescan で
+  登録し直結 GLOAD_S に。**fib30 82.4 → 74.8ms（−9.2%、8/9 ペア）**。
+- **式融合 LADDC / LSUBC / LMODC**（新命令 3 種）: `ローカル op 定数` の式評価を
+  LLOAD;*CI の 2 命令から 1 命令に（MUL は既存 LMULC）。fib の `n-1`/`n-2` が対象。
+  計算は akl_cist_compute 共有で逐語一致。**fib30 74.8 → 70.7ms**（対修正前 81.9ms
+  で **−13.7%、9/9 ペア**）。callseq −1.8%、loop −2.6%（6/7）。nest/primes/strcat は
+  帯内差なし（退行なし確認）。
+- **budget チェックの実コスト計測**: 毎命令の AKL_BUDGET を外した実験ビルドで
+  fib30 不変（+1.1% でむしろ遅い = 分岐予測が効いて無料）→ 現状維持（安全側）。
+- **computed goto vs switch ディスパッチ**: switch 版（AKL_TEST_SWITCH_DISPATCH）は
+  fib −5.9% だが loop +16%、nest +18% 悪化。8 ベンチ合計で computed goto が **3.0%
+  有利** → 現状維持。
+- **GCALL（GLOAD_S;CALL 融合）は試作→撤収**: 命令数は 10→8 に減るが、fn スロット
+  確保の引数シフトがディスパッチ削減を上回り速度無意味（fib −0.6% 帯内、callseq
+  +2.0% 悪化）。さらに argc≥2 でシフト式が誤る実バグも確認（callseq が全引数 a0 に
+  化け 0 を返す）→ 設計ごと撤収。教訓: スタックマシンで「push を省く融合」は
+  レイアウト修正コストが勝る。
+- **対 V8 比較（同一マシン実測）**: fib(30) AKL **70.7ms** vs node --jitless 83.7ms
+  （AKL が jitless を 15% 上回る）。vsx.py C4 fib も 10.6ms vs 12.7ms で PASS 化
+  （round 1 時は FAIL）。V8 full JIT（10.2ms）には JIT なし物理で 7x（OPEN 継続）。
+
 ## 計測工学の教訓（再発防止・現在有効）
 
 - ワークスペースは git リセットを受け得る → 復旧 bundle を repo 内に保持し、
