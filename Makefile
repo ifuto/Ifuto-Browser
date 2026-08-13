@@ -101,6 +101,14 @@ $(BUILD)/test_v8compat: $(BUILD)/v8_compat_smoke.o $(AKLSRC) | $(BUILD)
 akltest: $(BUILD)/akl
 	python3 tests/akl_cli_smoke.py ./$(BUILD)/akl
 
+# lodash 4.17.21 互換スモーク（tests/lodash_smoke.js を lodash.js と連結して実行。
+# LODASH 変数で lodash.js のパスを指定。npm pack lodash@4.17.21 で取得する）
+lodashsmoke: $(BUILD)/akl
+	@if [ -z "$(LODASH)" ]; then echo "usage: make lodashsmoke LODASH=/path/to/lodash.js" >&2; exit 2; fi
+	@cat $(LODASH) tests/lodash_smoke.js > $(BUILD)/lodash_test.js
+	@./$(BUILD)/akl --no-sandbox $(BUILD)/lodash_test.js | grep -q 'lodash-smoke ok=' \
+		&& echo "lodash smoke: PASS" || (echo "lodash smoke: FAIL" >&2; exit 1)
+
 cxxtest: $(BUILD)/test_v8compat
 	@if ldd $(BUILD)/test_v8compat | grep -q 'libstdc++'; then \
 		echo 'FATAL: v8compat links libstdc++ (製品法則違反)' >&2; exit 1; fi

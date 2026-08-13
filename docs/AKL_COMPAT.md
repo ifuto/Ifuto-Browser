@@ -195,6 +195,21 @@ akl は **意図的に切ったサブセット**であり、下表は `build/akl
 - nursery 拡張 8→64（深いネストのライブラリで溢れない）
 - 残課題: lodash のロードが memoize 内の capture 解析で失敗（`FUNC_ERROR_TEXT` が runInContext のカンマ区切り var 後半で capture されず GLOAD 化）。次ラウンドで修正（2026-08-12: `\x00proto` 特殊 prop（長さ 6、NUL 接頭でユーザーと衝突不能）で OBJ の [[Prototype]] を保持。PLOAD/MCALL/AGET/`in` のプロパティ解決が own → proto チェーン（深さ 64 有界）の順に辿る。オブジェクトリテラル / new インスタンス / ホスト生成（akl_mkobject）は既定で Object.prototype を持つ。Object.create(proto) は指定 proto を設定（null は proto なし）。Object.getPrototypeOf は [[Prototype]] を返し、無ければ null（Object.prototype の proto は null = V8 一致）。`\x00proto` は Object.keys/values/entries/for-in/JSON.stringify/spread/クラスメソッドコピーから除外（ユーザーに漏れない）。AKL_OBJ_MAX_PROPS を 64→65 に調整（内部 proto 1 個分）。Symbol() は新規 symbol 値（typeof = "symbol"、毎回異なる — description/well-known は未実装）。Proxy はトラップ未実装のため呼び出しで TypeError（明白失敗）。既知の近似: `Object.getPrototypeOf(5)` 等の primitive は TypeError（V8 はラッパーの prototype を返す）、Object.prototype に props を持たせていない（constructor/toString は将来））（2026-08-12: then/catch/finally のコールバックを同期実行から eval 終了時のマイクロタスク消化に変更（V8 準拠）。`Promise.resolve().then(f); x` は f 実行前の x を返す。mtq キュー {fn, value, result} と pwait 待機リスト {promise, onF, onR, result} を AklRT に追加（GC ルート）。drain は FIFO で callback を実行し戻り値で result promise を解決、その waiters を再キュー（チェーン動作）。executor の resolve/reject が pending 中の then を解決する経路も settle 経由でキューに移す。await は解決済み Promise のみ同期展開（未解決は undefined の近似のまま）。テストは 2 フェーズ（eval 内で 0、drain 後で値）に更新）シャドーイングは常に新スロット（cg_local_find が innermost 優先）。同ブロック重複宣言は SyntaxError。for(let...) / for(let k in/of...) はループ全体をスコープ化。トップレベル let は main ローカル + ENV capture（クロージャから参照可）。pop 時に slot の名前/captured を解除してスコープ外からの解決を絶つ。既知の近似: クロージャ capture 済み let を宣言前に読む経路は未検査（undefined）、トップレベル `var x` と同名ブロック let が混在する関数外クロージャは名前ベース解決のためブロック側を捕捉し得る）
 
+19k. ✅ 実ライブラリ互換ラウンド 2 — lodash 4.17.21 動作（2026-08-12: **ロード成功 + スモークテスト 320 件全通過**（tests/lodash_smoke.js。lodash.js を連結して実行し、全 API の結果を V8/node で検証済みの期待値と比較）。このラウンドで修正した実バグ・追加した機能:
+- **capture 解析の網羅**: N_WHILE/N_DOWHILE の本体宣言収集（`while` 内 `var computed` 等が ReferenceError になる実バグ）、関数スコープ var ホイスト（var を関数冒頭で undefined 初期化。V8 準拠）、N_NEW の callee/args を refs に追加
+- **capture 解決の厳密化**: cg_captured_probe を導入（命令発行と検査を分離。融合チェックでの二重 CELOAD 発行を防止）、自関数 decls のシャドーイング優先（baseKeys のローカル result が祖先 cap に誤一致する実バグ）、env_idx を u16 に拡張（256 超キャプチャの切り詰めで debounce が getNative の slot に化ける実バグ）
+- **GC 整合**: フレーム設定後に gc_sp を同期（4 経路。実行中 GC が新フレームの cap env を回収する実バグ）、GC の FUNC mark を u.fp + env + thisv の統合ブロックに（else-if の重複で env mark が欠落する実バグ）
+- **instanceof をプロトタイプチェーン準拠に**（旧近似はオペランド逆 + 常に true。LodashWrapper/baseLodash 判定が壊れていた）
+- **関数オブジェクト**: 独自プロパティ（u.fp。`_.bind = bind` 等。上限 1024）+ PLOAD/MCALL/AGET/列挙対応 + .length/.name + Function.prototype.valueOf（`typeof _.valueOf` が function）
+- **組み込み拡充**: Object.defineProperty（setToString 用）、Array コンストラクタ + .constructor（initCloneArray 用）、RegExp コンストラクタ + .constructor、Array.prototype.splice（listCacheDelete 等）、Object.prototype.constructor、配列/文字列のブラケットメソッドアクセス（`arr["map"]` 等）、delete obj[key]（baseUnset 用）、配列の数値文字列 index（`arr["0"]`）
+- **Date**: \x01tag + constructor + valueOf 数値化（`+new Date(1)` = 1。equalByTag 用）
+- **Error**: インスタンスの [[Prototype]] を対応コンストラクタの prototype に（`err instanceof TypeError`）
+- **RegExp ToString** = `/source/flags`（cloneRegExp の reFlags 用）、**rc_ins_insert の参照シフト修正**（代替 SPLIT 挿入時に「ちょうど挿入位置」を指す既存参照も +1。rePropName の `[^.[\]]+` が "a" を落とす実バグ）
+- **文字列**: split の空セパレータ（コードポイント分割）+ limit 引数、parseInt radix=0 → 十進（V8 準拠）、配列 ToString の undefined/null 空要素
+- **グローバル**: WeakMap（get/set/has/delete 付き簡易実装）/ WeakSet / TypedArray 群 / ArrayBuffer / DataView（タグ判定用）、setTimeout/setInterval/clearTimeout/clearInterval（**eval 完了後に 1 回実行の近似**。debounce/throttle の setData が動く）
+- MCALL の u.fp 優先（`_.bind(...)` が組み込み bind に化ける実バグ）
+- 既知の残差: `_.template` は Function コンストラクタ非対応のため TypeError（明白失敗）、countBy 等の数値キーの列挙順は V8 と異なる（数値キー昇順でなく挿入順。値は一致）
+
 ## V8 との位置づけ
 
 - API 形状互換（C++ facade）は docs/V8_COMPAT.md が唯一の正。

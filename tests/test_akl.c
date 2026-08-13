@@ -615,18 +615,18 @@ static void t_objects(void) {
     want_num("var o = {a}; o.a == undefined ? 1 : 0", 0); /* shorthand: a 未定義 → o.a は undefined */
     want_num("var x = 9; var o = {a:1, b: x}; o.b", 9);  /* b: x は通常プロパティ */
     want_num("{a:1}", 1);                              /* 文頭 { はブロック文。a:1 はラベル+式文（JS 準拠） */
-    /* prop 数天井 256（v0.6 拡張。内部 \x00proto 1 個分含む = ユーザー 255 個まで）:
-     * 256 個目で明白に失敗 */
+    /* prop 数天井 512（v0.7 拡張。lodash の mixin が prototype に 300+ 件コピーするため。
+     * 内部 \x00proto 1 個分含む = ユーザー 511 個まで）: 512 個目で明白に失敗 */
     {
-        char src[22000];
+        char src[45000];
         int n = snprintf(src, sizeof src, "var o = {}; ");
-        for (int i = 0; i <= 256; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = 0; ", i);
+        for (int i = 0; i <= 512; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = 0; ", i);
         want_err(src, "property budget");
         src[0] = 0;
         n = snprintf(src, sizeof src, "var o = {}; ");
-        for (int i = 0; i < 255; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = %d; ", i, i);
-        n += snprintf(src + n, sizeof src - (size_t)n, "o.k254");
-        want_num(src, 254);                            /* 255 個ちょうどは成功（v0.6） */
+        for (int i = 0; i < 511; i++) n += snprintf(src + n, sizeof src - (size_t)n, "o.k%d = %d; ", i, i);
+        n += snprintf(src + n, sizeof src - (size_t)n, "o.k510");
+        want_num(src, 510);                            /* 511 個ちょうどは成功（v0.7） */
     }
 }
 

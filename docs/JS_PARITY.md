@@ -49,7 +49,7 @@ ReferenceError）であり、黙って違う結果を返してはならない（
 | CLI 表示 | オブジェクト完了値は JS ToString で表示（旧フォールバックは "[function]" で紛らわしかった） | **修正済み（2026-08-12）** |
 | Symbol | `Symbol()` / `Symbol.iterator` | 未（大規模: キー体系拡張） |
 | Proxy | `Proxy` / `Reflect` | 未（大規模: トラップ dispatch） |
-| プロトタイプ | `Object.getPrototypeOf` / `Object.prototype` / `instanceof` チェーン | 未（大規模: 継承モデル） |
+| プロトタイプ | `Object.getPrototypeOf` / `Object.prototype` / `instanceof` チェーン（prototype 沿いの解決。`err instanceof TypeError` 等も正しい） | **修正済み（2026-08-12）** |
 | ラッパー | `new String()` のラッパー挙動 | 未（現在は変換関数と同値） |
 
 ## 既知の近似（V8 と意図的に異なる・文書化）
@@ -59,6 +59,10 @@ ReferenceError）であり、黙って違う結果を返してはならない（
   eval 終了時のマイクロタスク消化（V8 準拠）。await は解決済み Promise を同期展開する
   近似（未解決 Promise の await は undefined — 中断/再開は未実装）
 - Date のローカル系メソッドは UTC として扱う（TZ 非依存。TZ=UTC 環境なら V8 と一致）
+- `+new Date(ms)` 等の ToPrimitive は valueOf（\x01ms）経由で数値化（V8 一致）。ラッパー（new Number 等）は非対応のまま
+- 関数の `.valueOf` / `.toString` は Function.prototype のものを返す（V8 一致）。`_.toJSON` 等の lodash 側の欠落は V8 と同じく undefined
+- setTimeout/setInterval は eval 完了後に 1 回実行の近似（遅延 ms は無視。V8 は非同期）
+- Object.defineProperty は value のみ対応（getter/setter は無視して value を設定）
 - eval はグローバル近似（直接 eval のローカルスコープ参照は非対応）
 - BigInt は 64bit 符号付き整数（任意精度は将来）。BigInt + Number は Number 変換（V8 は TypeError）
 - `new Number(5)` 等のラッパー OBJ は数値変換されない（`+new Number(5)` は NaN。V8 は 5。ラッパー種別を持たないため）

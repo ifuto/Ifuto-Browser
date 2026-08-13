@@ -197,21 +197,26 @@ static bool rc_emit_op(RexC *rc, u8 op) {
 }
 
 /* 命令を pos に挿入。既存のジャンプ参照（u32v >= pos）を +1 シフト */
-static bool rc_ins_insert(RexC *rc, u32 pos, RexIns in) {
+static bool rc_ins_insert(RexC *rc, u32 pos, RexIns in, bool shift_ge) {
     if (rc->n_ins >= RX_MAX_INS) { rc_fail(rc, "pattern too complex"); return false; }
     if (!rc_grow(rc, rc->n_ins + 1)) return false;
     memmove(&rc->ins[pos + 1], &rc->ins[pos], (u64)(rc->n_ins - pos) * sizeof(RexIns));
     rc->ins[pos] = in;
     rc->n_ins++;
     /* 参照シフト: 挿入位置より「後ろ」を指す参照は +1（挿入により 1 命令ずれる）。
-     * 挿入位置「ちょうど pos」を指す参照はシフトしない — コンパイラは
-     * 「これから挿入される命令」を指す意図で pos を設定する（例: 量詞の
-     * スキップ先 = 次に置かれる SPLIT の位置）。 */
+     * shift_ge=true（代替 SPLIT の挿入のみ）: 挿入位置「ちょうど pos」を指す既存参照も
+     * +1 — 代替 1 の開始を指す参照（例: `[^.[\]]+` の + の JMP(atom)）は「挿入前の
+     * 代替 1 の最初の命令」を意図しており、挿入後は +1 すべき（v0.7: lodash rePropName
+     * の toPath が "a" を落とす実バグ — + のループが代替 SPLIT に戻って代替 2 へ
+     * フォールバックしていた）。
+     * それ以外の挿入（量詞・JMP(end)）は従来どおり「> pos」のみ: 「ちょうど pos」を
+     * 指す参照は「これから挿入される命令」を意図している（例: + の SPLIT の alt=end は
+     * 後から代替 1 の末尾に挿入される JMP(end) を指す。+1 すると代替 2 を指して壊れる）。 */
     for (u32 i = 0; i < rc->n_ins; i++) {
         if (i == pos) continue;
         u8 op = rc->ins[i].op;
         if ((op == RI_JMP || op == RI_SPLIT || op == RI_SPLIT_L) &&
-            rc->ins[i].u32v > pos) rc->ins[i].u32v++;
+            (shift_ge ? rc->ins[i].u32v >= pos : rc->ins[i].u32v > pos)) rc->ins[i].u32v++;
     }
     return true;
 }
@@ -563,12 +568,14 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
         bool first = true;
         u32 prev_lo = 0;
         bool in_range = false;
+
         for (;;) {
             if (rc->pos >= rc->len) { rc_fail(rc, "missing ']'"); rc->depth--; return false; }
             u8 cc = rc->pat[rc->pos];
             if (cc == ']' && !first) { rc->pos++; break; }
             first = false;
             u32 cp = 0;
+
             if (cc == '\\') {
                 u32 esc_cp;
                 int kind;
@@ -632,6 +639,7 @@ static bool rc_compile_atom(RexC *rc, u32 *s0, u32 *e0) {
                 }
                 in_range = false;
             } else if (cp < 0x80) {
+
                 if (rc->pos + 1 < rc->len && rc->pat[rc->pos] == '-' &&
                     rc->pat[rc->pos + 1] != ']') {
                     rc->pos++;
@@ -808,7 +816,7 @@ static bool rc_compile_seq(RexC *rc) {
                 RexIns sp;
                 memset(&sp, 0, sizeof sp);
                 sp.op = RI_SPLIT_L;
-                if (!rc_ins_insert(rc, s0, sp)) return false;
+                if (!rc_ins_insert(rc, s0, sp, false)) return false;
                 RexIns jm;
                 memset(&jm, 0, sizeof jm);
                 jm.op = RI_JMP; jm.u32v = s0;
@@ -818,7 +826,7 @@ static bool rc_compile_seq(RexC *rc) {
                 RexIns sp;
                 memset(&sp, 0, sizeof sp);
                 sp.op = RI_SPLIT;
-                if (!rc_ins_insert(rc, s0, sp)) return false;
+                if (!rc_ins_insert(rc, s0, sp, false)) return false;
                 RexIns jm;
                 memset(&jm, 0, sizeof jm);
                 jm.op = RI_JMP; jm.u32v = s0;
@@ -853,7 +861,7 @@ static bool rc_compile_seq(RexC *rc) {
             RexIns sp;
             memset(&sp, 0, sizeof sp);
             sp.op = lazy ? RI_SPLIT_L : RI_SPLIT;
-            if (!rc_ins_insert(rc, s0, sp)) return false;
+            if (!rc_ins_insert(rc, s0, sp, false)) return false;
             rc->ins[s0].u32v = e0 + 1; /* 挿入後は atom が 1 命令ずれる */
             continue;
         }
@@ -886,7 +894,7 @@ static bool rc_compile_seq(RexC *rc) {
                     RexIns sp;
                     memset(&sp, 0, sizeof sp);
                     sp.op = RI_SPLIT_L;
-                    if (!rc_ins_insert(rc, s0, sp)) return false;
+                    if (!rc_ins_insert(rc, s0, sp, false)) return false;
                     RexIns jm;
                     memset(&jm, 0, sizeof jm);
                     jm.op = RI_JMP; jm.u32v = s0;
@@ -896,7 +904,7 @@ static bool rc_compile_seq(RexC *rc) {
                     RexIns sp;
                     memset(&sp, 0, sizeof sp);
                     sp.op = RI_SPLIT;
-                    if (!rc_ins_insert(rc, s0, sp)) return false;
+                    if (!rc_ins_insert(rc, s0, sp, false)) return false;
                     RexIns jm;
                     memset(&jm, 0, sizeof jm);
                     jm.op = RI_JMP; jm.u32v = s0;
@@ -931,7 +939,7 @@ static bool rc_compile_seq(RexC *rc) {
             RexIns sp;
             memset(&sp, 0, sizeof sp);
             sp.op = lazy ? RI_SPLIT_L : RI_SPLIT;
-            if (!rc_ins_insert(rc, s0, sp)) return false;
+            if (!rc_ins_insert(rc, s0, sp, false)) return false;
             rc->ins[s0].u32v = e0 + 1;
             last_s = s0 + 1; /* 挿入後は atom 開始が +1 */
         }
@@ -949,7 +957,7 @@ static bool rc_compile_seq(RexC *rc) {
             RexIns sp;
             memset(&sp, 0, sizeof sp);
             sp.op = lazy ? RI_SPLIT_L : RI_SPLIT;
-            if (!rc_ins_insert(rc, s2, sp)) return false;
+            if (!rc_ins_insert(rc, s2, sp, false)) return false;
             rc->ins[s2].u32v = e2 + 1;
         }
         if (lo == 0 && hi == 0) {
@@ -957,7 +965,7 @@ static bool rc_compile_seq(RexC *rc) {
             RexIns jm;
             memset(&jm, 0, sizeof jm);
             jm.op = RI_JMP; jm.u32v = e0 + 1;
-            if (!rc_ins_insert(rc, s0, jm)) return false;
+            if (!rc_ins_insert(rc, s0, jm, false)) return false;
         }
     }
 }
@@ -979,7 +987,8 @@ static bool rc_compile_alt(RexC *rc) {
     RexIns sp0;
     memset(&sp0, 0, sizeof sp0);
     sp0.op = RI_SPLIT;
-    if (!rc_ins_insert(rc, alt_base, sp0)) return false;
+    if (!rc_ins_insert(rc, alt_base, sp0, true)) return false; /* v0.7: shift_ge — 代替 1 の
+                                                                 * 開始を指す既存参照を +1 */
     u32 split_slot = alt_base; /* パッチ待ち SPLIT（alt 未定） */
     for (;;) {
         if (rc->failed) return false;
@@ -991,7 +1000,7 @@ static bool rc_compile_alt(RexC *rc) {
         RexIns jm;
         memset(&jm, 0, sizeof jm);
         jm.op = RI_JMP;
-        if (!rc_ins_insert(rc, seq_start, jm)) return false;
+        if (!rc_ins_insert(rc, seq_start, jm, false)) return false;
         jmps[n_jmps++] = seq_start;
         rc->ins[split_slot].u32v = seq_start + 1; /* 前の分岐の alt = この分岐本体 */
         if (!rc_compile_seq(rc)) return false;
@@ -1000,7 +1009,7 @@ static bool rc_compile_alt(RexC *rc) {
             RexIns sp;
             memset(&sp, 0, sizeof sp);
             sp.op = RI_SPLIT;
-            if (!rc_ins_insert(rc, seq_start + 1, sp)) return false;
+            if (!rc_ins_insert(rc, seq_start + 1, sp, false)) return false;
             split_slot = seq_start + 1;
         } else {
             split_slot = UINT32_MAX;
@@ -1064,6 +1073,7 @@ static bool rx_run(RxRun *rr, u32 pos, u32 ip, u32 depth) {
             u32 cp, clen;
             if (!rx_utf8_get(rr->s, rr->s_len, pos, &cp, &clen)) return false;
             bool hit;
+
             if (cp < 0x80) {
                 hit = bits_has(rr->rx->classes + in->u32v * 32, (u8)cp);
             } else {
