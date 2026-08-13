@@ -4931,7 +4931,9 @@ static i32 cg_local_find(Cg *cg, u32 name) {
     for (u32 s = cg->n_lex; s-- > 0;)
         for (u32 i = 0; i < cg->lex[s].n; i++)
             if (cg->lex[s].names[i] == name) return (i32)cg->lex[s].slots[i];
-    for (u32 i = 0; i < cg->n_locals; i++)
+    /* v0.9f: 後ろから（直近宣言が最頻参照。locals 内の同名は cg_local_add が再利用する
+     * ため通常 1 つだが、複数ある場合も「後勝ち」= JS の var シャドーイングと一致） */
+    for (u32 i = cg->n_locals; i-- > 0;)
         if (cg->locals[i].name == name) return (i32)i;
     return -1;
 }
