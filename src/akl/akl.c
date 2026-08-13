@@ -4787,6 +4787,10 @@ static void an_main_decls(P *p, u32 ni, U32Vec *out) {
 }
 
 /* プログラム全体の解析。main 擬似関数の decls = トップレベル catch 束縛のみ。 */
+static int akl_u32_cmp(const void *a, const void *b) {
+    u32 x = *(const u32 *)a, y = *(const u32 *)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
 static bool akl_analyze(P *p, u32 prog) {
     if (p->n_nodes > 0) {
         p->fninfo = (AklFnInfo *)calloc(p->n_nodes, sizeof(AklFnInfo));
@@ -4812,7 +4816,29 @@ static bool akl_analyze(P *p, u32 prog) {
     anc[0] = N_NONE; /* main 擬似 */
     an_walk(p, prog, anc, 1);
     free(anc);
+    /* v0.9c: cap_names をソート（二分探索用）。env_idx = cap_names 内位置の不変条件は
+     * ソート後も保たれる（CELOAD/CESTORE の idx は cg がソート後の位置で発行するため）。
+     * 解析完了後の追加は無い（fi_an_cap_add は an_walk 中のみ）ので安全。 */
+    for (u32 i = 0; i < p->fninfo_n; i++)
+        if (p->fninfo[i].n_cap > 1)
+            qsort(p->fninfo[i].cap_names, p->fninfo[i].n_cap, sizeof(u32), akl_u32_cmp);
+    if (p->main_fi.n_cap > 1)
+        qsort(p->main_fi.cap_names, p->main_fi.n_cap, sizeof(u32), akl_u32_cmp);
     return !p->fail;
+}
+
+/* ソート済み cap_names の二分探索。見つかれば配列内位置（= ENV idx）、無ければ -1。
+ * n_cap <= 8 の小テーブルは線形の方が速いが、呼出側はキャプチャ数の多い関数
+ * （lodash runInContext は 297 キャプチャ）が支配的なので二分で統一。 */
+static int fi_cap_find(const AklFnInfo *fi, u32 name) {
+    i32 lo = 0, hi = (i32)fi->n_cap;
+    while (lo < hi) {
+        i32 mid = lo + (hi - lo) / 2;
+        u32 m = fi->cap_names[mid];
+        if (m == name) return mid;
+        if (m < name) lo = mid + 1; else hi = mid;
+    }
+    return -1;
 }
 
 /* ============================== codegen ============================== */
@@ -4929,14 +4955,12 @@ static i32 cg_local_add(Cg *cg, u32 name, u8 is_const) {
     cg->locals[cg->n_locals].captured = 0;
     cg->locals[cg->n_locals].env_idx = 0xFFFF;
     cg->locals[cg->n_locals].lex = 0;
-    /* 解析済み capture 名と突合（名前 → ENV idx = cap_names 内位置） */
+    /* 解析済み capture 名と突合（名前 → ENV idx = cap_names 内位置。v0.9c: 二分探索） */
     if (cg->cur_fi && name != UINT32_MAX) {
-        for (u16 k = 0; k < cg->cur_fi->n_cap; k++) {
-            if (cg->cur_fi->cap_names[k] == name) {
-                cg->locals[cg->n_locals].captured = 1;
-                cg->locals[cg->n_locals].env_idx = (u16)k;
-                break;
-            }
+        int k = fi_cap_find(cg->cur_fi, name);
+        if (k >= 0) {
+            cg->locals[cg->n_locals].captured = 1;
+            cg->locals[cg->n_locals].env_idx = (u16)k;
         }
     }
     return (i32)cg->n_locals++;
@@ -5188,10 +5212,7 @@ static bool cg_captured_probe(const Cg *cg, u32 name) {
         return false;
     for (u32 a = cg->n_outer; a-- > 0;) {
         const CgScope *os = &cg->outer[a];
-        if (os->fi) {
-            for (u16 k = 0; k < os->fi->n_cap; k++)
-                if (os->fi->cap_names[k] == name) return true;
-        }
+        if (os->fi && fi_cap_find(os->fi, name) >= 0) return true;
     }
     return false;
 }
@@ -5207,19 +5228,18 @@ static bool cg_captured(Cg *cg, u32 name, bool store, u32 *env_idx_out) {
     for (u32 a = cg->n_outer; a-- > 0;) {
         const CgScope *os = &cg->outer[a];
         if (os->fi) {
-            for (u16 k = 0; k < os->fi->n_cap; k++) {
-                if (os->fi->cap_names[k] == name) {
-                    u32 depth = 0;
-                    for (u32 m = a + 1; m < cg->n_outer; m++)
-                        if (cg->outer[m].n_env) depth++;
-                    u8 cap_slot = (u8)(1 + (cg->cur_n_env ? 1u : 0u));
-                    cg_op(cg, store ? OP_CESTORE : OP_CELOAD);
-                    cg_push_byte(cg, cap_slot);
-                    cg_push_byte(cg, (u8)depth);
-                    cg_u32(cg, k);
-                    if (env_idx_out) *env_idx_out = k;
-                    return true;
-                }
+            int k = fi_cap_find(os->fi, name);
+            if (k >= 0) {
+                u32 depth = 0;
+                for (u32 m = a + 1; m < cg->n_outer; m++)
+                    if (cg->outer[m].n_env) depth++;
+                u8 cap_slot = (u8)(1 + (cg->cur_n_env ? 1u : 0u));
+                cg_op(cg, store ? OP_CESTORE : OP_CELOAD);
+                cg_push_byte(cg, cap_slot);
+                cg_push_byte(cg, (u8)depth);
+                cg_u32(cg, (u32)k);
+                if (env_idx_out) *env_idx_out = (u32)k;
+                return true;
             }
         }
     }
