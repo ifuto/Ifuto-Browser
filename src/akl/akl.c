@@ -333,6 +333,11 @@ struct AklRT {
     /* GLOAD/GSTORE の O(1) 化: name(u32 intern id) -> global slot の脱 Salt ハッシュ
      * （globals は append-only。n_globals 変化検知でのみ全再構築） */
     u32 *ghash; u32 ghash_cap; u32 ghash_sync;
+    /* v0.9 文字列インターンの O(1) 化: 内容ハッシュ -> STR obj index（開番地、1-based）。
+     * GC が文字列を回収し得るため、akl_gc の最後に破棄し次回 akl_intern で再構築する
+     * （GC はまれなので再構築コストは無視できる。akl_mkstr 内 GC で破棄された場合は
+     * 挿入を諦めて線形フォールバック — 一意性は線形走査が保証）。 */
+    u32 *strtab; u32 strtab_cap, strtab_n;
     /* コード＋関数表（eval ごとに追記。関数は以後の eval から呼べる） */
     u8 *code; u32 code_len, code_cap;
     AklFuncEnt *funcs; u32 n_funcs, cap_funcs;
@@ -704,6 +709,10 @@ static u32 akl_gc(AklRT *rt) {
         got++;
     }
     free(mk);
+    /* v0.9: 文字列回収で strtab の index が無効化されるため破棄（次回 akl_intern が
+     * 生存文字列のみで再構築。GC はまれなので再構築コストは無視できる） */
+    free(rt->strtab);
+    rt->strtab = NULL; rt->strtab_cap = 0; rt->strtab_n = 0;
     u64 next = rt->heap_bytes * 2;
     u64 floor_ = 512u << 10, ceil_ = (u64)rt->heap_mb << 20;
     rt->gc_next = next < floor_ ? floor_ : next > ceil_ ? ceil_ : next;
@@ -1090,6 +1099,44 @@ static bool lex_eof(Lex *lx) { return lx->pos >= lx->n; }
 static u8 lex_cur(Lex *lx) { return lex_eof(lx) ? 0 : lx->s[lx->pos]; }
 static u8 lex_at(Lex *lx, u32 off) { return lx->pos + off >= lx->n ? 0 : lx->s[lx->pos + off]; }
 
+/* v0.9 字句テーブル（初回 lex_next で 1 回構築）: 毎トークンの全 punct/キーワード
+ * 線形走査（P_N=57 × strlen+memcmp、KW_N=42 × strlen+memcmp — lodash ロードの gprof
+ * で lex_next 39% の主因）を O(1) 候補に落とす。 */
+static int LEX_PUNCT1[256];            /* 1 文字 punct: 文字 → pk（-1 = なし） */
+static u8 LEX_PUNCTLEN[P_N];            /* punct の長さ（strlen の事前計算） */
+static u8 LEX_PUNCTLIST[P_N];           /* 多文字 punct を先頭文字ごとに固めた列 */
+static u8 LEX_PUNCT_START[256], LEX_PUNCT_N[256]; /* 先頭文字 → LIST の範囲 */
+static int LEX_KWHT[64];               /* キーワード内容ハッシュ（開番地、kw+1、0=空） */
+static u8 LEX_KWMAXLEN;
+static int lex_tables_ready = 0;
+static void lex_tables_init(void) {
+    u32 cnt[256] = {0}, cur[256] = {0}, off = 0;
+    for (int i = 0; i < 256; i++) { LEX_PUNCT1[i] = -1; LEX_PUNCT_START[i] = 0; LEX_PUNCT_N[i] = 0; }
+    for (int k = 0; k < P_N; k++) {
+        size_t pl = strlen(AKL_PUNCTS[k]);
+        LEX_PUNCTLEN[k] = (u8)pl;
+        if (pl == 1) LEX_PUNCT1[(u8)AKL_PUNCTS[k][0]] = k;
+        else cnt[(u8)AKL_PUNCTS[k][0]]++;
+    }
+    for (int i = 0; i < 256; i++) { LEX_PUNCT_START[i] = (u8)off; LEX_PUNCT_N[i] = (u8)cnt[i]; off += cnt[i]; }
+    for (int k = 0; k < P_N; k++) {
+        size_t pl = strlen(AKL_PUNCTS[k]);
+        if (pl <= 1) continue;
+        u8 c0 = (u8)AKL_PUNCTS[k][0];
+        LEX_PUNCTLIST[LEX_PUNCT_START[c0] + cur[c0]++] = (u8)k;
+    }
+    for (int i = 0; i < 64; i++) LEX_KWHT[i] = 0;
+    for (int k = 0; k < KW_N; k++) {
+        size_t kl = strlen(AKL_KWS[k]);
+        if (kl > LEX_KWMAXLEN) LEX_KWMAXLEN = (u8)kl;
+        u32 h = 2166136261u;
+        for (size_t i = 0; i < kl; i++) { h ^= (u8)AKL_KWS[k][i]; h *= 16777619u; }
+        h &= 63;
+        while (LEX_KWHT[h]) h = (h + 1) & 63;
+        LEX_KWHT[h] = k + 1;
+    }
+}
+
 static u8 ascii_lc(u8 c) { return (c >= 'A' && c <= 'Z') ? (u8)(c + 32) : c; }
 
 static void lex_skip_ws(Lex *lx) {
@@ -1274,6 +1321,7 @@ static bool lex_digits(Lex *lx) {
 }
 
 static int lex_next(Lex *lx) {
+    if (!lex_tables_ready) { lex_tables_init(); lex_tables_ready = 1; }
     lex_skip_ws(lx);
     if (lex_eof(lx)) { lx->kind = TK_EOF; return 0; }
     u8 c = lex_cur(lx);
@@ -1435,33 +1483,47 @@ static int lex_next(Lex *lx) {
             else break;
         }
         u32 ln = lx->pos - st;
-        for (int k = 0; k < KW_N; k++) {
-            if (strlen(AKL_KWS[k]) == ln && memcmp(lx->s + st, AKL_KWS[k], ln) == 0) {
-                lx->kind = TK_KW; lx->pk = (u8)k;
-                lx->str_p = lx->s + st; lx->str_len = ln; /* .catch 等のプロパティ名解決用 */
-                return 0;
+        if (ln <= LEX_KWMAXLEN) { /* 内容ハッシュで候補 1 個に絞る（開番地） */
+            u32 h = 2166136261u;
+            for (u32 i = 0; i < ln; i++) { h ^= lx->s[st + i]; h *= 16777619u; }
+            h &= 63;
+            while (LEX_KWHT[h]) {
+                int k = LEX_KWHT[h] - 1;
+                if (strlen(AKL_KWS[k]) == ln && memcmp(lx->s + st, AKL_KWS[k], ln) == 0) {
+                    lx->kind = TK_KW; lx->pk = (u8)k;
+                    lx->str_p = lx->s + st; lx->str_len = ln; /* .catch 等のプロパティ名解決用 */
+                    return 0;
+                }
+                h = (h + 1) & 63;
             }
         }
         lx->kind = TK_IDENT; lx->str_p = lx->s + st; lx->str_len = ln;
         return 0;
     }
-    /* punct 複数文字（最長一致。テーブル順序に依存しない: "==" が "===" を潰さない）。
-     * v0.3: "++"/"--" は正式トークン化（二重 unary 誤読の危険は lex 最長一致で排除） */
-    int best = -1; u32 bestl = 0;
-    for (int k = 0; k < P_N; k++) {
-        u32 pl = (u32)strlen(AKL_PUNCTS[k]);
-        if (pl >= 2 && pl > bestl && lx->pos + pl <= lx->n &&
-            memcmp(lx->s + lx->pos, AKL_PUNCTS[k], pl) == 0) {
-            best = k; bestl = pl;
+    /* punct: 多文字（最長一致、先頭文字で候補を絞る）が先 — ">>>" が ">" を潰さない。
+     * 1 文字は O(1) テーブル（旧実装の「多文字→1 文字」の順序を維持）。 */
+    {
+        u8 stm = LEX_PUNCT_START[c], nm = LEX_PUNCT_N[c];
+        if (nm) {
+            int best = -1; u32 bestl = 0;
+            for (u32 j = 0; j < nm; j++) {
+                int k = LEX_PUNCTLIST[stm + j];
+                u32 pl = LEX_PUNCTLEN[k];
+                if (pl > bestl && lx->pos + pl <= lx->n &&
+                    memcmp(lx->s + lx->pos, AKL_PUNCTS[k], pl) == 0) {
+                    best = k; bestl = pl;
+                }
+            }
+            if (best >= 0) {
+                lx->pos += bestl; lx->kind = TK_PUNCT; lx->pk = (u8)best;
+                return 0;
+            }
         }
     }
-    if (best >= 0) {
-        lx->pos += bestl; lx->kind = TK_PUNCT; lx->pk = (u8)best;
-        return 0;
-    }
-    for (int k = 0; k < P_N; k++) {
-        if (AKL_PUNCTS[k][1] == 0 && AKL_PUNCTS[k][0] == (char)c) {
-            lx->pos++; lx->kind = TK_PUNCT; lx->pk = (u8)k;
+    {
+        int p1 = LEX_PUNCT1[c];
+        if (p1 >= 0) {
+            lx->pos++; lx->kind = TK_PUNCT; lx->pk = (u8)p1;
             return 0;
         }
     }
@@ -1643,16 +1705,83 @@ static bool p_expect_punct(P *p, u8 pk, const char *what) {
  * created != NULL は「新規に STR を作ったか」を返す： VM 実行中（native 内）に
  * 新規作成した STR はルートに届くまで sweep され得るため、呼出側が nursery に積む
  * 責任を持つ（akl_prop_get/set が遵守する規約）。 */
+/* FNV-1a 32bit（intern 用。Salt 不要: 入力は攻撃者文字列でなくエンジン内部のバイト列で、
+ * 最悪でも開番地の線形クラスタにしかならず DoS 増幅は無い） */
+static u32 str_hash(const u8 *s, u32 n) {
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < n; i++) { h ^= s[i]; h *= 16777619u; }
+    return h;
+}
+/* 全生存文字列で strtab を再構築（GC 後・拡張時）。失敗時 false（呼出側は線形へ） */
+static bool strtab_rebuild(AklRT *rt, u32 ncap) {
+    u32 *nt = (u32 *)calloc(ncap, sizeof(u32));
+    if (!nt) return false;
+    u32 nn = 0;
+    for (u32 i = 0; i < rt->n_objs; i++) {
+        AklObj *o = &rt->objs[i];
+        if (o->kind != AKL_OK_STR) continue;
+        u32 h = str_hash(o->bytes, o->len) & (ncap - 1);
+        while (nt[h]) h = (h + 1) & (ncap - 1);
+        nt[h] = i + 1; /* 1-based。0 は空 */
+        nn++;
+    }
+    free(rt->strtab);
+    rt->strtab = nt; rt->strtab_cap = ncap; rt->strtab_n = nn;
+    return true;
+}
 static u32 akl_intern(AklRT *rt, const u8 *s, u32 n, bool *created) {
     if (created) *created = false;
+    if (!rt->strtab) {
+        /* 初期構築（初回 intern / GC 後）: 生存文字列数から 2 のべき乗 cap を決める */
+        u32 need = 8;
+        for (u32 i = 0; i < rt->n_objs; i++)
+            if (rt->objs[i].kind == AKL_OK_STR) need++;
+        u32 cap = 16;
+        while (cap < need * 2) cap <<= 1;
+        if (!strtab_rebuild(rt, cap)) goto linear; /* OOM: 線形フォールバック */
+    }
+    {
+        u32 cap = rt->strtab_cap;
+        u32 h = str_hash(s, n) & (cap - 1);
+        while (rt->strtab[h]) {
+            u32 idx = rt->strtab[h] - 1;
+            AklObj *o = &rt->objs[idx];
+            if (o->kind == AKL_OK_STR && o->len == n && (n == 0 || memcmp(o->bytes, s, n) == 0))
+                return idx;
+            h = (h + 1) & (cap - 1);
+        }
+    }
+    {
+        u32 k = akl_mkstr(rt, s, n);
+        if (k == UINT32_MAX) return k;
+        if (created) *created = true;
+        if (!rt->strtab) return k; /* mkstr 内 GC で破棄された → 次回 rebuild に任せる */
+        if (rt->strtab_n * 2 >= rt->strtab_cap) {
+            u32 ncap = rt->strtab_cap * 2;
+            if (!strtab_rebuild(rt, ncap)) {
+                /* OOM: 線形に戻す（一意性は線形走査が保証。次回成功時に再構築） */
+                free(rt->strtab); rt->strtab = NULL; rt->strtab_cap = 0; rt->strtab_n = 0;
+                return k;
+            }
+        }
+        u32 h2 = str_hash(s, n) & (rt->strtab_cap - 1);
+        while (rt->strtab[h2]) h2 = (h2 + 1) & (rt->strtab_cap - 1);
+        rt->strtab[h2] = k + 1;
+        rt->strtab_n++;
+        return k;
+    }
+linear: /* メモリ逼迫時のフォールバック（従来の線形走査。一意性は保証） */
     for (u32 i = 0; i < rt->n_objs; i++) {
-        if (rt->objs[i].kind != AKL_OK_STR) continue;
-        if (rt->objs[i].len == n && (n == 0 || memcmp(rt->objs[i].bytes, s, n) == 0))
+        AklObj *o = &rt->objs[i];
+        if (o->kind != AKL_OK_STR) continue;
+        if (o->len == n && (n == 0 || memcmp(o->bytes, s, n) == 0))
             return i;
     }
-    u32 k = akl_mkstr(rt, s, n);
-    if (created && k != UINT32_MAX) *created = true;
-    return k;
+    {
+        u32 k = akl_mkstr(rt, s, n);
+        if (created && k != UINT32_MAX) *created = true;
+        return k;
+    }
 }
 static u32 p_intern(P *p, const u8 *s, u32 n) {
     u32 idx = akl_intern(p->rt, s, n, NULL);
@@ -17731,6 +17860,7 @@ void akl_free(AklRT *rt) {
     free(rt->objs);
     free(rt->free_objs);
     free(rt->ghash);
+    free(rt->strtab);
     free(rt->code);
     free(rt->funcs);
     free(rt->globals);
