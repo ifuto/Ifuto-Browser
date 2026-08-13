@@ -1711,10 +1711,15 @@ static bool p_expect_punct(P *p, u8 pk, const char *what) {
  * 新規作成した STR はルートに届くまで sweep され得るため、呼出側が nursery に積む
  * 責任を持つ（akl_prop_get/set が遵守する規約）。 */
 /* FNV-1a 32bit（intern 用。Salt 不要: 入力は攻撃者文字列でなくエンジン内部のバイト列で、
- * 最悪でも開番地の線形クラスタにしかならず DoS 増幅は無い） */
+ * 最悪でも開番地の線形クラスタにしかならず DoS 増幅は無い）。
+ * v0.9g: 先頭 16 バイトのみでハッシュ（バケット選定専用）。一意性は memcmp が保証する
+ * ため、同一内容は必ず同ハッシュ（先頭 16B が同一）、異内容の衝突はプローブ延長で
+ * 解決されるだけで正しさは不変。長い識別子/文字列のハッシュコストを削減。 */
+#define AKL_HASH_LIMIT 16u
 static u32 str_hash(const u8 *s, u32 n) {
-    u32 h = 2166136261u;
-    for (u32 i = 0; i < n; i++) { h ^= s[i]; h *= 16777619u; }
+    u32 h = 2166136261u ^ n;
+    u32 lim = n < AKL_HASH_LIMIT ? n : AKL_HASH_LIMIT;
+    for (u32 i = 0; i < lim; i++) { h ^= s[i]; h *= 16777619u; }
     return h;
 }
 /* 全生存文字列で strtab を再構築（GC 後・拡張時）。失敗時 false（呼出側は線形へ） */
