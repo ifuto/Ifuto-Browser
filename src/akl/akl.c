@@ -664,10 +664,11 @@ static u32 akl_gc(AklRT *rt) {
          * その場合 mk[] 確保も先に失敗している想定なので実質到達不能。 */
     }
     u32 got = 0;
+    u32 str_reclaimed = 0; /* strtab 残置可否の判定用（v0.9d: 回収 0 なら全エントリ生存） */
     for (u32 i = rt->pin_mark; i < rt->n_objs; i++) {
         AklObj *o = &rt->objs[i];
         if (o->kind == 0 || mk[i - rt->pin_mark]) continue;
-        if (o->kind == AKL_OK_STR && o->bytes) { rt->heap_bytes -= o->len; free(o->bytes); }
+        if (o->kind == AKL_OK_STR && o->bytes) { rt->heap_bytes -= o->len; free(o->bytes); str_reclaimed++; }
         if (o->kind == AKL_OK_OBJ && o->u.po.props) {
             rt->heap_bytes -= (u64)o->u.po.cap * sizeof(AklProp);
             free(o->u.po.props);
@@ -709,13 +710,14 @@ static u32 akl_gc(AklRT *rt) {
         got++;
     }
     free(mk);
-    /* v0.9: 文字列回収で strtab の index が無効化されるため破棄（次回 akl_intern が
-     * 生存文字列のみで再構築。GC はまれなので再構築コストは無視できる）。
-     * 注: 「エントリ残置 + 条件付き破棄」案（v0.9b 試作）は開番地クラスタに死エントリが
-     * 溜まり、検索が O(挿入数) に劣化して test_script_gc_churn（300k 連結ループ）が
-     * 実質ハングしたため撤収。残置は削除エントリを「空」にできない開番地と相性が悪い。 */
-    free(rt->strtab);
-    rt->strtab = NULL; rt->strtab_cap = 0; rt->strtab_n = 0;
+    /* v0.9d: 文字列回収ゼロの GC では strtab の全エントリが生存しているため残置
+     * （rebuild 不要）。1 個でも回収したら破棄 → 次回 intern が生存文字列のみで再構築。
+     * これにより検索中に死エントリへ出会うことは構造的にない（破棄後は rebuild が
+     * 生存のみで作り直すため）。v0.9b 試作（回収ありでも残置）は開番地クラスタに
+     * 死エントリが溜まり O(n) 劣化で test_script_gc_churn が実質ハングした — 撤収。 */
+    if (rt->strtab && str_reclaimed) {
+        free(rt->strtab); rt->strtab = NULL; rt->strtab_cap = 0; rt->strtab_n = 0;
+    }
     u64 next = rt->heap_bytes * 2;
     u64 floor_ = 512u << 10, ceil_ = (u64)rt->heap_mb << 20;
     rt->gc_next = next < floor_ ? floor_ : next > ceil_ ? ceil_ : next;
