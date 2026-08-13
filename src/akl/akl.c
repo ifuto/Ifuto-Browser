@@ -710,7 +710,10 @@ static u32 akl_gc(AklRT *rt) {
     }
     free(mk);
     /* v0.9: 文字列回収で strtab の index が無効化されるため破棄（次回 akl_intern が
-     * 生存文字列のみで再構築。GC はまれなので再構築コストは無視できる） */
+     * 生存文字列のみで再構築。GC はまれなので再構築コストは無視できる）。
+     * 注: 「エントリ残置 + 条件付き破棄」案（v0.9b 試作）は開番地クラスタに死エントリが
+     * 溜まり、検索が O(挿入数) に劣化して test_script_gc_churn（300k 連結ループ）が
+     * 実質ハングしたため撤収。残置は削除エントリを「空」にできない開番地と相性が悪い。 */
     free(rt->strtab);
     rt->strtab = NULL; rt->strtab_cap = 0; rt->strtab_n = 0;
     u64 next = rt->heap_bytes * 2;
