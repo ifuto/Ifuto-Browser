@@ -253,6 +253,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Rust ツールチェーンをセットアップ（ランナーは毎回クリーンのため自己完結）
+        run: |
+          curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          . "$HOME/.cargo/env"
+          rustup toolchain install nightly --profile minimal
+          rustup component add clippy rustfmt
+          rustup component add miri --toolchain nightly
+          echo "RUSTUP_HOME=$HOME/.rustup" >> "$GITHUB_ENV"
+          echo "CARGO_HOME=$HOME/.cargo" >> "$GITHUB_ENV"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustc --version
+          cargo --version
+          echo "Rust セットアップ完了"
+
+      - name: Kani をインストール（cargo kani 用。数分かかる）
+        run: |
+          . "$HOME/.cargo/env"
+          cargo install --locked kani-verifier 2>&1 | tail -3
+          cargo kani --version || echo "kani install failed"
+
       - name: trigger.md の内容を実行
         id: run
         run: |
