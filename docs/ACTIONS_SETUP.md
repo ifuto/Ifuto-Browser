@@ -142,9 +142,11 @@ jobs:
       - name: Rudra (unsafe 静的解析)
         if: env.CFG_RUDRA == 'on'
         run: |
+          # 注: rudra はメンテ停止中のため最新 rustc でビルドできないことがある。
+          # 失敗してもジョブを止めない（Rust 検証は Kani/Miri/clippy が主軸）。
           . "$HOME/.cargo/env"
-          cargo install rudra
-          rudra --version
+          cargo install rudra || echo "rudra install failed (known issue)"
+          rudra --version || echo "rudra not available" 
 
       - name: cargo-audit (依存脆弱性スキャン)
         if: env.CFG_CARGO_AUDIT == 'on'
