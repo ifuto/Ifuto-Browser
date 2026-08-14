@@ -120,6 +120,12 @@ typedef struct { u32 name; AklVal v; } AklProp;
 /* nursery（C 側一時ルート）容量。最大同時ピンは eq/rel 系の入れ子で
  * 2(ハンドラ) + 2(loose/strict) + 1(flatten) = 5。余裕を見て 8。 */
 #define AKL_NURY_CAP 64 /* v0.6: 実ライブラリ（lodash 等）の深いネストで溢れないよう拡張 */
+/* v0.10: STR オブジェクトの「intern 済み」フラグ（_p[0] の bit0）。
+ * strtab（intern ハッシュ）には intern 経由で作られた STR だけを載せる。akl_mkstring 等の
+ * 直接 mkstr で作った文字列を rebuild が載せると、同じ内容が 2 つの intern id を持つ
+ * 一意性破壊が起きる（実測: エラー name プロパティの "TypeError" が bind の id と別 id に
+ * なり、TYPEOF_G のグローバル解決が miss → typeof TypeError が "undefined" になる）。 */
+#define AKL_STRF_INTERNED 1u
 
 typedef struct {
     u8 kind;
@@ -1729,7 +1735,9 @@ static bool strtab_rebuild(AklRT *rt, u32 ncap) {
     u32 nn = 0;
     for (u32 i = 0; i < rt->n_objs; i++) {
         AklObj *o = &rt->objs[i];
-        if (o->kind != AKL_OK_STR) continue;
+        /* v0.10: intern 済みフラグを持つ STR のみ載せる。akl_mkstring 等の直接 mkstr は
+         * フラグなし → ここに入らない（intern の一意性を保つ） */
+        if (o->kind != AKL_OK_STR || !(o->_p[0] & AKL_STRF_INTERNED)) continue;
         u32 h = str_hash(o->bytes, o->len) & (ncap - 1);
         while (nt[h]) h = (h + 1) & (ncap - 1);
         nt[h] = i + 1; /* 1-based。0 は空 */
@@ -1764,6 +1772,7 @@ static u32 akl_intern(AklRT *rt, const u8 *s, u32 n, bool *created) {
     {
         u32 k = akl_mkstr(rt, s, n);
         if (k == UINT32_MAX) return k;
+        rt->objs[k]._p[0] |= AKL_STRF_INTERNED; /* v0.10: intern 済みマーク（strtab 掲載条件） */
         if (created) *created = true;
         if (!rt->strtab) return k; /* mkstr 内 GC で破棄された → 次回 rebuild に任せる */
         if (rt->strtab_n * 2 >= rt->strtab_cap) {
@@ -1789,6 +1798,7 @@ linear: /* メモリ逼迫時のフォールバック（従来の線形走査。
     }
     {
         u32 k = akl_mkstr(rt, s, n);
+        if (k != UINT32_MAX) rt->objs[k]._p[0] |= AKL_STRF_INTERNED;
         if (created && k != UINT32_MAX) *created = true;
         return k;
     }
@@ -11926,6 +11936,9 @@ static void akl_timer_drain(AklRT *rt) {
  * V8 は文字列も許すが AKL は関数のみ（明白失敗）。 */
 static AklVal akl_m_setTimeout(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     (void)self; (void)udata;
+    fprintf(stderr, "[qm] argc=%d is_obj=%d kind=%d\n", argc,
+            argc > 0 && akl_is_objv(argv[0]) ? 1 : 0,
+            argc > 0 && akl_is_objv(argv[0]) ? rt->objs[akl_get_obj(argv[0])].kind : -1);
     if (argc < 1 || !akl_is_objv(argv[0]) ||
         (rt->objs[akl_get_obj(argv[0])].kind != AKL_OK_FUNC &&
          rt->objs[akl_get_obj(argv[0])].kind != AKL_OK_NATIVE))
@@ -11956,6 +11969,173 @@ static AklVal akl_m_setInterval(AklRT *rt, AklVal self, int argc, const AklVal *
 }
 static AklVal akl_m_clearInterval(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     return akl_m_clearTimeout(rt, self, argc, argv, udata);
+}
+
+/* queueMicrotask(fn): fn をマイクロタスクキューに積む（V8 準拠。引数は渡さない）。
+ * 実行は eval 完了後の akl_microtask_drain（Promise の then と同一キュー・FIFO）。 */
+static AklVal akl_m_queueMicrotask(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (argc < 1 || !akl_is_objv(argv[0]) ||
+        (rt->objs[akl_get_obj(argv[0])].kind != AKL_OK_FUNC &&
+         rt->objs[akl_get_obj(argv[0])].kind != AKL_OK_NATIVE))
+        return akl_native_typeerr(rt, "TypeError: not a function");
+    u32 ro = akl_obj_new(rt);
+    if (ro == UINT32_MAX) return akl_mkundefined();
+    rt->objs[ro].kind = AKL_OK_PROMISE;
+    rt->objs[ro].u.pr.state = 1;
+    rt->objs[ro].u.pr.value = akl_mkundefined();
+    if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ro;
+    if (!akl_mtq_push(rt, argv[0], akl_mkundefined(), ro)) return akl_mkundefined();
+    return akl_mkundefined();
+}
+
+/* ---- v0.10: atob / btoa（V8 準拠 base64。WHATWG "base64" 仕様） ----
+ * btoa(s): ToString → 各コードポイント ≤ 0xFF でないと InvalidCharacterError。
+ *          バイト列を base64 エンコード（パディング付き）。
+ * atob(s): ToString → ASCII whitespace（\t\n\f\r と space）除去 → base64 デコード。
+ *          長さ %4==1、'=' の位置不正、alphabet 外は InvalidCharacterError。 */
+static const u8 akl_b64_enc[64] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static int akl_b64_dec[256];
+static int akl_b64_tables_ready = 0;
+static void akl_b64_tables_init(void) {
+    for (int i = 0; i < 256; i++) akl_b64_dec[i] = -1;
+    for (int i = 0; i < 64; i++) akl_b64_dec[akl_b64_enc[i]] = i;
+}
+/* UTF-8 バイト列の各コードポイントを走査し、全て ≤0xFF なら 1 バイト列を out（malloc）
+ * に詰めて長さを返す。>0xFF があれば -1、OOM は -2。 */
+static i32 akl_b64_latin1(const u8 *s, u32 n, u8 **out) {
+    u8 *b = (u8 *)malloc(n ? n : 1);
+    if (!b) return -2;
+    u32 w = 0;
+    for (u32 i = 0; i < n; ) {
+        u8 c = s[i];
+        u32 cl = c < 0x80 ? 1 : (c & 0xE0) == 0xC0 ? 2 : (c & 0xF0) == 0xE0 ? 3
+               : (c & 0xF8) == 0xF0 ? 4 : 1;
+        u32 cp = c;
+        if (cl >= 2 && i + 1 < n) cp = ((u32)(c & (cl == 2 ? 0x1F : cl == 3 ? 0x0F : 0x07)) << (6 * (cl - 1))) |
+                                      ((u32)(s[i + 1] & 0x3F) << (6 * (cl - 2)));
+        if (cl >= 3 && i + 2 < n) cp |= (u32)(s[i + 2] & 0x3F) << (6 * (cl - 3));
+        if (cl >= 4 && i + 3 < n) cp |= (u32)(s[i + 3] & 0x3F);
+        if (cp > 0xFF) { free(b); return -1; }
+        b[w++] = (u8)cp;
+        i += cl;
+    }
+    *out = b;
+    return (i32)w;
+}
+static AklVal akl_m_btoa(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (!akl_b64_tables_ready) { akl_b64_tables_init(); akl_b64_tables_ready = 1; }
+    u32 si = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
+    if (rt->err[0]) { akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    u32 n = 0;
+    const u8 *s = akl_str(rt, si, &n);
+    u8 *lat = NULL;
+    i32 ln = akl_b64_latin1(s, n, &lat);
+    if (ln < 0) {
+        if (ln == -2) { akl_errf(rt, "oom: btoa"); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+        free(lat);
+        akl_native_throw(rt, "InvalidCharacterError: Invalid character");
+        return akl_mkundefined();
+    }
+    u32 olen = (u32)(((u32)ln + 2) / 3) * 4;
+    u8 *out = (u8 *)malloc(olen ? olen : 1);
+    if (!out) { free(lat); akl_errf(rt, "oom: btoa"); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    u32 w = 0;
+    for (u32 i = 0; i < (u32)ln; i += 3) {
+        u32 b0 = lat[i], b1 = i + 1 < (u32)ln ? lat[i + 1] : 0, b2 = i + 2 < (u32)ln ? lat[i + 2] : 0;
+        out[w++] = akl_b64_enc[b0 >> 2];
+        out[w++] = akl_b64_enc[((b0 & 3) << 4) | (b1 >> 4)];
+        out[w++] = i + 1 < (u32)ln ? akl_b64_enc[((b1 & 15) << 2) | (b2 >> 6)] : (u8)'=';
+        out[w++] = i + 2 < (u32)ln ? akl_b64_enc[b2 & 63] : (u8)'=';
+    }
+    free(lat);
+    AklVal r = akl_mkstring(rt, (const char *)out, olen);
+    free(out);
+    if (r == AKL_VAL_UNDEF) { akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    return r;
+}
+static AklVal akl_m_atob(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    if (!akl_b64_tables_ready) { akl_b64_tables_init(); akl_b64_tables_ready = 1; }
+    u32 si = akl_to_string(rt, argc > 0 ? argv[0] : akl_mkundefined());
+    if (rt->err[0]) { akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    u32 n = 0;
+    const u8 *s = akl_str(rt, si, &n);
+    u8 *clean = (u8 *)malloc(n ? n : 1);
+    if (!clean) { akl_errf(rt, "oom: atob"); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    u32 cl = 0;
+    for (u32 i = 0; i < n; i++) {
+        u8 c = s[i];
+        if (c == '\t' || c == '\n' || c == '\f' || c == '\r' || c == ' ') continue;
+        clean[cl++] = c;
+    }
+    if (cl % 4 == 1) {
+        free(clean);
+        akl_native_throw(rt, "InvalidCharacterError: The string to be decoded is not correctly encoded.");
+        return akl_mkundefined();
+    }
+    /* 文字検査（V8/WHATWG 準拠）: '=' は各 4 文字グループの末尾 1-2 文字（i%4==2 または 3）
+     * にのみ初出でき、初出後は全て '=' でなければならない。 */
+    u32 pad = UINT32_MAX;
+    for (u32 i = 0; i < cl; i++) {
+        u8 c = clean[i];
+        if (c == '=') {
+            if (pad == UINT32_MAX) {
+                if (i % 4 != 2 && i % 4 != 3) {
+                    free(clean);
+                    akl_native_throw(rt, "InvalidCharacterError: Invalid character");
+                    return akl_mkundefined();
+                }
+                pad = i;
+            }
+        } else {
+            if (pad != UINT32_MAX || akl_b64_dec[c] < 0) {
+                free(clean);
+                akl_native_throw(rt, "InvalidCharacterError: Invalid character");
+                return akl_mkundefined();
+            }
+        }
+    }
+    u32 vlen = pad == UINT32_MAX ? cl : pad;
+    u32 obytes = vlen / 4 * 3 + (vlen % 4 == 2 ? 1 : vlen % 4 == 3 ? 2 : 0);
+    u8 *out = (u8 *)malloc(obytes ? obytes : 1);
+    if (!out) { free(clean); akl_errf(rt, "oom: atob"); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    u32 w = 0;
+    for (u32 i = 0; i + 3 < vlen; i += 4) {
+        u32 v = ((u32)akl_b64_dec[clean[i]] << 18) | ((u32)akl_b64_dec[clean[i + 1]] << 12) |
+                ((u32)akl_b64_dec[clean[i + 2]] << 6) | (u32)akl_b64_dec[clean[i + 3]];
+        out[w++] = (u8)(v >> 16);
+        out[w++] = (u8)(v >> 8);
+        out[w++] = (u8)v;
+    }
+    u32 rem = vlen % 4;
+    if (rem == 2) {
+        u32 v = ((u32)akl_b64_dec[clean[vlen - 2]] << 18) | ((u32)akl_b64_dec[clean[vlen - 1]] << 12);
+        out[w++] = (u8)(v >> 16);
+    } else if (rem == 3) {
+        u32 v = ((u32)akl_b64_dec[clean[vlen - 3]] << 18) | ((u32)akl_b64_dec[clean[vlen - 2]] << 12) |
+                ((u32)akl_b64_dec[clean[vlen - 1]] << 6);
+        out[w++] = (u8)(v >> 16);
+        out[w++] = (u8)(v >> 8);
+    }
+    free(clean);
+    u32 u8len = 0;
+    for (u32 i = 0; i < w; i++) u8len += out[i] < 0x80 ? 1 : 2;
+    u8 *u8s = (u8 *)malloc(u8len ? u8len : 1);
+    if (!u8s) { free(out); akl_errf(rt, "oom: atob"); akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    u32 uw = 0;
+    for (u32 i = 0; i < w; i++) {
+        u32 cp = out[i];
+        if (cp < 0x80) u8s[uw++] = (u8)cp;
+        else { u8s[uw++] = (u8)(0xC0 | (cp >> 6)); u8s[uw++] = (u8)(0x80 | (cp & 63)); }
+    }
+    free(out);
+    AklVal r = akl_mkstring(rt, (const char *)u8s, u8len);
+    free(u8s);
+    if (r == AKL_VAL_UNDEF) { akl_native_throw(rt, rt->err); return akl_mkundefined(); }
+    return r;
 }
 
 /* Promise.prototype.then(onFulfilled, onRejected): v0.6 マイクロタスク化。
@@ -13374,6 +13554,9 @@ static bool akl_builtins_install(AklRT *rt) {
     u32 n_clearTimeout = akl_mkstr(rt, (const u8 *)"clearTimeout", 12);
     u32 n_setInterval = akl_mkstr(rt, (const u8 *)"setInterval", 11);
     u32 n_clearInterval = akl_mkstr(rt, (const u8 *)"clearInterval", 13);
+    u32 n_queueMicrotask = akl_mkstr(rt, (const u8 *)"queueMicrotask", 14);
+    u32 n_atob = akl_mkstr(rt, (const u8 *)"atob", 4);
+    u32 n_btoa = akl_mkstr(rt, (const u8 *)"btoa", 4);
     if (n_nan == UINT32_MAX || n_parseInt == UINT32_MAX || n_parseFloat == UINT32_MAX ||
         n_isNaN == UINT32_MAX || n_isFinite == UINT32_MAX) return false;
     AklVal math = akl_builtin_mkmath(rt);
@@ -13630,7 +13813,10 @@ static bool akl_builtins_install(AklRT *rt) {
         {n_isNaN, akl_m_isNaN}, {n_isFinite, akl_m_isFinite},
         /* v0.7: タイマー（eval 完了後に 1 回実行の近似。AKL_COMPAT 参照） */
         {n_setTimeout, akl_m_setTimeout}, {n_clearTimeout, akl_m_clearTimeout},
-        {n_setInterval, akl_m_setInterval}, {n_clearInterval, akl_m_clearInterval}
+        {n_setInterval, akl_m_setInterval}, {n_clearInterval, akl_m_clearInterval},
+        /* v0.10: queueMicrotask / atob / btoa（WPT 準拠） */
+        {n_queueMicrotask, akl_m_queueMicrotask},
+        {n_atob, akl_m_atob}, {n_btoa, akl_m_btoa}
     };
     /* String / Number / Boolean コンストラクタ（呼び出し = 変換。new は空オブジェクト近似） */
     {
@@ -13703,6 +13889,7 @@ static bool akl_builtins_install(AklRT *rt) {
         memcpy(buf, gp, gn);
         buf[gn] = 0;
         bool ok = akl_native_register(rt, buf, g[i].f, NULL);
+        fprintf(stderr, "[g] register %s ok=%d\n", buf, ok ? 1 : 0);
         free(buf);
         if (!ok) return false;
     }
@@ -13772,6 +13959,15 @@ static bool akl_builtins_install(AklRT *rt) {
             rt->objs[fn].u.nat.udata = NULL;
             if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = fn;
             if (!obj_prop_set(rt, &rt->objs[co], cn, AKL_MK_OBJ(fn))) return false;
+            /* v0.10: エラーコンストラクタの name プロパティ（V8 準拠。WPT の
+             * assert_throws_js(TypeError, ...) が errType.name を参照する）。
+             * 必ず akl_intern で作る（akl_mkstring 直接だと intern 一意性が壊れる） */
+            {
+                u32 ename = akl_intern(rt, (const u8 *)"name", 4, NULL);
+                u32 envid = akl_intern(rt, (const u8 *)ef[i].n, (u32)strlen(ef[i].n), NULL);
+                if (ename == UINT32_MAX || envid == UINT32_MAX) return false;
+                if (!obj_prop_set(rt, &rt->objs[co], ename, AKL_MK_OBJ(envid))) return false;
+            }
             if (!akl_bind_global(rt, ef[i].n, ev)) return false;
         }
         /* v0.6: globalThis は HANDLE 化（グローバル名を動的解決）。lodash 等は
@@ -14091,8 +14287,9 @@ static AklVal akl_native_err_to_js(AklRT *rt) {
     char nb[256];
     snprintf(nb, sizeof nb, "%s", rt->err[0] ? rt->err : "Error");
     rt->err[0] = 0;
-    static const char *const NMS[7] = { "TypeError", "RangeError", "SyntaxError",
-                                        "ReferenceError", "EvalError", "URIError", "Error" };
+    static const char *const NMS[8] = { "TypeError", "RangeError", "SyntaxError",
+                                        "ReferenceError", "EvalError", "URIError",
+                                        "InvalidCharacterError", "Error" };
     /* "Name: message" の先頭分解。v0.5: 既知エラー名を「先頭から走査して最初の既知名」で
      * 選ぶ（"uncaught exception: Error: boom" のような wrap 文字列でも .name/.message を
      * 正しく復元する。最初の区分が未知でも次区分が既知ならそちらを採用）。 */
@@ -14105,7 +14302,7 @@ static AklVal akl_native_err_to_js(AklRT *rt) {
         const char *col = strstr(start, ": ");
         if (!col) break;
         u32 nlen = (u32)(col - start);
-        for (int k = 0; k < 7; k++) {
+        for (int k = 0; k < 8; k++) {
             if (strlen(NMS[k]) == nlen && memcmp(start, NMS[k], nlen) == 0) {
                 nm = NMS[k];
                 ms = col + 2;

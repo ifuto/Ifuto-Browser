@@ -54,6 +54,21 @@ static double now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
+/* v0.10: print(...) グローバル（WPT ランナー等の結果出力用。JS の console.log 相当）。
+ * 各引数を ToString して空白区切り 1 行で出力。戻り値は undefined。
+ * 既存の vsx 突合テストは print を使わないため影響なし。 */
+static AklVal cli_print(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
+    (void)self; (void)udata;
+    for (int i = 0; i < argc; i++) {
+        if (i) fputc(' ', stdout);
+        AklVal sv = akl_tostring(rt, argv[i]);
+        uint32_t len;
+        const char *s = akl_as_str(rt, sv, &len);
+        if (s) fwrite(s, 1, len, stdout);
+    }
+    fputc('\n', stdout);
+    return akl_mkundefined();
+}
 static int cmpd(const void *a, const void *b) {
     double x = *(const double *)a, y = *(const double *)b;
     return x < y ? -1 : x > y ? 1 : 0;
@@ -145,6 +160,7 @@ int main(int argc, char **argv) {
         if (!tn || !tn[0]) { if (budget) akl_set_insn_budget(rt, budget); }
         if (!use_cojit) akl_set_cojit(rt, 0);
         AklVal v;
+        if (!akl_native_register(rt, "print", cli_print, NULL)) { fprintf(stderr, "print register failed\n"); akl_free(rt); return 1; }
         akl_set_module_loader(rt, cli_module_loader, NULL);
         akl_set_module_base(rt, file);
         double t0 = now_ms();
