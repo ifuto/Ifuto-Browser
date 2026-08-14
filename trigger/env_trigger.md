@@ -12,7 +12,9 @@ RUST_NIGHTLY=on
 CLIPPY=on
 KANI=on
 MIRI=on
-RUDRA=on
+# Rudra はメンテ停止中のため最新 rustc でビルド不能（Actions 実走で確認）。off にすると
+# env_trigger.yml の該当ステップがスキップされ、ジョブ全体は成功する。
+RUDRA=off
 CARGO_AUDIT=on
 CARGO_DENY=on
 CARGO_GEIGER=on
