@@ -18,3 +18,5 @@ CARGO_DENY=on
 CARGO_GEIGER=on
 # ビルドに約 1 時間かかるため、必要な時だけ on にすること
 VERUS=off
+
+# 最終発火: 2026-08-14（ユーザーが yml を配置した後の確認）
