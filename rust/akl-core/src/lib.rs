@@ -20,6 +20,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// 文字列インターン層（フェーズ 1）。
+pub mod string;
+
 /// タグ空間マスク（上位 16 bit が 0xFFFF）。
 pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 

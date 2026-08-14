@@ -45,9 +45,66 @@ Rust へ段階的に移行する。**1 フェーズ = 1 検証ゲート**を必�
 ## 現在地（2026-08-14 時点）
 
 - フェーズ 0 着手: `rust/akl-core`（AklVal newtype + int_add fast path + Kani 証明 7 件）
-- GitHub Actions 基盤: `env_trigger.yml` / `trigger.yml` 構築済み
-- ローカルに Rust がないため、最初の検証実行は `trigger/env_trigger.md` push 後
-  `trigger/trigger.md` push で行う（結果は `env_status.md` / `trigger/result.md` に反映）
+- フェーズ 1 着手: `rust/akl-core/src/string.rs`（Interner。HashMap ベースで
+  「intern 一意性」「GC 死エントリ劣化」「二重 free」を型レベルで排除。Kani 証明 4 件）
+- GitHub Actions 基盤: `env_trigger.yml` / `trigger.yml` 設計済み
+  （`docs/ACTIONS_SETUP.md` に全文。**ユーザーが .github/workflows/ に手動配置**）
+- ローカルに Rust がないため、最初の検証実行はユーザーの yml 配置後、
+  `trigger/env_trigger.md` push → `trigger/trigger.md` push で行う
+
+## フェーズ 2 設計メモ: GC（mark & sweep）の Rust での安全な書き方
+
+C 実装の GC（akl_gc）は以下を手動で管理しており、それぞれが過去に実バグを生んだ:
+- ルート集合（stk / globals / mtq / timers / nury / fn_protos / comp_pins…）の列挙漏れ
+  → 生存オブジェクトが回収される（"cap env chain broken" 等）
+- スイープ時の free 漏れ・二重 free（文字列 bytes / props / arr.v / env.vals / regex…）
+- free-list の再利用と「コンパイル中 pin 区間」の整合（compiling 中は free-list 禁止）
+
+Rust では以下の形で安全に移植する（unsafe 不要の設計）:
+
+```text
+struct Rt {
+    objs: Vec<Slot>,          // Slot = Option<AklObj>（C の obj 配列 + kind==0 に相当）
+    free: Vec<u32>,           // 空きスロットリスト
+    // ルート集合は全て Rt のフィールドとして明示（列挙漏れを型で防ぐ）
+    globals: Vec<Global>,     // name: StrId, value: AklVal
+    stk: Vec<AklVal>,
+    timers: Vec<AklVal>,
+    // ...
+}
+
+impl Rt {
+    fn gc(&mut self) {
+        // 1. mark: ルート集合から到達可能な index を worklist で辿る
+        //    （AklObj の参照フィールドは enum で型付けされているため、
+        //      「どの index が子か」はコンパイラが保証 = 伝播漏れが起きない）
+        // 2. sweep: 未到達 Slot を take() してドロップ
+        //    （所有権により子リソースが自動解放 = free 漏れ・二重 free が起きない）
+        // 3. free リストに index を積む
+    }
+}
+```
+
+ポイント:
+- **AklObj の参照フィールドを enum で型付け**: `Obj::Arr { v: Vec<AklVal> }` 等。
+  GC の伝播は「enum の全参照フィールド」を走査すればよく、C の
+  `akl_gc_kind_children` の switch と違って **追加漏れがコンパイルエラーになる**
+  （non_exhaustive な match 警告）。
+- **スイープ = ドロップ**: `slot.take()` で `AklObj` をムーブアウトすると、
+  `Vec<AklVal>` や `Box<str>` が自動で解放される。C の手動 free が消える。
+- **ルート集合はフィールド**: ローカル変数にルートを退避する C の
+  `root_stks`（連結リスト）も、`Vec<Vec<AklVal>>` のフィールドに置き換え可能。
+- 検証: 到達可能性の閉包（mark 後の生存集合がルートから辿れる集合と一致）を
+  Kani で証明、Miri で実行時検査、`check_uaf.py` の C 版と突合。
+
+## フェーズ 3 設計メモ: VM（vm_exec）の移植方針
+
+- バイトコードは C と同じ命令セット（OP_*）を維持し、`enum Op` + 即値の
+  `decode` を 1 箇所に集約（C の `akl_op_imm_len` 表の drift 問題を構造的に排除）
+- 命令ハンドラは `fn exec(&mut Rt, pc: &mut usize, ...)` の巨大 match ではなく、
+  命令ごとの小さな関数 + ディスパッチ（Kani が各命令のスタック効果を証明しやすい形）
+- スタック操作は `Vec<AklVal>` の push/pop（C の AKL_PUSH/AKL_POP マクロ + 下限検査
+  が不要になる。範囲外はパニック = バグの早期検出）
 
 ## リスクと対策
 
