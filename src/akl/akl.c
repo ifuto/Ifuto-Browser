@@ -488,7 +488,7 @@ static u32 akl_gc(AklRT *rt) {
     akl_gc_mark_val(rt, rt->reentry_exc, mk);
     akl_gc_mark_val(rt, rt->native_exc, mk);
     /* v0.6: マイクロタスクキューと Promise 待機リスト（fn/値/result promise を根に） */
-    for (u32 i = rt->mt_head; i + 2 < rt->mt_n; i += 3) {
+    for (u32 i = rt->mt_head; i + 3 < rt->mt_n; i += 4) { /* v0.10: 4 連（noargs フラグ含む） */
         akl_gc_mark_val(rt, rt->mtq[i], mk);
         akl_gc_mark_val(rt, rt->mtq[i + 1], mk);
         akl_gc_mark_val(rt, rt->mtq[i + 2], mk);
@@ -10174,8 +10174,15 @@ static AklVal akl_m_arr_map(AklRT *rt, AklVal self, int argc, const AklVal *argv
     if (akl_is_undefined(res) && rt->err[0]) { rt->n_nury = nur0; return akl_mkundefined(); }
     bool ok = true;
     for (u32 i = 0; i < n; i++) {
+        /* v0.10 UAF 修正: コールバック（akl_call）中の GC が rt->objs を realloc する
+         * ため、o は毎回再取得する（旧実装はループ前のポインタを保持 → use-after-free。
+         * ASan で akl_m_arr_map の heap-use-after-free として検出）。要素バッファも
+         * コールバックが元配列を変更（push/pop/splice）すると realloc され得るので、
+         * 参照は全て再取得後の o 経由にする。範囲外（コールバックが要素を削除）は
+         * undefined を渡す（V8 の HasProperty チェック相当の近似）。 */
+        AklObj *o2 = &rt->objs[(u32)ai];
         AklVal args[3];
-        args[0] = o->u.arr.v[i];
+        args[0] = i < o2->u.arr.n ? o2->u.arr.v[i] : akl_mkundefined();
         args[1] = akl_mknum((double)i);
         args[2] = self;
         AklVal r;
@@ -10212,13 +10219,18 @@ static AklVal akl_m_arr_filter(AklRT *rt, AklVal self, int argc, const AklVal *a
     bool ok = true;
     u32 w = 0;
     for (u32 i = 0; i < n; i++) {
+        /* v0.10 UAF 修正: map と同様、o は毎回再取得（コールバックの GC で rt->objs
+         * が realloc され得る）。要素は値コピーしてから使う（truthy 判定後に再参照
+         * しない）。要素削除は undefined 扱い（V8 相当）。 */
+        AklObj *o2 = &rt->objs[(u32)ai];
+        AklVal elem = i < o2->u.arr.n ? o2->u.arr.v[i] : akl_mkundefined();
         AklVal args[3];
-        args[0] = o->u.arr.v[i];
+        args[0] = elem;
         args[1] = akl_mknum((double)i);
         args[2] = self;
         AklVal r;
         if (!akl_call(rt, fn, 3, args, &r)) { ok = false; break; }
-        if (akl_truthy(rt, r)) outv[w++] = o->u.arr.v[i];
+        if (akl_truthy(rt, r)) outv[w++] = elem;
         rt->objs[oi].u.arr.n = w;
     }
     rt->n_nury = nur0;
@@ -10242,8 +10254,10 @@ static AklVal akl_m_arr_forEach(AklRT *rt, AklVal self, int argc, const AklVal *
     u32 n = o->u.arr.n;
     u32 nur0 = rt->n_nury;
     for (u32 i = 0; i < n; i++) {
+        /* v0.10 UAF 修正: map/filter と同様、o は毎回再取得 */
+        AklObj *o2 = &rt->objs[(u32)ai];
         AklVal args[3];
-        args[0] = o->u.arr.v[i];
+        args[0] = i < o2->u.arr.n ? o2->u.arr.v[i] : akl_mkundefined();
         args[1] = akl_mknum((double)i);
         args[2] = self;
         AklVal r;
@@ -10269,8 +10283,11 @@ static AklVal akl_m_arr_scan(AklRT *rt, AklVal self, int argc, const AklVal *arg
     u32 n = o->u.arr.n;
     u32 nur0 = rt->n_nury;
     for (u32 i = 0; i < n; i++) {
+        /* v0.10 UAF 修正: map/filter と同様、o は毎回再取得。要素は値コピー */
+        AklObj *o2 = &rt->objs[(u32)ai];
+        AklVal elem = i < o2->u.arr.n ? o2->u.arr.v[i] : akl_mkundefined();
         AklVal args[3];
-        args[0] = o->u.arr.v[i];
+        args[0] = elem;
         args[1] = akl_mknum((double)i);
         args[2] = self;
         AklVal r;
@@ -10282,7 +10299,7 @@ static AklVal akl_m_arr_scan(AklRT *rt, AklVal self, int argc, const AklVal *arg
         bool t = akl_truthy(rt, r);
         if (mode == 0 && t) { rt->n_nury = nur0; return akl_mkbool(true); }   /* some */
         if (mode == 1 && !t) { rt->n_nury = nur0; return akl_mkbool(false); }  /* every */
-        if (mode == 2 && t) { rt->n_nury = nur0; return o->u.arr.v[i]; }       /* find */
+        if (mode == 2 && t) { rt->n_nury = nur0; return elem; }                /* find */
         if (mode == 3 && t) { rt->n_nury = nur0; return akl_mknum((double)i); } /* findIndex */
     }
     rt->n_nury = nur0;
@@ -10329,9 +10346,11 @@ static AklVal akl_m_arr_reduce(AklRT *rt, AklVal self, int argc, const AklVal *a
         start = 1;
     }
     for (u32 i = start; i < n; i++) {
+        /* v0.10 UAF 修正: map/filter と同様、o は毎回再取得 */
+        AklObj *o2 = &rt->objs[(u32)ai];
         AklVal args[4];
         args[0] = acc;
-        args[1] = o->u.arr.v[i];
+        args[1] = i < o2->u.arr.n ? o2->u.arr.v[i] : akl_mkundefined();
         args[2] = akl_mknum((double)i);
         args[3] = self;
         AklVal r;
@@ -11803,8 +11822,10 @@ static AklVal akl_m_promise_ctor(AklRT *rt, AklVal self, int argc, const AklVal 
 }
 
 /* マイクロタスクキューへの push（{fn, value, result_promise} 3 連。失敗時 false） */
-static bool akl_mtq_push(AklRT *rt, AklVal fn, AklVal val, u32 result_promise) {
-    if (rt->mt_n + 3 > rt->mt_cap) {
+/* v0.10: noargs=true ならコールバックを引数なしで呼ぶ（queueMicrotask 用。V8 準拠）。
+ * エントリは {fn, val, result_promise, noargs} の 4 連。 */
+static bool akl_mtq_push(AklRT *rt, AklVal fn, AklVal val, u32 result_promise, bool noargs) {
+    if (rt->mt_n + 4 > rt->mt_cap) {
         u32 nc = rt->mt_cap ? rt->mt_cap * 2 : 24;
         AklVal *nq = (AklVal *)realloc(rt->mtq, (u64)nc * sizeof(AklVal));
         if (!nq) { akl_errf(rt, "oom: microtask queue"); return false; }
@@ -11813,6 +11834,7 @@ static bool akl_mtq_push(AklRT *rt, AklVal fn, AklVal val, u32 result_promise) {
     rt->mtq[rt->mt_n++] = fn;
     rt->mtq[rt->mt_n++] = val;
     rt->mtq[rt->mt_n++] = AKL_MK_OBJ(result_promise);
+    rt->mtq[rt->mt_n++] = noargs ? AKL_VAL_TRUE : AKL_VAL_FALSE;
     return true;
 }
 /* pending Promise への待機登録（{promise, onF, onR, result} 4 連。失敗時 false） */
@@ -11846,7 +11868,7 @@ static void akl_promise_settle(AklRT *rt, u32 res_idx, u8 state, AklVal out) {
             AklVal onF = rt->pwait[i + 1], onR = rt->pwait[i + 2];
             u32 res2 = akl_get_obj(rt->pwait[i + 3]);
             AklVal fn = state == 2 ? onR : onF;
-            (void)akl_mtq_push(rt, fn, out, res2);
+            (void)akl_mtq_push(rt, fn, out, res2, false);
             memmove(&rt->pwait[i], &rt->pwait[i + 4], (rt->pw_n - i - 4) * sizeof(AklVal));
             rt->pw_n -= 4;
         } else {
@@ -11863,10 +11885,11 @@ static void akl_microtask_drain(AklRT *rt) {
     bool old_live = rt->gc_live;
     rt->gc_live = true; /* コールバック実行中の GC を有効化（HOF 再入と同一条件） */
     u32 guard = 0;
-    while (rt->mt_head + 2 < rt->mt_n && guard++ < 100000) {
+    while (rt->mt_head + 3 < rt->mt_n && guard++ < 100000) {
         AklVal fn = rt->mtq[rt->mt_head];
         AklVal val = rt->mtq[rt->mt_head + 1];
         u32 res_idx = akl_get_obj(rt->mtq[rt->mt_head + 2]);
+        bool noargs = rt->mtq[rt->mt_head + 3] == AKL_VAL_TRUE; /* v0.10: queueMicrotask は引数なし */
         /* コールバック実行中はキューに残したまま（fn/val が GC ルートのまま） */
         AklVal out = val;
         if (akl_is_objv(fn)) {
@@ -11876,7 +11899,9 @@ static void akl_microtask_drain(AklRT *rt) {
                 AklVal r = AKL_VAL_UNDEF;
                 rt->err[0] = 0;
                 rt->native_err = false;
-                if (akl_call_this(rt, fn, AKL_VAL_UNDEF, 1, &val, &r)) {
+                bool cb_ok = noargs ? akl_call_this(rt, fn, AKL_VAL_UNDEF, 0, NULL, &r)
+                                    : akl_call_this(rt, fn, AKL_VAL_UNDEF, 1, &val, &r);
+                if (cb_ok) {
                     out = r;
                 } else {
                     /* 例外は reject 相当（メッセージを文字列化して解決値に） */
@@ -11891,7 +11916,7 @@ static void akl_microtask_drain(AklRT *rt) {
                 }
             }
         }
-        rt->mt_head += 3;
+        rt->mt_head += 4;
         if (rt->mt_head > 4096 && rt->mt_head >= rt->mt_n) { /* 先頭が進みすぎたら圧縮 */
             rt->mt_n = 0; rt->mt_head = 0;
         } else if (rt->mt_head >= rt->mt_n) {
@@ -11936,9 +11961,6 @@ static void akl_timer_drain(AklRT *rt) {
  * V8 は文字列も許すが AKL は関数のみ（明白失敗）。 */
 static AklVal akl_m_setTimeout(AklRT *rt, AklVal self, int argc, const AklVal *argv, void *udata) {
     (void)self; (void)udata;
-    fprintf(stderr, "[qm] argc=%d is_obj=%d kind=%d\n", argc,
-            argc > 0 && akl_is_objv(argv[0]) ? 1 : 0,
-            argc > 0 && akl_is_objv(argv[0]) ? rt->objs[akl_get_obj(argv[0])].kind : -1);
     if (argc < 1 || !akl_is_objv(argv[0]) ||
         (rt->objs[akl_get_obj(argv[0])].kind != AKL_OK_FUNC &&
          rt->objs[akl_get_obj(argv[0])].kind != AKL_OK_NATIVE))
@@ -11985,7 +12007,7 @@ static AklVal akl_m_queueMicrotask(AklRT *rt, AklVal self, int argc, const AklVa
     rt->objs[ro].u.pr.state = 1;
     rt->objs[ro].u.pr.value = akl_mkundefined();
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ro;
-    if (!akl_mtq_push(rt, argv[0], akl_mkundefined(), ro)) return akl_mkundefined();
+    if (!akl_mtq_push(rt, argv[0], akl_mkundefined(), ro, true)) return akl_mkundefined();
     return akl_mkundefined();
 }
 
@@ -12169,7 +12191,7 @@ static AklVal akl_m_promise_then(AklRT *rt, AklVal self, int argc, const AklVal 
     }
     /* resolved/rejected: マイクロタスクキューへ */
     AklVal fn = st == 2 ? onR : onF;
-    if (!akl_mtq_push(rt, fn, val, ro)) return akl_mkundefined();
+    if (!akl_mtq_push(rt, fn, val, ro, false)) return akl_mkundefined();
     return rv;
 }
 
@@ -12207,7 +12229,7 @@ static AklVal akl_m_promise_finally(AklRT *rt, AklVal self, int argc, const AklV
     rt->objs[ro].u.pr.state = 0;
     rt->objs[ro].u.pr.value = akl_mkundefined();
     if (rt->n_nury < AKL_NURY_CAP) rt->nury[rt->n_nury++] = ro;
-    if (!akl_mtq_push(rt, onF, val, ro)) return akl_mkundefined();
+    if (!akl_mtq_push(rt, onF, val, ro, false)) return akl_mkundefined();
     return AKL_MK_OBJ(ro);
 }
 
@@ -13889,7 +13911,6 @@ static bool akl_builtins_install(AklRT *rt) {
         memcpy(buf, gp, gn);
         buf[gn] = 0;
         bool ok = akl_native_register(rt, buf, g[i].f, NULL);
-        fprintf(stderr, "[g] register %s ok=%d\n", buf, ok ? 1 : 0);
         free(buf);
         if (!ok) return false;
     }
@@ -18047,10 +18068,13 @@ AklRT *akl_new(void) {
     /* main 関数エントリ（entry 0。code 範囲は eval ごとの末尾まで） */
     if (akl_obj_new(rt) == UINT32_MAX) { free(rt->stk); free(rt); return NULL; }
     /* obj0 = 予約（壊れ index 検出を容易に） */
-    /* JS グローバル定数（書換不可）: NaN, Infinity */
+    /* JS グローバル定数（書換不可）: NaN, Infinity。
+     * 名前は必ず akl_intern で作る（INTERNED フラグが付き strtab に載る。akl_mkstr
+     * 直接だと実行時の intern が別 STR を作り、グローバル解決が ReferenceError に
+     * なる — interned フラグ導入時の実測リグレッション） */
     {
-        u32 n_nan = akl_mkstr(rt, (const u8 *)"NaN", 3);
-        u32 n_inf = akl_mkstr(rt, (const u8 *)"Infinity", 8);
+        u32 n_nan = akl_intern(rt, (const u8 *)"NaN", 3, NULL);
+        u32 n_inf = akl_intern(rt, (const u8 *)"Infinity", 8, NULL);
         u32 g1 = n_nan == UINT32_MAX ? UINT32_MAX : cg_global_add(rt, n_nan, 1);
         u32 g2 = n_inf == UINT32_MAX ? UINT32_MAX : cg_global_add(rt, n_inf, 1);
         if (g1 == UINT32_MAX || g2 == UINT32_MAX) {
