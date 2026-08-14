@@ -228,15 +228,14 @@ mod tests {
         let a = t.alloc(obj(AklVal::mk_int(1))).unwrap();
         let b = t.alloc(obj(AklVal::mk_int(2))).unwrap();
         assert_eq!(t.live(), 2);
-        // 到達不能 a を GC → free-list に戻る
-        t.gc(&[]);
+        // ルートを a のみにして GC → 到達不能な b だけが sweep され free-list に戻る
+        t.gc(&[vec![AklVal::mk_obj(a)]]);
         assert_eq!(t.live(), 1);
         assert_eq!(t.free_count(), 1);
-        // 再利用: 新しい alloc は free-list の id を使う
+        // 再利用: 新しい alloc は free-list の id（= b）を使う
         let c = t.alloc(obj(AklVal::mk_int(3))).unwrap();
-        assert_eq!(c, a, "free-list は先頭を再利用する");
+        assert_eq!(c, b, "free-list は最後に sweep された id を再利用する");
         assert_eq!(t.live(), 2);
-        let _ = b;
     }
 
     #[test]
