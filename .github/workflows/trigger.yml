@@ -1,0 +1,112 @@
+# trigger.yml — 汎用実行トリガー
+#
+# trigger/trigger.md を push すると、このワークフローが起動し、
+# trigger.md に書かれたコマンド群を GitHub Actions ランナー上で順に実行する。
+#
+# 用途: ローカルサンドボックスでは実行できない作業
+#   - 外部ネットワークアクセス（ツールのダウンロード、リポジトリ取得）
+#   - 重いビルド（Verus 等）
+#   - 大量リソースが必要な検証（Kani/Miri/Rudra のフル実行）
+#
+# trigger.md の書き方:
+#   - `#` で始まる行はコメント
+#   - 空行は無視
+#   - それ以外の 1 行 = 1 コマンド（bash -c で実行。cwd はリポジトリルート）
+#   - コマンドの終了コードが 0 以外でも続行し、最終的に失敗として報告する
+#
+# セキュリティ:
+#   - push イベントのみで発火（PR / fork からは発火しない）
+#   - 実行されるのはリポジトリ内の trigger.md の内容のみ（外部入力なし）
+#   - 結果は trigger/result.md に自動追記コミットされる（トリガーパス外なので再発火しない）
+
+name: trigger
+
+on:
+  push:
+    paths:
+      - 'trigger/trigger.md'
+    branches:
+      - '**'
+
+permissions:
+  contents: write
+
+jobs:
+  run-trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: trigger.md の内容を実行
+        id: run
+        run: |
+          set +e
+          if [ ! -f trigger/trigger.md ]; then
+            echo "trigger/trigger.md がありません" >&2; exit 1
+          fi
+          # コメント行と空行を除いたコマンド列
+          grep -vE '^\s*(#|$)' trigger/trigger.md > /tmp/commands.txt
+          if [ ! -s /tmp/commands.txt ]; then
+            echo "実行するコマンドがありません（trigger.md はコメントのみ）"
+            echo "commands=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          n=0
+          while IFS= read -r line; do
+            n=$((n+1))
+            echo "===== [$n] $line ====="
+            bash -c "$line" > /tmp/out_$n.txt 2>&1
+            rc=$?
+            echo "----- exit=$rc -----"
+            cat /tmp/out_$n.txt | tail -40
+            echo "CMD_RESULT $n|$rc|$line" >> /tmp/cmd_results.txt
+          done < /tmp/commands.txt
+          echo "commands=$n" >> "$GITHUB_OUTPUT"
+          # 全コマンドの結果を result.md に保存（後続ステップがコミット）
+          {
+            echo "# 実行結果 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+            echo ""
+            echo "source: trigger/trigger.md @ ${{ github.sha }}"
+            echo ""
+            while IFS='|' read -r idx rc cmd; do
+              if [ "$rc" = "0" ]; then
+                echo "- [x] [$idx] \`$cmd\` — exit 0"
+              else
+                echo "- [ ] [$idx] \`$cmd\` — **exit $rc**"
+              fi
+            done < /tmp/cmd_results.txt
+          } > /tmp/result.md
+          # 失敗があればジョブを失敗させる（result.md はコミットされる）
+          if grep -q "exit [^0]" /tmp/result.md; then
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=ok" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: 結果を trigger/result.md に追記コミット
+        run: |
+          mkdir -p trigger
+          if [ -f trigger/result.md ]; then
+            cat /tmp/result.md >> trigger/result.md
+          else
+            cp /tmp/result.md trigger/result.md
+          fi
+          git config user.name "trigger-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add trigger/result.md
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "trigger: 実行結果を追記 [skip ci]"
+            git push
+          fi
+        shell: bash
+
+      - name: 失敗報告
+        if: steps.run.outputs.status == 'fail'
+        run: |
+          echo "::error::trigger.md の一部コマンドが失敗しました。詳細は trigger/result.md を確認してください。"
+          exit 1
