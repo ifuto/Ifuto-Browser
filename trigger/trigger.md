@@ -5,9 +5,8 @@
 # 結果は trigger/result.md に自動追記される。
 #
 # ローカルサンドボックスでできないこと（外部アクセス・重い検証）をここに書く。
-# 例: 環境構築後に `rust/` の全検証を回す。
 
-# --- Rust 移行フェーズ 0: akl-core の検証 ---
+# --- Rust 移行フェーズ 0-2: akl-core の全検証 ---
 
 cd rust && cargo build --workspace
 cd rust && cargo test --workspace
