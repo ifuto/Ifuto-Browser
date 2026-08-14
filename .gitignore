@@ -12,3 +12,4 @@ artifacts/
 ifuto-backup.bundle
 gmon.out
 gmon.sum
+rust/target/

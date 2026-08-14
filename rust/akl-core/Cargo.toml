@@ -1,0 +1,10 @@
+[package]
+name = "akl-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Aklus JS エンジンのコア値表現（NaN-box）。C 実装 src/akl/akl.c からの Rust 移行フェーズ 0"
+
+[dependencies]
+
+[dev-dependencies]
