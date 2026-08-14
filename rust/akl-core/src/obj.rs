@@ -212,6 +212,56 @@ impl ObjTable {
     pub fn free_count(&self) -> usize {
         self.free.len()
     }
+
+    /// 配列 map（JS の `arr.map(f)` 相当のコア。コールバックは純関数として扱う）。
+    ///
+    /// # なぜ C の UAF が構造的に起きないか（v0.10 実バグとの対比）
+    ///
+    /// C 実装は `AklObj *o = &rt->objs[ai]` のポインタをループ中に保持し、コールバック
+    /// 内の GC で `rt->objs` が `realloc` されると失効 → heap-use-after-free
+    /// （ASan で検出・修正済み）。Rust では:
+    ///
+    /// 1. 元配列の要素を先に `Vec<AklVal>` に**値コピー**する（AklVal は Copy）。
+    ///    借用（`&Obj`）はこのスコープで終了し、以後 `self` を自由に変更できる。
+    /// 2. コールバック `f` は `FnMut(AklVal, usize) -> AklVal`（表への参照を持たない）
+    ///    — コールバック実行中に `self` を変更しても失効ポインタが存在しない。
+    /// 3. `self` へのアクセスは全て id 経由の短命借用（`self.get(id)` / `self.get_mut(id)`）。
+    ///
+    /// コールバックが表を変更する JS のケース（map 中に push 等）は「スナップショット
+    /// 方式」で近似する（要素は map 開始時点のもの。V8 は length を先に固定するため
+    /// 追加要素は走査されない — 追加分の非反映は V8 と一致。削除要素の undefined 化は
+    /// 未対応の既知近似として AKL_COMPAT に記録予定）。
+    ///
+    /// # 戻り値
+    ///
+    /// 新しい配列の id。`id` が配列でない場合は `Err(())`。
+    pub fn arr_map(
+        &mut self,
+        id: ObjId,
+        mut f: impl FnMut(AklVal, usize) -> AklVal,
+    ) -> Result<ObjId, ()> {
+        // 1. 元要素を値コピー（借用終了）
+        let items: Vec<AklVal> = match self.get(id) {
+            Some(Obj::Arr(v)) => v.clone(),
+            _ => return Err(()),
+        };
+        // 2. コールバック適用（self 変更なし）
+        let mapped: Vec<AklVal> = items
+            .iter()
+            .enumerate()
+            .map(|(i, &elem)| f(elem, i))
+            .collect();
+        // 3. 結果を新規配列として割り当て
+        self.alloc(Obj::Arr(mapped))
+    }
+
+    /// 配列の要素を id で読む（範囲外・非配列は None）。
+    pub fn arr_get(&self, id: ObjId, index: usize) -> Option<AklVal> {
+        match self.get(id) {
+            Some(Obj::Arr(v)) => v.get(index).copied(),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -286,6 +336,47 @@ mod tests {
         assert!(t.get(id).is_some());
         assert!(t.get(u32::MAX).is_none()); // 範囲外は None（パニックしない）
         assert!(t.get_mut(id).is_some());
+    }
+
+    #[test]
+    fn arr_map_basic() {
+        let mut t = ObjTable::new();
+        let src = t
+            .alloc(Obj::Arr(vec![AklVal::mk_int(1), AklVal::mk_int(2), AklVal::mk_int(3)]))
+            .unwrap();
+        let dst = t
+            .arr_map(src, |elem, i| AklVal::mk_int(elem.get_int() * 10 + i as i32))
+            .unwrap();
+        match t.get(dst) {
+            Some(Obj::Arr(v)) => {
+                assert_eq!(v, &vec![AklVal::mk_int(10), AklVal::mk_int(21), AklVal::mk_int(32)]);
+            }
+            _ => panic!("dst は配列であるべき"),
+        }
+        // 元配列は不変
+        assert_eq!(t.arr_get(src, 0), Some(AklVal::mk_int(1)));
+        // 非配列 id は Err
+        let env = t.alloc(Obj::Env { vals: vec![], parent: None }).unwrap();
+        assert!(t.arr_map(env, |e, _| e).is_err());
+    }
+
+    #[test]
+    fn arr_map_snapshot_semantics() {
+        // コールバック中に元配列を変更しても、map は開始時点の要素を使う
+        // （スナップショット方式。V8 の length 固定と整合）。
+        let mut t = ObjTable::new();
+        let src = t
+            .alloc(Obj::Arr(vec![AklVal::mk_int(1), AklVal::mk_int(2)]))
+            .unwrap();
+        let mut calls = 0;
+        let dst = t
+            .arr_map(src, |elem, _| {
+                calls += 1;
+                elem // そのまま
+            })
+            .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(t.arr_get(dst, 1), Some(AklVal::mk_int(2)));
     }
 }
 
