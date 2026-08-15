@@ -221,3 +221,157 @@ source: trigger/trigger.md @ 8e49918b74cba54b34e4de34bbb3dddbd3078f28
 - [x] [CMD_RESULT 10] `trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `trigger/tc cargo prusti --version 2>/dev/null || trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-15T01:32:54Z) rc=0
+```
+==> Release toolchain-v1 が無いためビルドします（初回のみ・数十分）
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /home/runner/akl-toolchain/rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+info: downloading 3 components
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+
+  stable-x86_64-unknown-linux-gnu installed - rustc 1.97.1 (8bab26f4f 2026-07-14)
+
+
+Rust is installed now. Great!
+
+To get started you may need to restart your current shell.
+This would reload your PATH environment variable to include
+Cargo's bin directory (/home/runner/akl-toolchain/cargo/bin).
+
+To configure your current shell, you need to source
+the corresponding env file under /home/runner/akl-toolchain/cargo.
+
+This is usually done by running one of the following (note the leading DOT):
+. "/home/runner/akl-toolchain/cargo/env"            # For 
+sh/bash/zsh/ash/dash/pdksh
+source "/home/runner/akl-toolchain/cargo/env.fish"  # For fish
+source "/home/runner/akl-toolchain/cargo/env.nu"  # For nushell
+source "/home/runner/akl-toolchain/cargo/env.tcsh"  # For tcsh
+. "/home/runner/akl-toolchain/cargo/env.ps1"        # For pwsh
+source "/home/runner/akl-toolchain/cargo/env.xsh"   # For xonsh
+info: syncing channel updates for nightly-x86_64-unknown-linux-gnu
+info: latest update on 2026-08-14 for version 1.99.0-nightly (ba28ff76f 2026-08-13)
+info: downloading 3 components
+
+  nightly-x86_64-unknown-linux-gnu installed - rustc 1.99.0-nightly (ba28ff76f 2026-08-13)
+
+info: downloading component clippy
+info: downloading component rustfmt
+info: downloading component miri
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+  Installing /home/runner/akl-toolchain/cargo/bin/cargo-kani
+  Installing /home/runner/akl-toolchain/cargo/bin/kani
+   Installed package `kani-verifier v0.67.0` (executables `cargo-kani`, `kani`)
+[0/5] Running Kani first-time setup...
+[1/5] Ensuring the existence of: /home/runner/.kani/kani-0.67.0
+[2/5] Downloading Kani release bundle: kani-0.67.0-x86_64-unknown-linux-gnu.tar.gz
+[3/5] Installing rust toolchain version: nightly-2025-11-21-x86_64-unknown-linux-gnu
+info: syncing channel updates for nightly-2025-11-21-x86_64-unknown-linux-gnu
+info: latest update on 2025-11-21 for version 1.93.0-nightly (53732d5e0 2025-11-20)
+info: downloading 3 components
+
+  nightly-2025-11-21-x86_64-unknown-linux-gnu installed - rustc 1.93.0-nightly (53732d5e0 2025-11-20)
+
+[5/5] Successfully completed Kani first-time setup.
+cargo-kani 0.67.0
+  Installing /home/runner/akl-toolchain/cargo/bin/cargo-tarpaulin
+   Installed package `cargo-tarpaulin v0.37.1` (executable `cargo-tarpaulin`)
+  Installing /home/runner/akl-toolchain/cargo/bin/cargo-geiger
+   Installed package `cargo-geiger v0.13.0` (executable `cargo-geiger`)
+  Installing /home/runner/akl-toolchain/cargo/bin/cargo-fuzz
+   Installed package `cargo-fuzz v0.13.2` (executable `cargo-fuzz`)
+    Updating git repository `https://github.com/flux-rs/flux`
+error: could not find `flux` in https://github.com/flux-rs/flux with version `*`
+flux: skip
+`cargo install` is only for installing programs, and can't be used with libraries.
+To use a library crate, add it as a dependency to a Cargo project with `cargo add`.
+mirai: skip
+    Updating crates.io index
+error: could not find `prusti` in registry `crates-io` with version `=1.0.0`
+prusti: skip
+==> アーカイブ作成
+-rw-r--r-- 1 runner runner 918M Aug 15 01:32 /home/runner/akl-toolchain/akl-toolchain.tar.gz
+gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable. Example:
+  env:
+    GH_TOKEN: ${{ github.token }}
+==> Release toolchain-v1 作成完了
+```
+
+### clippy 実行 (2026-08-15T01:32:55Z)
+```
+    |                    ^                ^
+    |
+help: remove these parentheses
+    |
+237 -                 Ok((Step::Jump(*tgt)))
+237 +                 Ok(Step::Jump(*tgt))
+    |
+
+error[E0308]: mismatched types
+   --> akl-core/src/bytecode.rs:230:24
+    |
+230 |                     Ok((Step::Jump(*tgt)))
+    |                     -- ^^^^^^^^^^^^^^^^^^ expected `(Step, usize)`, found `Step`
+    |                     |
+    |                     arguments to this enum variant are incorrect
+    |
+    = note: expected tuple `(bytecode::Step, usize)`
+                found enum `bytecode::Step`
+help: the type constructed contains `bytecode::Step` due to the type of the argument passed
+   --> akl-core/src/bytecode.rs:230:21
+    |
+230 |                     Ok((Step::Jump(*tgt)))
+    |                     ^^^------------------^
+    |                        |
+    |                        this argument influences the type of `Ok`
+note: tuple variant defined here
+   --> /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/result.rs:561:4
+
+error[E0308]: mismatched types
+   --> akl-core/src/bytecode.rs:237:20
+    |
+237 |                 Ok((Step::Jump(*tgt)))
+    |                 -- ^^^^^^^^^^^^^^^^^^ expected `(Step, usize)`, found `Step`
+    |                 |
+    |                 arguments to this enum variant are incorrect
+    |
+    = note: expected tuple `(bytecode::Step, usize)`
+                found enum `bytecode::Step`
+help: the type constructed contains `bytecode::Step` due to the type of the argument passed
+   --> akl-core/src/bytecode.rs:237:17
+    |
+237 |                 Ok((Step::Jump(*tgt)))
+    |                 ^^^------------------^
+    |                    |
+    |                    this argument influences the type of `Ok`
+note: tuple variant defined here
+   --> /rustc/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/core/src/result.rs:561:4
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `akl-core` (lib) due to 6 previous errors
+```
+# 実行結果 (2026-08-15T01:33:13Z)
+
+source: trigger/trigger.md @ 450ae0e68c83dfff6105fdb0d3d33eaf25cc57d6
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [ ] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — **exit 101**
+- [ ] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — **exit 101**
+- [ ] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [ ] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace` — **exit 101**
+- [ ] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — **exit 1**
+- [x] [CMD_RESULT 7] `cd rust && (trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
