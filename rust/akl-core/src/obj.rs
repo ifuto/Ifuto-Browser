@@ -141,6 +141,11 @@ impl ObjTable {
         self.slots.len()
     }
 
+    /// スロットが 1 つも無いか。
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
     /// 生存オブジェクト数。
     pub fn live(&self) -> usize {
         self.live
@@ -210,8 +215,8 @@ impl ObjTable {
 
         // sweep
         let mut swept = 0;
-        for i in 0..n {
-            if !mark[i] && self.slots[i].take().is_some() {
+        for (i, m) in mark.iter().enumerate() {
+            if !m && self.slots[i].take().is_some() {
                 self.free.push(i as ObjId);
                 self.live -= 1;
                 swept += 1;
