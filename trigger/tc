@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# tc — ツールチェーン環境でコマンドを実行するラッパー（trigger.md の各行用）。
+# 使い方: trigger/tc <cmd...>  例: cd rust && trigger/tc timeout 300 cargo build
+# 事前ビルド済みツールチェーン（$HOME/akl-toolchain）を PATH に載せて exec する。
+set -u
+export RUSTUP_HOME="${TOOL_DIR:-$HOME/akl-toolchain}/rustup"
+export CARGO_HOME="${TOOL_DIR:-$HOME/akl-toolchain}/cargo"
+export PATH="$CARGO_HOME/bin:$PATH"
+exec "$@"
