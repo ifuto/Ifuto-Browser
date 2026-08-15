@@ -33,3 +33,70 @@ source: trigger/trigger.md @ 11ae9eba9f3110cb484992f363624663bb709cd7
 - [x] [CMD_RESULT 7] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 900 cargo kani --workspace` — exit 0
 - [x] [CMD_RESULT 8] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --locked prusti --version 1.0.0 2>&1 | tail -3 || echo "prusti install failed (version pin)"; cargo prusti --version 2>/dev/null || true'` — exit 0
 - [x] [CMD_RESULT 9] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+
+### clippy 実行 (2026-08-15T00:39:44Z)
+```
+    = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+    |
+200 ~             if !mark[i]
+201 ~                 && self.slots[i].take().is_some() {
+202 |                     self.free.push(i as ObjId);
+203 |                     self.live -= 1;
+204 |                     swept += 1;
+205 ~                 }
+    |
+
+error: this returns a `Result<_, ()>`
+   --> akl-core/src/obj.rs:238:5
+    |
+238 | /     pub fn arr_map(
+239 | |         &mut self,
+240 | |         id: ObjId,
+241 | |         mut f: impl FnMut(AklVal, usize) -> AklVal,
+242 | |     ) -> Result<ObjId, ()> {
+    | |__________________________^
+    |
+    = help: use a custom `Error` type instead
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#result_unit_err
+
+error: this operation has no effect
+  --> akl-core/src/lib.rs:55:34
+   |
+55 |     pub const UNDEF: Self = Self(TAG_MASK | 0);
+   |                                  ^^^^^^^^^^^^ help: consider reducing it to: `TAG_MASK`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#identity_op
+   = note: `-D clippy::identity-op` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::identity_op)]`
+
+error: missing documentation for a struct field
+  --> akl-core/src/obj.rs:60:11
+   |
+60 |     Env { vals: Vec<AklVal>, parent: Option<ObjId> },
+   |           ^^^^^^^^^^^^^^^^^
+   |
+   = note: `-D missing-docs` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(missing_docs)]`
+
+error: missing documentation for a struct field
+  --> akl-core/src/obj.rs:60:30
+   |
+60 |     Env { vals: Vec<AklVal>, parent: Option<ObjId> },
+   |                              ^^^^^^^^^^^^^^^^^^^^^
+
+error: could not compile `akl-core` (lib) due to 9 previous errors
+```
+# 実行結果 (2026-08-15T00:40:04Z)
+
+source: trigger/trigger.md @ ad54f1c670ee1321139dc7b2155479609a48262f
+
+- [x] [CMD_RESULT 1] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; rustup toolchain install nightly --profile minimal && rustup component add clippy rustfmt && rustup component add miri --toolchain nightly && rustc --version && cargo --version` — exit 0
+- [x] [CMD_RESULT 2] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 600 bash -c 'cargo install --locked kani-verifier 2>&1 | tail -5; cargo kani --version || echo "kani unavailable"'` — exit 0
+- [x] [CMD_RESULT 3] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 4] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo test --workspace` — exit 0
+- [ ] [CMD_RESULT 5] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [x] [CMD_RESULT 6] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 600 cargo +nightly miri test --workspace` — exit 0
+- [x] [CMD_RESULT 7] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 8] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --locked prusti --version 1.0.0 2>&1 | tail -3 || echo "prusti install failed (version pin)"; cargo prusti --version 2>/dev/null || true'` — exit 0
+- [x] [CMD_RESULT 9] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
