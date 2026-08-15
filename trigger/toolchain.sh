@@ -53,8 +53,8 @@ rustc --version
 cargo --version
 
 # 必須: Kani（形式検証）
-cargo install --locked kani-verifier 2>&1 | tail -2
-cargo kani --version
+cargo install kani-verifier 2>&1 | tail -3 || echo "kani: INSTALL FAILED"
+cargo kani --version 2>&1 || echo "kani: unavailable"
 
 # 補助（失敗しても続行。アーカイブには入るものだけ入る）
 cargo install cargo-tarpaulin 2>&1 | tail -2 || echo "tarpaulin: skip"
@@ -69,7 +69,16 @@ if [ -d "$HOME/.kani" ]; then
   cp -r "$HOME/.kani" "$TOOL_DIR/.kani"
 fi
 
-# ---------------- 3. アーカイブ作成 + リリース ----------------
+# ---------------- 3. 必須チェック ----------------
+if [ ! -x "$TOOL_DIR/cargo/bin/rustc" ]; then
+  echo "FATAL: rustc がありません（rustup インストール失敗）"
+  exit 1
+fi
+if ! "$TOOL_DIR/cargo/bin/cargo" kani --version >/dev/null 2>&1; then
+  echo "WARNING: kani が利用できません（後続の kani 検証は失敗します）"
+fi
+
+# ---------------- 4. アーカイブ作成 + リリース ----------------
 echo "==> アーカイブ作成"
 tar czf "$TOOL_DIR/$ARCHIVE" -C "$TOOL_DIR" rustup cargo .kani 2>/dev/null || \
   tar czf "$TOOL_DIR/$ARCHIVE" -C "$TOOL_DIR" rustup cargo
