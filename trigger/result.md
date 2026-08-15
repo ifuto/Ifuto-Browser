@@ -100,3 +100,63 @@ source: trigger/trigger.md @ ad54f1c670ee1321139dc7b2155479609a48262f
 - [x] [CMD_RESULT 7] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 900 cargo kani --workspace` — exit 0
 - [x] [CMD_RESULT 8] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --locked prusti --version 1.0.0 2>&1 | tail -3 || echo "prusti install failed (version pin)"; cargo prusti --version 2>/dev/null || true'` — exit 0
 - [x] [CMD_RESULT 9] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+
+### clippy 実行 (2026-08-15T00:42:14Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+error: unexpected `cfg` condition name: `kani`
+   --> akl-core/src/lib.rs:230:7
+    |
+230 | #[cfg(kani)]
+    |       ^^^^
+    |
+    = help: expected names are: `docsrs`, `feature`, and `test` and 32 more
+    = help: consider using a Cargo feature instead
+    = help: or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:
+             [lints.rust]
+             unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+    = help: or consider adding `println!("cargo::rustc-check-cfg=cfg(kani)");` to the top of the `build.rs`
+    = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+    = note: `-D unexpected-cfgs` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(unexpected_cfgs)]`
+
+error: struct `ObjTable` has a public `len` method, but no `is_empty` method
+   --> akl-core/src/obj.rs:140:5
+    |
+140 |     pub fn len(&self) -> usize {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#len_without_is_empty
+    = note: `-D clippy::len-without-is-empty` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::len_without_is_empty)]`
+
+error: the loop variable `i` is used to index `mark`
+   --> akl-core/src/obj.rs:213:18
+    |
+213 |         for i in 0..n {
+    |                  ^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_range_loop
+    = note: `-D clippy::needless-range-loop` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_range_loop)]`
+help: consider using an iterator and enumerate()
+    |
+213 -         for i in 0..n {
+213 +         for (i, <item>) in mark.iter().enumerate().take(n) {
+    |
+
+error: could not compile `akl-core` (lib) due to 3 previous errors
+```
+# 実行結果 (2026-08-15T00:42:33Z)
+
+source: trigger/trigger.md @ e33ea3bf57046ec8ae8b2a3164ff3b44f49770e1
+
+- [x] [CMD_RESULT 1] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; rustup toolchain install nightly --profile minimal && rustup component add clippy rustfmt && rustup component add miri --toolchain nightly && rustc --version && cargo --version` — exit 0
+- [x] [CMD_RESULT 2] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 600 bash -c 'cargo install --locked kani-verifier 2>&1 | tail -5; cargo kani --version || echo "kani unavailable"'` — exit 0
+- [x] [CMD_RESULT 3] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 4] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo test --workspace` — exit 0
+- [ ] [CMD_RESULT 5] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [x] [CMD_RESULT 6] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 600 cargo +nightly miri test --workspace` — exit 0
+- [x] [CMD_RESULT 7] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 8] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --locked prusti --version 1.0.0 2>&1 | tail -3 || echo "prusti install failed (version pin)"; cargo prusti --version 2>/dev/null || true'` — exit 0
+- [x] [CMD_RESULT 9] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
