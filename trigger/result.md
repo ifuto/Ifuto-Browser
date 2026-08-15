@@ -625,3 +625,51 @@ source: trigger/trigger.md @ 87b5e11b877c6fe3fb9fb23bbc94e7cf0c12f8d1
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-15T02:06:36Z) rc=0
+```
+==> ブランチ toolchain-bin にアーカイブ（9 分割）があります。取得して展開します
+==> 展開完了
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+==> rust-src を追加してアーカイブを更新します
+info: downloading component rust-src
+branch 'toolchain-bin' set up to track 'origin/toolchain-bin'.
+HEAD is now at 7ba4ffc toolchain toolchain-v1 parts [skip ci]
+[toolchain-bin c9debb6] toolchain toolchain-v1 parts + rust-src [skip ci]
+ 9 files changed, 0 insertions(+), 0 deletions(-)
+remote: warning: See https://gh.io/lfs for more information.        
+remote: warning: File part_00 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_01 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_02 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_03 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_04 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_05 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_06 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_07 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: GH001: Large files detected. You may want to try Git Large File Storage - https://git-lfs.github.com.        
+To https://github.com/ifuto/Ifuto-Browser
+   7ba4ffc..c9debb6  toolchain-bin -> toolchain-bin
+==> ブランチ更新完了（rust-src 込み）
+```
+
+### clippy 実行 (2026-08-15T02:06:37Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+```
+# 実行結果 (2026-08-15T02:07:04Z)
+
+source: trigger/trigger.md @ 2cc4d6d26673541a43f93cc6dba06050f527ec0b
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace` — exit 0
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
