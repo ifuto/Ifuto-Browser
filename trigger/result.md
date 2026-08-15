@@ -200,3 +200,24 @@ source: trigger/trigger.md @ 8bb60ff2095f38ee538b7c3701974a671dd4e329
 - [x] [CMD_RESULT 7] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 900 cargo kani --workspace` — exit 0
 - [x] [CMD_RESULT 8] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --locked prusti --version 1.0.0 2>&1 | tail -3 || echo "prusti install failed (version pin)"; cargo prusti --version 2>/dev/null || true'` — exit 0
 - [x] [CMD_RESULT 9] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+
+### clippy 実行 (2026-08-15T01:21:54Z)
+```
+bash: line 1: trigger/tc: No such file or directory
+```
+# 実行結果 (2026-08-15T01:21:54Z)
+
+source: trigger/trigger.md @ 8e49918b74cba54b34e4de34bbb3dddbd3078f28
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh` — exit 0
+- [ ] [CMD_RESULT 2] `cd rust && trigger/tc timeout 300 cargo build --workspace` — **exit 127**
+- [ ] [CMD_RESULT 3] `cd rust && trigger/tc timeout 300 cargo test --workspace` — **exit 127**
+- [ ] [CMD_RESULT 4] `cd rust && trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [ ] [CMD_RESULT 5] `cd rust && trigger/tc timeout 600 cargo +nightly miri test --workspace` — **exit 127**
+- [ ] [CMD_RESULT 6] `cd rust && trigger/tc timeout 900 cargo kani --workspace` — **exit 127**
+- [x] [CMD_RESULT 7] `cd rust && (trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `trigger/tc cargo prusti --version 2>/dev/null || trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
