@@ -3,7 +3,7 @@ members = ["akl-core"]
 resolver = "2"
 
 # cfg(kani) を check-cfg に登録（cargo 1.80+ の unexpected_cfgs 警告対策）
-[lints.rust]
+[workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
 
 [workspace.package]
