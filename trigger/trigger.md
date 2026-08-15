@@ -41,3 +41,5 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 ../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"
 ../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"
 ../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"
+
+# --- 実行ログ: 2026-08-15 git ブランチ方式 + bytecode 型修正後 ---
