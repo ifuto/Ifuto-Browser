@@ -181,3 +181,22 @@ source: trigger/trigger.md @ 35841747bd0b12431d20d173ce010a0afa2bb72c
 - [ ] [CMD_RESULT 7] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 900 cargo kani --workspace` — **exit 1**
 - [x] [CMD_RESULT 8] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --locked prusti --version 1.0.0 2>&1 | tail -3 || echo "prusti install failed (version pin)"; cargo prusti --version 2>/dev/null || true'` — exit 0
 - [x] [CMD_RESULT 9] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+
+### clippy 実行 (2026-08-15T00:45:27Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.38s
+```
+# 実行結果 (2026-08-15T00:45:50Z)
+
+source: trigger/trigger.md @ 8bb60ff2095f38ee538b7c3701974a671dd4e329
+
+- [x] [CMD_RESULT 1] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; rustup toolchain install nightly --profile minimal && rustup component add clippy rustfmt && rustup component add miri --toolchain nightly && rustc --version && cargo --version` — exit 0
+- [x] [CMD_RESULT 2] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 600 bash -c 'cargo install --locked kani-verifier 2>&1 | tail -5; cargo kani --version || echo "kani unavailable"'` — exit 0
+- [x] [CMD_RESULT 3] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 4] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 5] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 6] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 600 cargo +nightly miri test --workspace` — exit 0
+- [x] [CMD_RESULT 7] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 8] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --locked prusti --version 1.0.0 2>&1 | tail -3 || echo "prusti install failed (version pin)"; cargo prusti --version 2>/dev/null || true'` — exit 0
+- [x] [CMD_RESULT 9] `export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
