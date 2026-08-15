@@ -519,3 +519,109 @@ source: trigger/trigger.md @ 9864920993bd088dd92b45c23a13904193b5dd66
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-15T01:57:28Z) rc=0
+```
+sh/bash/zsh/ash/dash/pdksh
+source "/home/runner/akl-toolchain/cargo/env.fish"  # For fish
+source "/home/runner/akl-toolchain/cargo/env.nu"  # For nushell
+source "/home/runner/akl-toolchain/cargo/env.tcsh"  # For tcsh
+. "/home/runner/akl-toolchain/cargo/env.ps1"        # For pwsh
+source "/home/runner/akl-toolchain/cargo/env.xsh"   # For xonsh
+info: syncing channel updates for nightly-x86_64-unknown-linux-gnu
+info: latest update on 2026-08-15 for version 1.99.0-nightly (d453bdd8f 2026-08-14)
+info: downloading 3 components
+
+  nightly-x86_64-unknown-linux-gnu installed - rustc 1.99.0-nightly (d453bdd8f 2026-08-14)
+
+info: downloading component clippy
+info: downloading component rustfmt
+info: downloading component miri
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo 1.97.1 (c980f4866 2026-06-30)
+  Installing /home/runner/akl-toolchain/cargo/bin/cargo-kani
+  Installing /home/runner/akl-toolchain/cargo/bin/kani
+   Installed package `kani-verifier v0.67.0` (executables `cargo-kani`, `kani`)
+[0/5] Running Kani first-time setup...
+[1/5] Ensuring the existence of: /home/runner/.kani/kani-0.67.0
+[2/5] Downloading Kani release bundle: kani-0.67.0-x86_64-unknown-linux-gnu.tar.gz
+[3/5] Installing rust toolchain version: nightly-2025-11-21-x86_64-unknown-linux-gnu
+info: syncing channel updates for nightly-2025-11-21-x86_64-unknown-linux-gnu
+info: latest update on 2025-11-21 for version 1.93.0-nightly (53732d5e0 2025-11-20)
+info: downloading 3 components
+
+  nightly-2025-11-21-x86_64-unknown-linux-gnu installed - rustc 1.93.0-nightly (53732d5e0 2025-11-20)
+
+[5/5] Successfully completed Kani first-time setup.
+cargo-kani 0.67.0
+  Installing /home/runner/akl-toolchain/cargo/bin/cargo-tarpaulin
+   Installed package `cargo-tarpaulin v0.37.1` (executable `cargo-tarpaulin`)
+  Installing /home/runner/akl-toolchain/cargo/bin/cargo-geiger
+   Installed package `cargo-geiger v0.13.0` (executable `cargo-geiger`)
+  Installing /home/runner/akl-toolchain/cargo/bin/cargo-fuzz
+   Installed package `cargo-fuzz v0.13.2` (executable `cargo-fuzz`)
+    Updating git repository `https://github.com/flux-rs/flux`
+error: could not find `flux` in https://github.com/flux-rs/flux with version `*`
+flux: skip
+`cargo install` is only for installing programs, and can't be used with libraries.
+To use a library crate, add it as a dependency to a Cargo project with `cargo add`.
+mirai: skip
+    Updating crates.io index
+error: could not find `prusti` in registry `crates-io` with version `=1.0.0`
+prusti: skip
+==> アーカイブ作成
+-rw-r--r-- 1 runner runner 760M Aug 15 01:55 /home/runner/akl-toolchain/akl-toolchain.tar.gz
+==> 分割: 9 個
+Preparing worktree (new branch 'toolchain-bin')
+HEAD is now at 87b5e11 trigger: git ブランチ方式 + bytecode 型修正の検証を実行
+[toolchain-bin 7ba4ffc] toolchain toolchain-v1 parts [skip ci]
+ 9 files changed, 0 insertions(+), 0 deletions(-)
+ create mode 100644 part_00
+ create mode 100644 part_01
+ create mode 100644 part_02
+ create mode 100644 part_03
+ create mode 100644 part_04
+ create mode 100644 part_05
+ create mode 100644 part_06
+ create mode 100644 part_07
+ create mode 100644 part_08
+remote: warning: See https://gh.io/lfs for more information.        
+remote: warning: File part_02 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_03 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_04 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_05 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_06 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_07 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_00 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: File part_01 is 90.00 MB; this is larger than GitHub's recommended maximum file size of 50.00 MB        
+remote: warning: GH001: Large files detected. You may want to try Git Large File Storage - https://git-lfs.github.com.        
+remote: 
+remote: Create a pull request for 'toolchain-bin' on GitHub by visiting:        
+remote:      https://github.com/ifuto/Ifuto-Browser/pull/new/toolchain-bin        
+remote: 
+To https://github.com/ifuto/Ifuto-Browser
+ * [new branch]      toolchain-bin -> toolchain-bin
+==> ブランチ toolchain-bin へのアップロード完了
+```
+
+### clippy 実行 (2026-08-15T01:57:29Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s
+```
+# 実行結果 (2026-08-15T01:57:54Z)
+
+source: trigger/trigger.md @ 87b5e11b877c6fe3fb9fb23bbc94e7cf0c12f8d1
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace` — exit 0
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
