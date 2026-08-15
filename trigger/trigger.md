@@ -29,10 +29,10 @@ cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace
 cd rust && ../trigger/tc timeout 900 cargo kani --workspace
 
 # --- 7. cargo-geiger（unsafe 使用量カウント。未導入なら許容） ---
-cd rust && (trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)
+cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)
 
 # --- 8. cargo-tarpaulin（カバレッジ。未導入なら許容） ---
-cd rust && (trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)
+cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)
 
 # --- 9. cargo-fuzz（ファジング基盤の存在確認。未導入なら許容） ---
 ../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"

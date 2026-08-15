@@ -17,6 +17,7 @@
 set -uo pipefail
 
 TOOL_TAG="${TOOL_TAG:-toolchain-v1}"
+export GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"  # Actions では GITHUB_TOKEN を gh に渡す
 TOOL_DIR="${TOOL_DIR:-$HOME/akl-toolchain}"
 ARCHIVE="akl-toolchain.tar.gz"
 REPO="${GITHUB_REPOSITORY:-}"
@@ -79,12 +80,19 @@ if ! "$TOOL_DIR/cargo/bin/cargo" kani --version >/dev/null 2>&1; then
 fi
 
 # ---------------- 4. アーカイブ作成 + リリース ----------------
+# registry キャッシュは不要（バイナリのみで完結）。サイズ削減のため除去
+rm -rf "$TOOL_DIR/cargo/registry" "$TOOL_DIR/cargo/git" 2>/dev/null || true
 echo "==> アーカイブ作成"
 tar czf "$TOOL_DIR/$ARCHIVE" -C "$TOOL_DIR" rustup cargo .kani 2>/dev/null || \
   tar czf "$TOOL_DIR/$ARCHIVE" -C "$TOOL_DIR" rustup cargo
 ls -lh "$TOOL_DIR/$ARCHIVE"
 
+if [ -z "$GH_TOKEN" ]; then
+  echo "FATAL: GH_TOKEN がありません（gh release create 不可）"
+  exit 1
+fi
 gh release create "$TOOL_TAG" "$TOOL_DIR/$ARCHIVE" ${REPO:+-R "$REPO"} \
   --title "Akl toolchain $TOOL_TAG" \
-  --notes "事前ビルド済み Rust 検証ツールチェーン（stable/nightly + miri + clippy + kani + tarpaulin + geiger + cargo-fuzz + flux + mirai + prusti）。trigger/toolchain.sh が自動で取得・展開する。"
+  --notes "事前ビルド済み Rust 検証ツールチェーン。trigger/toolchain.sh が自動で取得・展開する。" \
+  || { echo "FATAL: release create 失敗"; exit 1; }
 echo "==> Release $TOOL_TAG 作成完了"
