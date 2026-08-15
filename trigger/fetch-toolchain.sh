@@ -21,4 +21,7 @@ if [ -d "$TOOL_DIR/.kani" ] && [ ! -e "$HOME/.kani" ]; then
 fi
 echo "==> 展開完了: $TOOL_DIR"
 "$TOOL_DIR/cargo/bin/rustc" --version
-echo "使い方: RUSTUP_HOME=$TOOL_DIR/rustup CARGO_HOME=$TOOL_DIR/cargo PATH=$TOOL_DIR/cargo/bin:\$PATH cargo test"
+echo ""
+echo "使い方（env を設定してから cargo を使う）:"
+echo "  export RUSTUP_HOME=$TOOL_DIR/rustup CARGO_HOME=$TOOL_DIR/cargo PATH=$TOOL_DIR/cargo/bin:\$PATH"
+echo "  cd rust && cargo test && cargo clippy -- -D warnings && cargo +nightly miri test"

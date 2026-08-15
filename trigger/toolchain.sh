@@ -40,6 +40,28 @@ if git -C "$REPO_ROOT" fetch origin "$BIN_BRANCH:refs/remotes/origin/$BIN_BRANCH
     fi
     echo "==> 展開完了"
     "$TOOL_DIR/cargo/bin/rustc" --version || echo "(rustc が見つかりません)"
+    # miri 用 rust-src が無ければ追加してアーカイブを更新（ランナーにはネットワークがある）
+    if ! RUSTUP_HOME="$TOOL_DIR/rustup" "$TOOL_DIR/cargo/bin/rustup" component list --toolchain nightly 2>/dev/null | grep -q 'rust-src.*installed'; then
+      echo "==> rust-src を追加してアーカイブを更新します"
+      export RUSTUP_HOME="$TOOL_DIR/rustup" CARGO_HOME="$TOOL_DIR/cargo" PATH="$TOOL_DIR/cargo/bin:$PATH"
+      rustup component add rust-src --toolchain nightly || echo "rust-src: 追加失敗"
+      rm -rf "$TOOL_DIR/cargo/registry" "$TOOL_DIR/cargo/git" 2>/dev/null || true
+      tar czf "$TOOL_DIR/$ARCHIVE" -C "$TOOL_DIR" rustup cargo .kani 2>/dev/null || \
+        tar czf "$TOOL_DIR/$ARCHIVE" -C "$TOOL_DIR" rustup cargo
+      SPLIT_DIR="$TOOL_DIR/parts"
+      rm -rf "$SPLIT_DIR"; mkdir -p "$SPLIT_DIR"
+      split -b 90m -d -a 2 "$TOOL_DIR/$ARCHIVE" "$SPLIT_DIR/part_"
+      git -C "$REPO_ROOT" worktree add "$TOOL_DIR/wt" "$BIN_BRANCH" 2>/dev/null || \
+        git -C "$REPO_ROOT" worktree add "$TOOL_DIR/wt" -b "$BIN_BRANCH"
+      rm -f "$TOOL_DIR/wt"/part_*
+      cp "$SPLIT_DIR"/part_* "$TOOL_DIR/wt/"
+      if ( cd "$TOOL_DIR/wt" && git config user.name "toolchain-bot" && git config user.email "actions@users.noreply.github.com" && git add part_* && git commit -m "toolchain $TOOL_TAG parts + rust-src [skip ci]" && git push origin "$BIN_BRANCH" ); then
+        echo "==> ブランチ更新完了（rust-src 込み）"
+      else
+        echo "WARNING: ブランチ更新に失敗"
+      fi
+      git -C "$REPO_ROOT" worktree remove "$TOOL_DIR/wt" --force 2>/dev/null || true
+    fi
     exit 0
   fi
 fi
