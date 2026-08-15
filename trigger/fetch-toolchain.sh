@@ -8,7 +8,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"
 BR="toolchain-bin"
 
 echo "==> $BR ブランチを取得します（760MB 前後・初回は時間がかかる）"
-git -C "$REPO_ROOT" fetch origin "$BR" 2>&1 | tail -1 || { echo "FATAL: fetch 失敗"; exit 1; }
+git -C "$REPO_ROOT" fetch origin "$BR:refs/remotes/origin/$BR" 2>&1 | tail -1 2>&1 | tail -1 || { echo "FATAL: fetch 失敗"; exit 1; }
 mkdir -p "$TOOL_DIR/parts"
 for f in $(git -C "$REPO_ROOT" ls-tree --name-only "origin/$BR" | grep '^part_'); do
   git -C "$REPO_ROOT" show "origin/$BR:$f" > "$TOOL_DIR/parts/$f"

@@ -24,7 +24,7 @@ mkdir -p "$TOOL_DIR"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
 
 # ---------------- 1. 既存ブランチがあれば取得 ----------------
-if git -C "$REPO_ROOT" fetch origin "$BIN_BRANCH" >/dev/null 2>&1; then
+if git -C "$REPO_ROOT" fetch origin "$BIN_BRANCH:refs/remotes/origin/$BIN_BRANCH" 2>&1 | tail -1 >/dev/null 2>&1; then
   NPARTS=$(git -C "$REPO_ROOT" ls-tree --name-only "origin/$BIN_BRANCH" 2>/dev/null | grep -c '^part_' || true)
   if [ "$NPARTS" -gt 0 ]; then
     echo "==> ブランチ $BIN_BRANCH にアーカイブ（$NPARTS 分割）があります。取得して展開します"
