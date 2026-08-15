@@ -46,6 +46,15 @@ pub type ObjId = u32;
 /// 空きスロットの番兵（C の kind==0 相当）。
 pub const NONE: ObjId = u32::MAX;
 
+/// オブジェクト表の操作エラー。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjError {
+    /// オブジェクト表の上限（u32 全域）に達した。
+    TableFull,
+    /// 対象が配列ではない。
+    NotArray,
+}
+
 /// オブジェクト（C の AklObj。kind タグ + union を enum で型安全に表現）。
 ///
 /// 子参照（他オブジェクトへの AklVal）は [`children`](Self::children) で
@@ -57,7 +66,12 @@ pub enum Obj {
     /// 配列（要素列）。
     Arr(Vec<AklVal>),
     /// クロージャ環境（キャプチャ済みローカル + 親環境）。
-    Env { vals: Vec<AklVal>, parent: Option<ObjId> },
+    Env {
+        /// キャプチャ済みローカル値。
+        vals: Vec<AklVal>,
+        /// 親環境（無ければ None）。
+        parent: Option<ObjId>,
+    },
     /// プレーンオブジェクト（プロパティ列。name は intern 済み StrId）。
     Obj(Vec<(StrId, AklVal)>),
 }
@@ -133,8 +147,8 @@ impl ObjTable {
     }
 
     /// オブジェクトを 1 個割り当てる（free-list 再利用。C の akl_obj_new）。
-    /// 成功時 `Ok(id)`、失敗（上限到達）時 `Err(())`。
-    pub fn alloc(&mut self, obj: Obj) -> Result<ObjId, ()> {
+    /// 成功時 `Ok(id)`、失敗（上限到達）時 `Err(ObjError::TableFull)`。
+    pub fn alloc(&mut self, obj: Obj) -> Result<ObjId, ObjError> {
         if let Some(id) = self.free.pop() {
             self.slots[id as usize] = Some(obj);
             self.live += 1;
@@ -142,7 +156,7 @@ impl ObjTable {
         }
         let id = self.slots.len() as ObjId;
         if id == NONE {
-            return Err(()); // u32 上限
+            return Err(ObjError::TableFull); // u32 上限
         }
         self.slots.push(Some(obj));
         self.live += 1;
@@ -197,12 +211,10 @@ impl ObjTable {
         // sweep
         let mut swept = 0;
         for i in 0..n {
-            if !mark[i] {
-                if self.slots[i].take().is_some() {
-                    self.free.push(i as ObjId);
-                    self.live -= 1;
-                    swept += 1;
-                }
+            if !mark[i] && self.slots[i].take().is_some() {
+                self.free.push(i as ObjId);
+                self.live -= 1;
+                swept += 1;
             }
         }
         swept
@@ -234,16 +246,16 @@ impl ObjTable {
     ///
     /// # 戻り値
     ///
-    /// 新しい配列の id。`id` が配列でない場合は `Err(())`。
+    /// 新しい配列の id。`id` が配列でない場合は `Err(ObjError::NotArray)`。
     pub fn arr_map(
         &mut self,
         id: ObjId,
         mut f: impl FnMut(AklVal, usize) -> AklVal,
-    ) -> Result<ObjId, ()> {
+    ) -> Result<ObjId, ObjError> {
         // 1. 元要素を値コピー（借用終了）
         let items: Vec<AklVal> = match self.get(id) {
             Some(Obj::Arr(v)) => v.clone(),
-            _ => return Err(()),
+            _ => return Err(ObjError::NotArray),
         };
         // 2. コールバック適用（self 変更なし）
         let mapped: Vec<AklVal> = items

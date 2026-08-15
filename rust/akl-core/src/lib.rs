@@ -52,7 +52,7 @@ pub struct AklVal(u64);
 
 impl AklVal {
     /// undefined（タグ空間 0）。
-    pub const UNDEF: Self = Self(TAG_MASK | 0);
+    pub const UNDEF: Self = Self(TAG_MASK);
     /// null（タグ空間 1）。
     pub const NULL: Self = Self(TAG_MASK | 1);
     /// false（タグ空間 2）。
