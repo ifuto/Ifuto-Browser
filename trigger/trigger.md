@@ -39,3 +39,5 @@ export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 3
 # --- 実行ログ: 2026-08-15 clippy 修正後（identity_op / missing_docs / collapsible_if / ObjError） ---
 
 # --- 実行ログ: 2026-08-15 clippy 修正 2 後 ---
+
+# --- 実行ログ: 2026-08-15 workspace.lints 修正後 ---
