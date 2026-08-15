@@ -20,8 +20,8 @@ export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 30
 # --- 4. test（全ユニットテスト） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo test --workspace
 
-# --- 5. clippy（警告 = エラー。失敗時に詳細を出す） ---
-export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo clippy --workspace -- -D warnings 2>&1 | tail -30; test ${PIPESTATUS[0]} -eq 0
+# --- 5. clippy（警告 = エラー。ログを result.md に追記してコミットに載せる） ---
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
 
 # --- 6. Miri（未定義動作検出。nightly で実行） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 600 cargo +nightly miri test --workspace
