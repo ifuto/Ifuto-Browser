@@ -11,23 +11,27 @@
 # --- 1. ツールチェーン整備（nightly / miri / clippy / prusti） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; rustup toolchain install nightly --profile minimal && rustup component add clippy rustfmt && rustup component add miri --toolchain nightly && rustc --version && cargo --version
 
-# --- 2. build（スカラー検証のベース） ---
+# --- 2. Kani インストール（cargo kani 用。初回 5-10 分。失敗時も続行） ---
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 600 bash -c 'cargo install --locked kani-verifier 2>&1 | tail -5; cargo kani --version || echo "kani unavailable"'
+
+# --- 3. build（スカラー検証のベース） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo build --workspace
 
-# --- 3. test（全ユニットテスト） ---
+# --- 4. test（全ユニットテスト） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo test --workspace
 
-# --- 4. clippy（警告 = エラー） ---
-export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo clippy --workspace -- -D warnings
+# --- 5. clippy（警告 = エラー。失敗時に詳細を出す） ---
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 300 cargo clippy --workspace -- -D warnings 2>&1 | tail -30; test ${PIPESTATUS[0]} -eq 0
 
-# --- 5. Miri（未定義動作検出。nightly で実行） ---
+# --- 6. Miri（未定義動作検出。nightly で実行） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 600 cargo +nightly miri test --workspace
 
-# --- 6. Kani（機械的証明。スカラー純粋関数のみ。ハング防止の timeout 付き） ---
+# --- 7. Kani（機械的証明。スカラー純粋関数のみ。ハング防止の timeout 付き） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && timeout 900 cargo kani --workspace
 
-# --- 7. Prusti（契約検証。viper/z3 依存で初回インストールに数分） ---
+# --- 8. Prusti（契約検証。viper/z3 依存で初回インストールに数分） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --locked prusti --version 1.0.0 2>&1 | tail -3 || echo "prusti install failed (version pin)"; cargo prusti --version 2>/dev/null || true'
 
-# --- 8. cargo-geiger（unsafe 使用量カウント。未導入なら許容） ---
+# --- 9. cargo-geiger（unsafe 使用量カウント。未導入なら許容） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)
+
