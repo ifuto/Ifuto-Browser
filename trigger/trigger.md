@@ -35,3 +35,5 @@ export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c '
 # --- 9. cargo-geiger（unsafe 使用量カウント。未導入なら許容） ---
 export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo geiger --workspace 2>/dev/null || true)
 
+
+# --- 実行ログ: 2026-08-15 clippy 修正後（identity_op / missing_docs / collapsible_if / ObjError） ---
