@@ -108,7 +108,29 @@ proof が `kani::any()` で長さ不定のループを回していたこと。�
 - **Prusti / Verus**: 将来、契約ベースでデータ構造の不変条件を証明（要 CI 時間）
 - 各 trigger コマンドに `timeout` を付け、ハングしても次へ進む
 
-## フェーズ 3 設計メモ: VM（vm_exec）の移植方針
+## フェーズ 3（着手済み）: VM コア（bytecode.rs）
+
+- `Op` enum（C の OP_* のコアサブセット: ConstI/LLoad/LStore/GLoadS/GStoreS/Add/Sub/
+  Mul/CJmpfL/Jmp/Pop/Dup/Halt）
+- `Vm::step` は 1 命令実行（`Vec<i64>` スタック。C の AKL_POP マクロの下限検査が
+  `get()` の Option で構造的に安全）
+- `Op::stack_effect` は pop/push 数を 1 箇所に集約（C の akl_op_imm_len 表の
+  drift 問題を enum match の網羅性で排除）
+- `verify_stack` は C の akl_verify 相当の静的スタック検査
+- Kani 証明 5 件: stack_effect 有界 / Cmp 全数 / checked_add 正確性 /
+  verify_stack の検出（全てスカラー範囲）
+
+残り（フェーズ 3b）: 関数呼び出し（CALL/RET/frames）・ジャンプ先整合の制御フロー
+解析・文字列/オブジェクト値を扱う命令。
+
+## ツール拡充（2026-08-15）
+
+- 基本: rustup / clippy / Miri / Kani / Prusti / geiger（trigger.md 常時実行）
+- 追加: cargo-fuzz / cargo-tarpaulin / Flux / MIRAI（インストール失敗は許容。
+  Rudra の教訓: メンテ停止ツールはジョブを止めない）
+- Verus は env_trigger.md の VERUS=on で単独ビルド（約 1 時間）
+
+## フェーズ 3 設計メモ: VM（vm_exec）の移植方針（旧）
 
 - バイトコードは C と同じ命令セット（OP_*）を維持し、`enum Op` + 即値の
   `decode` を 1 箇所に集約（C の `akl_op_imm_len` 表の drift 問題を構造的に排除）

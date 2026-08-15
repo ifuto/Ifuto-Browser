@@ -26,6 +26,9 @@ pub mod string;
 /// オブジェクトモデル + GC（フェーズ 2）。
 pub mod obj;
 
+/// バイトコード VM コア（フェーズ 3）。
+pub mod bytecode;
+
 /// タグ空間マスク（上位 16 bit が 0xFFFF）。
 pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 

@@ -41,3 +41,18 @@ export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 3
 # --- 実行ログ: 2026-08-15 clippy 修正 2 後 ---
 
 # --- 実行ログ: 2026-08-15 workspace.lints 修正後 ---
+
+# --- 10. cargo-fuzz（ファジング基盤。インストール失敗は許容） ---
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 cargo install cargo-fuzz 2>&1 | tail -3 || echo "cargo-fuzz install failed"
+
+# --- 11. cargo-tarpaulin（カバレッジ計測。インストール失敗は許容） ---
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 cargo install cargo-tarpaulin 2>&1 | tail -3 || echo "tarpaulin install failed"
+
+# --- 12. tarpaulin でカバレッジ計測（akl-core。失敗は許容） ---
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; cd rust && (timeout 300 cargo tarpaulin --workspace 2>&1 | tail -15 || echo "tarpaulin run failed")
+
+# --- 13. Flux（型レベル refined 検証。git ビルド。失敗は許容） ---
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install --git https://github.com/flux-rs/flux flux 2>&1 | tail -3 || echo "flux install failed"'
+
+# --- 14. MIRAI（抽象解釈。特定 nightly 依存で壊れやすい。失敗は許容） ---
+export PATH="$HOME/.cargo/bin:/usr/local/cargo/bin:$PATH"; timeout 900 bash -c 'cargo install mirai 2>&1 | tail -3 || echo "mirai install failed"'
