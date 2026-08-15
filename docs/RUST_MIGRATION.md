@@ -97,6 +97,17 @@ impl Rt {
 - 検証: 到達可能性の閉包（mark 後の生存集合がルートから辿れる集合と一致）を
   Kani で証明、Miri で実行時検査、`check_uaf.py` の C 版と突合。
 
+## 検証ツールの適用範囲（2026-08-14 Actions 実走の教訓）
+
+**Kani はコレクション（Vec/HashMap）+ シンボリック長ループを扱えない**。実走で
+`cargo kani --workspace` が 2 時間ハング（打ち切り）した。原因は obj.rs/string.rs の
+proof が `kani::any()` で長さ不定のループを回していたこと。修正後:
+
+- **Kani**: スカラー純粋関数のみ（AklVal タグ演算・int_add・f64 正規化の代表パターン等）
+- **Miri + ユニットテスト**: データ構造（Interner / GC / 配列 HOF）の実行時検査
+- **Prusti / Verus**: 将来、契約ベースでデータ構造の不変条件を証明（要 CI 時間）
+- 各 trigger コマンドに `timeout` を付け、ハングしても次へ進む
+
 ## フェーズ 3 設計メモ: VM（vm_exec）の移植方針
 
 - バイトコードは C と同じ命令セット（OP_*）を維持し、`enum Op` + 即値の
