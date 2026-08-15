@@ -227,14 +227,14 @@ impl Vm {
                     if (*tgt as usize) > code_len {
                         return Err(VmError::JumpOob(*tgt));
                     }
-                    Ok(Step::Jump(*tgt))
+                    Ok((Step::Jump(*tgt), *tgt as usize))
                 }
             }
             Op::Jmp(tgt) => {
                 if (*tgt as usize) > code_len {
                     return Err(VmError::JumpOob(*tgt));
                 }
-                Ok(Step::Jump(*tgt))
+                Ok((Step::Jump(*tgt), *tgt as usize))
             }
             Op::Pop => {
                 self.stk.pop().ok_or(VmError::StackUnderflow)?;
