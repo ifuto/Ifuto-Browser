@@ -108,7 +108,7 @@ proof が `kani::any()` で長さ不定のループを回していたこと。�
 - **Prusti / Verus**: 将来、契約ベースでデータ構造の不変条件を証明（要 CI 時間）
 - 各 trigger コマンドに `timeout` を付け、ハングしても次へ進む
 
-## フェーズ 3（着手済み）: VM コア（bytecode.rs）
+## フェーズ 3（進行中）: VM コア（bytecode.rs）
 
 - `Op` enum（C の OP_* のコアサブセット: ConstI/LLoad/LStore/GLoadS/GStoreS/Add/Sub/
   Mul/CJmpfL/Jmp/Pop/Dup/Halt）
@@ -117,11 +117,16 @@ proof が `kani::any()` で長さ不定のループを回していたこと。�
 - `Op::stack_effect` は pop/push 数を 1 箇所に集約（C の akl_op_imm_len 表の
   drift 問題を enum match の網羅性で排除）
 - `verify_stack` は C の akl_verify 相当の静的スタック検査
-- Kani 証明 5 件: stack_effect 有界 / Cmp 全数 / checked_add 正確性 /
-  verify_stack の検出（全てスカラー範囲）
+- `verify_control_flow`（3b 着手）: ジャンプ先整合（全 `Jmp`/`CJmpfL` の tgt が
+  0..=len）+ 制御フローグラフ上のスタック深さ整合（worklist 走査）。C の
+  `akl_verify` の「ジャンプ先は命令境界かつ範囲内」に相当。分岐合流の深さ不一致は
+  `VmError::ControlFlowMismatch` として検出（順次走査の verify_stack では見逃す
+  不正バイトコードを構造的に排除）
+- Kani 証明 8 件: stack_effect 有界 / Cmp 全数 / checked_add 正確性 /
+  verify_stack の検出 / verify_control_flow の jump-oob・mismatch・balanced
+  （全てスカラー範囲）
 
-残り（フェーズ 3b）: 関数呼び出し（CALL/RET/frames）・ジャンプ先整合の制御フロー
-解析・文字列/オブジェクト値を扱う命令。
+残り（フェーズ 3b）: 関数呼び出し（CALL/RET/frames）・文字列/オブジェクト値を扱う命令。
 
 ## ツール拡充（2026-08-15）
 

@@ -138,6 +138,8 @@ pub enum VmError {
     JumpOob(u32),
     /// 整数演算のオーバーフロー（i64 上限）。
     Overflow,
+    /// 分岐合流でスタック深さが一致しない（不正なバイトコード）。
+    ControlFlowMismatch,
 }
 
 /// 1 命令実行のコンテキスト（スタック・ローカル・グローバル）。
@@ -271,6 +273,104 @@ pub fn verify_stack(code: &[Op]) -> Result<usize, VmError> {
     Ok(max_depth)
 }
 
+/// 制御フロー解析（フェーズ 3b）。C の `akl_verify` の「ジャンプ先整合」に相当する。
+///
+/// 順次走査のみの [`verify_stack`] では、ジャンプ命令が無関係な位置（命令境界でない
+/// 深さの不一致点）へ飛ぶ不正バイトコードを検出できない。この関数は以下を検証する:
+///
+/// 1. **ジャンプ先整合**: 全 `Jmp` / `CJmpfL` の `tgt` が `0..=code.len()` の範囲内
+///    （`code.len()` は「終端」へのジャンプを許容。C の `code_end` 対応）。
+/// 2. **到達可能経路上のスタック整合**: worklist で制御フローグラフを走査し、
+///    - どの命令も pop で underflow しないこと
+///    - 分岐合流（2 経路の合流点）でスタック深さが一致すること
+///
+/// 戻り値は到達可能経路上の最大スタック深さ。深さ不一致は [`VmError::ControlFlowMismatch`]。
+///
+/// # 例
+/// ```
+/// use akl_core::bytecode::{Op, VmError, verify_control_flow};
+/// // ConstI; Jmp(3); Pop; Halt : Jmp が Pop を飛び越えるため、深さは終端で 1 のまま。
+/// let code = [Op::ConstI(1), Op::Jmp(3), Op::Pop, Op::Halt];
+/// assert_eq!(verify_control_flow(&code), Ok(1));
+/// ```
+pub fn verify_control_flow(code: &[Op]) -> Result<usize, VmError> {
+    let n = code.len();
+
+    // 1. ジャンプ先整合（命令境界 = pc は必ず 0..=n の index。Rust 側は Op 列なので
+    //    「境界」は型で保証済み。ここでは範囲のみ検査）。
+    for op in code {
+        let tgt = match op {
+            Op::Jmp(t) | Op::CJmpfL { tgt: t, .. } => *t as usize,
+            _ => continue,
+        };
+        if tgt > n {
+            return Err(VmError::JumpOob(tgt as u32));
+        }
+    }
+
+    // 2. worklist によるスタック深さの整合検査。
+    //    depth[i] = 位置 i に到達した時点のスタック深さ（None = 未到達）。
+    //    終端（n）もノードとして扱う（ジャンプ先が n のケース）。
+    let mut depth: Vec<Option<i64>> = vec![None; n + 1];
+    let mut worklist: Vec<usize> = Vec::new();
+    depth[0] = Some(0);
+    worklist.push(0);
+    let mut max_depth: usize = 0;
+
+    while let Some(i) = worklist.pop() {
+        if i == n {
+            continue; // 終端: 後続なし
+        }
+        let d = depth[i].expect("worklist は depth 確定済みの位置のみ積む");
+        let e = code[i].stack_effect();
+        let nd = d - e.pop as i64;
+        if nd < 0 {
+            return Err(VmError::StackUnderflow);
+        }
+        let nd = nd + e.push as i64;
+        if nd as usize > max_depth {
+            max_depth = nd as usize;
+        }
+
+        // 後続ノードを決定（fallthrough / ジャンプ / 分岐）。
+        let mut succs: [Option<usize>; 2] = [None, None];
+        let mut ns = 0;
+        match &code[i] {
+            Op::Jmp(t) => {
+                succs[ns] = Some(*t as usize);
+                ns += 1;
+            }
+            Op::CJmpfL { tgt, .. } => {
+                succs[ns] = Some(i + 1);
+                ns += 1;
+                succs[ns] = Some(*tgt as usize);
+                ns += 1;
+            }
+            Op::Halt => {}
+            _ => {
+                succs[ns] = Some(i + 1);
+                ns += 1;
+            }
+        }
+        for s in succs.iter().take(ns) {
+            let s = s.expect("ns 分だけ埋めている");
+            match depth[s] {
+                None => {
+                    depth[s] = Some(nd);
+                    worklist.push(s);
+                }
+                Some(prev) => {
+                    if prev != nd {
+                        // 合流点での深さ不一致 = 不正バイトコード（スタック効果の破綻）。
+                        return Err(VmError::ControlFlowMismatch);
+                    }
+                }
+            }
+        }
+    }
+    Ok(max_depth)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +471,58 @@ mod tests {
     }
 
     #[test]
+    fn control_flow_jump_ok() {
+        // ConstI; Jmp(3); Pop; Halt : Jmp が Pop を飛び越す。深さは 1 のまま終端へ。
+        let code = [Op::ConstI(1), Op::Jmp(3), Op::Pop, Op::Halt];
+        assert_eq!(verify_control_flow(&code), Ok(1));
+    }
+
+    #[test]
+    fn control_flow_jump_oob_detected() {
+        let code = [Op::Jmp(5), Op::Halt];
+        assert_eq!(verify_control_flow(&code), Err(VmError::JumpOob(5)));
+    }
+
+    #[test]
+    fn control_flow_mismatch_detected() {
+        // ConstI; CJmpfL(真→3, 偽→2); Pop; Halt : 真経路は深さ 1、偽経路は Pop で深さ 0。
+        // 終端（Halt）で合流し深さ不一致 → ControlFlowMismatch。
+        let code = [
+            Op::ConstI(1),
+            Op::CJmpfL { slot: 0, imm: 0, cmp: Cmp::Lt, tgt: 3 },
+            Op::Pop,
+            Op::Halt,
+        ];
+        assert_eq!(verify_control_flow(&code), Err(VmError::ControlFlowMismatch));
+    }
+
+    #[test]
+    fn control_flow_balanced_branch_ok() {
+        // 0: ConstI(1)   → 深さ 1
+        // 1: CJmpfL tgt=4 → 深さ 1 のまま分岐（真→2, 偽→4）
+        // 2: Dup         → 深さ 2
+        // 3: Pop         → 深さ 1
+        // 4: Pop         → 深さ 0（真経路も偽経路も深さ 1 で合流 = 一致）
+        // 5: Halt
+        let code = [
+            Op::ConstI(1),
+            Op::CJmpfL { slot: 0, imm: 0, cmp: Cmp::Lt, tgt: 4 },
+            Op::Dup,
+            Op::Pop,
+            Op::Pop,
+            Op::Halt,
+        ];
+        assert_eq!(verify_control_flow(&code), Ok(2));
+    }
+
+    #[test]
+    fn control_flow_underflow_detected() {
+        // Jmp で Pop に飛ぶが、直前のスタックが空 → Pop で underflow。
+        let code = [Op::Jmp(1), Op::Pop, Op::Halt];
+        assert_eq!(verify_control_flow(&code), Err(VmError::StackUnderflow));
+    }
+
+    #[test]
     fn cmp_all() {
         assert!(Cmp::Lt.apply(1, 2));
         assert!(!Cmp::Lt.apply(2, 2));
@@ -452,5 +604,38 @@ mod verification {
     fn verify_stack_detects_underflow() {
         let code = [Op::Pop];
         assert_eq!(verify_stack(&code), Err(VmError::StackUnderflow));
+    }
+
+    /// verify_control_flow は範囲外ジャンプを検出する。
+    #[kani::proof]
+    fn verify_control_flow_jump_oob() {
+        let code = [Op::Jmp(5), Op::Halt];
+        assert_eq!(verify_control_flow(&code), Err(VmError::JumpOob(5)));
+    }
+
+    /// verify_control_flow は不正な制御フロー（分岐合流の深さ不一致）を検出する。
+    #[kani::proof]
+    fn verify_control_flow_mismatch() {
+        let code = [
+            Op::ConstI(1),
+            Op::CJmpfL { slot: 0, imm: 0, cmp: Cmp::Lt, tgt: 3 },
+            Op::Pop,
+            Op::Halt,
+        ];
+        assert_eq!(verify_control_flow(&code), Err(VmError::ControlFlowMismatch));
+    }
+
+    /// verify_control_flow は整合した制御フローを受け入れる。
+    #[kani::proof]
+    fn verify_control_flow_balanced() {
+        let code = [
+            Op::ConstI(1),
+            Op::CJmpfL { slot: 0, imm: 0, cmp: Cmp::Lt, tgt: 4 },
+            Op::Dup,
+            Op::Pop,
+            Op::Pop,
+            Op::Halt,
+        ];
+        assert_eq!(verify_control_flow(&code), Ok(2));
     }
 }
