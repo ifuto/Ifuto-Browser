@@ -32,6 +32,12 @@ pub mod bytecode;
 /// レキサ（フェーズ 4）。C 実装の `lex_next` / `lex_string` / `lex_template` を移植。
 pub mod lexer;
 
+/// パーサ（フェーズ 4）。C 実装の再帰下降パーサを移植。
+pub mod parser;
+
+/// コード生成（フェーズ 4）。AST → バイトコード。
+pub mod codegen;
+
 /// タグ空間マスク（上位 16 bit が 0xFFFF）。
 pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 
@@ -147,6 +153,12 @@ impl AklVal {
     /// 内部ビット列（C 連携・テスト用。通常は使わない）。
     pub const fn bits(self) -> u64 {
         self.0
+    }
+}
+
+impl Default for AklVal {
+    fn default() -> Self {
+        Self::UNDEF
     }
 }
 

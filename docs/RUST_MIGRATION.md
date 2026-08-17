@@ -170,6 +170,26 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 検証: cargo test 41 件（キーワード全数・記号最長一致・数値各進数/BigInt/区切り・
 文字列エスケープ・CJK・テンプレート・コメント・行番号・エラー系）。clippy 緑。
 
+## フェーズ 4（進行中）: パーサ + コード生成（parser.rs / codegen.rs）
+
+- [`Expr`](rust/akl-core/src/parser.rs) / [`Stmt`]（enum ツリー。C の AklNode プール相当）
+- 再帰下降パーサ（優先順位段ごと）: 代入 / `||` / `&&` / 等値 / 比較 / 加減 /
+  乗除余 / 単項（`! - + typeof`）/ 呼び出し / 基本式
+- 文: 式文・`var`/`let`/`const`・`return`・`if`/`else`・`while`・ブロック・関数宣言・空文
+- コード生成（`codegen.rs`）: AST → バイトコード。スコープ解決は C の関数スコープ近似
+  （パラメータ + var 宣言 → ローカルスロット、他はグローバル GLoad/GStore）
+- 関数宣言はパス 1 で全登録 → main 先頭で MakeF + GStore の hoist（C の cg_hoist_funcs 相当）
+- VM に `PopV`（last_val 更新）・`And`/`Or` を追加。`Halt` は last_val を返す
+  （C の「最後の式文の値」セマンティクス）
+
+検証: cargo test 58 件 + clippy 緑。**JS ソース文字列からの e2e** が通る:
+- `fib(10) = 55`（再帰・関数宣言・if/else・二項演算）
+- `while` ループの和、ネスト関数呼び出し（`double(add(...))`）
+- 文字列連結・比較・論理・typeof・if/else
+
+残り: オブジェクト/配列リテラル・メンバーアクセス・三項・`for`/`switch`・複合代入・
+クロージャ（env 経由解決）・組み込み（builtins = フェーズ 5）。
+
 ## ツール拡充（2026-08-15）
 
 - 基本: rustup / clippy / Miri / Kani / Prusti / geiger（trigger.md 常時実行）

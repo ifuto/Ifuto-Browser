@@ -130,6 +130,10 @@ pub enum Op {
     Seq,
     /// 厳密不等 `!==`。
     Sne,
+    /// 論理積 `&&`（両辺を真偽値化して返す近似。JS の値返しは未対応）。
+    And,
+    /// 論理和 `||`（同上）。
+    Or,
     /// 論理否定 `!`。
     Not,
     /// 単項マイナス `-`。
@@ -140,6 +144,8 @@ pub enum Op {
     Typeof,
     /// スタックから 1 個捨てる。
     Pop,
+    /// スタックから 1 個 pop して `last_val` に保存（C の `POPV`。式文の値）。
+    PopV,
     /// スタック先頭を複製。
     Dup,
     /// ローカル slot を push（C の `LLOAD`）。
@@ -223,6 +229,8 @@ pub struct Runtime {
     pub funcs: Vec<FuncObj>,
     /// グローバル変数（name = intern 済み文字列 ObjId, value）。
     pub globals: Vec<(ObjId, AklVal)>,
+    /// 最後の式文の値（C の `rt->last_val`。`Halt` 時に返す）。
+    pub last_val: AklVal,
 }
 
 impl Runtime {
@@ -346,6 +354,16 @@ impl Runtime {
                     let v = stack.pop().ok_or(VmError::StackUnderflow)?;
                     stack.push(AklVal::from_bool(!self.truthy(v)));
                 }
+                Op::And => {
+                    let b = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let a = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    stack.push(AklVal::from_bool(self.truthy(a) && self.truthy(b)));
+                }
+                Op::Or => {
+                    let b = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let a = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    stack.push(AklVal::from_bool(self.truthy(a) || self.truthy(b)));
+                }
                 Op::Neg => {
                     let v = stack.pop().ok_or(VmError::StackUnderflow)?;
                     stack.push(AklVal::from_f64(-self.to_number(v)));
@@ -362,6 +380,10 @@ impl Runtime {
                 }
                 Op::Pop => {
                     stack.pop().ok_or(VmError::StackUnderflow)?;
+                }
+                Op::PopV => {
+                    let v = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    self.last_val = v;
                 }
                 Op::Dup => {
                     let top = *stack.last().ok_or(VmError::StackUnderflow)?;
@@ -511,8 +533,7 @@ impl Runtime {
                     stack.push(val);
                 }
                 Op::Halt => {
-                    let v = stack.last().copied().unwrap_or(AklVal::UNDEF);
-                    return Ok(v);
+                    return Ok(self.last_val);
                 }
             }
             pc += 1;
