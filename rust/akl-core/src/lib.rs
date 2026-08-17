@@ -29,6 +29,9 @@ pub mod obj;
 /// バイトコード VM コア（フェーズ 3）。
 pub mod bytecode;
 
+/// レキサ（フェーズ 4）。C 実装の `lex_next` / `lex_string` / `lex_template` を移植。
+pub mod lexer;
+
 /// タグ空間マスク（上位 16 bit が 0xFFFF）。
 pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 

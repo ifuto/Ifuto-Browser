@@ -155,6 +155,21 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 残り: クロージャ（env 経由解決）・組み込み（builtins/native 群 = フェーズ 5）・
 パーサ/レキサ（フェーズ 4）との接続。
 
+## フェーズ 4（進行中）: レキサ（lexer.rs）
+
+- `Lexer`（C の `Lex` + `lex_next` 相当）。`&str` 借用・`pos`/`line` を進める
+- [`Token`](rust/akl-core/src/lexer.rs) enum: Eof/Ident/Num/Str/Punct/Kw/Tpl
+- [`Keyword`]（41 個。C の `AKL_KWS` と同順）+ [`Punct`]（57 個。最長一致）
+- 数値リテラル: 10/16/2/8 進・小数・指数・BigInt `n`・`_` 区切り（C の桁上限
+  guard を同値で移植。BigInt は 64bit 符号付き範囲超で明白に失敗）
+- 文字列エスケープ（`\n \t \r \b \f \v \0 \\ \' \" \/ \xHH \uHHHH`）を復号。
+  UTF-8 マルチバイトは原列複製（C の `lex_emit_raw`。CJK 二重エンコード化を防止）
+- テンプレートリテラル断片（`` ` `` と `${` まで。閉じ backtick はパーサが
+  lex_template を再呼び出しして消費する C と同一の責務分担）
+
+検証: cargo test 41 件（キーワード全数・記号最長一致・数値各進数/BigInt/区切り・
+文字列エスケープ・CJK・テンプレート・コメント・行番号・エラー系）。clippy 緑。
+
 ## ツール拡充（2026-08-15）
 
 - 基本: rustup / clippy / Miri / Kani / Prusti / geiger（trigger.md 常時実行）
