@@ -110,23 +110,50 @@ proof が `kani::any()` で長さ不定のループを回していたこと。�
 
 ## フェーズ 3（進行中）: VM コア（bytecode.rs）
 
-- `Op` enum（C の OP_* のコアサブセット: ConstI/LLoad/LStore/GLoadS/GStoreS/Add/Sub/
-  Mul/CJmpfL/Jmp/Pop/Dup/Halt）
-- `Vm::step` は 1 命令実行（`Vec<i64>` スタック。C の AKL_POP マクロの下限検査が
-  `get()` の Option で構造的に安全）
-- `Op::stack_effect` は pop/push 数を 1 箇所に集約（C の akl_op_imm_len 表の
-  drift 問題を enum match の網羅性で排除）
-- `verify_stack` は C の akl_verify 相当の静的スタック検査
-- `verify_control_flow`（3b 着手）: ジャンプ先整合（全 `Jmp`/`CJmpfL` の tgt が
-  0..=len）+ 制御フローグラフ上のスタック深さ整合（worklist 走査）。C の
-  `akl_verify` の「ジャンプ先は命令境界かつ範囲内」に相当。分岐合流の深さ不一致は
-  `VmError::ControlFlowMismatch` として検出（順次走査の verify_stack では見逃す
-  不正バイトコードを構造的に排除）
-- Kani 証明 8 件: stack_effect 有界 / Cmp 全数 / checked_add 正確性 /
-  verify_stack の検出 / verify_control_flow の jump-oob・mismatch・balanced
-  （全てスカラー範囲）
+- `Op` enum（C の OP_* のコア: ConstI/ConstD/ConstStr/True/False/Null/Undef/
+  Add/Sub/Mul/Div/Mod/Lt/Le/Gt/Ge/Eq/Ne/Seq/Sne/Not/Neg/Pos/Typeof/Pop/Dup/
+  LLoad/LStore/GLoad/GStore/Jmp/JmpF/JmpT/Call/Ret/MakeF/This/ObjNew/PLoad/PStore/
+  ArrNew/AGet/ASet/Halt）
+- `Runtime::run` は実 JS 値（[`AklVal`](rust/akl-core/src/lib.rs)）をスタックに積む
+  match ループ。C の `vm_exec` 相当
+- スタックは `Vec<AklVal>`、下限検査は `pop().ok_or(StackUnderflow)`（C の AKL_POP
+  マクロの検査漏れが構造的に消える）
+- フレームは [`Frame`](rust/akl-core/src/bytecode.rs) が locals を明示保持
+  （C の base オフセット方式より安全。GC ルート深さ同期漏れの実バグが起きない）
+- 関数呼び出し（CALL/RET/MAKEF）を実装。`Ret` は**戻るフレーム自身の ret_pc** を使う
+  （実測で特定したバグ: 呼び出し元フレームの ret_pc を使うと再帰が直上の呼び出し元へ
+  誤って戻る）
 
-残り（フェーズ 3b）: 関数呼び出し（CALL/RET/frames）・文字列/オブジェクト値を扱う命令。
+### 値モデルの統一（フェーズ 1/2 の改訂）
+
+C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。旧 Rust 実装は
+`Interner`（StrId）と `ObjTable`（ObjId）を別 id 空間に分けていたが、これを**単一
+ヒープ**に統一した:
+
+- 文字列の正体は `Obj::Str`（ヒープ内）。`Interner` は内容→ObjId のキャッシュのみ
+- プロパティ名も ObjId（intern 済み文字列オブジェクト）
+- これで `AklVal::mk_obj` が文字列・配列・オブジェクト・関数・環境のいずれも指せる
+  （C の NaN-box obj タグと同一セマンティクス）
+
+### フェーズ 3b の検証（cargo test 29 件 + doctest 緑）
+
+- fib(10) = 55（再帰・関数呼び出し・数値比較・分岐の e2e）
+- ループ和（for 相当の JmpF 回転）
+- 文字列連結（`"hello " + "world"`）
+- オブジェクトのプロパティ set/get、配列リテラル・要素アクセス
+- typeof・厳密等値（`1 === 1.0` は true）
+- 非関数呼び出しのエラー（NotCallable）
+
+### 既知の近似（フェーズ 3b 時点）
+
+- クロージャ: `Obj::Func.env` は保持するが VM の LLoad/LStore は自フレームのみ参照。
+  自由変数の env 経由解決（C の CELOAD/CESTORE）は codegen フェーズで導入
+- ルーズ等値 `==`: 数値・文字列・null/undefined・真偽値の単純化版（オブジェクトの
+  ToPrimitive は未対応。`===` は完全）
+- オブジェクトの ToString は `[object Object]` / `[object Array]` の近似
+
+残り: クロージャ（env 経由解決）・組み込み（builtins/native 群 = フェーズ 5）・
+パーサ/レキサ（フェーズ 4）との接続。
 
 ## ツール拡充（2026-08-15）
 

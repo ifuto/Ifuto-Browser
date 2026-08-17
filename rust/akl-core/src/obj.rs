@@ -16,8 +16,7 @@
 //!    ポインタは GC 後に失効する。配列 HOF（map/filter 等）のループで古い `o` を
 //!    使い続けて heap-use-after-free になった。Rust では `&Rt` の共有借用と
 //!    `&mut Rt` の排他借用がコンパイラに強制されるため、**「参照を保持したまま
-//!    テーブルを変更する」コードはコンパイルエラー**になる（下の [`ObjTable::gc`]
-//!    が `&mut self` を取る一方、`children()` は `&self` の一時借用のみ）。
+//!    テーブルを変更する」コードはコンパイルエラー**になる。
 //!
 //! 2. **スイープの free 漏れ・二重 free**: C は kind ごとに手動で
 //!    `free(o->bytes)` / `free(o->u.po.props)` 等を列挙する（追加漏れが生存中の
@@ -30,14 +29,15 @@
 //!
 //! # 設計
 //!
-//! - [`ObjId`] は u32（C の obj index と同じ。AklVal の obj タグ空間に乗る）
+//! - [`ObjId`] は u32（C の obj index と同じ。`AklVal::mk_obj` の obj タグ空間に乗る）
+//! - 文字列もこのヒープの [`Obj::Str`] として載る（単一 id 空間。詳細は
+//!   [`crate::string`] モジュール参照）
 //! - [`ObjTable`] は `Vec<Slot>`（`Slot = Option<Obj>`）。`None` は空きスロット
-//! - GC はルート集合（`&[AklVal]` のリスト）から worklist で mark → sweep
+//! - GC はルート集合（`&[Vec<AklVal>]` のリスト）から worklist で mark → sweep
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use crate::string::StrId;
 use crate::AklVal;
 
 /// オブジェクト表の index（C の obj index。u32 なので AklVal の obj タグに乗る）。
@@ -53,6 +53,8 @@ pub enum ObjError {
     TableFull,
     /// 対象が配列ではない。
     NotArray,
+    /// 対象がオブジェクト（プレーン）ではない。
+    NotObject,
 }
 
 /// オブジェクト（C の AklObj。kind タグ + union を enum で型安全に表現）。
@@ -61,7 +63,7 @@ pub enum ObjError {
 /// 網羅的に列挙される。GC はこれだけを辿ればよい。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Obj {
-    /// ランタイム生成文字列（intern 済み文字列は Interner 側が保持）。
+    /// 文字列（intern 済み文字列は [`crate::string::Interner`] が索引を持つ）。
     Str(Box<str>),
     /// 配列（要素列）。
     Arr(Vec<AklVal>),
@@ -72,8 +74,19 @@ pub enum Obj {
         /// 親環境（無ければ None）。
         parent: Option<ObjId>,
     },
-    /// プレーンオブジェクト（プロパティ列。name は intern 済み StrId）。
-    Obj(Vec<(StrId, AklVal)>),
+    /// プレーンオブジェクト（プロパティ列。name は intern 済み文字列の ObjId）。
+    Obj(Vec<(ObjId, AklVal)>),
+    /// バイトコード関数（C の `AklObj` FUNC 相当）。
+    ///
+    /// - `fidx`: 関数表（`Runtime.funcs`）の index。コード本体はそこにあり、
+    ///   ヒープからは index だけを参照する（C の `code_off` と同型）。
+    /// - `env`: クロージャ捕捉環境（無ければ None）。
+    Func {
+        /// 関数表 index。
+        fidx: u32,
+        /// 捕捉環境（クロージャ）。無ければ None。
+        env: Option<ObjId>,
+    },
 }
 
 impl Obj {
@@ -101,10 +114,18 @@ impl Obj {
                 }
             }
             Obj::Obj(props) => {
-                for (_, v) in props {
+                for (name, v) in props {
+                    // プロパティ名（intern 済み文字列 ObjId）も子として mark する
+                    // （C の「prop 名を obj に連動させて生存させる」設計と同一）。
+                    out.push(*name);
                     if v.is_obj() {
                         out.push(v.get_obj());
                     }
+                }
+            }
+            Obj::Func { fidx: _, env } => {
+                if let Some(e) = env {
+                    out.push(*e);
                 }
             }
         }
@@ -235,14 +256,13 @@ impl ObjTable {
     /// # なぜ C の UAF が構造的に起きないか（v0.10 実バグとの対比）
     ///
     /// C 実装は `AklObj *o = &rt->objs[ai]` のポインタをループ中に保持し、コールバック
-    /// 内の GC で `rt->objs` が `realloc` されると失効 → heap-use-after-free
-    /// （ASan で検出・修正済み）。Rust では:
+    /// 内の GC で `rt->objs` が `realloc` されると失効 → heap-use-after-free。
+    /// Rust では:
     ///
     /// 1. 元配列の要素を先に `Vec<AklVal>` に**値コピー**する（AklVal は Copy）。
     ///    借用（`&Obj`）はこのスコープで終了し、以後 `self` を自由に変更できる。
-    /// 2. コールバック `f` は `FnMut(AklVal, usize) -> AklVal`（表への参照を持たない）
-    ///    — コールバック実行中に `self` を変更しても失効ポインタが存在しない。
-    /// 3. `self` へのアクセスは全て id 経由の短命借用（`self.get(id)` / `self.get_mut(id)`）。
+    /// 2. コールバック `f` は `FnMut(AklVal, usize) -> AklVal`（表への参照を持たない）。
+    /// 3. `self` へのアクセスは全て id 経由の短命借用。
     ///
     /// コールバックが表を変更する JS のケース（map 中に push 等）は「スナップショット
     /// 方式」で近似する（要素は map 開始時点のもの。V8 は length を先に固定するため
@@ -277,6 +297,33 @@ impl ObjTable {
         match self.get(id) {
             Some(Obj::Arr(v)) => v.get(index).copied(),
             _ => None,
+        }
+    }
+
+    /// プレーンオブジェクトのプロパティを name で読む（無ければ None）。
+    pub fn prop_get(&self, id: ObjId, name: ObjId) -> Option<AklVal> {
+        match self.get(id) {
+            Some(Obj::Obj(props)) => props
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v),
+            _ => None,
+        }
+    }
+
+    /// プレーンオブジェクトにプロパティを設定（既存は上書き、新規は追加）。
+    /// 対象がプレーンオブジェクトでなければ `Err(ObjError::NotObject)`。
+    pub fn prop_set(&mut self, id: ObjId, name: ObjId, value: AklVal) -> Result<(), ObjError> {
+        match self.get_mut(id) {
+            Some(Obj::Obj(props)) => {
+                if let Some(slot) = props.iter_mut().find(|(n, _)| *n == name) {
+                    slot.1 = value;
+                } else {
+                    props.push((name, value));
+                }
+                Ok(())
+            }
+            _ => Err(ObjError::NotObject),
         }
     }
 }
@@ -347,6 +394,28 @@ mod tests {
     }
 
     #[test]
+    fn func_env_is_child() {
+        let mut t = ObjTable::new();
+        let env = t.alloc(Obj::Env { vals: vec![AklVal::mk_int(1)], parent: None }).unwrap();
+        let f = t.alloc(Obj::Func { fidx: 0, env: Some(env) }).unwrap();
+        // f をルート → env も生存（Func の env 参照を辿る）
+        t.gc(&[vec![AklVal::mk_obj(f)]]);
+        assert_eq!(t.live(), 2);
+        assert!(t.get(env).is_some());
+    }
+
+    #[test]
+    fn prop_name_is_child() {
+        let mut t = ObjTable::new();
+        let name = t.alloc(Obj::Str("key".into())).unwrap();
+        let o = t.alloc(Obj::Obj(vec![(name, AklVal::mk_int(5))])).unwrap();
+        // o をルート → プロパティ名（文字列 ObjId）も生存
+        t.gc(&[vec![AklVal::mk_obj(o)]]);
+        assert_eq!(t.live(), 2);
+        assert!(t.get(name).is_some());
+    }
+
+    #[test]
     fn get_bounds_safe() {
         let mut t = ObjTable::new();
         let id = t.alloc(obj(AklVal::mk_int(1))).unwrap();
@@ -394,5 +463,21 @@ mod tests {
             .unwrap();
         assert_eq!(calls, 2);
         assert_eq!(t.arr_get(dst, 1), Some(AklVal::mk_int(2)));
+    }
+
+    #[test]
+    fn prop_set_get_roundtrip() {
+        let mut t = ObjTable::new();
+        let o = t.alloc(Obj::Obj(Vec::new())).unwrap();
+        let key = t.alloc(Obj::Str("x".into())).unwrap();
+        assert!(t.prop_get(o, key).is_none());
+        t.prop_set(o, key, AklVal::mk_int(9)).unwrap();
+        assert_eq!(t.prop_get(o, key), Some(AklVal::mk_int(9)));
+        // 上書き
+        t.prop_set(o, key, AklVal::mk_int(10)).unwrap();
+        assert_eq!(t.prop_get(o, key), Some(AklVal::mk_int(10)));
+        // 非オブジェクトは Err
+        let arr = t.alloc(Obj::Arr(Vec::new())).unwrap();
+        assert_eq!(t.prop_set(arr, key, AklVal::UNDEF), Err(ObjError::NotObject));
     }
 }

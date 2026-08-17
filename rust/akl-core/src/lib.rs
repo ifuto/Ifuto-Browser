@@ -95,6 +95,15 @@ impl AklVal {
         self.0 as u32
     }
 
+    /// 真偽値を包む（C の `AKL_VAL_TRUE` / `AKL_VAL_FALSE`）。
+    pub const fn from_bool(b: bool) -> Self {
+        if b {
+            Self::TRUE
+        } else {
+            Self::FALSE
+        }
+    }
+
     /// undefined か。
     pub const fn is_undef(self) -> bool {
         self.0 == TAG_MASK
