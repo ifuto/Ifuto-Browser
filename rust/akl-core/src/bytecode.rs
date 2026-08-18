@@ -215,6 +215,12 @@ pub enum VmError {
     NotObject,
 }
 
+/// ネイティブ関数（C の `AklNativeFn` 相当）。
+///
+/// `this` はメソッド呼び出しのレシーバ。`args` は引数列。戻り値はエラー付き
+/// （失敗は実行を停止させる）。
+pub type NativeFn = fn(&mut Runtime, AklVal, &[AklVal]) -> Result<AklVal, VmError>;
+
 /// 呼び出しフレーム。locals を明示的に保持する（C の `base` オフセット方式より安全）。
 #[derive(Clone, Debug)]
 struct Frame {
@@ -243,6 +249,17 @@ pub struct Runtime {
     pub globals: Vec<(ObjId, AklVal)>,
     /// 最後の式文の値（C の `rt->last_val`。`Halt` 時に返す）。
     pub last_val: AklVal,
+    /// ネイティブ関数表（C の native fn ポインタ + udata と同型。`Obj::Native(i)` が参照）。
+    pub native_fns: Vec<NativeFn>,
+    /// `console.log` の出力先バッファ（テストで検証可能に。None なら無視）。
+    pub console_out: Vec<String>,
+    /// 文字列メソッド表（name → native）。`PLoad` が文字列リテラルで解決する。
+    /// C の `str_meth_vals` 相当。
+    pub str_methods: Vec<(ObjId, AklVal)>,
+    /// 配列メソッド表（name → native）。`PLoad` が配列で解決する。C の `arr_meth_vals` 相当。
+    pub arr_methods: Vec<(ObjId, AklVal)>,
+    /// `length` プロパティ名の ObjId（install_builtins で設定。文字列/配列の length 用）。
+    pub length_id: ObjId,
 }
 
 impl Runtime {
@@ -268,6 +285,22 @@ impl Runtime {
         } else {
             self.globals.push((name, value));
         }
+    }
+
+    /// ネイティブ関数を登録して `Obj::Native` の AklVal を返す。
+    pub fn register_native(&mut self, f: NativeFn) -> Result<AklVal, VmError> {
+        let idx = self.native_fns.len() as u32;
+        self.native_fns.push(f);
+        let id = self.heap.alloc(Obj::Native(idx)).map_err(|_| VmError::Oom)?;
+        Ok(AklVal::mk_obj(id))
+    }
+
+    /// ネイティブ関数をグローバルに登録する（C の `akl_native_register` 相当）。
+    pub fn register_global_native(&mut self, name: &str, f: NativeFn) -> Result<(), VmError> {
+        let v = self.register_native(f)?;
+        let name_id = self.intern(name).ok_or(VmError::Oom)?;
+        self.global_set(name_id, v);
+        Ok(())
     }
 
     /// 関数表 index の関数を実行する（C の `vm_exec` 相当）。
@@ -453,8 +486,15 @@ impl Runtime {
                     let callee = stack[stack.len() - argc - 1];
                     let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
                     stack.truncate(stack.len() - argc - 1);
-                    self.do_call(&mut frames, &mut pc, callee, AklVal::UNDEF, &args)?;
-                    continue;
+                    if let Some(r) = self.do_call(&mut frames, &mut pc, callee, AklVal::UNDEF, &args)? {
+                        // native 関数の結果を push。pc は do_call 後も呼び出し元位置のまま
+                        // なので +1 して次の命令へ（ループ末尾の pc += 1 と二重にしない）。
+                        stack.push(r);
+                        pc += 1;
+                        continue;
+                    } else {
+                        continue;
+                    }
                 }
                 Op::MCall(argc) => {
                     let argc = argc as usize;
@@ -465,8 +505,13 @@ impl Runtime {
                     let receiver = stack[stack.len() - argc - 2];
                     let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
                     stack.truncate(stack.len() - argc - 2);
-                    self.do_call(&mut frames, &mut pc, callee, receiver, &args)?;
-                    continue;
+                    if let Some(r) = self.do_call(&mut frames, &mut pc, callee, receiver, &args)? {
+                        stack.push(r);
+                        pc += 1;
+                        continue;
+                    } else {
+                        continue;
+                    }
                 }
                 Op::Ret => {
                     let v = stack.pop().ok_or(VmError::StackUnderflow)?;
@@ -547,7 +592,44 @@ impl Runtime {
                     if !obj.is_obj() {
                         return Err(VmError::NotObject);
                     }
-                    let v = self.heap.prop_get(obj.get_obj(), name).unwrap_or(AklVal::UNDEF);
+                    let id = obj.get_obj();
+                    // 文字列リテラルの length プロパティ（直接返す）
+                    if let Some(Obj::Str(s)) = self.heap.get(id) {
+                        if name == self.length_id {
+                            stack.push(AklVal::mk_int(s.chars().count() as i32));
+                            pc += 1;
+                            continue;
+                        }
+                        // メソッド（String.prototype 相当）
+                        let v = self
+                            .str_methods
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, v)| *v)
+                            .unwrap_or(AklVal::UNDEF);
+                        stack.push(v);
+                        pc += 1;
+                        continue;
+                    }
+                    // 配列の length プロパティ（直接返す）
+                    if let Some(Obj::Arr(items)) = self.heap.get(id) {
+                        if name == self.length_id {
+                            stack.push(AklVal::mk_int(items.len() as i32));
+                            pc += 1;
+                            continue;
+                        }
+                        // メソッド（Array.prototype 相当）
+                        let v = self
+                            .arr_methods
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, v)| *v)
+                            .unwrap_or(AklVal::UNDEF);
+                        stack.push(v);
+                        pc += 1;
+                        continue;
+                    }
+                    let v = self.heap.prop_get(id, name).unwrap_or(AklVal::UNDEF);
                     stack.push(v);
                 }
                 Op::PStore(name) => {
@@ -608,6 +690,9 @@ impl Runtime {
 
     /// 関数呼び出し（C の `OP_CALL` / `OP_MCALL` ハンドラ相当）。フレームを積み pc を
     /// callee 先頭へ。`this_v` は呼び出し時の `this`（メソッド呼び出しならレシーバ）。
+    ///
+    /// 戻り値: ネイティブ関数なら `Some(結果)`（フレームを積まず即座に返す）。
+    /// バイトコード関数なら `None`（フレームを積んで pc を callee 先頭へ）。
     fn do_call(
         &mut self,
         frames: &mut Vec<Frame>,
@@ -615,11 +700,19 @@ impl Runtime {
         callee: AklVal,
         this_v: AklVal,
         args: &[AklVal],
-    ) -> Result<(), VmError> {
+    ) -> Result<Option<AklVal>, VmError> {
         if !callee.is_obj() {
             return Err(VmError::NotCallable);
         }
         let id = callee.get_obj();
+        // ネイティブ関数なら直接呼んで結果を返す
+        if let Some(Obj::Native(nidx)) = self.heap.get(id) {
+            let nidx = *nidx;
+            let f = self.native_fns.get(nidx as usize).ok_or(VmError::NotCallable)?;
+            let f = *f;
+            let r = f(self, this_v, args)?;
+            return Ok(Some(r));
+        }
         let (fidx, env) = match self.heap.get(id) {
             Some(Obj::Func { fidx, env }) => (*fidx, *env),
             _ => return Err(VmError::NotCallable),
@@ -636,7 +729,7 @@ impl Runtime {
         let ret_pc = *pc + 1;
         frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env });
         *pc = 0;
-        Ok(())
+        Ok(None)
     }
 
     /// 加算（int fast path + double + 文字列連結）。
@@ -798,7 +891,7 @@ impl Runtime {
         } else if v.is_obj() {
             match self.heap.get(v.get_obj()) {
                 Some(Obj::Str(_)) => "string",
-                Some(Obj::Func { .. }) => "function",
+                Some(Obj::Func { .. }) | Some(Obj::Native(_)) => "function",
                 _ => "object",
             }
         } else {
@@ -925,6 +1018,11 @@ fn str_of(obj: &Obj) -> Option<&str> {
         Obj::Str(s) => Some(s),
         _ => None,
     }
+}
+
+/// f64 の JS 風文字列化（整数は小数点なし、NaN/Infinity は JS 表記）。公開版。
+pub fn fmt_num_pub(d: f64) -> String {
+    fmt_num(d)
 }
 
 /// f64 の JS 風文字列化（整数は小数点なし、NaN/Infinity は JS 表記）。

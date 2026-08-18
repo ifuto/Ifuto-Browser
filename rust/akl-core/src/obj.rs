@@ -87,6 +87,9 @@ pub enum Obj {
         /// 捕捉環境（クロージャ）。無ければ None。
         env: Option<ObjId>,
     },
+    /// ネイティブ関数（C の `AKL_OK_NATIVE` 相当）。index はランタイムの
+    /// `native_fns` 表を指す（C の fn ポインタ + udata と同型）。
+    Native(u32),
 }
 
 impl Obj {
@@ -128,6 +131,7 @@ impl Obj {
                     out.push(*e);
                 }
             }
+            Obj::Native(_) => {}
         }
         out.into_iter()
     }

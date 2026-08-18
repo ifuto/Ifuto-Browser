@@ -220,7 +220,31 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: cargo test 87 件 + clippy 緑。アロー/関数式/switch/this の e2e が通る。
 
-残り: 分割代入・try/catch/throw・ビット演算・組み込み（builtins = フェーズ 5）。
+残り: 分割代入・try/catch/throw・ビット演算。
+
+## フェーズ 5（進行中）: 組み込み（builtins.rs）
+
+- VM に `Obj::Native` + `NativeFn` 型 + `register_native` / `register_global_native` を追加
+  （C の `AKL_OK_NATIVE` + `akl_native_register` 相当）。`do_call` が native を直接呼ぶ
+- `console.log`（`console_out` バッファへ追記。テストで検証可能）
+- `Math` オブジェクト: abs/floor/ceil/round/sqrt/pow/max/min/random/trunc
+- グローバル関数: parseInt / parseFloat / isNaN / Number / String
+- 文字列メソッド（`str_methods` 表 = C の `str_meth_vals`）: toUpperCase/toLowerCase/
+  trim/indexOf/slice/includes/startsWith/endsWith/repeat
+- 配列メソッド（`arr_methods` 表）: push/pop/join/indexOf/slice/map
+- 文字列/配列の `length` はプロパティとして `PLoad` が直接返す（C の PLOAD の
+  length 分岐と同型）
+
+### 実測で特定した VM バグ（修正済み）
+
+- `Call`/`MCall` ハンドラ内の `pc += 1` がループ末尾の `pc += 1` と二重になり、
+  次の命令（`PopV`）が飛ばされるバグ。`continue` で解消（native 呼び出しの結果が
+  last_val に反映されず UNDEF になる症状として顕在化）
+
+検証: cargo test 91 件 + clippy 緑。console.log / Math / parseInt / 文字列・配列
+メソッドの e2e が通る。
+
+残り: 正規表現系メソッド・JSON.stringify/parse・Date・try/catch/throw・ビット演算。
 
 ### フェーズ 4 追補 2: 制御フロー完全化
 
