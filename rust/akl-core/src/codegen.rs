@@ -51,29 +51,27 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
     let mut c = Compiler {
         rt,
         locals: HashMap::new(),
+        captures: HashMap::new(),
+        capture_order: Vec::new(),
         break_patches: Vec::new(),
         continue_patches: Vec::new(),
     };
 
-    // パス 1: トップレベル関数宣言を収集・登録
+    // パス 1: トップレベル関数宣言を収集・登録（box 化ローカルを解析してから）
     let mut funcs: Vec<(String, u32)> = Vec::new();
     for stmt in program {
         if let Stmt::FuncDecl { name, params, body } = stmt {
-            let fidx = c.compile_function(name, params, body)?;
+            let boxed = compute_boxed(params, body);
+            let fidx = c.compile_function(name, params, body, &boxed)?;
             funcs.push((name.clone(), fidx));
         }
     }
 
-    // パス 2: main のローカルスロット（トップレベル var 宣言）を割り当て
-    let mut locals = HashMap::new();
-    for stmt in program {
-        if let Stmt::Var { name, .. } = stmt {
-            if !locals.contains_key(name) {
-                locals.insert(name.clone(), locals.len() as u32);
-            }
-        }
-    }
-    c.locals = locals;
+    // パス 2: main はローカルを持たない（トップレベル var は JS 同様グローバル）。
+    // これにより `var g = 1; function f(){ return g; }` の g が正しくグローバル解決される。
+    c.locals = HashMap::new();
+    c.captures = HashMap::new();
+    c.capture_order = Vec::new();
 
     let mut code = Vec::new();
     // 関数宣言の hoist（MakeF + GStore）
@@ -102,6 +100,10 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
 struct Compiler<'a> {
     rt: &'a mut Runtime,
     locals: HashMap<String, u32>,
+    /// 現在の関数が捕捉する変数（name → env index）。トップレベル/main は空。
+    captures: HashMap<String, u32>,
+    /// 捕捉変数の出現順（env 構築用）。
+    capture_order: Vec<String>,
     /// `break` のジャンプ先パッチ位置（ループごとのスタック）。
     break_patches: Vec<Vec<usize>>,
     /// `continue` のジャンプ先パッチ位置（ループごとのスタック）。
@@ -110,26 +112,38 @@ struct Compiler<'a> {
 
 impl Compiler<'_> {
     /// 関数をコンパイルして関数表に登録し、index を返す。
+    /// `boxed` は「ネスト関数に捕捉される自ローカル」の集合（共有セルとして env に box 化）。
     fn compile_function(
         &mut self,
         name: &str,
         params: &[String],
         body: &[Stmt],
+        boxed: &HashMap<String, u32>,
     ) -> Result<u32, CompileError> {
         let mut locals = HashMap::new();
         for p in params {
             locals.insert(p.clone(), locals.len() as u32);
         }
         collect_vars(body, &mut locals);
+        // box 化されたローカルは locals に残したまま、参照時に captures を優先する
+        // （スロット番号の穴を避ける。box 化ローカルは未使用の locals スロットが残るが無害）
 
         let saved_locals = std::mem::take(&mut self.locals);
+        let saved_captures = std::mem::take(&mut self.captures);
+        let saved_order = std::mem::take(&mut self.capture_order);
         let saved_breaks = std::mem::take(&mut self.break_patches);
         let saved_continues = std::mem::take(&mut self.continue_patches);
         self.locals = locals;
+        self.captures = boxed.clone();
+        self.capture_order = Vec::new();
         self.break_patches = Vec::new();
         self.continue_patches = Vec::new();
 
         let mut code = Vec::new();
+        // 関数入口で自前 env（box 化ローカル）を生成（C の frame_hidden 相当）
+        if !boxed.is_empty() {
+            code.push(Op::MakeEnv(boxed.len() as u32));
+        }
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
         }
@@ -149,8 +163,78 @@ impl Compiler<'_> {
         });
 
         self.locals = saved_locals;
+        self.captures = saved_captures;
+        self.capture_order = saved_order;
         self.break_patches = saved_breaks;
         self.continue_patches = saved_continues;
+        Ok(fidx)
+    }
+
+    /// ネスト関数をコンパイルして関数表に登録し、fidx を返す。
+    /// 自由変数は「外側の env（captures）に解決」されたら CeLoad/CeStore、なければグローバル。
+    fn compile_nested(
+        &mut self,
+        name: &str,
+        params: &[String],
+        body: &[Stmt],
+        enclosing_env: &HashMap<String, u32>,
+    ) -> Result<u32, CompileError> {
+        // 深いネスト（3 段以上）は未対応（env チェーンが必要。明白に失敗させる）
+        if body.iter().any(|s| matches!(s, Stmt::FuncDecl { .. })) {
+            return Err(CompileError("deeply nested closures are not yet supported".into()));
+        }
+
+        // ネスト関数のローカル（パラメータ + var 宣言 + ネスト関数名）
+        let mut locals = HashMap::new();
+        for p in params {
+            locals.insert(p.clone(), locals.len() as u32);
+        }
+        collect_vars(body, &mut locals);
+
+        // 自由変数（参照されるがローカルでない名前）
+        let mut refs = std::collections::HashSet::new();
+        collect_refs(body, &mut refs);
+        let mut captures: HashMap<String, u32> = HashMap::new();
+        for r in refs {
+            if locals.contains_key(&r) {
+                continue;
+            }
+            if let Some(idx) = enclosing_env.get(&r) {
+                captures.insert(r, *idx);
+            }
+            // それ以外はグローバル（GLoad/GStore）
+        }
+
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_captures = std::mem::take(&mut self.captures);
+        let saved_order = std::mem::take(&mut self.capture_order);
+        let saved_breaks = std::mem::take(&mut self.break_patches);
+        let saved_continues = std::mem::take(&mut self.continue_patches);
+        self.locals = locals;
+        self.captures = captures;
+        self.capture_order = Vec::new();
+        self.break_patches = Vec::new();
+        self.continue_patches = Vec::new();
+
+        let mut code = Vec::new();
+        for stmt in body {
+            self.gen_stmt(stmt, &mut code)?;
+        }
+        code.push(Op::Undef);
+        code.push(Op::Ret);
+
+        let n_locals = self.locals.len();
+        let n_params = params.len();
+        let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+        let fidx = self.rt.funcs.len() as u32;
+        self.rt.funcs.push(FuncObj { code, name: Some(name_id), n_params, n_locals });
+
+        self.locals = saved_locals;
+        self.captures = saved_captures;
+        self.capture_order = saved_order;
+        self.break_patches = saved_breaks;
+        self.continue_patches = saved_continues;
+
         Ok(fidx)
     }
 
@@ -465,16 +549,23 @@ impl Compiler<'_> {
                 code.push(Op::Jmp(0)); // プレースホルダ
                 patches.push(idx);
             }
-            Stmt::FuncDecl { .. } => {
-                return Err(CompileError("nested function declarations are not yet supported".into()))
+            Stmt::FuncDecl { name, params, body } => {
+                // ネスト関数宣言: 現在フレームの env を共有するクロージャを生成して束縛
+                let enclosing_env = self.captures.clone();
+                let fidx = self.compile_nested(name, params, body, &enclosing_env)?;
+                code.push(Op::MakeClosure(fidx));
+                self.gen_store(name, code)?;
             }
         }
         Ok(())
     }
 
-    /// 変数を読み出す（ローカルなら LLoad、グローバルなら GLoad）。
+    /// 変数を読み出す（捕捉 env → ローカル → グローバルの順で解決）。
+    /// 捕捉をローカルより優先するのは、box 化ローカルが locals に残るため。
     fn gen_load(&mut self, name: &str, code: &mut Vec<Op>) -> Result<(), CompileError> {
-        if let Some(slot) = self.locals.get(name) {
+        if let Some(idx) = self.captures.get(name) {
+            code.push(Op::CeLoad(*idx));
+        } else if let Some(slot) = self.locals.get(name) {
             code.push(Op::LLoad(*slot));
         } else {
             let id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
@@ -483,9 +574,11 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// 変数へ書き込む（ローカルなら LStore、グローバルなら GStore）。
+    /// 変数へ書き込む（捕捉 env → ローカル → グローバルの順で解決）。
     fn gen_store(&mut self, name: &str, code: &mut Vec<Op>) -> Result<(), CompileError> {
-        if let Some(slot) = self.locals.get(name) {
+        if let Some(idx) = self.captures.get(name) {
+            code.push(Op::CeStore(*idx));
+        } else if let Some(slot) = self.locals.get(name) {
             code.push(Op::LStore(*slot));
         } else {
             let id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
@@ -501,6 +594,12 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
     for stmt in stmts {
         match stmt {
             Stmt::Var { name, .. } => {
+                if !locals.contains_key(name) {
+                    locals.insert(name.clone(), locals.len() as u32);
+                }
+            }
+            Stmt::FuncDecl { name, .. } => {
+                // ネスト関数宣言の名前も外側関数のローカル（クロージャ束縛先）
                 if !locals.contains_key(name) {
                     locals.insert(name.clone(), locals.len() as u32);
                 }
@@ -525,6 +624,196 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
             _ => {}
         }
     }
+}
+
+/// 文列から参照される識別子名を収集する（クロージャの自由変数解析用）。
+fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Expr(e) => collect_expr_refs(e, out),
+            Stmt::Var { init, .. } => {
+                if let Some(e) = init {
+                    collect_expr_refs(e, out);
+                }
+            }
+            Stmt::Return(e) => {
+                if let Some(e) = e {
+                    collect_expr_refs(e, out);
+                }
+            }
+            Stmt::If { cond, then, else_ } => {
+                collect_expr_refs(cond, out);
+                collect_refs(std::slice::from_ref(then), out);
+                if let Some(e) = else_ {
+                    collect_refs(std::slice::from_ref(e), out);
+                }
+            }
+            Stmt::While { cond, body } => {
+                collect_expr_refs(cond, out);
+                collect_refs(std::slice::from_ref(body), out);
+            }
+            Stmt::For { init, cond, step, body } => {
+                if let Some(ForInit::Expr(e)) = init {
+                    collect_expr_refs(e, out);
+                }
+                if let Some(ForInit::Var { init: Some(e), .. }) = init {
+                    collect_expr_refs(e, out);
+                }
+                if let Some(c) = cond {
+                    collect_expr_refs(c, out);
+                }
+                if let Some(s) = step {
+                    collect_expr_refs(s, out);
+                }
+                collect_refs(std::slice::from_ref(body), out);
+            }
+            Stmt::DoWhile { body, cond } => {
+                collect_refs(std::slice::from_ref(body), out);
+                collect_expr_refs(cond, out);
+            }
+            Stmt::Block(inner) => collect_refs(inner, out),
+            // ネスト関数宣言の中身は、その関数自身の自由変数として別途解析されるため
+            // ここでは名前（束縛先）だけを参照扱いしない（locals で解決される）。
+            Stmt::FuncDecl { .. } | Stmt::Empty | Stmt::Break | Stmt::Continue => {}
+        }
+    }
+}
+
+/// 式から参照される識別子名を収集する。
+fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+    match expr {
+        Expr::Ident(name) => {
+            out.insert(name.clone());
+        }
+        Expr::Assign { name, rhs } => {
+            out.insert(name.clone());
+            collect_expr_refs(rhs, out);
+        }
+        Expr::CompoundAssign { name, rhs, .. } => {
+            out.insert(name.clone());
+            collect_expr_refs(rhs, out);
+        }
+        Expr::IncDec { name, .. } => {
+            out.insert(name.clone());
+        }
+        Expr::Unary { operand, .. } => collect_expr_refs(operand, out),
+        Expr::Bin { lhs, rhs, .. } => {
+            collect_expr_refs(lhs, out);
+            collect_expr_refs(rhs, out);
+        }
+        Expr::Call { callee, args } => {
+            collect_expr_refs(callee, out);
+            for a in args {
+                collect_expr_refs(a, out);
+            }
+        }
+        Expr::Arr(items) => {
+            for i in items {
+                collect_expr_refs(i, out);
+            }
+        }
+        Expr::ObjLit(entries) => {
+            for (_, v) in entries {
+                collect_expr_refs(v, out);
+            }
+        }
+        Expr::Member { obj, .. } => collect_expr_refs(obj, out),
+        Expr::Index { obj, index } => {
+            collect_expr_refs(obj, out);
+            collect_expr_refs(index, out);
+        }
+        Expr::IndexAssign { obj, index, rhs } => {
+            collect_expr_refs(obj, out);
+            collect_expr_refs(index, out);
+            collect_expr_refs(rhs, out);
+        }
+        Expr::MemberAssign { obj, rhs, .. } => {
+            collect_expr_refs(obj, out);
+            collect_expr_refs(rhs, out);
+        }
+        Expr::Ternary { cond, then, else_ } => {
+            collect_expr_refs(cond, out);
+            collect_expr_refs(then, out);
+            collect_expr_refs(else_, out);
+        }
+        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Undef => {}
+    }
+}
+
+/// 制御フローを跨いで文列から直接のネスト関数宣言を収集する（ネスト関数の中身は降りない）。
+fn collect_nested_funcs(
+    stmts: &[Stmt],
+    out: &mut Vec<(String, Vec<String>, Vec<Stmt>)>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::FuncDecl { name, params, body } => {
+                out.push((name.clone(), params.clone(), body.clone()));
+            }
+            Stmt::Block(inner) => collect_nested_funcs(inner, out),
+            Stmt::If { then, else_, .. } => {
+                collect_nested_funcs(std::slice::from_ref(then), out);
+                if let Some(e) = else_ {
+                    collect_nested_funcs(std::slice::from_ref(e), out);
+                }
+            }
+            Stmt::While { body, .. } => collect_nested_funcs(std::slice::from_ref(body), out),
+            Stmt::For { body, .. } => collect_nested_funcs(std::slice::from_ref(body), out),
+            Stmt::DoWhile { body, .. } => collect_nested_funcs(std::slice::from_ref(body), out),
+            _ => {}
+        }
+    }
+}
+
+/// 関数の自由変数（参照されるが自ローカルでない名前）を列挙する。
+fn free_vars(params: &[String], body: &[Stmt]) -> Vec<String> {
+    let mut locals = std::collections::HashSet::new();
+    for p in params {
+        locals.insert(p.clone());
+    }
+    let mut local_map = HashMap::new();
+    for l in &locals {
+        local_map.insert(l.clone(), 0u32);
+    }
+    collect_vars(body, &mut local_map);
+    let mut refs = std::collections::HashSet::new();
+    collect_refs(body, &mut refs);
+    let mut free = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for r in refs {
+        if local_map.contains_key(&r) {
+            continue;
+        }
+        if !seen.contains(&r) {
+            seen.insert(r.clone());
+            free.push(r);
+        }
+    }
+    free
+}
+
+/// ネスト関数に捕捉される「自ローカル」の集合を算出（共有セルとして env に box 化）。
+/// 戻り値は name → env index（出現順）。
+fn compute_boxed(params: &[String], body: &[Stmt]) -> HashMap<String, u32> {
+    let mut locals = HashMap::new();
+    for p in params {
+        locals.insert(p.clone(), locals.len() as u32);
+    }
+    collect_vars(body, &mut locals);
+
+    let mut nested = Vec::new();
+    collect_nested_funcs(body, &mut nested);
+
+    let mut boxed = HashMap::new();
+    for (_name, nparams, nbody) in &nested {
+        let free = free_vars(nparams, nbody);
+        for f in free {
+            if locals.contains_key(&f) && !boxed.contains_key(&f) {
+                boxed.insert(f.clone(), boxed.len() as u32);
+            }
+        }
+    }
+    boxed
 }
 
 #[cfg(test)]
@@ -754,5 +1043,81 @@ mod tests {
         let program = crate::parser::Parser::new(src).parse_program().unwrap();
         let mut rt = Runtime::new();
         assert!(compile(&mut rt, &program).is_err());
+    }
+
+    #[test]
+    fn closure_captures_enclosing_local() {
+        let src = "
+            function outer() {
+                var x = 10;
+                function inner() { return x; }
+                return inner();
+            }
+            outer();
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(10));
+    }
+
+    #[test]
+    fn closure_counter() {
+        let src = "
+            function makeCounter() {
+                var count = 0;
+                function inc() { count = count + 1; return count; }
+                return inc;
+            }
+            var c = makeCounter();
+            c();
+            c();
+            c();
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(3));
+    }
+
+    #[test]
+    fn closure_mutates_captured() {
+        // 捕捉変数への書き込みが外側にも反映される（共有セマンティクス）
+        let src = "
+            function makeCounter() {
+                var count = 0;
+                function bump() { count = count + 1; }
+                function read() { return count; }
+                bump();
+                bump();
+                return read();
+            }
+            makeCounter();
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(2));
+    }
+
+    #[test]
+    fn closure_recursive_inner() {
+        // ネスト関数が自分自身を再帰呼び出し（自由変数として捕捉）
+        let src = "
+            function outer() {
+                function fib(n) {
+                    if (n < 2) { return n; }
+                    return fib(n - 1) + fib(n - 2);
+                }
+                return fib(10);
+            }
+            outer();
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(55));
+    }
+
+    #[test]
+    fn closure_uses_global_not_captured() {
+        // ネスト関数の自由変数がグローバルなら GLoad のまま（捕捉しない）
+        let src = "
+            var g = 42;
+            function outer() {
+                function inner() { return g; }
+                return inner();
+            }
+            outer();
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(42));
     }
 }

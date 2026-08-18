@@ -182,6 +182,14 @@ pub enum Op {
     AGet,
     /// 要素書き込み（val, idx, obj を pop、val を push。C の `ASET`）。
     ASet,
+    /// 環境オブジェクトを生成（n 個 pop して Env を push。C の env 生成）。
+    MakeEnv(u32),
+    /// クロージャを生成（env を pop、Func{fidx, env} を push。C の `MAKEF` env 版）。
+    MakeClosure(u32),
+    /// 捕捉変数の読み出し（frame.env.vals[idx] を push。C の `CELOAD` 簡略版）。
+    CeLoad(u32),
+    /// 捕捉変数への書き込み（pop → frame.env.vals[idx]。C の `CESTORE` 簡略版）。
+    CeStore(u32),
     /// 停止（C の `HALT`）。
     Halt,
 }
@@ -216,6 +224,8 @@ struct Frame {
     locals: Vec<AklVal>,
     /// このフレームの `this`。
     this: AklVal,
+    /// クロージャ捕捉環境（無ければ None）。
+    env: Option<ObjId>,
 }
 
 /// ランタイム（C の `AklRT` 相当）。ヒープ・文字列インターン・関数表・グローバルを束ねる。
@@ -275,7 +285,7 @@ impl Runtime {
             for (i, a) in args.iter().enumerate().take(f.n_params) {
                 locals[i] = *a;
             }
-            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this: AklVal::UNDEF });
+            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this: AklVal::UNDEF, env: None });
         }
 
         loop {
@@ -458,12 +468,54 @@ impl Runtime {
                     continue;
                 }
                 Op::MakeF(fidx) => {
-                    let env = None; // クロージャ捕捉はパーサ・codegen フェーズで導入
+                    let id = self
+                        .heap
+                        .alloc(Obj::Func { fidx, env: None })
+                        .map_err(|_| VmError::Oom)?;
+                    stack.push(AklVal::mk_obj(id));
+                }
+                Op::MakeEnv(n) => {
+                    // 現在フレームの自前 env（box 化されたローカル n 個を undefined で生成）。
+                    // クロージャはこの env を共有する（C の frame_hidden の n_env 生成相当）。
+                    let id = self
+                        .heap
+                        .alloc(Obj::Env { vals: vec![AklVal::UNDEF; n as usize], parent: None })
+                        .map_err(|_| VmError::Oom)?;
+                    let frame = frames.last_mut().ok_or(VmError::StackUnderflow)?;
+                    frame.env = Some(id);
+                }
+                Op::MakeClosure(fidx) => {
+                    // 現在フレームの env を共有するクロージャを生成（C の MAKEF env 版）。
+                    // 捕捉変数は共有セルなので、値コピーではなく env 参照を共有する。
+                    let env = frames.last().and_then(|f| f.env);
                     let id = self
                         .heap
                         .alloc(Obj::Func { fidx, env })
                         .map_err(|_| VmError::Oom)?;
                     stack.push(AklVal::mk_obj(id));
+                }
+                Op::CeLoad(idx) => {
+                    let frame = frames.last().ok_or(VmError::StackUnderflow)?;
+                    let env_id = frame.env.ok_or(VmError::LocalOob)?;
+                    let v = match self.heap.get(env_id) {
+                        Some(Obj::Env { vals, .. }) => {
+                            *vals.get(idx as usize).ok_or(VmError::LocalOob)?
+                        }
+                        _ => return Err(VmError::LocalOob),
+                    };
+                    stack.push(v);
+                }
+                Op::CeStore(idx) => {
+                    let v = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let frame = frames.last().ok_or(VmError::StackUnderflow)?;
+                    let env_id = frame.env.ok_or(VmError::LocalOob)?;
+                    match self.heap.get_mut(env_id) {
+                        Some(Obj::Env { vals, .. }) => {
+                            let dst = vals.get_mut(idx as usize).ok_or(VmError::LocalOob)?;
+                            *dst = v;
+                        }
+                        _ => return Err(VmError::LocalOob),
+                    }
                 }
                 Op::This => {
                     let this = frames.last().ok_or(VmError::StackUnderflow)?.this;
@@ -552,8 +604,8 @@ impl Runtime {
             return Err(VmError::NotCallable);
         }
         let id = callee.get_obj();
-        let fidx = match self.heap.get(id) {
-            Some(Obj::Func { fidx, .. }) => *fidx,
+        let (fidx, env) = match self.heap.get(id) {
+            Some(Obj::Func { fidx, env }) => (*fidx, *env),
             _ => return Err(VmError::NotCallable),
         };
         let (n_params, n_locals) = {
@@ -566,7 +618,7 @@ impl Runtime {
             locals[i] = *a;
         }
         let ret_pc = *pc + 1;
-        frames.push(Frame { func: fidx, ret_pc, locals, this: AklVal::UNDEF });
+        frames.push(Frame { func: fidx, ret_pc, locals, this: AklVal::UNDEF, env });
         *pc = 0;
         Ok(())
     }
