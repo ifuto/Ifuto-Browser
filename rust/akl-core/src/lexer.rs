@@ -394,6 +394,7 @@ impl std::fmt::Display for LexError {
 }
 
 /// レキサ。ソースは `&str` を借用し、`pos`（バイト位置）と `line`（1 始まり）を進める。
+#[derive(Clone)]
 pub struct Lexer<'a> {
     src: &'a str,
     bytes: &'a [u8],

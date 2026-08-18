@@ -164,6 +164,8 @@ pub enum Op {
     JmpT(u32),
     /// 関数呼び出し（argc 個の引数 + callee を pop）。
     Call(u8),
+    /// メソッド呼び出し（`[receiver, callee, ...args]`。callee を this=receiver で呼ぶ）。
+    MCall(u8),
     /// 戻る（TOS を返り値として pop）。
     Ret,
     /// 関数オブジェクトを生成して push（C の `MAKEF`。fidx = 関数表 index）。
@@ -451,7 +453,19 @@ impl Runtime {
                     let callee = stack[stack.len() - argc - 1];
                     let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
                     stack.truncate(stack.len() - argc - 1);
-                    self.do_call(&mut frames, &mut pc, callee, &args)?;
+                    self.do_call(&mut frames, &mut pc, callee, AklVal::UNDEF, &args)?;
+                    continue;
+                }
+                Op::MCall(argc) => {
+                    let argc = argc as usize;
+                    if stack.len() < argc + 2 {
+                        return Err(VmError::StackUnderflow);
+                    }
+                    let callee = stack[stack.len() - argc - 1];
+                    let receiver = stack[stack.len() - argc - 2];
+                    let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
+                    stack.truncate(stack.len() - argc - 2);
+                    self.do_call(&mut frames, &mut pc, callee, receiver, &args)?;
                     continue;
                 }
                 Op::Ret => {
@@ -592,12 +606,14 @@ impl Runtime {
         }
     }
 
-    /// 関数呼び出し（C の `OP_CALL` ハンドラ相当）。フレームを積み pc を callee 先頭へ。
+    /// 関数呼び出し（C の `OP_CALL` / `OP_MCALL` ハンドラ相当）。フレームを積み pc を
+    /// callee 先頭へ。`this_v` は呼び出し時の `this`（メソッド呼び出しならレシーバ）。
     fn do_call(
         &mut self,
         frames: &mut Vec<Frame>,
         pc: &mut usize,
         callee: AklVal,
+        this_v: AklVal,
         args: &[AklVal],
     ) -> Result<(), VmError> {
         if !callee.is_obj() {
@@ -618,7 +634,7 @@ impl Runtime {
             locals[i] = *a;
         }
         let ret_pc = *pc + 1;
-        frames.push(Frame { func: fidx, ret_pc, locals, this: AklVal::UNDEF, env });
+        frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env });
         *pc = 0;
         Ok(())
     }

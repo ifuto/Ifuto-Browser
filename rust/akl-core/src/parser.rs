@@ -152,6 +152,24 @@ pub enum Expr {
         /// 右辺。
         rhs: Box<Expr>,
     },
+    /// `this` キーワード。
+    This,
+    /// 関数式 `function [name] (params) { body }`（無名は name=None）。
+    FuncExpr {
+        /// 関数名（無名は None）。
+        name: Option<String>,
+        /// パラメータ名。
+        params: Vec<String>,
+        /// 本体。
+        body: Vec<Stmt>,
+    },
+    /// アロー関数 `(params) => expr` または `(params) => { body }`。
+    Arrow {
+        /// パラメータ名。
+        params: Vec<String>,
+        /// 本体（式の場合は暗黙 return、ブロックは文列）。
+        body: Box<Expr>,
+    },
     /// 三項演算子 `cond ? then : else_`。
     Ternary {
         /// 条件式。
@@ -260,6 +278,13 @@ pub enum Stmt {
     Break,
     /// `continue;`。
     Continue,
+    /// `switch (disc) { case x: ...; default: ... }`。
+    Switch {
+        /// 判別式。
+        disc: Expr,
+        /// (case 値（None = default）, 本体) の列。
+        cases: Vec<(Option<Expr>, Vec<Stmt>)>,
+    },
 }
 
 /// パースエラー（短いメッセージ。行番号は [`ParseError`] に含めない。呼び出し側で付加）。
@@ -344,6 +369,17 @@ impl<'a> Parser<'a> {
         } else {
             Err(ParseError(format!("expected {what}")))
         }
+    }
+
+    /// パーサ状態を退避する（アロー関数の先読みロールバック用）。
+    fn save_state(&self) -> (Lexer<'a>, Option<Token>) {
+        (self.lx.clone(), self.peeked.clone())
+    }
+
+    /// パーサ状態を復元する。
+    fn restore_state(&mut self, state: (Lexer<'a>, Option<Token>)) {
+        self.lx = state.0;
+        self.peeked = state.1;
     }
 
     /// プログラム全体（文の列）をパースする。
@@ -618,8 +654,29 @@ impl<'a> Parser<'a> {
             Token::Kw(Keyword::False) => Ok(Expr::Bool(false)),
             Token::Kw(Keyword::Null) => Ok(Expr::Null),
             Token::Kw(Keyword::Undefined) => Ok(Expr::Undef),
-            Token::Ident(name) => Ok(Expr::Ident(name.to_string())),
+            Token::Kw(Keyword::This) => Ok(Expr::This),
+            Token::Ident(name) => {
+                // アロー関数の単一引数形: `x => body`
+                if self.at_punct(Punct::Arrow)? {
+                    self.bump()?;
+                    let body = self.parse_arrow_body()?;
+                    return Ok(Expr::Arrow { params: vec![name.to_string()], body: Box::new(body) });
+                }
+                Ok(Expr::Ident(name.to_string()))
+            }
+            Token::Kw(Keyword::Function) => self.parse_func_expr(),
             Token::Punct(Punct::LParen) => {
+                // アロー関数 `(params) => body` か、グループ式 `(expr)` かの先読み
+                let saved = self.save_state();
+                if let Some(params) = self.try_parse_params()? {
+                    if self.at_punct(Punct::Arrow)? {
+                        self.bump()?;
+                        let body = self.parse_arrow_body()?;
+                        return Ok(Expr::Arrow { params, body: Box::new(body) });
+                    }
+                }
+                // ロールバックしてグループ式
+                self.restore_state(saved);
                 let e = self.parse_expr()?;
                 self.expect_punct(Punct::RParen, "')'")?;
                 Ok(e)
@@ -662,8 +719,83 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::RBracket, "']'")?;
                 Ok(Expr::Arr(items))
             }
-            Token::Kw(Keyword::Function) => Err(ParseError("function expressions are not yet supported".into())),
             other => Err(ParseError(format!("unexpected token in expression: {other:?}"))),
+        }
+    }
+
+    /// `function [name] (params) { body }`（関数式。`function` は消費済み）。
+    fn parse_func_expr(&mut self) -> Result<Expr, ParseError> {
+        // 省略可能な名前
+        let name = match self.peek()? {
+            Token::Ident(n) => {
+                let n = n.to_string();
+                self.bump()?;
+                Some(n)
+            }
+            _ => None,
+        };
+        self.expect_punct(Punct::LParen, "'('")?;
+        let mut params = Vec::new();
+        if !self.at_punct(Punct::RParen)? {
+            loop {
+                match self.bump()? {
+                    Token::Ident(p) => params.push(p.to_string()),
+                    other => return Err(ParseError(format!("expected parameter, got {other:?}"))),
+                }
+                if !self.eat_punct(Punct::Comma)? {
+                    break;
+                }
+            }
+        }
+        self.expect_punct(Punct::RParen, "')'")?;
+        let body = match self.parse_block()? {
+            Stmt::Block(s) => s,
+            _ => unreachable!(),
+        };
+        Ok(Expr::FuncExpr { name, params, body })
+    }
+
+    /// `=> body` の本体（`=>` は消費済み）。式なら暗黙 return、ブロックは文列。
+    fn parse_arrow_body(&mut self) -> Result<Expr, ParseError> {
+        if self.at_punct(Punct::LBrace)? {
+            // ブロック本体 → Return 文に変換して 1 つの Expr::Block 風に包む
+            // （Expr::Arrow の body は Box<Expr> なので、Block を表す専用式は持たず、
+            // ここでは式を返す。ブロック本体は codegen 側で特別扱いしないため、
+            // 式のみサポートし、ブロックは未対応とする）
+            return Err(ParseError("arrow function with block body is not yet supported".into()));
+        }
+        self.parse_expr()
+    }
+
+    /// `(params)` を試す（アロー関数用）。成功なら params、失敗（グループ式）なら None。
+    /// 呼び出し時点で `(` は既に消費済み。
+    fn try_parse_params(&mut self) -> Result<Option<Vec<String>>, ParseError> {
+        // 空の `()` はアロー（params 空）にもグループ（空は不正）にもなり得るが、
+        // `() => ...` のみ有効なので空でも params として扱う。
+        if self.at_punct(Punct::RParen)? {
+            self.bump()?;
+            return Ok(Some(Vec::new()));
+        }
+        let mut params = Vec::new();
+        loop {
+            match self.peek()? {
+                Token::Ident(_) => {
+                    let p = match self.bump()? {
+                        Token::Ident(n) => n.to_string(),
+                        _ => unreachable!(),
+                    };
+                    params.push(p);
+                }
+                _ => return Ok(None), // グループ式（識別子でない）
+            }
+            if self.eat_punct(Punct::Comma)? {
+                continue;
+            }
+            if self.at_punct(Punct::RParen)? {
+                self.bump()?;
+                return Ok(Some(params));
+            }
+            return Ok(None);
         }
     }
 
@@ -716,6 +848,9 @@ impl<'a> Parser<'a> {
         }
         if self.at_kw(Keyword::Function)? {
             return self.parse_func_decl();
+        }
+        if self.at_kw(Keyword::Switch)? {
+            return self.parse_switch();
         }
         // 式文
         let e = self.parse_expr()?;
@@ -849,6 +984,41 @@ impl<'a> Parser<'a> {
             self.bump()?;
         }
         Ok(Stmt::DoWhile { body: Box::new(body), cond })
+    }
+
+    /// `switch (disc) { case x: ...; default: ... }`。
+    fn parse_switch(&mut self) -> Result<Stmt, ParseError> {
+        self.bump()?; // switch
+        self.expect_punct(Punct::LParen, "'('")?;
+        let disc = self.parse_expr()?;
+        self.expect_punct(Punct::RParen, "')'")?;
+        self.expect_punct(Punct::LBrace, "'{'")?;
+        let mut cases = Vec::new();
+        while !self.at_punct(Punct::RBrace)? && !self.at_eof()? {
+            // case 値 or default
+            let case_val = if self.at_kw(Keyword::Case)? {
+                self.bump()?;
+                Some(self.parse_expr()?)
+            } else if self.at_kw(Keyword::Default)? {
+                self.bump()?;
+                None
+            } else {
+                return Err(ParseError("expected 'case' or 'default'".into()));
+            };
+            self.expect_punct(Punct::Colon, "':'")?;
+            // 本体の文列（次の case/default か `}` まで）
+            let mut body = Vec::new();
+            while !self.at_kw(Keyword::Case)?
+                && !self.at_kw(Keyword::Default)?
+                && !self.at_punct(Punct::RBrace)?
+                && !self.at_eof()?
+            {
+                body.push(self.parse_stmt()?);
+            }
+            cases.push((case_val, body));
+        }
+        self.expect_punct(Punct::RBrace, "'}'")?;
+        Ok(Stmt::Switch { disc, cases })
     }
 
     /// `while (cond) body`。
@@ -1007,7 +1177,25 @@ mod tests {
     #[test]
     fn unsupported_errors() {
         assert!(parse("class C {}").is_err()); // class は未対応
-        assert!(parse("switch(x){}").is_err()); // switch は未対応
+    }
+
+    #[test]
+    fn this_and_arrow() {
+        assert_eq!(parse("this;").unwrap(), vec![Stmt::Expr(Expr::This)]);
+        // アロー関数（単一引数）
+        let stmts = parse("var f = x => x * 2;").unwrap();
+        assert!(matches!(stmts[0], Stmt::Var { name: _, init: Some(Expr::Arrow { .. }) }));
+        // アロー関数（複数引数）
+        let stmts = parse("var g = (a, b) => a + b;").unwrap();
+        assert!(matches!(stmts[0], Stmt::Var { name: _, init: Some(Expr::Arrow { .. }) }));
+    }
+
+    #[test]
+    fn func_expr_and_switch() {
+        let stmts = parse("var f = function(x) { return x; };").unwrap();
+        assert!(matches!(stmts[0], Stmt::Var { name: _, init: Some(Expr::FuncExpr { .. }) }));
+        let stmts = parse("switch (x) { case 1: break; default: break; }").unwrap();
+        assert!(matches!(stmts[0], Stmt::Switch { .. }));
     }
 
     #[test]

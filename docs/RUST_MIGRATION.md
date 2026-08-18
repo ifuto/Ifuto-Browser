@@ -206,9 +206,21 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 - グローバルは捕捉しない（`g` は GLoad のまま）
 
 既知の制限: 3 段以上の深いネスト（クロージャ内のクロージャが祖父母を捕捉）は未対応
-（env チェーンが必要。明白にコンパイルエラー）。アロー関数・関数式は未対応。
+（env チェーンが必要。明白にコンパイルエラー）。
 
-残り: `switch`・分割代入・アロー関数/関数式・組み込み（builtins = フェーズ 5）。
+### フェーズ 4 追補 4: アロー関数・関数式・this・switch
+
+- `this` キーワード（`Expr::This` → `Op::This`）
+- メソッド呼び出し `obj.method(args)` は `this=obj` を束縛（`Op::MCall` 追加）
+- アロー関数 `x => expr` / `(a,b) => expr`（式本体を暗黙 return。パーサは Lexer
+  クローンによる先読みロールバックで `(expr)` グループ式と区別）
+- 関数式 `function(x){...}` / `(function(x){...})(...)`（無名・即時実行）
+- `switch (disc) { case x: ...; default: ... }`（=== 比較・break 前提の
+  if/else-if チェーンにコンパイル。switch 内 break 対応）
+
+検証: cargo test 87 件 + clippy 緑。アロー/関数式/switch/this の e2e が通る。
+
+残り: 分割代入・try/catch/throw・ビット演算・組み込み（builtins = フェーズ 5）。
 
 ### フェーズ 4 追補 2: 制御フロー完全化
 

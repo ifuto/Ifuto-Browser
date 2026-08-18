@@ -238,6 +238,70 @@ impl Compiler<'_> {
         Ok(fidx)
     }
 
+    /// 匿名関数（関数式・アロー関数）をコンパイルして関数表に登録し、fidx を返す。
+    /// 自由変数は `enclosing_env`（外側の捕捉 env）に解決されたら CeLoad/CeStore、
+    /// なければグローバル。`boxed` は自ローカルのうちネスト関数に捕捉されるもの。
+    fn compile_function_anon(
+        &mut self,
+        params: &[String],
+        body: &[Stmt],
+        boxed: &HashMap<String, u32>,
+        enclosing_env: &HashMap<String, u32>,
+    ) -> Result<u32, CompileError> {
+        let mut locals = HashMap::new();
+        for p in params {
+            locals.insert(p.clone(), locals.len() as u32);
+        }
+        collect_vars(body, &mut locals);
+
+        // 自由変数（参照されるが自ローカルでない名前）を捕捉解決
+        let mut refs = std::collections::HashSet::new();
+        collect_refs(body, &mut refs);
+        let mut captures: HashMap<String, u32> = boxed.clone();
+        for r in refs {
+            if locals.contains_key(&r) || captures.contains_key(&r) {
+                continue;
+            }
+            if let Some(idx) = enclosing_env.get(&r) {
+                captures.insert(r, *idx);
+            }
+        }
+
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_captures = std::mem::take(&mut self.captures);
+        let saved_order = std::mem::take(&mut self.capture_order);
+        let saved_breaks = std::mem::take(&mut self.break_patches);
+        let saved_continues = std::mem::take(&mut self.continue_patches);
+        self.locals = locals;
+        self.captures = captures;
+        self.capture_order = Vec::new();
+        self.break_patches = Vec::new();
+        self.continue_patches = Vec::new();
+
+        let mut code = Vec::new();
+        if !boxed.is_empty() {
+            code.push(Op::MakeEnv(boxed.len() as u32));
+        }
+        for stmt in body {
+            self.gen_stmt(stmt, &mut code)?;
+        }
+        code.push(Op::Undef);
+        code.push(Op::Ret);
+
+        let n_locals = self.locals.len();
+        let n_params = params.len();
+        let fidx = self.rt.funcs.len() as u32;
+        self.rt.funcs.push(FuncObj { code, name: None, n_params, n_locals });
+
+        self.locals = saved_locals;
+        self.captures = saved_captures;
+        self.capture_order = saved_order;
+        self.break_patches = saved_breaks;
+        self.continue_patches = saved_continues;
+
+        Ok(fidx)
+    }
+
     /// 式をコード生成（結果をスタックに残す）。
     fn gen_expr(&mut self, expr: &Expr, code: &mut Vec<Op>) -> Result<(), CompileError> {
         match expr {
@@ -291,14 +355,32 @@ impl Compiler<'_> {
                 self.gen_store(name, code)?;
             }
             Expr::Call { callee, args } => {
-                self.gen_expr(callee, code)?;
-                for a in args {
-                    self.gen_expr(a, code)?;
+                // メソッド呼び出し `obj.method(...)` は this=obj で呼ぶ（MCall）
+                if let Expr::Member { obj, name } = &**callee {
+                    self.gen_expr(obj, code)?; // receiver
+                    code.push(Op::Dup); // receiver を this 用に残す
+                    let name_id = self
+                        .rt
+                        .intern(name)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::PLoad(name_id)); // method 取得
+                    for a in args {
+                        self.gen_expr(a, code)?;
+                    }
+                    if args.len() > u8::MAX as usize {
+                        return Err(CompileError("too many arguments".into()));
+                    }
+                    code.push(Op::MCall(args.len() as u8));
+                } else {
+                    self.gen_expr(callee, code)?;
+                    for a in args {
+                        self.gen_expr(a, code)?;
+                    }
+                    if args.len() > u8::MAX as usize {
+                        return Err(CompileError("too many arguments".into()));
+                    }
+                    code.push(Op::Call(args.len() as u8));
                 }
-                if args.len() > u8::MAX as usize {
-                    return Err(CompileError("too many arguments".into()));
-                }
-                code.push(Op::Call(args.len() as u8));
             }
             Expr::Arr(items) => {
                 for item in items {
@@ -393,6 +475,35 @@ impl Compiler<'_> {
                     code.push(Op::ConstI(1));
                     code.push(if *inc { Op::Add } else { Op::Sub });
                     self.gen_store(name, code)?;
+                }
+            }
+            Expr::This => {
+                code.push(Op::This);
+            }
+            Expr::FuncExpr { name, params, body } => {
+                // 関数式: 関数をコンパイルして MakeF/MakeClosure で生成
+                let enclosing_env = self.captures.clone();
+                let boxed = compute_boxed(params, body);
+                let fidx = self.compile_function_anon(params, body, &boxed, &enclosing_env)?;
+                // 名前付き関数式は自分自身を束縛（簡易: グローバルに置く近似は避け、
+                // ローカルスコープの自己参照は未対応のため名前は無視）
+                let _ = name;
+                if boxed.is_empty() {
+                    code.push(Op::MakeF(fidx));
+                } else {
+                    code.push(Op::MakeClosure(fidx));
+                }
+            }
+            Expr::Arrow { params, body } => {
+                // アロー関数: 式本体を暗黙 return に包んでコンパイル
+                let stmts = vec![Stmt::Return(Some((**body).clone()))];
+                let enclosing_env = self.captures.clone();
+                let boxed = compute_boxed(params, &stmts);
+                let fidx = self.compile_function_anon(params, &stmts, &boxed, &enclosing_env)?;
+                if boxed.is_empty() {
+                    code.push(Op::MakeF(fidx));
+                } else {
+                    code.push(Op::MakeClosure(fidx));
                 }
             }
         }
@@ -556,6 +667,59 @@ impl Compiler<'_> {
                 code.push(Op::MakeClosure(fidx));
                 self.gen_store(name, code)?;
             }
+            Stmt::Switch { disc, cases } => {
+                // switch を if/else-if チェーンにコンパイル（=== 比較、break 前提で
+                // フォールスルー無し）。disc はグローバル一時に退避して各 case で比較。
+                self.gen_expr(disc, code)?;
+                let tmp_id = self
+                    .rt
+                    .intern("\x01switch_disc")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                code.push(Op::GStore(tmp_id));
+
+                // パス 1: 値 case の比較ヘッダ（GLoad; val; Seq; JmpF）を生成。
+                // 値 case の「case 全体における index」を記録して default を正しく扱う。
+                let mut jmpf_patches: Vec<usize> = Vec::new();
+                let mut value_case_idx: Vec<usize> = Vec::new();
+                for (idx, (case_val, _)) in cases.iter().enumerate() {
+                    if let Some(val_expr) = case_val {
+                        code.push(Op::GLoad(tmp_id));
+                        self.gen_expr(val_expr, code)?;
+                        code.push(Op::Seq);
+                        jmpf_patches.push(code.len());
+                        code.push(Op::JmpF(0)); // プレースホルダ
+                        value_case_idx.push(idx);
+                    }
+                }
+
+                // パス 2: 各 case 本体（開始位置を記録）+ break 相当の Jmp(end)。
+                // switch 内の `break` もこの end へ飛ばすため break_patches を積む。
+                let mut case_starts = vec![0usize; cases.len()];
+                let mut end_patches: Vec<usize> = Vec::new();
+                self.break_patches.push(Vec::new());
+                for (idx, (_, body)) in cases.iter().enumerate() {
+                    case_starts[idx] = code.len();
+                    for s in body {
+                        self.gen_stmt(s, code)?;
+                    }
+                    end_patches.push(code.len());
+                    code.push(Op::Jmp(0)); // フォールスルー防止（break 相当）
+                }
+                let end_pos = code.len();
+                for p in &end_patches {
+                    code[*p] = Op::Jmp(end_pos as u32);
+                }
+                let breaks = self.break_patches.pop().unwrap();
+                for b in &breaks {
+                    code[*b] = Op::Jmp(end_pos as u32);
+                }
+                // JmpF のターゲット = 「次の case」の開始（無ければ end）
+                for (j, patch) in jmpf_patches.iter().enumerate() {
+                    let case_idx = value_case_idx[j];
+                    let target = case_starts.get(case_idx + 1).copied().unwrap_or(end_pos);
+                    code[*patch] = Op::JmpF(target as u32);
+                }
+            }
         }
         Ok(())
     }
@@ -621,6 +785,11 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
                 collect_vars(std::slice::from_ref(body), locals);
             }
             Stmt::DoWhile { body, .. } => collect_vars(std::slice::from_ref(body), locals),
+            Stmt::Switch { cases, .. } => {
+                for (_, body) in cases {
+                    collect_vars(body, locals);
+                }
+            }
             _ => {}
         }
     }
@@ -670,6 +839,15 @@ fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
             Stmt::DoWhile { body, cond } => {
                 collect_refs(std::slice::from_ref(body), out);
                 collect_expr_refs(cond, out);
+            }
+            Stmt::Switch { disc, cases } => {
+                collect_expr_refs(disc, out);
+                for (case_val, body) in cases {
+                    if let Some(v) = case_val {
+                        collect_expr_refs(v, out);
+                    }
+                    collect_refs(body, out);
+                }
             }
             Stmt::Block(inner) => collect_refs(inner, out),
             // ネスト関数宣言の中身は、その関数自身の自由変数として別途解析されるため
@@ -736,7 +914,18 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             collect_expr_refs(then, out);
             collect_expr_refs(else_, out);
         }
-        Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Undef => {}
+        Expr::FuncExpr { body, .. } => {
+            collect_refs(body, out);
+        }
+        Expr::Arrow { body, .. } => {
+            collect_expr_refs(body, out);
+        }
+        Expr::This
+        | Expr::Num(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undef => {}
     }
 }
 
@@ -1117,6 +1306,61 @@ mod tests {
                 return inner();
             }
             outer();
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(42));
+    }
+
+    #[test]
+    fn arrow_function() {
+        assert_eq!(run_src("var f = x => x * 2; f(21);").unwrap(), crate::AklVal::mk_int(42));
+        assert_eq!(run_src("var g = (a, b) => a + b; g(1, 2);").unwrap(), crate::AklVal::mk_int(3));
+        // 即時実行
+        assert_eq!(run_src("(x => x + 1)(41);").unwrap(), crate::AklVal::mk_int(42));
+    }
+
+    #[test]
+    fn function_expression() {
+        assert_eq!(
+            run_src("var f = function(x) { return x * 2; }; f(21);").unwrap(),
+            crate::AklVal::mk_int(42)
+        );
+        assert_eq!(
+            run_src("(function(x) { return x + 1; })(41);").unwrap(),
+            crate::AklVal::mk_int(42)
+        );
+    }
+
+    #[test]
+    fn switch_statement() {
+        assert_eq!(
+            run_src("var x = 2; switch (x) { case 1: 10; break; case 2: 20; break; default: 30; } 20;").unwrap(),
+            crate::AklVal::mk_int(20)
+        );
+        // switch の結果は break 前の式文の値ではなく、後続の文の値を見る
+        let src = "
+            function f(x) {
+                switch (x) {
+                    case 1: return 10;
+                    case 2: return 20;
+                    default: return 30;
+                }
+            }
+            f(2);
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(20));
+        assert_eq!(
+            run_src("function f(x) { switch (x) { case 1: return 10; default: return 99; } } f(5);").unwrap(),
+            crate::AklVal::mk_int(99)
+        );
+    }
+
+    #[test]
+    fn this_in_method() {
+        // メソッド内の this がレシーバを指す
+        let src = "
+            var obj = { value: 42 };
+            obj.get = function() { return this.value; };
+            obj.get();
         ";
         assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(42));
     }
