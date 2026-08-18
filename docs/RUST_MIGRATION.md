@@ -231,7 +231,9 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 - グローバル関数: parseInt / parseFloat / isNaN / Number / String
 - 文字列メソッド（`str_methods` 表 = C の `str_meth_vals`）: toUpperCase/toLowerCase/
   trim/indexOf/slice/includes/startsWith/endsWith/repeat
-- 配列メソッド（`arr_methods` 表）: push/pop/join/indexOf/slice/map
+- 配列メソッド（`arr_methods` 表）: push/pop/shift/unshift/join/concat/indexOf/includes/
+  reverse/slice/map/filter/forEach/reduce（高階関数はネイティブコールバックで
+  `call_native` によりバイトコード関数を呼ぶ）
 - 文字列/配列の `length` はプロパティとして `PLoad` が直接返す（C の PLOAD の
   length 分岐と同型）
 

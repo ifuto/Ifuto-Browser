@@ -125,6 +125,26 @@ fn to_number(rt: &Runtime, v: AklVal) -> f64 {
     }
 }
 
+/// 値を truthy 判定（filter 用）。
+fn truthy_builtin(rt: &Runtime, v: AklVal) -> bool {
+    if v.is_undef() || v.is_null() || v == AklVal::FALSE {
+        return false;
+    }
+    if v == AklVal::TRUE {
+        return true;
+    }
+    if v.is_int() {
+        return v.get_int() != 0;
+    }
+    if let Some(d) = v.as_f64() {
+        return d != 0.0 && !d.is_nan();
+    }
+    if v.is_obj() {
+        return !matches!(rt.heap.get(v.get_obj()), Some(Obj::Str(s)) if s.is_empty());
+    }
+    true
+}
+
 /// console.log(...)。引数を空白区切りで console_out に追記。
 fn console_log(rt: &mut Runtime, _this: AklVal, args: &[AklVal]) -> Result<AklVal, VmError> {
     let parts: Vec<String> = args.iter().map(|a| to_js_string(rt, *a)).collect();
@@ -349,10 +369,18 @@ fn install_array_methods(rt: &mut Runtime) -> Result<(), VmError> {
     for (name, f) in [
         ("push", arr_push as crate::bytecode::NativeFn),
         ("pop", arr_pop),
+        ("shift", arr_shift),
+        ("unshift", arr_unshift),
         ("join", arr_join),
+        ("concat", arr_concat),
         ("indexOf", arr_index_of),
+        ("includes", arr_includes),
+        ("reverse", arr_reverse),
         ("slice", arr_slice),
         ("map", arr_map),
+        ("filter", arr_filter),
+        ("forEach", arr_for_each),
+        ("reduce", arr_reduce),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -429,6 +457,110 @@ fn arr_map(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     Ok(AklVal::mk_obj(id))
 }
 
+fn arr_filter(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let mut out = Vec::new();
+    for (i, v) in items.iter().enumerate() {
+        let args = vec![*v, AklVal::mk_int(i as i32)];
+        let r = call_native(rt, cb, AklVal::UNDEF, &args)?;
+        if truthy_builtin(rt, r) {
+            out.push(*v);
+        }
+    }
+    let id = rt.heap.alloc(Obj::Arr(out)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn arr_for_each(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    for (i, v) in items.iter().enumerate() {
+        let args = vec![*v, AklVal::mk_int(i as i32)];
+        call_native(rt, cb, AklVal::UNDEF, &args)?;
+    }
+    Ok(AklVal::UNDEF)
+}
+
+fn arr_reduce(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let mut acc = a.get(1).copied().unwrap_or(AklVal::UNDEF);
+    let mut start = 0;
+    if a.len() < 2 {
+        // 初期値なし: 先頭要素を初期値に
+        if items.is_empty() {
+            return Ok(AklVal::UNDEF);
+        }
+        acc = items[0];
+        start = 1;
+    }
+    for (i, v) in items.iter().enumerate().skip(start) {
+        let args = vec![acc, *v, AklVal::mk_int(i as i32)];
+        acc = call_native(rt, cb, AklVal::UNDEF, &args)?;
+    }
+    Ok(acc)
+}
+
+fn arr_shift(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    match rt.heap.get_mut(id) {
+        Some(Obj::Arr(v)) => {
+            if v.is_empty() {
+                Ok(AklVal::UNDEF)
+            } else {
+                Ok(v.remove(0))
+            }
+        }
+        _ => Ok(AklVal::UNDEF),
+    }
+}
+
+fn arr_unshift(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::mk_int(0)) };
+    match rt.heap.get_mut(id) {
+        Some(Obj::Arr(v)) => {
+            let mut new_items = a.to_vec();
+            new_items.append(v);
+            *v = new_items;
+            Ok(AklVal::mk_int(v.len() as i32))
+        }
+        _ => Ok(AklVal::mk_int(0)),
+    }
+}
+
+fn arr_concat(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let mut out = this_arr(rt, this);
+    for v in a {
+        if v.is_obj() {
+            if let Some(Obj::Arr(items)) = rt.heap.get(v.get_obj()) {
+                out.extend_from_slice(items);
+                continue;
+            }
+        }
+        out.push(*v);
+    }
+    let id = rt.heap.alloc(Obj::Arr(out)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn arr_includes(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let needle = a.first().copied().unwrap_or(AklVal::UNDEF);
+    Ok(AklVal::from_bool(items.contains(&needle)))
+}
+
+fn arr_reverse(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    match rt.heap.get_mut(id) {
+        Some(Obj::Arr(v)) => {
+            v.reverse();
+            Ok(this)
+        }
+        _ => Ok(AklVal::UNDEF),
+    }
+}
+
 /// 値（関数）を呼ぶ（native またはバイトコード関数）。簡易実装。
 fn call_native(rt: &mut Runtime, f: AklVal, this: AklVal, args: &[AklVal]) -> Result<AklVal, VmError> {
     if !f.is_obj() {
@@ -498,5 +630,34 @@ mod tests {
         assert_eq!(run_src("\"abc\".length;").unwrap().0, AklVal::mk_int(3));
         assert_eq!(run_src("\"hello\".indexOf(\"l\");").unwrap().0, AklVal::mk_int(2));
         assert_eq!(run_src("\"hello\".includes(\"ell\");").unwrap().0, AklVal::TRUE);
+    }
+
+    #[test]
+    fn array_methods_higher_order() {
+        // map
+        assert_eq!(
+            run_src("var a = [1, 2, 3]; a.map(function(x) { return x * 2; })[1];").unwrap().0,
+            AklVal::mk_int(4)
+        );
+        // filter
+        assert_eq!(
+            run_src("var a = [1, 2, 3, 4]; a.filter(function(x) { return x % 2 === 0; }).length;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+        // reduce
+        assert_eq!(
+            run_src("var a = [1, 2, 3, 4]; a.reduce(function(acc, x) { return acc + x; }, 0);").unwrap().0,
+            AklVal::mk_int(10)
+        );
+    }
+
+    #[test]
+    fn array_methods_basic() {
+        assert_eq!(run_src("[1, 2, 3].push(4);").unwrap().0, AklVal::mk_int(4));
+        assert_eq!(run_src("[1, 2, 3].shift();").unwrap().0, AklVal::mk_int(1));
+        assert_eq!(run_src("[2, 3].unshift(1);").unwrap().0, AklVal::mk_int(3));
+        assert_eq!(run_src("[1, 2, 3].includes(2);").unwrap().0, AklVal::TRUE);
+        assert_eq!(run_src("[1, 2, 3].concat([4, 5]).length;").unwrap().0, AklVal::mk_int(5));
+        assert_eq!(run_src("[1, 2, 3].join(\"-\") === \"1-2-3\";").unwrap().0, AklVal::TRUE);
     }
 }
