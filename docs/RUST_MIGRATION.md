@@ -232,8 +232,11 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 - 文字列メソッド（`str_methods` 表 = C の `str_meth_vals`）: toUpperCase/toLowerCase/
   trim/indexOf/slice/includes/startsWith/endsWith/repeat
 - 配列メソッド（`arr_methods` 表）: push/pop/shift/unshift/join/concat/indexOf/includes/
-  reverse/slice/map/filter/forEach/reduce（高階関数はネイティブコールバックで
-  `call_native` によりバイトコード関数を呼ぶ）
+  reverse/slice/map/filter/forEach/reduce/find/findIndex/some/every/sort/splice/flat/at
+  （高階関数はネイティブコールバックで `call_native` によりバイトコード関数を呼ぶ）
+- `Object.keys` / `Object.values` / `Object.assign`（静的メソッド）
+- `JSON.stringify`（文字列・数値・真偽値・null・配列・プレーンオブジェクトを再帰的に
+  文字列化。NaN/Infinity は null、undefined は省略）
 - 文字列/配列の `length` はプロパティとして `PLoad` が直接返す（C の PLOAD の
   length 分岐と同型）
 

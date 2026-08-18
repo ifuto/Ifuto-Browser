@@ -69,6 +69,10 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     install_string_methods(rt)?;
     // Array.prototype メソッド
     install_array_methods(rt)?;
+    // Object 静的メソッド（keys/values/assign）
+    install_object_methods(rt)?;
+    // JSON.stringify
+    install_json(rt)?;
 
     Ok(())
 }
@@ -381,6 +385,14 @@ fn install_array_methods(rt: &mut Runtime) -> Result<(), VmError> {
         ("filter", arr_filter),
         ("forEach", arr_for_each),
         ("reduce", arr_reduce),
+        ("find", arr_find),
+        ("findIndex", arr_find_index),
+        ("some", arr_some),
+        ("every", arr_every),
+        ("sort", arr_sort),
+        ("splice", arr_splice),
+        ("flat", arr_flat),
+        ("at", arr_at),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -561,6 +573,295 @@ fn arr_reverse(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, 
     }
 }
 
+fn arr_find(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    for (i, v) in items.iter().enumerate() {
+        let args = vec![*v, AklVal::mk_int(i as i32)];
+        let r = call_native(rt, cb, AklVal::UNDEF, &args)?;
+        if truthy_builtin(rt, r) {
+            return Ok(*v);
+        }
+    }
+    Ok(AklVal::UNDEF)
+}
+
+fn arr_find_index(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    for (i, v) in items.iter().enumerate() {
+        let args = vec![*v, AklVal::mk_int(i as i32)];
+        let r = call_native(rt, cb, AklVal::UNDEF, &args)?;
+        if truthy_builtin(rt, r) {
+            return Ok(AklVal::mk_int(i as i32));
+        }
+    }
+    Ok(AklVal::mk_int(-1))
+}
+
+fn arr_some(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    for (i, v) in items.iter().enumerate() {
+        let args = vec![*v, AklVal::mk_int(i as i32)];
+        let r = call_native(rt, cb, AklVal::UNDEF, &args)?;
+        if truthy_builtin(rt, r) {
+            return Ok(AklVal::TRUE);
+        }
+    }
+    Ok(AklVal::FALSE)
+}
+
+fn arr_every(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    for (i, v) in items.iter().enumerate() {
+        let args = vec![*v, AklVal::mk_int(i as i32)];
+        let r = call_native(rt, cb, AklVal::UNDEF, &args)?;
+        if !truthy_builtin(rt, r) {
+            return Ok(AklVal::FALSE);
+        }
+    }
+    Ok(AklVal::TRUE)
+}
+
+fn arr_sort(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let mut items = this_arr(rt, this);
+    // デフォルトは文字列化比較（JS の sort 既定）。借用回避のため文字列キーを先に作る。
+    let mut keyed: Vec<(String, AklVal)> = items
+        .iter()
+        .map(|v| (to_js_string(rt, *v), *v))
+        .collect();
+    keyed.sort_by(|x, y| x.0.cmp(&y.0));
+    items = keyed.into_iter().map(|(_, v)| v).collect();
+    if let Some(Obj::Arr(v)) = rt.heap.get_mut(id) {
+        *v = items;
+    }
+    Ok(this)
+}
+
+fn arr_splice(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let mut items = this_arr(rt, this);
+    let n = items.len() as i64;
+    let start = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
+    let start = if start < 0 { (n + start).max(0) } else { start.min(n) } as usize;
+    let delete_count = a
+        .get(1)
+        .map(|v| to_number(rt, *v) as i64)
+        .unwrap_or(n - start as i64)
+        .max(0) as usize;
+    let removed: Vec<AklVal> = items.splice(start..(start + delete_count).min(items.len()), a[2..].to_vec()).collect();
+    if let Some(Obj::Arr(v)) = rt.heap.get_mut(id) {
+        *v = items;
+    }
+    let rid = rt.heap.alloc(Obj::Arr(removed)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(rid))
+}
+
+fn arr_flat(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let depth = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(1).max(0) as usize;
+    let mut out = Vec::new();
+    fn flatten(rt: &Runtime, items: &[AklVal], depth: usize, out: &mut Vec<AklVal>) {
+        for v in items {
+            if depth > 0 && v.is_obj() {
+                if let Some(Obj::Arr(inner)) = rt.heap.get(v.get_obj()) {
+                    flatten(rt, inner, depth - 1, out);
+                    continue;
+                }
+            }
+            out.push(*v);
+        }
+    }
+    flatten(rt, &items, depth, &mut out);
+    let id = rt.heap.alloc(Obj::Arr(out)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn arr_at(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let n = items.len() as i64;
+    let idx = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
+    let idx = if idx < 0 { n + idx } else { idx };
+    if idx < 0 || idx >= n {
+        Ok(AklVal::UNDEF)
+    } else {
+        Ok(items[idx as usize])
+    }
+}
+
+/// Object 静的メソッド（keys/values/assign）を登録。
+fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
+    let obj_id = rt.intern("Object").ok_or(VmError::Oom)?;
+    let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    for (name, f) in [
+        ("keys", obj_keys as crate::bytecode::NativeFn),
+        ("values", obj_values),
+        ("assign", obj_assign),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(obj, nid, v).map_err(|_| VmError::Oom)?;
+    }
+    rt.global_set(obj_id, AklVal::mk_obj(obj));
+    Ok(())
+}
+
+/// プレーンオブジェクトのプロパティ列を取得。
+fn obj_props(rt: &Runtime, v: AklVal) -> Vec<(AklVal, AklVal)> {
+    if v.is_obj() {
+        if let Some(Obj::Obj(props)) = rt.heap.get(v.get_obj()) {
+            return props
+                .iter()
+                .map(|(n, val)| (AklVal::mk_obj(*n), *val))
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn obj_keys(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let keys: Vec<AklVal> = obj_props(rt, v).into_iter().map(|(k, _)| k).collect();
+    let id = rt.heap.alloc(Obj::Arr(keys)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn obj_values(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let vals: Vec<AklVal> = obj_props(rt, v).into_iter().map(|(_, val)| val).collect();
+    let id = rt.heap.alloc(Obj::Arr(vals)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn obj_assign(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let target = a.first().copied().unwrap_or(AklVal::UNDEF);
+    for src in a.iter().skip(1) {
+        for (k, val) in obj_props(rt, *src) {
+            if k.is_obj() && target.is_obj() {
+                let _ = rt.heap.prop_set(target.get_obj(), k.get_obj(), val);
+            }
+        }
+    }
+    Ok(target)
+}
+
+/// JSON.stringify を登録（簡易版）。
+fn install_json(rt: &mut Runtime) -> Result<(), VmError> {
+    let json_id = rt.intern("JSON").ok_or(VmError::Oom)?;
+    let json = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let f = rt.register_native(json_stringify)?;
+    let nid = rt.intern("stringify").ok_or(VmError::Oom)?;
+    rt.heap.prop_set(json, nid, f).map_err(|_| VmError::Oom)?;
+    rt.global_set(json_id, AklVal::mk_obj(json));
+    Ok(())
+}
+
+/// JSON 文字列化（再帰。文字列・数値・真偽値・null・配列・プレーンオブジェクト）。
+fn json_stringify(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let s = json_stringify_val(rt, v, 0)?;
+    let id = rt.intern(&s).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn json_stringify_val(rt: &mut Runtime, v: AklVal, depth: u32) -> Result<String, VmError> {
+    if depth > 64 {
+        return Ok("\"[circular]\"".to_string());
+    }
+    if v.is_undef() {
+        return Ok("undefined".to_string());
+    }
+    if v.is_null() {
+        return Ok("null".to_string());
+    }
+    if v == AklVal::TRUE {
+        return Ok("true".to_string());
+    }
+    if v == AklVal::FALSE {
+        return Ok("false".to_string());
+    }
+    if v.is_int() {
+        return Ok(v.get_int().to_string());
+    }
+    if let Some(d) = v.as_f64() {
+        if d.is_nan() || d.is_infinite() {
+            return Ok("null".to_string());
+        }
+        return Ok(crate::bytecode::fmt_num_pub(d));
+    }
+    if v.is_obj() {
+        let id = v.get_obj();
+        // 借用回避: データをクローンしてから再帰
+        let cloned = match rt.heap.get(id) {
+            Some(Obj::Str(s)) => Some(JsonRepr::Str(s.clone())),
+            Some(Obj::Arr(items)) => Some(JsonRepr::Arr(items.clone())),
+            Some(Obj::Obj(props)) => Some(JsonRepr::Obj(
+                props
+                    .iter()
+                    .filter_map(|(n, val)| match rt.heap.get(*n) {
+                        Some(Obj::Str(s)) => Some((s.clone(), *val)),
+                        _ => None,
+                    })
+                    .collect(),
+            )),
+            _ => None,
+        };
+        return match cloned {
+            Some(JsonRepr::Str(s)) => Ok(json_quote(&s)),
+            Some(JsonRepr::Arr(items)) => {
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|x| json_stringify_val(rt, *x, depth + 1))
+                    .collect::<Result<_, _>>()?;
+                Ok(format!("[{}]", parts.join(",")))
+            }
+            Some(JsonRepr::Obj(props)) => {
+                let mut parts = Vec::new();
+                for (s, val) in props {
+                    let val_s = json_stringify_val(rt, val, depth + 1)?;
+                    if val_s != "undefined" {
+                        parts.push(format!("{}:{}", json_quote(&s), val_s));
+                    }
+                }
+                Ok(format!("{{{}}}", parts.join(",")))
+            }
+            None => Ok("null".to_string()),
+        };
+    }
+    Ok("undefined".to_string())
+}
+
+/// JSON 再帰のためのデータ表現（借用回避）。
+enum JsonRepr {
+    /// 文字列。
+    Str(Box<str>),
+    /// 配列。
+    Arr(Vec<AklVal>),
+    /// オブジェクト（キーは文字列）。
+    Obj(Vec<(Box<str>, AklVal)>),
+}
+
+/// JSON 文字列のクォート（エスケープ）。
+fn json_quote(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// 値（関数）を呼ぶ（native またはバイトコード関数）。簡易実装。
 fn call_native(rt: &mut Runtime, f: AklVal, this: AklVal, args: &[AklVal]) -> Result<AklVal, VmError> {
     if !f.is_obj() {
@@ -659,5 +960,79 @@ mod tests {
         assert_eq!(run_src("[1, 2, 3].includes(2);").unwrap().0, AklVal::TRUE);
         assert_eq!(run_src("[1, 2, 3].concat([4, 5]).length;").unwrap().0, AklVal::mk_int(5));
         assert_eq!(run_src("[1, 2, 3].join(\"-\") === \"1-2-3\";").unwrap().0, AklVal::TRUE);
+        assert_eq!(run_src("[1, 2, 3].at(1);").unwrap().0, AklVal::mk_int(2));
+        assert_eq!(run_src("[1, 2, 3].at(-1);").unwrap().0, AklVal::mk_int(3));
+    }
+
+    #[test]
+    fn array_methods_find_some_every() {
+        assert_eq!(
+            run_src("[1, 2, 3, 4].find(function(x) { return x > 2; });").unwrap().0,
+            AklVal::mk_int(3)
+        );
+        assert_eq!(
+            run_src("[1, 2, 3].findIndex(function(x) { return x === 2; });").unwrap().0,
+            AklVal::mk_int(1)
+        );
+        assert_eq!(
+            run_src("[1, 2, 3].some(function(x) { return x > 2; });").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("[1, 2, 3].every(function(x) { return x > 0; });").unwrap().0,
+            AklVal::TRUE
+        );
+    }
+
+    #[test]
+    fn array_sort_splice_flat() {
+        assert_eq!(
+            run_src("var a = [3, 1, 2]; a.sort(); a[0];").unwrap().0,
+            AklVal::mk_int(1)
+        );
+        assert_eq!(
+            run_src("var a = [1, 2, 3, 4]; a.splice(1, 2); a.length;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+        assert_eq!(
+            run_src("[[1, 2], [3, 4]].flat().length;").unwrap().0,
+            AklVal::mk_int(4)
+        );
+    }
+
+    #[test]
+    fn object_methods() {
+        assert_eq!(
+            run_src("Object.keys({a: 1, b: 2}).length;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+        assert_eq!(
+            run_src("Object.values({a: 1, b: 2}).length;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+        assert_eq!(
+            run_src("var o = {a: 1}; Object.assign(o, {b: 2}); o.b;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+    }
+
+    #[test]
+    fn json_stringify() {
+        assert_eq!(
+            run_src("JSON.stringify(42) === \"42\";").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("JSON.stringify(\"hi\") === \"\\\"hi\\\"\";").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("JSON.stringify([1, 2, 3]) === \"[1,2,3]\";").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("JSON.stringify({a: 1}) === \"{\\\"a\\\":1}\";").unwrap().0,
+            AklVal::TRUE
+        );
     }
 }
