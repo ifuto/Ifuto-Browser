@@ -201,6 +201,56 @@ impl Compiler<'_> {
                 }
                 code.push(Op::Call(args.len() as u8));
             }
+            Expr::Arr(items) => {
+                for item in items {
+                    self.gen_expr(item, code)?;
+                }
+                if items.len() > u32::MAX as usize {
+                    return Err(CompileError("array too large".into()));
+                }
+                code.push(Op::ArrNew(items.len() as u32));
+            }
+            Expr::ObjLit(entries) => {
+                code.push(Op::ObjNew);
+                for (key, val) in entries {
+                    code.push(Op::Dup);
+                    self.gen_expr(val, code)?;
+                    let key_id = self
+                        .rt
+                        .intern(key)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::PStore(key_id));
+                    code.push(Op::Pop); // PStore が返す val を捨て、obj を残す
+                }
+            }
+            Expr::Member { obj, name } => {
+                self.gen_expr(obj, code)?;
+                let name_id = self
+                    .rt
+                    .intern(name)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                code.push(Op::PLoad(name_id));
+            }
+            Expr::Index { obj, index } => {
+                self.gen_expr(obj, code)?;
+                self.gen_expr(index, code)?;
+                code.push(Op::AGet);
+            }
+            Expr::IndexAssign { obj, index, rhs } => {
+                self.gen_expr(obj, code)?;
+                self.gen_expr(index, code)?;
+                self.gen_expr(rhs, code)?;
+                code.push(Op::ASet);
+            }
+            Expr::MemberAssign { obj, name, rhs } => {
+                self.gen_expr(obj, code)?;
+                self.gen_expr(rhs, code)?;
+                let name_id = self
+                    .rt
+                    .intern(name)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                code.push(Op::PStore(name_id));
+            }
         }
         Ok(())
     }
@@ -409,5 +459,44 @@ mod tests {
             double(21);
         ";
         assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(42));
+    }
+
+    #[test]
+    fn array_literal_and_index() {
+        assert_eq!(run_src("[10, 20, 30][1];").unwrap(), crate::AklVal::mk_int(20));
+        assert_eq!(
+            run_src("var a = [1, 2, 3]; a[2];").unwrap(),
+            crate::AklVal::mk_int(3)
+        );
+        // 要素代入
+        assert_eq!(
+            run_src("var a = [1, 2, 3]; a[0] = 9; a[0];").unwrap(),
+            crate::AklVal::mk_int(9)
+        );
+    }
+
+    #[test]
+    fn object_literal_and_member() {
+        assert_eq!(run_src("({x: 42}).x;").unwrap(), crate::AklVal::mk_int(42));
+        assert_eq!(
+            run_src("var o = {a: 1, b: 2}; o.b;").unwrap(),
+            crate::AklVal::mk_int(2)
+        );
+        // メンバー代入
+        assert_eq!(
+            run_src("var o = {a: 1}; o.a = 7; o.a;").unwrap(),
+            crate::AklVal::mk_int(7)
+        );
+    }
+
+    #[test]
+    fn object_method_call() {
+        // 関数を値としてオブジェクトに持たせ、メンバー経由で呼ぶ
+        let src = "
+            function add(a, b) { return a + b; }
+            var obj = { op: add };
+            obj.op(3, 4);
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(7));
     }
 }

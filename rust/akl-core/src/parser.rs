@@ -116,6 +116,42 @@ pub enum Expr {
         /// 引数列。
         args: Vec<Expr>,
     },
+    /// 配列リテラル `[e, ...]`。
+    Arr(Vec<Expr>),
+    /// オブジェクトリテラル `{ k: v, ... }`。
+    ObjLit(Vec<(String, Expr)>),
+    /// メンバーアクセス `obj.prop`。
+    Member {
+        /// 対象。
+        obj: Box<Expr>,
+        /// プロパティ名。
+        name: String,
+    },
+    /// インデックスアクセス `obj[index]`。
+    Index {
+        /// 対象。
+        obj: Box<Expr>,
+        /// インデックス式。
+        index: Box<Expr>,
+    },
+    /// 配列/オブジェクトへの要素代入 `obj[index] = rhs`。
+    IndexAssign {
+        /// 対象。
+        obj: Box<Expr>,
+        /// インデックス式。
+        index: Box<Expr>,
+        /// 右辺。
+        rhs: Box<Expr>,
+    },
+    /// メンバー代入 `obj.prop = rhs`。
+    MemberAssign {
+        /// 対象。
+        obj: Box<Expr>,
+        /// プロパティ名。
+        name: String,
+        /// 右辺。
+        rhs: Box<Expr>,
+    },
 }
 
 /// 文。
@@ -264,6 +300,12 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_expr()?; // 代入は右結合
             match lhs {
                 Expr::Ident(name) => Ok(Expr::Assign { name, rhs: Box::new(rhs) }),
+                Expr::Index { obj, index } => {
+                    Ok(Expr::IndexAssign { obj, index, rhs: Box::new(rhs) })
+                }
+                Expr::Member { obj, name } => {
+                    Ok(Expr::MemberAssign { obj, name, rhs: Box::new(rhs) })
+                }
                 _ => Err(ParseError("invalid assignment target".into())),
             }
         } else {
@@ -400,22 +442,41 @@ impl<'a> Parser<'a> {
         self.parse_postfix()
     }
 
-    /// 後置（呼び出し `()`）。
+    /// 後置（呼び出し `()`・メンバー `.prop`・インデックス `[i]`）。
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
         let mut base = self.parse_primary()?;
-        while self.at_punct(Punct::LParen)? {
-            self.bump()?;
-            let mut args = Vec::new();
-            if !self.at_punct(Punct::RParen)? {
-                loop {
-                    args.push(self.parse_expr()?);
-                    if !self.eat_punct(Punct::Comma)? {
-                        break;
+        loop {
+            if self.at_punct(Punct::LParen)? {
+                self.bump()?;
+                let mut args = Vec::new();
+                if !self.at_punct(Punct::RParen)? {
+                    loop {
+                        args.push(self.parse_expr()?);
+                        if !self.eat_punct(Punct::Comma)? {
+                            break;
+                        }
                     }
                 }
+                self.expect_punct(Punct::RParen, "')'")?;
+                base = Expr::Call { callee: Box::new(base), args };
+            } else if self.at_punct(Punct::Dot)? {
+                self.bump()?;
+                let name = match self.bump()? {
+                    Token::Ident(n) => n.to_string(),
+                    Token::Kw(kw) => format!("{kw:?}").to_lowercase(),
+                    other => {
+                        return Err(ParseError(format!("expected property name after '.', got {other:?}")))
+                    }
+                };
+                base = Expr::Member { obj: Box::new(base), name };
+            } else if self.at_punct(Punct::LBracket)? {
+                self.bump()?;
+                let index = self.parse_expr()?;
+                self.expect_punct(Punct::RBracket, "']'")?;
+                base = Expr::Index { obj: Box::new(base), index: Box::new(index) };
+            } else {
+                break;
             }
-            self.expect_punct(Punct::RParen, "')'")?;
-            base = Expr::Call { callee: Box::new(base), args };
         }
         Ok(base)
     }
@@ -436,8 +497,44 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::RParen, "')'")?;
                 Ok(e)
             }
-            Token::Punct(Punct::LBrace) => Err(ParseError("object literals are not yet supported".into())),
-            Token::Punct(Punct::LBracket) => Err(ParseError("array literals are not yet supported".into())),
+            Token::Punct(Punct::LBrace) => {
+                // オブジェクトリテラル { k: v, ... }
+                let mut entries = Vec::new();
+                if !self.at_punct(Punct::RBrace)? {
+                    loop {
+                        let key = match self.bump()? {
+                            Token::Ident(n) => n.to_string(),
+                            Token::Str(s) => s,
+                            Token::Kw(kw) => format!("{kw:?}").to_lowercase(),
+                            other => {
+                                return Err(ParseError(format!("expected property key, got {other:?}")))
+                            }
+                        };
+                        self.expect_punct(Punct::Colon, "':'")?;
+                        let val = self.parse_expr()?;
+                        entries.push((key, val));
+                        if !self.eat_punct(Punct::Comma)? {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(Punct::RBrace, "'}'")?;
+                Ok(Expr::ObjLit(entries))
+            }
+            Token::Punct(Punct::LBracket) => {
+                // 配列リテラル [ e, ... ]
+                let mut items = Vec::new();
+                if !self.at_punct(Punct::RBracket)? {
+                    loop {
+                        items.push(self.parse_expr()?);
+                        if !self.eat_punct(Punct::Comma)? {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(Punct::RBracket, "']'")?;
+                Ok(Expr::Arr(items))
+            }
             Token::Kw(Keyword::Function) => Err(ParseError("function expressions are not yet supported".into())),
             other => Err(ParseError(format!("unexpected token in expression: {other:?}"))),
         }
@@ -702,8 +799,69 @@ mod tests {
 
     #[test]
     fn unsupported_errors() {
-        assert!(parse("obj.prop;").is_ok() == false || true); // メンバーは parse_primary が Ident を返すだけ
-        assert!(parse("[1,2];").is_err()); // 配列リテラルは未対応
         assert!(parse("a ? b : c;").is_err()); // 三項は未対応（? が予期せぬトークン）
+        assert!(parse("class C {}").is_err()); // class は未対応
+    }
+
+    #[test]
+    fn array_literal() {
+        assert_eq!(
+            parse("[1, 2, 3];").unwrap(),
+            vec![Stmt::Expr(Expr::Arr(vec![
+                Expr::Num(NumLit::Int(1)),
+                Expr::Num(NumLit::Int(2)),
+                Expr::Num(NumLit::Int(3)),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn object_literal() {
+        // 文頭の `{` はブロックなので、式文脈にするため括弧で包む（JS と同一の曖昧性解決）
+        assert_eq!(
+            parse("({a: 1, b: \"x\"});").unwrap(),
+            vec![Stmt::Expr(Expr::ObjLit(vec![
+                ("a".into(), Expr::Num(NumLit::Int(1))),
+                ("b".into(), Expr::Str("x".into())),
+            ]))]
+        );
+    }
+
+    #[test]
+    fn member_and_index_access() {
+        assert_eq!(
+            parse("o.a;").unwrap(),
+            vec![Stmt::Expr(Expr::Member {
+                obj: Box::new(Expr::Ident("o".into())),
+                name: "a".into(),
+            })]
+        );
+        assert_eq!(
+            parse("a[0];").unwrap(),
+            vec![Stmt::Expr(Expr::Index {
+                obj: Box::new(Expr::Ident("a".into())),
+                index: Box::new(Expr::Num(NumLit::Int(0))),
+            })]
+        );
+    }
+
+    #[test]
+    fn index_and_member_assign() {
+        assert_eq!(
+            parse("a[0] = 5;").unwrap(),
+            vec![Stmt::Expr(Expr::IndexAssign {
+                obj: Box::new(Expr::Ident("a".into())),
+                index: Box::new(Expr::Num(NumLit::Int(0))),
+                rhs: Box::new(Expr::Num(NumLit::Int(5))),
+            })]
+        );
+        assert_eq!(
+            parse("o.x = 1;").unwrap(),
+            vec![Stmt::Expr(Expr::MemberAssign {
+                obj: Box::new(Expr::Ident("o".into())),
+                name: "x".into(),
+                rhs: Box::new(Expr::Num(NumLit::Int(1))),
+            })]
+        );
     }
 }
