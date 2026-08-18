@@ -152,6 +152,47 @@ pub enum Expr {
         /// 右辺。
         rhs: Box<Expr>,
     },
+    /// 三項演算子 `cond ? then : else_`。
+    Ternary {
+        /// 条件式。
+        cond: Box<Expr>,
+        /// 真のときの値。
+        then: Box<Expr>,
+        /// 偽のときの値。
+        else_: Box<Expr>,
+    },
+    /// 複合代入 `x += y`（`op` は二項演算子。変数のみサポート）。
+    CompoundAssign {
+        /// 代入先の変数名。
+        name: String,
+        /// 演算子。
+        op: BinOp,
+        /// 右辺。
+        rhs: Box<Expr>,
+    },
+    /// 前置/後置インクリメント・デクリメント（変数のみサポート）。
+    IncDec {
+        /// 対象の変数名。
+        name: String,
+        /// true = `++`、false = `--`。
+        inc: bool,
+        /// true = 前置（`++x`）、false = 後置（`x++`）。
+        prefix: bool,
+    },
+}
+
+/// `for` 文の初期化節。
+#[derive(Clone, Debug, PartialEq)]
+pub enum ForInit {
+    /// `var x = init`（変数宣言）。
+    Var {
+        /// 変数名。
+        name: String,
+        /// 初期化式。
+        init: Option<Expr>,
+    },
+    /// 式（代入など）。
+    Expr(Expr),
 }
 
 /// 文。
@@ -197,6 +238,28 @@ pub enum Stmt {
     },
     /// 空文（`;`）。
     Empty,
+    /// `for (init; cond; step) body`。
+    For {
+        /// 初期化節。
+        init: Option<ForInit>,
+        /// 条件式（省略時は常に真）。
+        cond: Option<Expr>,
+        /// 更新節。
+        step: Option<Expr>,
+        /// 本体。
+        body: Box<Stmt>,
+    },
+    /// `do { body } while (cond);`。
+    DoWhile {
+        /// 本体。
+        body: Box<Stmt>,
+        /// 条件式。
+        cond: Expr,
+    },
+    /// `break;`。
+    Break,
+    /// `continue;`。
+    Continue,
 }
 
 /// パースエラー（短いメッセージ。行番号は [`ParseError`] に含めない。呼び出し側で付加）。
@@ -294,11 +357,12 @@ impl<'a> Parser<'a> {
 
     /// 式をパースする（代入が最上位）。
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        let lhs = self.parse_or()?;
+        let lhs = self.parse_conditional()?;
+        // 単純代入 =
         if self.at_punct(Punct::Assign)? {
             self.bump()?;
             let rhs = self.parse_expr()?; // 代入は右結合
-            match lhs {
+            return match lhs {
                 Expr::Ident(name) => Ok(Expr::Assign { name, rhs: Box::new(rhs) }),
                 Expr::Index { obj, index } => {
                     Ok(Expr::IndexAssign { obj, index, rhs: Box::new(rhs) })
@@ -307,9 +371,48 @@ impl<'a> Parser<'a> {
                     Ok(Expr::MemberAssign { obj, name, rhs: Box::new(rhs) })
                 }
                 _ => Err(ParseError("invalid assignment target".into())),
-            }
+            };
+        }
+        // 複合代入 += -= *= /= %=
+        let op = if self.at_punct(Punct::AddAss)? {
+            Some(BinOp::Add)
+        } else if self.at_punct(Punct::SubAss)? {
+            Some(BinOp::Sub)
+        } else if self.at_punct(Punct::MulAss)? {
+            Some(BinOp::Mul)
+        } else if self.at_punct(Punct::DivAss)? {
+            Some(BinOp::Div)
+        } else if self.at_punct(Punct::ModAss)? {
+            Some(BinOp::Mod)
         } else {
-            Ok(lhs)
+            None
+        };
+        if let Some(op) = op {
+            self.bump()?;
+            let rhs = self.parse_expr()?;
+            return match lhs {
+                Expr::Ident(name) => Ok(Expr::CompoundAssign { name, op, rhs: Box::new(rhs) }),
+                _ => Err(ParseError("invalid assignment target".into())),
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// 三項 `?:`（`||` より低い優先順位。then/else は代入レベル）。
+    fn parse_conditional(&mut self) -> Result<Expr, ParseError> {
+        let cond = self.parse_or()?;
+        if self.at_punct(Punct::Question)? {
+            self.bump()?;
+            let then = self.parse_expr()?;
+            self.expect_punct(Punct::Colon, "':'")?;
+            let else_ = self.parse_expr()?;
+            Ok(Expr::Ternary {
+                cond: Box::new(cond),
+                then: Box::new(then),
+                else_: Box::new(else_),
+            })
+        } else {
+            Ok(cond)
         }
     }
 
@@ -421,7 +524,7 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// 単項 `! - + typeof`。
+    /// 単項 `! - + typeof` + 前置 `++`/`--`。
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
         let op = if self.at_punct(Punct::Bang)? {
             Some(UnaryOp::Not)
@@ -438,6 +541,22 @@ impl<'a> Parser<'a> {
             self.bump()?;
             let operand = self.parse_unary()?;
             return Ok(Expr::Unary { op, operand: Box::new(operand) });
+        }
+        // 前置 ++ / --
+        let incdec = if self.at_punct(Punct::Inc)? {
+            Some(true)
+        } else if self.at_punct(Punct::Dec)? {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(inc) = incdec {
+            self.bump()?;
+            let operand = self.parse_unary()?;
+            return match operand {
+                Expr::Ident(name) => Ok(Expr::IncDec { name, inc, prefix: true }),
+                _ => Err(ParseError("invalid increment/decrement target".into())),
+            };
         }
         self.parse_postfix()
     }
@@ -474,6 +593,14 @@ impl<'a> Parser<'a> {
                 let index = self.parse_expr()?;
                 self.expect_punct(Punct::RBracket, "']'")?;
                 base = Expr::Index { obj: Box::new(base), index: Box::new(index) };
+            } else if self.at_punct(Punct::Inc)? || self.at_punct(Punct::Dec)? {
+                // 後置 ++ / --
+                let inc = self.at_punct(Punct::Inc)?;
+                self.bump()?;
+                return match base {
+                    Expr::Ident(name) => Ok(Expr::IncDec { name, inc, prefix: false }),
+                    _ => Err(ParseError("invalid increment/decrement target".into())),
+                };
             } else {
                 break;
             }
@@ -567,15 +694,28 @@ impl<'a> Parser<'a> {
         if self.at_kw(Keyword::While)? {
             return self.parse_while();
         }
+        if self.at_kw(Keyword::For)? {
+            return self.parse_for();
+        }
+        if self.at_kw(Keyword::Do)? {
+            return self.parse_do_while();
+        }
+        if self.at_kw(Keyword::Break)? {
+            self.bump()?;
+            if self.at_punct(Punct::Semi)? {
+                self.bump()?;
+            }
+            return Ok(Stmt::Break);
+        }
+        if self.at_kw(Keyword::Continue)? {
+            self.bump()?;
+            if self.at_punct(Punct::Semi)? {
+                self.bump()?;
+            }
+            return Ok(Stmt::Continue);
+        }
         if self.at_kw(Keyword::Function)? {
             return self.parse_func_decl();
-        }
-        if self.at_kw(Keyword::Break)?
-            || self.at_kw(Keyword::Continue)?
-            || self.at_kw(Keyword::For)?
-            || self.at_kw(Keyword::Do)?
-        {
-            return Err(ParseError("statement not yet supported".into()));
         }
         // 式文
         let e = self.parse_expr()?;
@@ -642,6 +782,73 @@ impl<'a> Parser<'a> {
             None
         };
         Ok(Stmt::If { cond, then: Box::new(then), else_ })
+    }
+
+    /// `for (init; cond; step) body`。
+    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        self.bump()?; // for
+        self.expect_punct(Punct::LParen, "'('")?;
+        // init
+        let init = if self.at_punct(Punct::Semi)? {
+            self.bump()?;
+            None
+        } else if self.at_kw(Keyword::Var)?
+            || self.at_kw(Keyword::Let)?
+            || self.at_kw(Keyword::Const)?
+        {
+            self.bump()?; // var/let/const
+            let name = match self.bump()? {
+                Token::Ident(n) => n.to_string(),
+                other => return Err(ParseError(format!("expected identifier, got {other:?}"))),
+            };
+            let init = if self.eat_punct(Punct::Assign)? {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            self.expect_punct(Punct::Semi, "';'")?;
+            Some(ForInit::Var { name, init })
+        } else {
+            let e = self.parse_expr()?;
+            self.expect_punct(Punct::Semi, "';'")?;
+            Some(ForInit::Expr(e))
+        };
+        // cond
+        let cond = if self.at_punct(Punct::Semi)? {
+            self.bump()?;
+            None
+        } else {
+            let c = self.parse_expr()?;
+            self.expect_punct(Punct::Semi, "';'")?;
+            Some(c)
+        };
+        // step
+        let step = if self.at_punct(Punct::RParen)? {
+            None
+        } else {
+            let s = self.parse_expr()?;
+            Some(s)
+        };
+        self.expect_punct(Punct::RParen, "')'")?;
+        let body = self.parse_stmt()?;
+        Ok(Stmt::For { init, cond, step, body: Box::new(body) })
+    }
+
+    /// `do { body } while (cond);`。
+    fn parse_do_while(&mut self) -> Result<Stmt, ParseError> {
+        self.bump()?; // do
+        let body = self.parse_stmt()?;
+        if !self.at_kw(Keyword::While)? {
+            return Err(ParseError("expected 'while' after do body".into()));
+        }
+        self.bump()?; // while
+        self.expect_punct(Punct::LParen, "'('")?;
+        let cond = self.parse_expr()?;
+        self.expect_punct(Punct::RParen, "')'")?;
+        if self.at_punct(Punct::Semi)? {
+            self.bump()?;
+        }
+        Ok(Stmt::DoWhile { body: Box::new(body), cond })
     }
 
     /// `while (cond) body`。
@@ -799,8 +1006,49 @@ mod tests {
 
     #[test]
     fn unsupported_errors() {
-        assert!(parse("a ? b : c;").is_err()); // 三項は未対応（? が予期せぬトークン）
         assert!(parse("class C {}").is_err()); // class は未対応
+        assert!(parse("switch(x){}").is_err()); // switch は未対応
+    }
+
+    #[test]
+    fn ternary() {
+        assert_eq!(
+            parse("a ? b : c;").unwrap(),
+            vec![Stmt::Expr(Expr::Ternary {
+                cond: Box::new(Expr::Ident("a".into())),
+                then: Box::new(Expr::Ident("b".into())),
+                else_: Box::new(Expr::Ident("c".into())),
+            })]
+        );
+    }
+
+    #[test]
+    fn compound_assign_and_incdec() {
+        assert_eq!(
+            parse("x += 1;").unwrap(),
+            vec![Stmt::Expr(Expr::CompoundAssign {
+                name: "x".into(),
+                op: BinOp::Add,
+                rhs: Box::new(Expr::Num(NumLit::Int(1))),
+            })]
+        );
+        assert_eq!(
+            parse("++x;").unwrap(),
+            vec![Stmt::Expr(Expr::IncDec { name: "x".into(), inc: true, prefix: true })]
+        );
+        assert_eq!(
+            parse("y--;").unwrap(),
+            vec![Stmt::Expr(Expr::IncDec { name: "y".into(), inc: false, prefix: false })]
+        );
+    }
+
+    #[test]
+    fn for_do_while_break_continue() {
+        let stmts = parse("for (var i = 0; i < 10; i = i + 1) { break; }").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(stmts[0], Stmt::For { .. }));
+        let stmts = parse("do { continue; } while (x < 5);").unwrap();
+        assert!(matches!(stmts[0], Stmt::DoWhile { .. }));
     }
 
     #[test]

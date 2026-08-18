@@ -187,8 +187,20 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 - `while` ループの和、ネスト関数呼び出し（`double(add(...))`）
 - 文字列連結・比較・論理・typeof・if/else
 
-残り: 三項・`for`/`switch`・複合代入・クロージャ（env 経由解決）・組み込み
-（builtins = フェーズ 5）。
+残り: `switch`・分割代入・クロージャ（env 経由解決）・組み込み（builtins = フェーズ 5）。
+
+### フェーズ 4 追補 2: 制御フロー完全化
+
+- `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）
+- `do { } while (cond);`
+- `break` / `continue`（ループ外はコンパイルエラー。codegen が loop context で
+  ジャンプ先をパッチ）
+- 三項 `cond ? then : else`
+- 複合代入 `+= -= *= /= %=`（変数のみ）
+- 前置/後置インクリメント・デクリメント `++`/`--`（変数のみ。後置は旧値を返す）
+
+検証: cargo test 76 件 + clippy 緑。for/do-while/break/continue/三項/複合代入/
+inc/dec の e2e が通る。
 
 ### フェーズ 4 追補: 配列/オブジェクトリテラル + メンバー/インデックスアクセス
 

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use crate::bytecode::{FuncObj, Op, Runtime};
 use crate::lexer::NumLit;
-use crate::parser::{BinOp, Expr, Stmt, UnaryOp};
+use crate::parser::{BinOp, Expr, ForInit, Stmt, UnaryOp};
 
 /// コード生成エラー。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -48,7 +48,12 @@ impl std::fmt::Display for CompileError {
 /// パス 1 で全トップレベル関数宣言をコンパイル・登録し、パス 2 で main を生成する
 /// （main の先頭で各関数をグローバルへ hoist 束縛）。
 pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> {
-    let mut c = Compiler { rt, locals: HashMap::new() };
+    let mut c = Compiler {
+        rt,
+        locals: HashMap::new(),
+        break_patches: Vec::new(),
+        continue_patches: Vec::new(),
+    };
 
     // パス 1: トップレベル関数宣言を収集・登録
     let mut funcs: Vec<(String, u32)> = Vec::new();
@@ -97,6 +102,10 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
 struct Compiler<'a> {
     rt: &'a mut Runtime,
     locals: HashMap<String, u32>,
+    /// `break` のジャンプ先パッチ位置（ループごとのスタック）。
+    break_patches: Vec<Vec<usize>>,
+    /// `continue` のジャンプ先パッチ位置（ループごとのスタック）。
+    continue_patches: Vec<Vec<usize>>,
 }
 
 impl Compiler<'_> {
@@ -113,8 +122,12 @@ impl Compiler<'_> {
         }
         collect_vars(body, &mut locals);
 
-        let saved = std::mem::take(&mut self.locals);
+        let saved_locals = std::mem::take(&mut self.locals);
+        let saved_breaks = std::mem::take(&mut self.break_patches);
+        let saved_continues = std::mem::take(&mut self.continue_patches);
         self.locals = locals;
+        self.break_patches = Vec::new();
+        self.continue_patches = Vec::new();
 
         let mut code = Vec::new();
         for stmt in body {
@@ -135,7 +148,9 @@ impl Compiler<'_> {
             n_locals,
         });
 
-        self.locals = saved;
+        self.locals = saved_locals;
+        self.break_patches = saved_breaks;
+        self.continue_patches = saved_continues;
         Ok(fidx)
     }
 
@@ -251,6 +266,51 @@ impl Compiler<'_> {
                     .ok_or_else(|| CompileError("intern failed".into()))?;
                 code.push(Op::PStore(name_id));
             }
+            Expr::Ternary { cond, then, else_ } => {
+                self.gen_expr(cond, code)?;
+                let jmpf_idx = code.len();
+                code.push(Op::JmpF(0)); // 偽 → else
+                self.gen_expr(then, code)?;
+                let jmp_idx = code.len();
+                code.push(Op::Jmp(0)); // → end
+                let else_pos = code.len();
+                code[jmpf_idx] = Op::JmpF(else_pos as u32);
+                self.gen_expr(else_, code)?;
+                let end_pos = code.len();
+                code[jmp_idx] = Op::Jmp(end_pos as u32);
+            }
+            Expr::CompoundAssign { name, op, rhs } => {
+                // x op= y  →  x = x op y（値は新値）
+                self.gen_load(name, code)?;
+                self.gen_expr(rhs, code)?;
+                code.push(match op {
+                    BinOp::Add => Op::Add,
+                    BinOp::Sub => Op::Sub,
+                    BinOp::Mul => Op::Mul,
+                    BinOp::Div => Op::Div,
+                    BinOp::Mod => Op::Mod,
+                    _ => return Err(CompileError("invalid compound assignment operator".into())),
+                });
+                code.push(Op::Dup);
+                self.gen_store(name, code)?;
+            }
+            Expr::IncDec { name, inc, prefix } => {
+                if *prefix {
+                    // ++x / --x: 値は新値
+                    self.gen_load(name, code)?;
+                    code.push(Op::ConstI(1));
+                    code.push(if *inc { Op::Add } else { Op::Sub });
+                    code.push(Op::Dup);
+                    self.gen_store(name, code)?;
+                } else {
+                    // x++ / x--: 値は旧値
+                    self.gen_load(name, code)?;
+                    code.push(Op::Dup); // 旧値を残す
+                    code.push(Op::ConstI(1));
+                    code.push(if *inc { Op::Add } else { Op::Sub });
+                    self.gen_store(name, code)?;
+                }
+            }
         }
         Ok(())
     }
@@ -292,20 +352,118 @@ impl Compiler<'_> {
                 let end_pos = code.len();
                 code[jmp_idx] = Op::Jmp(end_pos as u32);
             }
-            Stmt::While { cond, body } => {
-                let loop_start = code.len();
-                self.gen_expr(cond, code)?;
-                let jmpf_idx = code.len();
-                code.push(Op::JmpF(0)); // 仮。falsy なら end へ
-                self.gen_stmt(body, code)?;
-                code.push(Op::Jmp(loop_start as u32));
-                let end_pos = code.len();
-                code[jmpf_idx] = Op::JmpF(end_pos as u32);
-            }
             Stmt::Block(stmts) => {
                 for s in stmts {
                     self.gen_stmt(s, code)?;
                 }
+            }
+            Stmt::While { cond, body } => {
+                let loop_start = code.len();
+                self.gen_expr(cond, code)?;
+                let jmpf_idx = code.len();
+                code.push(Op::JmpF(0)); // 偽 → end
+                self.break_patches.push(Vec::new());
+                self.continue_patches.push(Vec::new());
+                let continue_target = loop_start;
+                self.gen_stmt(body, code)?;
+                code.push(Op::Jmp(loop_start as u32));
+                let end_pos = code.len();
+                code[jmpf_idx] = Op::JmpF(end_pos as u32);
+                // パッチ適用
+                let breaks = self.break_patches.pop().unwrap();
+                let continues = self.continue_patches.pop().unwrap();
+                for idx in breaks {
+                    code[idx] = Op::Jmp(end_pos as u32);
+                }
+                for idx in continues {
+                    code[idx] = Op::Jmp(continue_target as u32);
+                }
+            }
+            Stmt::For { init, cond, step, body } => {
+                // init（ループ前）
+                match init {
+                    Some(ForInit::Var { name, init }) => {
+                        match init {
+                            Some(e) => self.gen_expr(e, code)?,
+                            None => code.push(Op::Undef),
+                        }
+                        self.gen_store(name, code)?;
+                    }
+                    Some(ForInit::Expr(e)) => {
+                        self.gen_expr(e, code)?;
+                        code.push(Op::Pop);
+                    }
+                    None => {}
+                }
+                let loop_start = code.len();
+                // cond（省略時は常に真）
+                if let Some(c) = cond {
+                    self.gen_expr(c, code)?;
+                } else {
+                    code.push(Op::True);
+                }
+                let jmpf_idx = code.len();
+                code.push(Op::JmpF(0)); // 偽 → end
+                self.break_patches.push(Vec::new());
+                self.continue_patches.push(Vec::new());
+                self.gen_stmt(body, code)?;
+                // continue のジャンプ先 = step 実行
+                let step_target = code.len();
+                if let Some(s) = step {
+                    self.gen_expr(s, code)?;
+                    code.push(Op::Pop);
+                }
+                code.push(Op::Jmp(loop_start as u32));
+                let end_pos = code.len();
+                code[jmpf_idx] = Op::JmpF(end_pos as u32);
+                let breaks = self.break_patches.pop().unwrap();
+                let continues = self.continue_patches.pop().unwrap();
+                for idx in breaks {
+                    code[idx] = Op::Jmp(end_pos as u32);
+                }
+                for idx in continues {
+                    code[idx] = Op::Jmp(step_target as u32);
+                }
+            }
+            Stmt::DoWhile { body, cond } => {
+                let loop_start = code.len();
+                self.break_patches.push(Vec::new());
+                self.continue_patches.push(Vec::new());
+                self.gen_stmt(body, code)?;
+                // continue のジャンプ先 = 条件評価
+                let cond_target = code.len();
+                self.gen_expr(cond, code)?;
+                let jmpf_idx = code.len();
+                code.push(Op::JmpF(0)); // 偽 → end
+                code.push(Op::Jmp(loop_start as u32));
+                let end_pos = code.len();
+                code[jmpf_idx] = Op::JmpF(end_pos as u32);
+                let breaks = self.break_patches.pop().unwrap();
+                let continues = self.continue_patches.pop().unwrap();
+                for idx in breaks {
+                    code[idx] = Op::Jmp(end_pos as u32);
+                }
+                for idx in continues {
+                    code[idx] = Op::Jmp(cond_target as u32);
+                }
+            }
+            Stmt::Break => {
+                let patches = self
+                    .break_patches
+                    .last_mut()
+                    .ok_or_else(|| CompileError("break outside loop".into()))?;
+                let idx = code.len();
+                code.push(Op::Jmp(0)); // プレースホルダ
+                patches.push(idx);
+            }
+            Stmt::Continue => {
+                let patches = self
+                    .continue_patches
+                    .last_mut()
+                    .ok_or_else(|| CompileError("continue outside loop".into()))?;
+                let idx = code.len();
+                code.push(Op::Jmp(0)); // プレースホルダ
+                patches.push(idx);
             }
             Stmt::FuncDecl { .. } => {
                 return Err(CompileError("nested function declarations are not yet supported".into()))
@@ -355,6 +513,15 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
                 }
             }
             Stmt::While { body, .. } => collect_vars(std::slice::from_ref(body), locals),
+            Stmt::For { init, body, .. } => {
+                if let Some(ForInit::Var { name, .. }) = init {
+                    if !locals.contains_key(name) {
+                        locals.insert(name.clone(), locals.len() as u32);
+                    }
+                }
+                collect_vars(std::slice::from_ref(body), locals);
+            }
+            Stmt::DoWhile { body, .. } => collect_vars(std::slice::from_ref(body), locals),
             _ => {}
         }
     }
@@ -498,5 +665,94 @@ mod tests {
             obj.op(3, 4);
         ";
         assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(7));
+    }
+
+    #[test]
+    fn for_loop() {
+        let src = "
+            var s = 0;
+            for (var i = 0; i < 10; i = i + 1) { s = s + i; }
+            s;
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(45));
+    }
+
+    #[test]
+    fn for_loop_with_break() {
+        let src = "
+            var s = 0;
+            for (var i = 0; i < 10; i = i + 1) { if (i === 5) { break; } s = s + i; }
+            s;
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(10)); // 0+1+2+3+4
+    }
+
+    #[test]
+    fn for_loop_with_continue() {
+        let src = "
+            var s = 0;
+            for (var i = 0; i < 5; i = i + 1) { if (i === 2) { continue; } s = s + i; }
+            s;
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(8)); // 0+1+3+4
+    }
+
+    #[test]
+    fn do_while_loop() {
+        let src = "
+            var i = 0;
+            var s = 0;
+            do { s = s + i; i = i + 1; } while (i < 5);
+            s;
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(10)); // 0+1+2+3+4
+    }
+
+    #[test]
+    fn ternary_expr() {
+        assert_eq!(run_src("1 < 2 ? 10 : 20;").unwrap(), crate::AklVal::mk_int(10));
+        assert_eq!(run_src("1 > 2 ? 10 : 20;").unwrap(), crate::AklVal::mk_int(20));
+    }
+
+    #[test]
+    fn compound_assign() {
+        assert_eq!(
+            run_src("var x = 10; x += 5; x;").unwrap(),
+            crate::AklVal::mk_int(15)
+        );
+        assert_eq!(
+            run_src("var x = 10; x -= 3; x;").unwrap(),
+            crate::AklVal::mk_int(7)
+        );
+        assert_eq!(
+            run_src("var x = 2; x *= 6; x;").unwrap(),
+            crate::AklVal::mk_int(12)
+        );
+        assert_eq!(
+            run_src("var x = 10; x /= 4; x;").unwrap(),
+            crate::AklVal::from_f64(2.5)
+        );
+        assert_eq!(
+            run_src("var x = 10; x %= 3; x;").unwrap(),
+            crate::AklVal::mk_int(1)
+        );
+    }
+
+    #[test]
+    fn inc_dec() {
+        assert_eq!(run_src("var x = 5; ++x;").unwrap(), crate::AklVal::mk_int(6));
+        assert_eq!(run_src("var x = 5; x++;").unwrap(), crate::AklVal::mk_int(5));
+        assert_eq!(run_src("var x = 5; x++; x;").unwrap(), crate::AklVal::mk_int(6));
+        assert_eq!(run_src("var x = 5; --x;").unwrap(), crate::AklVal::mk_int(4));
+        assert_eq!(run_src("var x = 5; x--; x;").unwrap(), crate::AklVal::mk_int(4));
+    }
+
+    #[test]
+    fn break_continue_outside_loop_errors() {
+        // break / continue はループ外でエラー（コンパイル時）
+        let src = "break;";
+        let program = crate::parser::Parser::new(src).parse_program().unwrap();
+        let mut rt = Runtime::new();
+        assert!(compile(&mut rt, &program).is_err());
     }
 }
