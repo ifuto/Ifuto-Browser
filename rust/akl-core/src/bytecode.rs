@@ -367,8 +367,12 @@ pub struct Runtime {
     pub set_methods: Vec<(ObjId, AklVal)>,
     /// Date メソッド表（name → native）。`PLoad` が `Obj::Date` で解決する。
     pub date_methods: Vec<(ObjId, AklVal)>,
+    /// 正規表現メソッド表（name → native）。`PLoad` が `Obj::RegExp` で解決する。
+    pub regex_methods: Vec<(ObjId, AklVal)>,
     /// `length` プロパティ名の ObjId（install_builtins で設定。文字列/配列の length 用）。
     pub length_id: ObjId,
+    /// `size` プロパティ名の ObjId（Map/Set の size 用）。
+    pub size_id: ObjId,
     /// `constructor` プロパティ名の ObjId（コンストラクタ解決フォールバック用）。
     pub ctor_name: ObjId,
     /// `\x00proto` プロパティ名の ObjId（プロトタイプチェーン用。C の `proto_name` 相当）。
@@ -383,6 +387,8 @@ impl Runtime {
         let mut rt = Self::default();
         // `length` プロパティ名を設定（文字列/配列の length 解決用。install_builtins 前でも有効）。
         rt.length_id = rt.intern("length").unwrap_or(0);
+        // `size` プロパティ名（Map/Set の size 解決用）。
+        rt.size_id = rt.intern("size").unwrap_or(0);
         // `\x00proto` プロパティ名（プロトタイプチェーン）。
         rt.proto_name = rt.intern("\x00proto").unwrap_or(0);
         // `constructor` プロパティ名（コンストラクタ解決フォールバック用）。
@@ -490,7 +496,10 @@ impl Runtime {
                 .map(|(_, v)| *v)
                 .unwrap_or(AklVal::UNDEF);
         }
-        if matches!(self.heap.get(id), Some(Obj::Map(_))) {
+        if let Some(Obj::Map(kv)) = self.heap.get(id) {
+            if name == self.size_id {
+                return AklVal::mk_int(kv.len() as i32);
+            }
             return self
                 .map_methods
                 .iter()
@@ -498,7 +507,10 @@ impl Runtime {
                 .map(|(_, v)| *v)
                 .unwrap_or(AklVal::UNDEF);
         }
-        if matches!(self.heap.get(id), Some(Obj::Set(_))) {
+        if let Some(Obj::Set(items)) = self.heap.get(id) {
+            if name == self.size_id {
+                return AklVal::mk_int(items.len() as i32);
+            }
             return self
                 .set_methods
                 .iter()
@@ -506,9 +518,17 @@ impl Runtime {
                 .map(|(_, v)| *v)
                 .unwrap_or(AklVal::UNDEF);
         }
-        if matches!(self.heap.get(id), Some(Obj::Date { .. })) {
+        if let Some(Obj::Date { .. }) = self.heap.get(id) {
             return self
                 .date_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
+        if let Some(Obj::RegExp { .. }) = self.heap.get(id) {
+            return self
+                .regex_methods
                 .iter()
                 .find(|(n, _)| *n == name)
                 .map(|(_, v)| *v)
@@ -1111,6 +1131,23 @@ impl Runtime {
                         return Err(VmError::NotObject);
                     }
                     let id = obj.get_obj();
+                    // 配列の length セッター（`arr.length = n` で伸縮）
+                    if name == self.length_id {
+                        let new_len = self.to_number(val) as i64;
+                        if let Some(Obj::Arr(items)) = self.heap.get_mut(id) {
+                            if new_len >= 0 {
+                                let nl = new_len as usize;
+                                if nl < items.len() {
+                                    items.truncate(nl);
+                                } else {
+                                    items.resize(nl, AklVal::UNDEF);
+                                }
+                            }
+                            stack.push(val);
+                            pc += 1;
+                            continue;
+                        }
+                    }
                     // ホストハンドルのプロパティ設定
                     if let Some(Obj::Handle { vtab, data, ptr }) = self.heap.get(id) {
                         let (vtab, data, ptr) = (*vtab, *data, *ptr);

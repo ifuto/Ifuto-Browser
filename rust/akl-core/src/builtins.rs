@@ -75,6 +75,8 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     install_json(rt)?;
     // Map / Set / Promise
     install_map_set(rt)?;
+    // 正規表現メソッド（exec / test）
+    install_regex_methods(rt)?;
     // Date（同期近似）
     install_date(rt)?;
 
@@ -305,6 +307,8 @@ fn install_string_methods(rt: &mut Runtime) -> Result<(), VmError> {
         ("replace", str_replace),
         ("search", str_search),
         ("split", str_split),
+        ("padStart", str_pad_start),
+        ("padEnd", str_pad_end),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -376,6 +380,50 @@ fn str_repeat(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
     Ok(AklVal::mk_obj(id))
 }
 
+/// `padStart` / `padEnd` の共通実装。`from_end` が true なら padEnd。
+fn str_pad(rt: &mut Runtime, this: AklVal, a: &[AklVal], from_end: bool) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let target = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0).max(0) as usize;
+    let pad = a.get(1).map(|v| to_js_string(rt, *v)).unwrap_or_else(|| " ".to_string());
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= target {
+        let id = rt.intern(&s).ok_or(VmError::Oom)?;
+        return Ok(AklVal::mk_obj(id));
+    }
+    let need = target - chars.len();
+    let pad_chars: Vec<char> = pad.chars().collect();
+    let mut out = String::new();
+    if from_end {
+        out.extend(&chars);
+        for i in 0..need {
+            if pad_chars.is_empty() {
+                out.push(' ');
+            } else {
+                out.push(pad_chars[i % pad_chars.len()]);
+            }
+        }
+    } else {
+        for i in 0..need {
+            if pad_chars.is_empty() {
+                out.push(' ');
+            } else {
+                out.push(pad_chars[i % pad_chars.len()]);
+            }
+        }
+        out.extend(&chars);
+    }
+    let id = rt.intern(&out).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn str_pad_start(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    str_pad(rt, this, a, false)
+}
+
+fn str_pad_end(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    str_pad(rt, this, a, true)
+}
+
 /// 正規表現オブジェクトを取得（引数が Obj::RegExp ならその pattern/flags）。
 fn regex_of(rt: &Runtime, v: AklVal) -> Option<(String, String)> {
     if v.is_obj() {
@@ -420,24 +468,141 @@ fn str_match(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     }
 }
 
+/// `repl` が callable（Func/Native）か。
+fn is_callable(rt: &Runtime, v: AklVal) -> bool {
+    v.is_obj()
+        && matches!(
+            rt.heap.get(v.get_obj()),
+            Some(Obj::Func { .. })
+                | Some(Obj::Native(_))
+                | Some(Obj::ForeignNative { .. })
+                | Some(Obj::BoundMethod { .. })
+        )
+}
+
 fn str_replace(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let s = this_str(rt, this);
     let rx_v = a.first().copied().unwrap_or(AklVal::UNDEF);
-    let repl = a
-        .get(1)
-        .map(|v| to_js_string(rt, *v))
-        .unwrap_or_default();
+    let repl_v = a.get(1).copied().unwrap_or(AklVal::UNDEF);
+    let callable = is_callable(rt, repl_v);
     let out = if let Some((pattern, flags)) = regex_of(rt, rx_v) {
         let flag_num = flags_to_num(&flags);
         let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
-        crate::regex::replace_first(&s, &rx, &repl)
+        let global = flags.contains('g');
+        if callable {
+            replace_regex_fn(rt, &s, &rx, repl_v, global)?
+        } else {
+            let repl = to_js_string(rt, repl_v);
+            if global {
+                crate::regex::replace_all(&s, &rx, &repl)
+            } else {
+                crate::regex::replace_first(&s, &rx, &repl)
+            }
+        }
     } else {
-        // 文字列置換（最初の 1 箇所）
         let needle = to_js_string(rt, rx_v);
-        s.replacen(&needle, &repl, 1)
+        if callable {
+            // 文字列 needle + 関数: 最初の 1 箇所を cb(needle) で置換
+            match s.find(&needle) {
+                Some(start) => {
+                    let mut result = String::new();
+                    result.push_str(&s[..start]);
+                    let arg = rt.intern(&needle).ok_or(VmError::Oom)?;
+                    let r = call_native(rt, repl_v, AklVal::UNDEF, &[AklVal::mk_obj(arg)])?;
+                    result.push_str(&to_js_string(rt, r));
+                    result.push_str(&s[start + needle.len()..]);
+                    result
+                }
+                None => s.clone(),
+            }
+        } else {
+            let repl = to_js_string(rt, repl_v);
+            s.replacen(&needle, &repl, 1)
+        }
     };
     let id = rt.intern(&out).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
+}
+
+/// RegExp + 関数コールバックの置換（`s.replace(/re/g, cb)`）。cb は (match, ...caps) を
+/// 受け、戻り値を置換文字列とする。`g` が無ければ最初の 1 箇所のみ。
+fn replace_regex_fn(
+    rt: &mut Runtime,
+    s: &str,
+    rx: &crate::regex::Regex,
+    cb: AklVal,
+    global: bool,
+) -> Result<String, VmError> {
+    let mut result = String::new();
+    let mut rest = s;
+    let mut guard = 0;
+    loop {
+        if guard > 10000 {
+            break;
+        }
+        guard += 1;
+        match rx.find(rest) {
+            Some(caps) => {
+                let full = caps[0].clone();
+                if full.is_empty() {
+                    result.push_str(rest);
+                    break;
+                }
+                let start = rest.find(&full).unwrap_or(0);
+                result.push_str(&rest[..start]);
+                // コールバック引数: マッチ全体 + 捕捉グループ
+                let mut args = Vec::new();
+                for c in &caps {
+                    let arg = rt.intern(c).ok_or(VmError::Oom)?;
+                    args.push(AklVal::mk_obj(arg));
+                }
+                let r = call_native(rt, cb, AklVal::UNDEF, &args)?;
+                result.push_str(&to_js_string(rt, r));
+                rest = &rest[start + full.len()..];
+                if !global {
+                    result.push_str(rest);
+                    break;
+                }
+            }
+            None => {
+                result.push_str(rest);
+                break;
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// `RegExp.prototype.exec`：マッチ全体 + 捕捉グループの配列（無ければ null）。
+fn regex_exec(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = to_js_string(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+    let Some((pattern, flags)) = regex_of(rt, this) else {
+        return Ok(AklVal::NULL);
+    };
+    let flag_num = flags_to_num(&flags);
+    let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+    match rx.find(&s) {
+        Some(caps) => {
+            let items: Vec<AklVal> = caps
+                .iter()
+                .map(|c| rt.intern(c).map(AklVal::mk_obj).unwrap_or(AklVal::UNDEF))
+                .collect();
+            let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
+            Ok(AklVal::mk_obj(id))
+        }
+        None => Ok(AklVal::NULL),
+    }
+}
+
+/// `RegExp.prototype.test`：マッチすれば true。
+fn regex_test(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = to_js_string(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+    let Some((pattern, flags)) = regex_of(rt, this) else {
+        return Ok(AklVal::FALSE);
+    };
+    let flag_num = flags_to_num(&flags);
+    let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::from_bool(rx.find(&s).is_some()))
 }
 
 fn str_search(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
@@ -835,6 +1000,19 @@ fn arr_at(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErro
     } else {
         Ok(items[idx as usize])
     }
+}
+
+/// 正規表現メソッド（exec / test）を登録（`rt.regex_methods` 経由で `PLoad` が解決）。
+fn install_regex_methods(rt: &mut Runtime) -> Result<(), VmError> {
+    for (name, f) in [
+        ("exec", regex_exec as crate::bytecode::NativeFn),
+        ("test", regex_test),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.regex_methods.push((nid, v));
+    }
+    Ok(())
 }
 
 /// Map / Set / Promise を登録。

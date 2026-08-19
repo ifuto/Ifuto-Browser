@@ -86,29 +86,28 @@ impl Regex {
     /// 位置 `start` からマッチを試みる。
     fn try_match_at(&self, text: &str, start: usize, ignore: bool) -> Option<Vec<String>> {
         let chars: Vec<char> = text.chars().collect();
-        let mut caps = vec![None; self.ncap + 1];
         for branch in &self.branches {
             let mut bcap = vec![None; self.ncap + 1];
-            if match_node(branch, &chars, start, ignore, &mut bcap) {
-                // 全体マッチの終端を取得
-                let end = find_end(branch, &chars, start, ignore, &mut bcap.clone());
-                bcap[0] = Some((start, end));
-                caps = bcap;
-                break;
+            let mut end = None;
+            let ok = match_at(branch, &chars, start, ignore, &mut bcap, &mut |e, _caps| {
+                end = Some(e);
+                true
+            });
+            if ok {
+                if let Some(e) = end {
+                    bcap[0] = Some((start, e));
+                    let result: Vec<String> = bcap
+                        .iter()
+                        .map(|c| match c {
+                            Some((s, e2)) => chars[*s..*e2].iter().collect(),
+                            None => String::new(),
+                        })
+                        .collect();
+                    return Some(result);
+                }
             }
         }
-        if caps[0].is_some() {
-            let result: Vec<String> = caps
-                .iter()
-                .map(|c| match c {
-                    Some((s, e)) => chars[*s..*e].iter().collect(),
-                    None => String::new(),
-                })
-                .collect();
-            Some(result)
-        } else {
-            None
-        }
+        None
     }
 
     /// 全マッチを返す（`g` フラグ用）。各要素はマッチ全体文字列。
@@ -234,7 +233,32 @@ impl Parser {
                 self.pos += 1;
                 let e = self.peek().ok_or("trailing backslash")?;
                 self.pos += 1;
-                Ok(RegexNode::Literal(e))
+                // 文字クラスエスケープ（\d \w \s と否定形）。範囲/文字集合へ展開する。
+                match e {
+                    'd' => Ok(RegexNode::Class { negated: false, chars: vec![], ranges: vec![('0', '9')] }),
+                    'D' => Ok(RegexNode::Class { negated: true, chars: vec![], ranges: vec![('0', '9')] }),
+                    'w' => Ok(RegexNode::Class {
+                        negated: false,
+                        chars: vec!['_'],
+                        ranges: vec![('0', '9'), ('A', 'Z'), ('a', 'z')],
+                    }),
+                    'W' => Ok(RegexNode::Class {
+                        negated: true,
+                        chars: vec!['_'],
+                        ranges: vec![('0', '9'), ('A', 'Z'), ('a', 'z')],
+                    }),
+                    's' => Ok(RegexNode::Class {
+                        negated: false,
+                        chars: vec![' ', '\t', '\n', '\r', '\u{0b}', '\u{0c}'],
+                        ranges: vec![],
+                    }),
+                    'S' => Ok(RegexNode::Class {
+                        negated: true,
+                        chars: vec![' ', '\t', '\n', '\r', '\u{0b}', '\u{0c}'],
+                        ranges: vec![],
+                    }),
+                    _ => Ok(RegexNode::Literal(e)),
+                }
             }
             '*' | '+' | '?' => Err(format!("quantifier without target: {c}")),
             _ => {
@@ -278,104 +302,36 @@ impl Parser {
     }
 }
 
-/// 連結のマッチ（バックトラッキング対応）。
-fn match_concat(
-    nodes: &[RegexNode],
-    chars: &[char],
-    pos: usize,
-    ignore: bool,
-    caps: &mut [Option<(usize, usize)>],
-) -> bool {
-    if nodes.is_empty() {
-        return true;
-    }
-    // バックトラッキング: 各 Repeat の消費量を段階的に試す
-    // 簡易実装: 先頭から順に貪欲マッチし、失敗したら直前の Repeat の消費を 1 減らす
-    let mut positions = vec![pos; nodes.len() + 1];
-    positions[0] = pos;
-    let mut counts: Vec<u32> = vec![0; nodes.len()];
-    let mut i = 0usize;
-    while i < nodes.len() {
-        let node = &nodes[i];
-        match node {
-            RegexNode::Repeat(child, min, _max) => {
-                // 消費量を counts[i] に設定してマッチ
-                let mut p = positions[i];
-                let mut c = 0u32;
-                while c < counts[i] {
-                    if match_node(child, chars, p, ignore, caps) {
-                        p = advance_past(child, chars, p, ignore, caps);
-                        c += 1;
-                    } else {
-                        return false;
-                    }
-                }
-                // さらに貪欲に伸ばせるか
-                let mut extend = p;
-                let mut ec = c;
-                while match_node(child, chars, extend, ignore, caps) {
-                    extend = advance_past(child, chars, extend, ignore, caps);
-                    ec += 1;
-                }
-                if ec < *min {
-                    return false;
-                }
-                positions[i + 1] = extend;
-                counts[i] = ec;
-                i += 1;
-            }
-            _ => {
-                if match_node(node, chars, positions[i], ignore, caps) {
-                    positions[i + 1] = advance_past(node, chars, positions[i], ignore, caps);
-                    i += 1;
-                } else {
-                    // バックトラック: 直前の Repeat を探す
-                    let mut j = i;
-                    loop {
-                        if j == 0 {
-                            return false;
-                        }
-                        j -= 1;
-                        if let RegexNode::Repeat(child, min, _) = &nodes[j] {
-                            if counts[j] > *min {
-                                counts[j] -= 1;
-                                // 再計算
-                                let mut p = positions[j];
-                                let mut c = 0u32;
-                                while c < counts[j] {
-                                    if match_node(child, chars, p, ignore, caps) {
-                                        p = advance_past(child, chars, p, ignore, caps);
-                                        c += 1;
-                                    } else {
-                                        return false;
-                                    }
-                                }
-                                positions[j + 1] = p;
-                                i = j + 1;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    true
-}
+/// 捕捉グループ列の型。
+type Caps = Vec<Option<(usize, usize)>>;
 
-/// ノードのマッチ（位置 start から）。
-fn match_node(
+/// 継続渡し（CPS）の正規表現マッチャ。`node` が `pos` からマッチし、消費後の位置で
+/// 継続 `k` を呼ぶ。`k` が false を返すと別の消費量を試す（バックトラッキング）。
+/// `caps` は継続に明示的に渡すことで、`Group` 内の Repeat 等のネストでも正しく
+/// バックトラックできる。
+fn match_at(
     node: &RegexNode,
     chars: &[char],
     pos: usize,
     ignore: bool,
-    caps: &mut [Option<(usize, usize)>],
+    caps: &mut Caps,
+    k: &mut dyn FnMut(usize, &mut Caps) -> bool,
 ) -> bool {
     match node {
         RegexNode::Literal(c) => {
-            pos < chars.len() && char_eq(*c, chars[pos], ignore)
+            if pos < chars.len() && char_eq(*c, chars[pos], ignore) {
+                k(pos + 1, caps)
+            } else {
+                false
+            }
         }
-        RegexNode::Any => pos < chars.len(),
+        RegexNode::Any => {
+            if pos < chars.len() {
+                k(pos + 1, caps)
+            } else {
+                false
+            }
+        }
         RegexNode::Class { negated, chars: cl, ranges } => {
             if pos >= chars.len() {
                 return false;
@@ -383,123 +339,98 @@ fn match_node(
             let tc = chars[pos];
             let in_class = cl.iter().any(|c| char_eq(*c, tc, ignore))
                 || ranges.iter().any(|(a, b)| char_in_range(*a, *b, tc, ignore));
-            in_class != *negated
-        }
-        RegexNode::Start => pos == 0,
-        RegexNode::End => pos == chars.len(),
-        RegexNode::Concat(nodes) => {
-            // バックトラッキング付き連結
-            match_concat(nodes, chars, pos, ignore, caps)
-        }
-        RegexNode::Alt(alts) => alts.iter().any(|a| match_node(a, chars, pos, ignore, caps)),
-        RegexNode::Repeat(child, min, max) => {
-            // 貪欲マッチ（できるだけ消費。バックトラッキングは match_concat が担う）
-            let mut p = pos;
-            let mut count = 0u32;
-            loop {
-                if let Some(m) = max {
-                    if count >= *m {
-                        break;
-                    }
-                }
-                if match_node(child, chars, p, ignore, caps) {
-                    p = advance_past(child, chars, p, ignore, caps);
-                    count += 1;
-                } else {
-                    break;
-                }
-            }
-            count >= *min
-        }
-        RegexNode::Group(idx, child) => {
-            if match_node(child, chars, pos, ignore, caps) {
-                let end = advance_past(child, chars, pos, ignore, caps);
-                caps[*idx] = Some((pos, end));
-                true
+            if in_class != *negated {
+                k(pos + 1, caps)
             } else {
                 false
             }
         }
-    }
-}
-
-/// ノードがマッチしたときの消費文字数を求める（advance 用）。
-fn advance_past(
-    node: &RegexNode,
-    chars: &[char],
-    pos: usize,
-    ignore: bool,
-    caps: &mut [Option<(usize, usize)>],
-) -> usize {
-    match node {
-        RegexNode::Literal(_) | RegexNode::Any | RegexNode::Class { .. } | RegexNode::Start | RegexNode::End => {
-            if matches!(node, RegexNode::Start | RegexNode::End) {
-                pos
+        RegexNode::Start => {
+            if pos == 0 {
+                k(pos, caps)
             } else {
-                pos + 1
+                false
             }
         }
-        RegexNode::Concat(nodes) => {
-            let mut p = pos;
-            for n in nodes {
-                if !match_node(n, chars, p, ignore, caps) {
-                    break;
-                }
-                p = advance_past(n, chars, p, ignore, caps);
+        RegexNode::End => {
+            if pos == chars.len() {
+                k(pos, caps)
+            } else {
+                false
             }
-            p
         }
-        RegexNode::Alt(alts) => {
-            for a in alts {
-                if match_node(a, chars, pos, ignore, caps) {
-                    return advance_past(a, chars, pos, ignore, caps);
-                }
-            }
-            pos
-        }
+        RegexNode::Concat(nodes) => match_concat(nodes, chars, pos, ignore, caps, k),
+        RegexNode::Alt(alts) => alts
+            .iter()
+            .any(|a| match_at(a, chars, pos, ignore, caps, k)),
         RegexNode::Repeat(child, min, max) => {
-            let mut p = pos;
-            let mut count = 0u32;
+            let maxc = match max {
+                Some(m) => *m as usize,
+                None => chars.len().saturating_sub(pos) + 1,
+            };
+            let minc = *min as usize;
+            // 貪欲: 最大消費から最小へ順に試す
+            let mut c = maxc;
             loop {
-                if let Some(m) = max {
-                    if count >= *m {
-                        break;
-                    }
+                if c >= minc && match_repeat(child, c, chars, pos, ignore, caps, k) {
+                    return true;
                 }
-                if match_node(child, chars, p, ignore, caps) {
-                    p = advance_past(child, chars, p, ignore, caps);
-                    count += 1;
-                } else {
+                if c <= minc {
                     break;
                 }
+                c -= 1;
             }
-            if count >= *min {
-                p
-            } else {
-                pos
-            }
+            false
         }
         RegexNode::Group(idx, child) => {
-            if match_node(child, chars, pos, ignore, caps) {
-                let end = advance_past(child, chars, pos, ignore, caps);
-                caps[*idx] = Some((pos, end));
-                end
-            } else {
-                pos
+            let saved = caps[*idx];
+            let gpos = pos;
+            let gidx = *idx;
+            let ok = match_at(child, chars, pos, ignore, caps, &mut |end, caps2| {
+                caps2[gidx] = Some((gpos, end));
+                k(end, caps2)
+            });
+            if !ok {
+                caps[gidx] = saved;
             }
+            ok
         }
     }
 }
 
-/// 全体マッチの終端を求める。
-fn find_end(
-    node: &RegexNode,
+/// 連結（`Concat`）のマッチ。先頭ノードをマッチし、残りを継続で再帰する。
+fn match_concat(
+    nodes: &[RegexNode],
     chars: &[char],
     pos: usize,
     ignore: bool,
-    caps: &mut [Option<(usize, usize)>],
-) -> usize {
-    advance_past(node, chars, pos, ignore, caps)
+    caps: &mut Caps,
+    k: &mut dyn FnMut(usize, &mut Caps) -> bool,
+) -> bool {
+    if nodes.is_empty() {
+        return k(pos, caps);
+    }
+    match_at(&nodes[0], chars, pos, ignore, caps, &mut |end, caps2| {
+        match_concat(&nodes[1..], chars, end, ignore, caps2, k)
+    })
+}
+
+/// `child` をちょうど `count` 回マッチさせて継続へ渡す（Repeat のバックトラッキング用）。
+fn match_repeat(
+    child: &RegexNode,
+    count: usize,
+    chars: &[char],
+    pos: usize,
+    ignore: bool,
+    caps: &mut Caps,
+    k: &mut dyn FnMut(usize, &mut Caps) -> bool,
+) -> bool {
+    if count == 0 {
+        return k(pos, caps);
+    }
+    match_at(child, chars, pos, ignore, caps, &mut |end, caps2| {
+        match_repeat(child, count - 1, chars, end, ignore, caps2, k)
+    })
 }
 
 /// 文字の等値判定（i フラグ対応）。
@@ -539,6 +470,38 @@ pub fn replace_first(text: &str, rx: &Regex, replacement: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// 文字列の全置換（`String.replace` の RegExp 版、`g` フラグ用）。
+/// 各マッチで `$1` 等の捕捉グループを展開する。
+pub fn replace_all(text: &str, rx: &Regex, replacement: &str) -> String {
+    let mut result = String::new();
+    let mut rest = text;
+    let mut guard = 0;
+    loop {
+        if guard > 10000 {
+            break;
+        }
+        guard += 1;
+        match rx.find(rest) {
+            Some(caps) => {
+                let full = &caps[0];
+                if full.is_empty() {
+                    result.push_str(rest);
+                    break;
+                }
+                let start = rest.find(full).unwrap_or(0);
+                result.push_str(&rest[..start]);
+                result.push_str(&expand_replacement(replacement, &caps));
+                rest = &rest[start + full.len()..];
+            }
+            None => {
+                result.push_str(rest);
+                break;
+            }
+        }
+    }
+    result
 }
 
 /// 置換文字列の `$1` 展開。
