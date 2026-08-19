@@ -27,7 +27,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bytecode::{FuncObj, Op, Runtime};
 use crate::lexer::NumLit;
@@ -102,8 +102,9 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
 struct Compiler<'a> {
     rt: &'a mut Runtime,
     locals: HashMap<String, u32>,
-    /// 現在の関数が捕捉する変数（name → env index）。トップレベル/main は空。
-    captures: HashMap<String, u32>,
+    /// 現在の関数が捕捉する変数（name → (env 深さ, env index)）。深さ 0 = 自 env、
+    /// 1 = 親 env（＝外側関数の env）、2 = 祖父 env。トップレベル/main は空。
+    captures: HashMap<String, (u32, u32)>,
     /// 捕捉変数の出現順（env 構築用）。
     capture_order: Vec<String>,
     /// `break` のジャンプ先パッチ位置（ループごとのスタック）。
@@ -153,7 +154,7 @@ impl Compiler<'_> {
         let saved_continues = std::mem::take(&mut self.continue_patches);
         let saved_async = self.cur_is_async;
         self.locals = locals;
-        self.captures = boxed.clone();
+        self.captures = boxed.iter().map(|(n, i)| (n.clone(), (0, *i))).collect();
         self.capture_order = Vec::new();
         self.break_patches = Vec::new();
         self.continue_patches = Vec::new();
@@ -163,6 +164,14 @@ impl Compiler<'_> {
         // 関数入口で自前 env（box 化ローカル）を生成（C の frame_hidden 相当）
         if !boxed.is_empty() {
             code.push(Op::MakeEnv(boxed.len() as u32));
+            // boxed パラメータの初期値（do_call が locals に入れた値）を env セルへコピー
+            for p in params {
+                if let Some(idx) = boxed.get(p) {
+                    let slot = *self.locals.get(p).ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::LLoad(slot));
+                    code.push(Op::CeStore(0, *idx));
+                }
+            }
         }
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
@@ -205,15 +214,10 @@ impl Compiler<'_> {
         params: &[String],
         rest: Option<&str>,
         body: &[Stmt],
-        enclosing_env: &HashMap<String, u32>,
+        enclosing_env: &HashMap<String, (u32, u32)>,
         is_gen: bool,
         is_async: bool,
     ) -> Result<u32, CompileError> {
-        // 深いネスト（3 段以上）は未対応（env チェーンが必要。明白に失敗させる）
-        if body.iter().any(|s| matches!(s, Stmt::FuncDecl { .. })) {
-            return Err(CompileError("deeply nested closures are not yet supported".into()));
-        }
-
         // ネスト関数のローカル（パラメータ + var 宣言 + ネスト関数名）
         let mut locals = HashMap::new();
         for p in params {
@@ -227,17 +231,25 @@ impl Compiler<'_> {
             None
         };
         collect_vars(body, &mut locals);
+        // この関数が自前 env に box 化するローカル（＝更に内側のネスト関数に捕捉される）
+        let boxed = compute_boxed(params, body);
 
-        // 自由変数（参照されるがローカルでない名前）
-        let mut refs = std::collections::HashSet::new();
-        collect_refs(body, &mut refs);
-        let mut captures: HashMap<String, u32> = HashMap::new();
+        // 自由変数（参照されるがローカルでない名前。ネスト関数の参照は再帰的に伝播）
+        let bound: HashSet<String> = locals.keys().cloned().collect();
+        let mut refs = HashSet::new();
+        free_refs(body, &bound, &mut refs);
+        let mut captures: HashMap<String, (u32, u32)> =
+            boxed.iter().map(|(n, i)| (n.clone(), (0, *i))).collect();
+        // 自前 env（boxed）を作る場合のみ、外側の捕捉が 1 段深くなる
+        // （MakeEnv が frame.env を自前 env に差し替え、parent に外側 env が入るため）。
+        let has_own_env = !boxed.is_empty();
         for r in refs {
-            if locals.contains_key(&r) {
+            if captures.contains_key(&r) {
                 continue;
             }
-            if let Some(idx) = enclosing_env.get(&r) {
-                captures.insert(r, *idx);
+            if let Some((d, i)) = enclosing_env.get(&r) {
+                let depth = if has_own_env { d + 1 } else { *d };
+                captures.insert(r, (depth, *i));
             }
             // それ以外はグローバル（GLoad/GStore）
         }
@@ -256,6 +268,18 @@ impl Compiler<'_> {
         self.cur_is_async = is_async;
 
         let mut code = Vec::new();
+        // 自前 env（box 化ローカル）を生成（外側関数の env を parent に繋ぐ）
+        if !boxed.is_empty() {
+            code.push(Op::MakeEnv(boxed.len() as u32));
+            // boxed パラメータの初期値を env セルへコピー
+            for p in params {
+                if let Some(idx) = boxed.get(p) {
+                    let slot = *self.locals.get(p).ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::LLoad(slot));
+                    code.push(Op::CeStore(0, *idx));
+                }
+            }
+        }
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
         }
@@ -281,7 +305,9 @@ impl Compiler<'_> {
         Ok(fidx)
     }
 
-    /// 匿名関数（関数式・アロー関数）をコンパイルして関数表に登録し、fidx を返す。
+    /// 匿名関数（関数式・アロー関数）をコンパイルして関数表に登録し、
+    /// `(fidx, needs_closure)` を返す。`needs_closure` は「捕捉変数（自 boxed または
+    /// 外側 env の捕捉）を参照する＝ MakeClosure で env を束縛する必要がある」か。
     /// 自由変数は `enclosing_env`（外側の捕捉 env）に解決されたら CeLoad/CeStore、
     /// なければグローバル。`boxed` は自ローカルのうちネスト関数に捕捉されるもの。
     fn compile_function_anon(
@@ -290,8 +316,8 @@ impl Compiler<'_> {
         rest: Option<&str>,
         body: &[Stmt],
         boxed: &HashMap<String, u32>,
-        enclosing_env: &HashMap<String, u32>,
-    ) -> Result<u32, CompileError> {
+        enclosing_env: &HashMap<String, (u32, u32)>,
+    ) -> Result<(u32, bool), CompileError> {
         let mut locals = HashMap::new();
         for p in params {
             locals.insert(p.clone(), locals.len() as u32);
@@ -305,16 +331,21 @@ impl Compiler<'_> {
         };
         collect_vars(body, &mut locals);
 
-        // 自由変数（参照されるが自ローカルでない名前）を捕捉解決
-        let mut refs = std::collections::HashSet::new();
-        collect_refs(body, &mut refs);
-        let mut captures: HashMap<String, u32> = boxed.clone();
+        // 自由変数（参照されるが自ローカルでない名前。ネスト関数の参照は再帰的に伝播）
+        let bound: HashSet<String> = locals.keys().cloned().collect();
+        let mut refs = HashSet::new();
+        free_refs(body, &bound, &mut refs);
+        let mut captures: HashMap<String, (u32, u32)> =
+            boxed.iter().map(|(n, i)| (n.clone(), (0, *i))).collect();
+        // 自前 env（boxed）を作る場合のみ、外側の捕捉が 1 段深くなる。
+        let has_own_env = !boxed.is_empty();
         for r in refs {
-            if locals.contains_key(&r) || captures.contains_key(&r) {
+            if captures.contains_key(&r) {
                 continue;
             }
-            if let Some(idx) = enclosing_env.get(&r) {
-                captures.insert(r, *idx);
+            if let Some((d, i)) = enclosing_env.get(&r) {
+                let depth = if has_own_env { d + 1 } else { *d };
+                captures.insert(r, (depth, *i));
             }
         }
 
@@ -332,6 +363,14 @@ impl Compiler<'_> {
         let mut code = Vec::new();
         if !boxed.is_empty() {
             code.push(Op::MakeEnv(boxed.len() as u32));
+            // boxed パラメータの初期値を env セルへコピー
+            for p in params {
+                if let Some(idx) = boxed.get(p) {
+                    let slot = *self.locals.get(p).ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::LLoad(slot));
+                    code.push(Op::CeStore(0, *idx));
+                }
+            }
         }
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
@@ -341,6 +380,7 @@ impl Compiler<'_> {
 
         let n_locals = self.locals.len();
         let n_params = params.len();
+        let needs_closure = !self.captures.is_empty();
         let fidx = self.rt.funcs.len() as u32;
         self.rt.funcs.push(FuncObj { code, name: None, n_params, rest_slot, n_locals, is_gen: false });
 
@@ -350,7 +390,7 @@ impl Compiler<'_> {
         self.break_patches = saved_breaks;
         self.continue_patches = saved_continues;
 
-        Ok(fidx)
+        Ok((fidx, needs_closure))
     }
 
     /// 式をコード生成（結果をスタックに残す）。
@@ -369,6 +409,21 @@ impl Compiler<'_> {
             Expr::Undef => code.push(Op::Undef),
             Expr::Ident(name) => self.gen_load(name, code)?,
             Expr::Unary { op, operand } => {
+                // `typeof undeclared` は ReferenceError を投げず "undefined" を返す
+                // （JS の仕様。lodash 等の環境検出 `typeof global == 'object'` が依存）。
+                if *op == UnaryOp::Typeof {
+                    if let Expr::Ident(name) = &**operand {
+                        if !self.captures.contains_key(name) && !self.locals.contains_key(name) {
+                            let id = self
+                                .rt
+                                .intern(name)
+                                .ok_or_else(|| CompileError("intern failed".into()))?;
+                            code.push(Op::GLoadSafe(id));
+                            code.push(Op::Typeof);
+                            return Ok(());
+                        }
+                    }
+                }
                 self.gen_expr(operand, code)?;
                 code.push(match op {
                     UnaryOp::Neg => Op::Neg,
@@ -531,10 +586,14 @@ impl Compiler<'_> {
                         ObjEntry::Getter(name, body) => {
                             let enclosing = self.captures.clone();
                             let empty = HashMap::new();
-                            let fidx =
+                            let (fidx, needs_closure) =
                                 self.compile_function_anon(&[], None, body, &empty, &enclosing)?;
                             code.push(Op::Dup);
-                            code.push(Op::MakeF(fidx));
+                            if needs_closure {
+                                code.push(Op::MakeClosure(fidx));
+                            } else {
+                                code.push(Op::MakeF(fidx));
+                            }
                             let sid = self
                                 .rt
                                 .intern(&format!("get:\x01{name}"))
@@ -547,7 +606,7 @@ impl Compiler<'_> {
                             let empty = HashMap::new();
                             let params: Vec<String> =
                                 if param.is_empty() { vec![] } else { vec![param.clone()] };
-                            let fidx = self.compile_function_anon(
+                            let (fidx, needs_closure) = self.compile_function_anon(
                                 &params,
                                 None,
                                 body,
@@ -555,7 +614,11 @@ impl Compiler<'_> {
                                 &enclosing,
                             )?;
                             code.push(Op::Dup);
-                            code.push(Op::MakeF(fidx));
+                            if needs_closure {
+                                code.push(Op::MakeClosure(fidx));
+                            } else {
+                                code.push(Op::MakeF(fidx));
+                            }
                             let sid = self
                                 .rt
                                 .intern(&format!("set:\x01{name}"))
@@ -839,14 +902,15 @@ impl Compiler<'_> {
                 // 関数式: 関数をコンパイルして MakeF/MakeClosure で生成
                 let enclosing_env = self.captures.clone();
                 let boxed = compute_boxed(params, body);
-                let fidx = self.compile_function_anon(params, rest.as_deref(), body, &boxed, &enclosing_env)?;
+                let (fidx, needs_closure) =
+                    self.compile_function_anon(params, rest.as_deref(), body, &boxed, &enclosing_env)?;
                 // 名前付き関数式は自分自身を束縛（簡易: グローバルに置く近似は避け、
                 // ローカルスコープの自己参照は未対応のため名前は無視）
                 let _ = name;
-                if boxed.is_empty() {
-                    code.push(Op::MakeF(fidx));
-                } else {
+                if needs_closure {
                     code.push(Op::MakeClosure(fidx));
+                } else {
+                    code.push(Op::MakeF(fidx));
                 }
             }
             Expr::Arrow { params, rest, body } => {
@@ -854,11 +918,12 @@ impl Compiler<'_> {
                 let stmts = vec![Stmt::Return(Some((**body).clone()))];
                 let enclosing_env = self.captures.clone();
                 let boxed = compute_boxed(params, &stmts);
-                let fidx = self.compile_function_anon(params, rest.as_deref(), &stmts, &boxed, &enclosing_env)?;
-                if boxed.is_empty() {
-                    code.push(Op::MakeF(fidx));
-                } else {
+                let (fidx, needs_closure) =
+                    self.compile_function_anon(params, rest.as_deref(), &stmts, &boxed, &enclosing_env)?;
+                if needs_closure {
                     code.push(Op::MakeClosure(fidx));
+                } else {
+                    code.push(Op::MakeF(fidx));
                 }
             }
         }
@@ -1164,16 +1229,16 @@ impl Compiler<'_> {
                 // メソッドを先にコンパイル
                 let enclosing_env = self.captures.clone();
                 let empty_boxed = HashMap::new();
-                let mut method_fidxs = Vec::new();
+                let mut method_fidxs: Vec<(String, u32, bool)> = Vec::new();
                 for (mname, mparams, mrest, mbody) in methods {
-                    let fidx = self.compile_function_anon(
+                    let (fidx, needs_closure) = self.compile_function_anon(
                         mparams,
                         mrest.as_deref(),
                         mbody,
                         &empty_boxed,
                         &enclosing_env,
                     )?;
-                    method_fidxs.push((mname.clone(), fidx));
+                    method_fidxs.push((mname.clone(), fidx, needs_closure));
                 }
                 // フィールド初期化を constructor 本体の先頭に前置（`this.name = init`）
                 let mut ctor_body = Vec::new();
@@ -1186,7 +1251,7 @@ impl Compiler<'_> {
                 }
                 ctor_body.extend(constructor.2.iter().cloned());
                 // constructor をコンパイル
-                let ctor_fidx = self.compile_function_anon(
+                let (ctor_fidx, ctor_needs_closure) = self.compile_function_anon(
                     &constructor.0,
                     constructor.1.as_deref(),
                     &ctor_body,
@@ -1199,12 +1264,20 @@ impl Compiler<'_> {
                 //   PStore(prototype)  → ctor.prototype = proto → [ctor, proto]
                 //   Pop → [ctor]
                 //   gen_store(name) → []
-                code.push(Op::MakeF(ctor_fidx));
+                if ctor_needs_closure {
+                    code.push(Op::MakeClosure(ctor_fidx));
+                } else {
+                    code.push(Op::MakeF(ctor_fidx));
+                }
                 code.push(Op::Dup);
                 code.push(Op::ObjNew);
-                for (mname, mfidx) in &method_fidxs {
+                for (mname, mfidx, mclosure) in &method_fidxs {
                     code.push(Op::Dup); // [ctor, ctor, proto, proto]
-                    code.push(Op::MakeF(*mfidx)); // [ctor, ctor, proto, proto, method]
+                    if *mclosure {
+                        code.push(Op::MakeClosure(*mfidx));
+                    } else {
+                        code.push(Op::MakeF(*mfidx));
+                    }
                     let mname_id = self
                         .rt
                         .intern(mname)
@@ -1410,8 +1483,8 @@ impl Compiler<'_> {
     /// 変数を読み出す（捕捉 env → ローカル → グローバルの順で解決）。
     /// 捕捉をローカルより優先するのは、box 化ローカルが locals に残るため。
     fn gen_load(&mut self, name: &str, code: &mut Vec<Op>) -> Result<(), CompileError> {
-        if let Some(idx) = self.captures.get(name) {
-            code.push(Op::CeLoad(*idx));
+        if let Some((depth, idx)) = self.captures.get(name) {
+            code.push(Op::CeLoad(*depth, *idx));
         } else if let Some(slot) = self.locals.get(name) {
             code.push(Op::LLoad(*slot));
         } else {
@@ -1423,8 +1496,8 @@ impl Compiler<'_> {
 
     /// 変数へ書き込む（捕捉 env → ローカル → グローバルの順で解決）。
     fn gen_store(&mut self, name: &str, code: &mut Vec<Op>) -> Result<(), CompileError> {
-        if let Some(idx) = self.captures.get(name) {
-            code.push(Op::CeStore(*idx));
+        if let Some((depth, idx)) = self.captures.get(name) {
+            code.push(Op::CeStore(*depth, *idx));
         } else if let Some(slot) = self.locals.get(name) {
             code.push(Op::LStore(*slot));
         } else {
@@ -1625,22 +1698,24 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
     }
 }
 
-/// 分割代入パターンから参照される識別子名を収集（自由変数解析用）。
-fn collect_pattern_refs(pattern: &crate::parser::Pattern, out: &mut std::collections::HashSet<String>) {
+/// 分割代入パターンから、束縛されていない名前（＝書き込み先として外側を参照）を収集。
+fn free_pattern_refs(pattern: &crate::parser::Pattern, bound: &HashSet<String>, out: &mut HashSet<String>) {
     match pattern {
         crate::parser::Pattern::Ident(name)
         | crate::parser::Pattern::Rest(name)
         | crate::parser::Pattern::ObjRest(name) => {
-            out.insert(name.clone());
+            if !bound.contains(name) {
+                out.insert(name.clone());
+            }
         }
         crate::parser::Pattern::Arr(items) => {
             for item in items {
-                collect_pattern_refs(item, out);
+                free_pattern_refs(item, bound, out);
             }
         }
         crate::parser::Pattern::Obj(items) => {
             for (_, item) in items {
-                collect_pattern_refs(item, out);
+                free_pattern_refs(item, bound, out);
             }
         }
         crate::parser::Pattern::Hole => {}
@@ -1671,216 +1746,255 @@ fn collect_pattern_vars(pattern: &crate::parser::Pattern, locals: &mut HashMap<S
     }
 }
 
-/// 文列から参照される識別子名を収集する（クロージャの自由変数解析用）。
-fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+/// ネスト関数の束縛集合（外側 `bound` + params + 関数名 + ネスト関数内の var/関数名）。
+fn nested_bound(
+    bound: &HashSet<String>,
+    params: &[String],
+    body: &[Stmt],
+    name: Option<&str>,
+) -> HashSet<String> {
+    let mut inner = bound.clone();
+    for p in params {
+        inner.insert(p.clone());
+    }
+    if let Some(n) = name {
+        inner.insert(n.to_string());
+    }
+    let mut lmap = HashMap::new();
+    collect_vars(body, &mut lmap);
+    for n in lmap.keys() {
+        inner.insert(n.clone());
+    }
+    inner
+}
+
+/// 文列の自由変数を、ネスト関数を跨いで再帰的に収集する（bound-aware）。
+/// `bound` = このスコープで束縛済みの名前。ネスト関数（FuncDecl / FuncExpr / Arrow）は
+/// その params + ローカルを `bound` に加えて再帰し、真の自由変数（＝外側への捕捉要求）
+/// だけを `out` に合流させる。
+fn free_refs(stmts: &[Stmt], bound: &HashSet<String>, out: &mut HashSet<String>) {
     for stmt in stmts {
         match stmt {
-            Stmt::Expr(e) => collect_expr_refs(e, out),
+            Stmt::Expr(e) => free_expr_refs(e, bound, out),
             Stmt::Var { init, .. } => {
                 if let Some(e) = init {
-                    collect_expr_refs(e, out);
+                    free_expr_refs(e, bound, out);
                 }
             }
             Stmt::Return(e) => {
                 if let Some(e) = e {
-                    collect_expr_refs(e, out);
+                    free_expr_refs(e, bound, out);
                 }
             }
             Stmt::If { cond, then, else_ } => {
-                collect_expr_refs(cond, out);
-                collect_refs(std::slice::from_ref(then), out);
+                free_expr_refs(cond, bound, out);
+                free_refs(std::slice::from_ref(then), bound, out);
                 if let Some(e) = else_ {
-                    collect_refs(std::slice::from_ref(e), out);
+                    free_refs(std::slice::from_ref(e), bound, out);
                 }
             }
             Stmt::While { cond, body } => {
-                collect_expr_refs(cond, out);
-                collect_refs(std::slice::from_ref(body), out);
+                free_expr_refs(cond, bound, out);
+                free_refs(std::slice::from_ref(body), bound, out);
             }
             Stmt::For { init, cond, step, body } => {
                 if let Some(ForInit::Expr(e)) = init {
-                    collect_expr_refs(e, out);
+                    free_expr_refs(e, bound, out);
                 }
                 if let Some(ForInit::Var { init: Some(e), .. }) = init {
-                    collect_expr_refs(e, out);
+                    free_expr_refs(e, bound, out);
                 }
                 if let Some(c) = cond {
-                    collect_expr_refs(c, out);
+                    free_expr_refs(c, bound, out);
                 }
                 if let Some(s) = step {
-                    collect_expr_refs(s, out);
+                    free_expr_refs(s, bound, out);
                 }
-                collect_refs(std::slice::from_ref(body), out);
+                free_refs(std::slice::from_ref(body), bound, out);
             }
             Stmt::DoWhile { body, cond } => {
-                collect_refs(std::slice::from_ref(body), out);
-                collect_expr_refs(cond, out);
+                free_refs(std::slice::from_ref(body), bound, out);
+                free_expr_refs(cond, bound, out);
             }
             Stmt::ForIn { obj, body, .. } => {
-                collect_expr_refs(obj, out);
-                collect_refs(std::slice::from_ref(body), out);
+                free_expr_refs(obj, bound, out);
+                free_refs(std::slice::from_ref(body), bound, out);
             }
             Stmt::Switch { disc, cases } => {
-                collect_expr_refs(disc, out);
-                for (case_val, body) in cases {
-                    if let Some(v) = case_val {
-                        collect_expr_refs(v, out);
+                free_expr_refs(disc, bound, out);
+                for (cv, cbody) in cases {
+                    if let Some(v) = cv {
+                        free_expr_refs(v, bound, out);
                     }
-                    collect_refs(body, out);
+                    free_refs(cbody, bound, out);
                 }
             }
-            Stmt::Throw(e) => collect_expr_refs(e, out),
+            Stmt::Throw(e) => free_expr_refs(e, bound, out),
             Stmt::Try { try_body, catch_body, .. } => {
-                collect_refs(try_body, out);
-                collect_refs(catch_body, out);
+                free_refs(try_body, bound, out);
+                free_refs(catch_body, bound, out);
             }
-            Stmt::Destructure { init, .. } => {
-                collect_expr_refs(init, out);
+            Stmt::Destructure { init, .. } => free_expr_refs(init, bound, out),
+            Stmt::FuncDecl { params, body, .. } => {
+                // 関数宣言の名前は「外側スコープ」の束縛（＝外側関数のローカル）であり、
+                // この関数の内部では自由変数として解決される（再帰 `fib(n-1)` 等）。
+                let inner = nested_bound(bound, params, body, None);
+                free_refs(body, &inner, out);
             }
             Stmt::ClassDecl { .. } => {
-                // メソッド内の自由変数は compile_function_anon が別途解析するため
-                // ここでは何もしない（クラス名は locals で解決される）。
+                // メソッド内の自由変数は compile_function_anon が別途解析する
             }
-            Stmt::Export { value, .. } => {
-                collect_expr_refs(value, out);
-            }
-            Stmt::Import { .. } => {}
-            Stmt::Block(inner) => collect_refs(inner, out),
-            Stmt::Labeled { body, .. } => collect_refs(std::slice::from_ref(body), out),
-            // ネスト関数宣言の中身は、その関数自身の自由変数として別途解析されるため
-            // ここでは名前（束縛先）だけを参照扱いしない（locals で解決される）。
-            Stmt::FuncDecl { .. } | Stmt::Empty | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Export { value, .. } => free_expr_refs(value, bound, out),
+            Stmt::Import { .. } | Stmt::Empty | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::Block(inner) => free_refs(inner, bound, out),
+            Stmt::Labeled { body, .. } => free_refs(std::slice::from_ref(body), bound, out),
         }
     }
 }
 
-/// 式から参照される識別子名を収集する。
-fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
+/// 式の自由変数を bound-aware で収集する（ネスト関数は params/ローカルを bound に加える）。
+fn free_expr_refs(expr: &Expr, bound: &HashSet<String>, out: &mut HashSet<String>) {
     match expr {
         Expr::Ident(name) => {
-            out.insert(name.clone());
+            if !bound.contains(name) {
+                out.insert(name.clone());
+            }
         }
         Expr::Assign { name, rhs } => {
-            out.insert(name.clone());
-            collect_expr_refs(rhs, out);
+            if !bound.contains(name) {
+                out.insert(name.clone());
+            }
+            free_expr_refs(rhs, bound, out);
         }
         Expr::CompoundAssign { name, rhs, .. } => {
-            out.insert(name.clone());
-            collect_expr_refs(rhs, out);
+            if !bound.contains(name) {
+                out.insert(name.clone());
+            }
+            free_expr_refs(rhs, bound, out);
         }
         Expr::MemberCompoundAssign { obj, rhs, .. } => {
-            collect_expr_refs(obj, out);
-            collect_expr_refs(rhs, out);
+            free_expr_refs(obj, bound, out);
+            free_expr_refs(rhs, bound, out);
         }
         Expr::IndexCompoundAssign { obj, index, rhs, .. } => {
-            collect_expr_refs(obj, out);
-            collect_expr_refs(index, out);
-            collect_expr_refs(rhs, out);
+            free_expr_refs(obj, bound, out);
+            free_expr_refs(index, bound, out);
+            free_expr_refs(rhs, bound, out);
         }
         Expr::IncDec { name, .. } => {
-            out.insert(name.clone());
+            if !bound.contains(name) {
+                out.insert(name.clone());
+            }
         }
-        Expr::MemberIncDec { obj, .. } => collect_expr_refs(obj, out),
+        Expr::MemberIncDec { obj, .. } => free_expr_refs(obj, bound, out),
         Expr::IndexIncDec { obj, index, .. } => {
-            collect_expr_refs(obj, out);
-            collect_expr_refs(index, out);
+            free_expr_refs(obj, bound, out);
+            free_expr_refs(index, bound, out);
         }
-        Expr::Unary { operand, .. } => collect_expr_refs(operand, out),
+        Expr::Unary { operand, .. } => free_expr_refs(operand, bound, out),
         Expr::Bin { lhs, rhs, .. } => {
-            collect_expr_refs(lhs, out);
-            collect_expr_refs(rhs, out);
+            free_expr_refs(lhs, bound, out);
+            free_expr_refs(rhs, bound, out);
         }
         Expr::Call { callee, args } => {
-            collect_expr_refs(callee, out);
+            free_expr_refs(callee, bound, out);
             for a in args {
-                collect_expr_refs(a, out);
+                free_expr_refs(a, bound, out);
             }
         }
         Expr::Arr(items) => {
             for i in items {
-                collect_expr_refs(i, out);
+                free_expr_refs(i, bound, out);
             }
         }
         Expr::ObjLit(entries) => {
             for e in entries {
                 match e {
-                    crate::parser::ObjEntry::KeyValue(_, v) => collect_expr_refs(v, out),
-                    crate::parser::ObjEntry::Spread(v) => collect_expr_refs(v, out),
-                    crate::parser::ObjEntry::Getter(_, body) => collect_refs(body, out),
-                    crate::parser::ObjEntry::Setter(_, _, body) => collect_refs(body, out),
+                    crate::parser::ObjEntry::KeyValue(_, v) => free_expr_refs(v, bound, out),
+                    crate::parser::ObjEntry::Spread(v) => free_expr_refs(v, bound, out),
+                    crate::parser::ObjEntry::Getter(_, body) => free_refs(body, bound, out),
+                    crate::parser::ObjEntry::Setter(_, param, body) => {
+                        let mut inner = bound.clone();
+                        inner.insert(param.clone());
+                        free_refs(body, &inner, out);
+                    }
                 }
             }
         }
         Expr::LogicalAssign { target, rhs, .. } => {
-            collect_expr_refs(target, out);
-            collect_expr_refs(rhs, out);
+            free_expr_refs(target, bound, out);
+            free_expr_refs(rhs, bound, out);
         }
         Expr::DestructureAssign { pattern, rhs } => {
-            collect_expr_refs(rhs, out);
-            collect_pattern_refs(pattern, out);
+            free_expr_refs(rhs, bound, out);
+            free_pattern_refs(pattern, bound, out);
         }
-        Expr::Member { obj, .. } => collect_expr_refs(obj, out),
+        Expr::Member { obj, .. } => free_expr_refs(obj, bound, out),
         Expr::Index { obj, index } => {
-            collect_expr_refs(obj, out);
-            collect_expr_refs(index, out);
+            free_expr_refs(obj, bound, out);
+            free_expr_refs(index, bound, out);
         }
         Expr::IndexAssign { obj, index, rhs } => {
-            collect_expr_refs(obj, out);
-            collect_expr_refs(index, out);
-            collect_expr_refs(rhs, out);
+            free_expr_refs(obj, bound, out);
+            free_expr_refs(index, bound, out);
+            free_expr_refs(rhs, bound, out);
         }
         Expr::MemberAssign { obj, rhs, .. } => {
-            collect_expr_refs(obj, out);
-            collect_expr_refs(rhs, out);
+            free_expr_refs(obj, bound, out);
+            free_expr_refs(rhs, bound, out);
         }
         Expr::Ternary { cond, then, else_ } => {
-            collect_expr_refs(cond, out);
-            collect_expr_refs(then, out);
-            collect_expr_refs(else_, out);
+            free_expr_refs(cond, bound, out);
+            free_expr_refs(then, bound, out);
+            free_expr_refs(else_, bound, out);
         }
-        Expr::FuncExpr { body, .. } => {
-            collect_refs(body, out);
+        Expr::FuncExpr { name, params, body, .. } => {
+            let inner = nested_bound(bound, params, body, name.as_deref());
+            free_refs(body, &inner, out);
         }
-        Expr::Arrow { body, .. } => {
-            collect_expr_refs(body, out);
+        Expr::Arrow { params, rest, body } => {
+            let mut inner = bound.clone();
+            for p in params {
+                inner.insert(p.clone());
+            }
+            if let Some(r) = rest {
+                inner.insert(r.clone());
+            }
+            free_expr_refs(body, &inner, out);
         }
         Expr::Instanceof { lhs, rhs } => {
-            collect_expr_refs(lhs, out);
-            collect_expr_refs(rhs, out);
+            free_expr_refs(lhs, bound, out);
+            free_expr_refs(rhs, bound, out);
         }
         Expr::In { key, obj } => {
-            collect_expr_refs(key, out);
-            collect_expr_refs(obj, out);
+            free_expr_refs(key, bound, out);
+            free_expr_refs(obj, bound, out);
         }
-        Expr::Delete { target } => {
-            collect_expr_refs(target, out);
-        }
-        Expr::Spread(e) => collect_expr_refs(e, out),
+        Expr::Delete { target } => free_expr_refs(target, bound, out),
+        Expr::Spread(e) => free_expr_refs(e, bound, out),
         Expr::SuperCall { args, .. } => {
-            // parent はグローバル名（GLoad で解決）。引数のみ収集。
             for a in args {
-                collect_expr_refs(a, out);
+                free_expr_refs(a, bound, out);
             }
         }
         Expr::Yield(operand) => {
             if let Some(e) = operand {
-                collect_expr_refs(e, out);
+                free_expr_refs(e, bound, out);
             }
         }
-        Expr::Await(operand) => collect_expr_refs(operand, out),
+        Expr::Await(operand) => free_expr_refs(operand, bound, out),
         Expr::Seq(items) => {
             for e in items {
-                collect_expr_refs(e, out);
+                free_expr_refs(e, bound, out);
             }
         }
         Expr::New { callee, args } => {
-            collect_expr_refs(callee, out);
+            free_expr_refs(callee, bound, out);
             for a in args {
-                collect_expr_refs(a, out);
+                free_expr_refs(a, bound, out);
             }
         }
-        Expr::Rest(_) | Expr::Hole => {}
-        Expr::Regex { .. } => {}
+        Expr::Rest(_) | Expr::Hole | Expr::Regex { .. } => {}
         Expr::This
         | Expr::Num(_)
         | Expr::Str(_)
@@ -1890,57 +2004,177 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
     }
 }
 
-/// 制御フローを跨いで文列から直接のネスト関数宣言を収集する（ネスト関数の中身は降りない）。
-fn collect_nested_funcs(
-    stmts: &[Stmt],
-    out: &mut Vec<(String, Vec<String>, Vec<Stmt>)>,
-) {
-    for stmt in stmts {
-        match stmt {
-            Stmt::FuncDecl { name, params, body, .. } => {
-                out.push((name.clone(), params.clone(), body.clone()));
+/// ネスト関数（直接の子。FuncDecl / FuncExpr / Arrow）が参照する「外側ローカル」を
+/// boxed に追加する（compute_boxed 用）。自由変数は free_refs が再帰的に伝播する。
+fn collect_boxed_stmt(stmt: &Stmt, outer: &HashSet<String>, boxed: &mut HashMap<String, u32>) {
+    match stmt {
+        Stmt::FuncDecl { params, body, .. } => {
+            // 関数宣言の名前は外側スコープの束縛（自由変数として外側に解決される）。
+            box_nested(params, body, None, outer, boxed);
+        }
+        Stmt::Expr(e) => collect_boxed_expr(e, outer, boxed),
+        Stmt::Var { init, .. } => {
+            if let Some(e) = init {
+                collect_boxed_expr(e, outer, boxed);
             }
-            Stmt::Block(inner) => collect_nested_funcs(inner, out),
-            Stmt::Labeled { body, .. } => collect_nested_funcs(std::slice::from_ref(body), out),
-            Stmt::If { then, else_, .. } => {
-                collect_nested_funcs(std::slice::from_ref(then), out);
-                if let Some(e) = else_ {
-                    collect_nested_funcs(std::slice::from_ref(e), out);
+        }
+        Stmt::Return(e) => {
+            if let Some(e) = e {
+                collect_boxed_expr(e, outer, boxed);
+            }
+        }
+        Stmt::Throw(e) => collect_boxed_expr(e, outer, boxed),
+        Stmt::Destructure { init, .. } => collect_boxed_expr(init, outer, boxed),
+        Stmt::Export { value, .. } => collect_boxed_expr(value, outer, boxed),
+        Stmt::Block(inner) => {
+            for s in inner {
+                collect_boxed_stmt(s, outer, boxed);
+            }
+        }
+        Stmt::Labeled { body, .. } => collect_boxed_stmt(body, outer, boxed),
+        Stmt::If { cond, then, else_ } => {
+            collect_boxed_expr(cond, outer, boxed);
+            collect_boxed_stmt(then, outer, boxed);
+            if let Some(e) = else_ {
+                collect_boxed_stmt(e, outer, boxed);
+            }
+        }
+        Stmt::While { cond, body } | Stmt::DoWhile { cond, body } => {
+            collect_boxed_expr(cond, outer, boxed);
+            collect_boxed_stmt(body, outer, boxed);
+        }
+        Stmt::For { init, cond, step, body } => {
+            if let Some(ForInit::Expr(e)) = init {
+                collect_boxed_expr(e, outer, boxed);
+            }
+            if let Some(ForInit::Var { init: Some(e), .. }) = init {
+                collect_boxed_expr(e, outer, boxed);
+            }
+            if let Some(c) = cond {
+                collect_boxed_expr(c, outer, boxed);
+            }
+            if let Some(s) = step {
+                collect_boxed_expr(s, outer, boxed);
+            }
+            collect_boxed_stmt(body, outer, boxed);
+        }
+        Stmt::ForIn { obj, body, .. } => {
+            collect_boxed_expr(obj, outer, boxed);
+            collect_boxed_stmt(body, outer, boxed);
+        }
+        Stmt::Switch { disc, cases } => {
+            collect_boxed_expr(disc, outer, boxed);
+            for (cv, cbody) in cases {
+                if let Some(v) = cv {
+                    collect_boxed_expr(v, outer, boxed);
+                }
+                for s in cbody {
+                    collect_boxed_stmt(s, outer, boxed);
                 }
             }
-            Stmt::While { body, .. } => collect_nested_funcs(std::slice::from_ref(body), out),
-            Stmt::For { body, .. } => collect_nested_funcs(std::slice::from_ref(body), out),
-            Stmt::DoWhile { body, .. } => collect_nested_funcs(std::slice::from_ref(body), out),
-            _ => {}
         }
+        Stmt::Try { try_body, catch_body, .. } => {
+            for s in try_body {
+                collect_boxed_stmt(s, outer, boxed);
+            }
+            for s in catch_body {
+                collect_boxed_stmt(s, outer, boxed);
+            }
+        }
+        Stmt::ClassDecl { .. } | Stmt::Import { .. } | Stmt::Empty | Stmt::Break(_) | Stmt::Continue(_) => {}
     }
 }
 
-/// 関数の自由変数（参照されるが自ローカルでない名前）を列挙する。
-fn free_vars(params: &[String], body: &[Stmt]) -> Vec<String> {
-    let mut locals = std::collections::HashSet::new();
-    for p in params {
-        locals.insert(p.clone());
-    }
-    let mut local_map = HashMap::new();
-    for l in &locals {
-        local_map.insert(l.clone(), 0u32);
-    }
-    collect_vars(body, &mut local_map);
-    let mut refs = std::collections::HashSet::new();
-    collect_refs(body, &mut refs);
-    let mut free = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for r in refs {
-        if local_map.contains_key(&r) {
-            continue;
+/// 式からネスト関数（FuncExpr / Arrow）を探して boxed に反映する。
+fn collect_boxed_expr(expr: &Expr, outer: &HashSet<String>, boxed: &mut HashMap<String, u32>) {
+    match expr {
+        Expr::FuncExpr { name, params, body, .. } => {
+            box_nested(params, body, name.as_deref(), outer, boxed);
         }
-        if !seen.contains(&r) {
-            seen.insert(r.clone());
-            free.push(r);
+        Expr::Arrow { params, rest, body } => {
+            let mut inner = HashSet::new();
+            for p in params {
+                inner.insert(p.clone());
+            }
+            if let Some(r) = rest {
+                inner.insert(r.clone());
+            }
+            let mut free = HashSet::new();
+            free_expr_refs(body, &inner, &mut free);
+            for f in free {
+                if outer.contains(&f) && !boxed.contains_key(&f) {
+                    boxed.insert(f.clone(), boxed.len() as u32);
+                }
+            }
+        }
+        Expr::Call { callee, args } => {
+            collect_boxed_expr(callee, outer, boxed);
+            for a in args {
+                collect_boxed_expr(a, outer, boxed);
+            }
+        }
+        Expr::Unary { operand, .. } | Expr::Spread(operand) | Expr::Await(operand) => {
+            collect_boxed_expr(operand, outer, boxed);
+        }
+        Expr::Bin { lhs, rhs, .. } => {
+            collect_boxed_expr(lhs, outer, boxed);
+            collect_boxed_expr(rhs, outer, boxed);
+        }
+        Expr::Arr(items) | Expr::Seq(items) => {
+            for i in items {
+                collect_boxed_expr(i, outer, boxed);
+            }
+        }
+        Expr::ObjLit(entries) => {
+            for e in entries {
+                match e {
+                    crate::parser::ObjEntry::KeyValue(_, v)
+                    | crate::parser::ObjEntry::Spread(v) => collect_boxed_expr(v, outer, boxed),
+                    _ => {}
+                }
+            }
+        }
+        Expr::Member { obj, .. } | Expr::MemberCompoundAssign { obj, .. } => {
+            collect_boxed_expr(obj, outer, boxed);
+        }
+        Expr::Index { obj, index } | Expr::IndexAssign { obj, index, .. } => {
+            collect_boxed_expr(obj, outer, boxed);
+            collect_boxed_expr(index, outer, boxed);
+        }
+        Expr::Ternary { cond, then, else_ } => {
+            collect_boxed_expr(cond, outer, boxed);
+            collect_boxed_expr(then, outer, boxed);
+            collect_boxed_expr(else_, outer, boxed);
+        }
+        Expr::Assign { rhs, .. }
+        | Expr::CompoundAssign { rhs, .. }
+        | Expr::LogicalAssign { rhs, .. } => collect_boxed_expr(rhs, outer, boxed),
+        Expr::New { callee, args } => {
+            collect_boxed_expr(callee, outer, boxed);
+            for a in args {
+                collect_boxed_expr(a, outer, boxed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// ネスト関数の自由変数のうち `outer`（＝外側関数のローカル）に属するものを boxed へ。
+fn box_nested(
+    params: &[String],
+    body: &[Stmt],
+    name: Option<&str>,
+    outer: &HashSet<String>,
+    boxed: &mut HashMap<String, u32>,
+) {
+    let inner = nested_bound(&HashSet::new(), params, body, name);
+    let mut free = HashSet::new();
+    free_refs(body, &inner, &mut free);
+    for f in free {
+        if outer.contains(&f) && !boxed.contains_key(&f) {
+            boxed.insert(f.clone(), boxed.len() as u32);
         }
     }
-    free
 }
 
 /// ネスト関数に捕捉される「自ローカル」の集合を算出（共有セルとして env に box 化）。
@@ -1951,18 +2185,11 @@ fn compute_boxed(params: &[String], body: &[Stmt]) -> HashMap<String, u32> {
         locals.insert(p.clone(), locals.len() as u32);
     }
     collect_vars(body, &mut locals);
-
-    let mut nested = Vec::new();
-    collect_nested_funcs(body, &mut nested);
+    let outer: HashSet<String> = locals.keys().cloned().collect();
 
     let mut boxed = HashMap::new();
-    for (_name, nparams, nbody) in &nested {
-        let free = free_vars(nparams, nbody);
-        for f in free {
-            if locals.contains_key(&f) && !boxed.contains_key(&f) {
-                boxed.insert(f.clone(), boxed.len() as u32);
-            }
-        }
+    for stmt in body {
+        collect_boxed_stmt(stmt, &outer, &mut boxed);
     }
     boxed
 }
@@ -2254,6 +2481,35 @@ mod tests {
             outer();
         ";
         assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(55));
+    }
+
+    #[test]
+    fn closure_expr_captures_param() {
+        // 関数式が外側関数のパラメータを捕捉（lodash の baseReduce パターン）
+        let src = "
+            function baseReduce(a, b) {
+                return (function() { return a + b; })();
+            }
+            baseReduce(20, 22);
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(42));
+    }
+
+    #[test]
+    fn deep_closure_three_levels() {
+        // 3 段の関数宣言ネスト（outer → middle → inner）。inner が outer のローカルを捕捉。
+        let src = "
+            function outer() {
+                var x = 10;
+                function middle() {
+                    function inner() { return x; }
+                    return inner();
+                }
+                return middle();
+            }
+            outer();
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(10));
     }
 
     #[test]

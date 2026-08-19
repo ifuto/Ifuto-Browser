@@ -172,6 +172,9 @@ pub enum Op {
     LStore(u32),
     /// グローバル変数（name 指定）を push（C の `GLOAD`）。
     GLoad(ObjId),
+    /// グローバル変数を push。未宣言なら undefined（`typeof undeclared` 用。C の
+    /// `GLOAD` は未宣言で ReferenceError だが、JS の `typeof` は投げない）。
+    GLoadSafe(ObjId),
     /// グローバル変数へ pop した値を保存（C の `GSTORE`）。
     GStore(ObjId),
     /// 無条件ジャンプ。
@@ -261,10 +264,12 @@ pub enum Op {
     MakeEnv(u32),
     /// クロージャを生成（env を pop、Func{fidx, env} を push。C の `MAKEF` env 版）。
     MakeClosure(u32),
-    /// 捕捉変数の読み出し（frame.env.vals[idx] を push。C の `CELOAD` 簡略版）。
-    CeLoad(u32),
-    /// 捕捉変数への書き込み（pop → frame.env.vals[idx]。C の `CESTORE` 簡略版）。
-    CeStore(u32),
+    /// 捕捉変数の読み出し（`frame.env` から `depth` 段親を辿り `vals[idx]` を push）。
+    /// C の `CELOAD` 相当。`depth` は env チェーンの段数（0 = 自 env）。
+    CeLoad(u32, u32),
+    /// 捕捉変数への書き込み（pop → `frame.env` の `depth` 段親の `vals[idx]`）。
+    /// C の `CESTORE` 相当。
+    CeStore(u32, u32),
     /// BigInt 定数を push（i64 保持近似。`Obj::BigInt` を生成）。
     BigInt(i64),
     /// `yield expr`（ジェネレータ。TOS の値を yield し、再開位置を保存する）。
@@ -416,6 +421,9 @@ pub struct Runtime {
     pub gen_methods: Vec<(ObjId, AklVal)>,
     /// Promise メソッド表（name → native）。`PLoad` が `Obj::Promise` で解決する。
     pub promise_methods: Vec<(ObjId, AklVal)>,
+    /// 関数メソッド表（name → native）。`PLoad` が `Obj::Func`/`Native` で解決する
+    /// （`Function.prototype.call` / `apply`）。
+    pub func_methods: Vec<(ObjId, AklVal)>,
     /// `length` プロパティ名の ObjId（install_builtins で設定。文字列/配列の length 用）。
     pub length_id: ObjId,
     /// `size` プロパティ名の ObjId（Map/Set の size 用）。
@@ -600,6 +608,20 @@ impl Runtime {
         if let Some(Obj::Promise { .. }) = self.heap.get(id) {
             return self
                 .promise_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
+        if matches!(
+            self.heap.get(id),
+            Some(Obj::Func { .. })
+                | Some(Obj::Native(_))
+                | Some(Obj::ForeignNative { .. })
+                | Some(Obj::BoundMethod { .. })
+        ) {
+            return self
+                .func_methods
                 .iter()
                 .find(|(n, _)| *n == name)
                 .map(|(_, v)| *v)
@@ -976,6 +998,10 @@ impl Runtime {
                     let v = self.global_get(name).ok_or(VmError::GlobalNotFound)?;
                     stack.push(v);
                 }
+                Op::GLoadSafe(name) => {
+                    let v = self.global_get(name).unwrap_or(AklVal::UNDEF);
+                    stack.push(v);
+                }
                 Op::GStore(name) => {
                     let v = stack.pop().ok_or(VmError::StackUnderflow)?;
                     self.global_set(name, v);
@@ -1289,10 +1315,12 @@ impl Runtime {
                 }
                 Op::MakeEnv(n) => {
                     // 現在フレームの自前 env（box 化されたローカル n 個を undefined で生成）。
-                    // クロージャはこの env を共有する（C の frame_hidden の n_env 生成相当）。
+                    // parent は「この関数を呼んだ時点の frame.env」（＝外側関数の env）で、
+                    // 多段クロージャの env チェーンを構成する。
+                    let parent = frames.last().and_then(|f| f.env);
                     let id = self
                         .heap
-                        .alloc(Obj::Env { vals: vec![AklVal::UNDEF; n as usize], parent: None })
+                        .alloc(Obj::Env { vals: vec![AklVal::UNDEF; n as usize], parent })
                         .map_err(|_| VmError::Oom)?;
                     let frame = frames.last_mut().ok_or(VmError::StackUnderflow)?;
                     frame.env = Some(id);
@@ -1307,9 +1335,16 @@ impl Runtime {
                         .map_err(|_| VmError::Oom)?;
                     stack.push(AklVal::mk_obj(id));
                 }
-                Op::CeLoad(idx) => {
+                Op::CeLoad(depth, idx) => {
                     let frame = frames.last().ok_or(VmError::StackUnderflow)?;
-                    let env_id = frame.env.ok_or(VmError::LocalOob)?;
+                    let mut env_id = frame.env.ok_or(VmError::LocalOob)?;
+                    // env チェーンを depth 段辿る
+                    for _ in 0..depth {
+                        env_id = match self.heap.get(env_id) {
+                            Some(Obj::Env { parent: Some(p), .. }) => *p,
+                            _ => return Err(VmError::LocalOob),
+                        };
+                    }
                     let v = match self.heap.get(env_id) {
                         Some(Obj::Env { vals, .. }) => {
                             *vals.get(idx as usize).ok_or(VmError::LocalOob)?
@@ -1318,10 +1353,16 @@ impl Runtime {
                     };
                     stack.push(v);
                 }
-                Op::CeStore(idx) => {
+                Op::CeStore(depth, idx) => {
                     let v = stack.pop().ok_or(VmError::StackUnderflow)?;
                     let frame = frames.last().ok_or(VmError::StackUnderflow)?;
-                    let env_id = frame.env.ok_or(VmError::LocalOob)?;
+                    let mut env_id = frame.env.ok_or(VmError::LocalOob)?;
+                    for _ in 0..depth {
+                        env_id = match self.heap.get(env_id) {
+                            Some(Obj::Env { parent: Some(p), .. }) => *p,
+                            _ => return Err(VmError::LocalOob),
+                        };
+                    }
                     match self.heap.get_mut(env_id) {
                         Some(Obj::Env { vals, .. }) => {
                             let dst = vals.get_mut(idx as usize).ok_or(VmError::LocalOob)?;

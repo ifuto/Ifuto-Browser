@@ -75,6 +75,8 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     install_json(rt)?;
     // Map / Set / Promise
     install_map_set(rt)?;
+    // Function.prototype.call / apply
+    install_func_methods(rt)?;
     // ジェネレータメソッド（next）
     install_gen_methods(rt)?;
     // 正規表現メソッド（exec / test）
@@ -1065,6 +1067,40 @@ fn install_map_set(rt: &mut Runtime) -> Result<(), VmError> {
         rt.promise_methods.push((nid, v));
     }
     Ok(())
+}
+
+/// `Function.prototype.call` / `apply` を登録（lodash 等が `fn.call(thisArg, ...)` を使う）。
+fn install_func_methods(rt: &mut Runtime) -> Result<(), VmError> {
+    for (name, f) in [
+        ("call", func_call as crate::bytecode::NativeFn),
+        ("apply", func_apply),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.func_methods.push((nid, v));
+    }
+    Ok(())
+}
+
+/// `fn.call(thisArg, ...args)`：`this`（＝呼ばれる関数）を thisArg で呼ぶ。
+fn func_call(rt: &mut Runtime, this: AklVal, args: &[AklVal]) -> Result<AklVal, VmError> {
+    let this_arg = args.first().copied().unwrap_or(AklVal::UNDEF);
+    rt.call_value(this, this_arg, &args[1..])
+}
+
+/// `fn.apply(thisArg, [args])`：`this`（＝呼ばれる関数）を thisArg で呼ぶ。
+fn func_apply(rt: &mut Runtime, this: AklVal, args: &[AklVal]) -> Result<AklVal, VmError> {
+    let this_arg = args.first().copied().unwrap_or(AklVal::UNDEF);
+    let arg_arr = args.get(1).copied().unwrap_or(AklVal::UNDEF);
+    let rest: Vec<AklVal> = if arg_arr.is_obj() {
+        match rt.heap.get(arg_arr.get_obj()) {
+            Some(Obj::Arr(items)) => items.clone(),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    rt.call_value(this, this_arg, &rest)
 }
 
 /// ジェネレータメソッド（`next`）を登録。
@@ -2526,6 +2562,23 @@ mod tests {
         let src2 = "function* g() { yield 1; }
                     var it = g(); it.next(); it.next().done;";
         assert_eq!(run_src(src2).unwrap().0, AklVal::TRUE);
+    }
+
+    #[test]
+    fn func_call_apply() {
+        // Function.prototype.call / apply（lodash 等が `fn.call(thisArg, ...)` を使う）
+        assert_eq!(
+            run_src("function f(a, b) { return this.v + a + b; } f.call({v: 1}, 2, 3);")
+                .unwrap()
+                .0,
+            AklVal::mk_int(6)
+        );
+        assert_eq!(
+            run_src("function f(a, b) { return this.v + a + b; } f.apply({v: 1}, [2, 3]);")
+                .unwrap()
+                .0,
+            AklVal::mk_int(6)
+        );
     }
 
     #[test]
