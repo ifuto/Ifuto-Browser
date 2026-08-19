@@ -8,10 +8,28 @@ SRC     := $(wildcard src/*.c)
 # 単一翻訳・LTO 一括ビルドのためヘッダは全て成員に列挙する
 # （ヘッダ変更で再ビルドが走らず古いバイナリを信用する事故の防除）
 ENGINE  := $(filter-out src/main.c,$(SRC))
-# Akl（自作 JS エンジン, C11/JIT なし）: 拡張 E1（docs/EXTENSIONS.md）で本体へリンク。
+# Akl（自作 JS エンジン）: フェーズ 6 で Rust FFI（libakl_ffi.a）へ移行。
+# 旧 C エンジン（src/akl/*.c）は RUST_ENGINE=0 で戻せる（比較検証用）。
 # 台帳上の大きさ効果は BENCH.md に実測で記録する（旧 v0.0 の「200KB 天井」は
 # E1 統合で再設定 = 台帳の約定どおり実測で扱う）。
 AKLSRC  := $(wildcard src/akl/*.c)
+RUST_ENGINE ?= 1
+RUST_FFI := rust/target/release/libakl_ffi.a
+RUST_SRC := $(shell find rust/akl-ffi/src rust/akl-core/src -name '*.rs' 2>/dev/null) \
+            rust/akl-ffi/Cargo.toml rust/akl-core/Cargo.toml rust/Cargo.toml
+
+$(RUST_FFI): $(RUST_SRC)
+	cd rust && cargo build --release -p akl-ffi
+
+ifeq ($(RUST_ENGINE),1)
+AKL_OBJS := $(RUST_FFI)
+AKL_LIBS := -lpthread -ldl
+AKL_DEPS := $(RUST_FFI)
+else
+AKL_OBJS := $(AKLSRC)
+AKL_LIBS :=
+AKL_DEPS := $(AKLSRC)
+endif
 # BearSSL（vendor/bearssl, MIT）: TLS 1.2 クライアント。サードパーティは警告抑制で
 # コンパイル（自前コードの警告ゼロ規律は維持）。--gc-sections で使用シンボルのみ残る。
 # ec_prime_i31_secp{256,384,521}r1.c は inner.h で #if 0 の旧残骸（型定義が消えており
@@ -39,12 +57,12 @@ $(BUILD):
 # GUI は TUI 廃止（2026-08-01）で単一 UI。ifuto 本体に統合（--gui / --shot）。
 GUISRC := $(wildcard src/gui/*.c)
 HDRS    := $(wildcard src/*.h src/gui/*.h src/akl/*.h)
-$(BUILD)/ifuto: $(SRC) $(GUISRC) $(AKLSRC) $(BEARSRC) $(HDRS) | $(BUILD)
-	$(CC) $(BASE) $(REL) $(BEARINC) $(BEARWARN) -o $@ $(SRC) $(GUISRC) $(AKLSRC) $(BEARSRC) $(LDFLAGS_REL) -lm
+$(BUILD)/ifuto: $(SRC) $(GUISRC) $(AKL_DEPS) $(BEARSRC) $(HDRS) | $(BUILD)
+	$(CC) $(BASE) $(REL) $(BEARINC) $(BEARWARN) -o $@ $(SRC) $(GUISRC) $(AKL_OBJS) $(BEARSRC) $(LDFLAGS_REL) $(AKL_LIBS) -lm
 
 # 開発用: sanitizer 付きバイナリ（テスト・手動検証は常にこちらで）
-$(BUILD)/ifuto-asan: $(SRC) $(GUISRC) $(AKLSRC) $(BEARSRC) $(HDRS) | $(BUILD)
-	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -o $@ $(SRC) $(GUISRC) $(AKLSRC) $(BEARSRC) -lm
+$(BUILD)/ifuto-asan: $(SRC) $(GUISRC) $(AKL_DEPS) $(BEARSRC) $(HDRS) | $(BUILD)
+	$(CC) $(BASE) $(SAN) $(BEARINC) $(BEARWARN) -o $@ $(SRC) $(GUISRC) $(AKL_OBJS) $(BEARSRC) $(AKL_LIBS) -lm
 
 gui: $(BUILD)/ifuto
 

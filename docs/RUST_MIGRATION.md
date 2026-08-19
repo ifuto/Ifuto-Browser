@@ -372,8 +372,27 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 `rust/akl-ffi/smoke.c` を本物の `akl.h` と `libakl_ffi.a` にリンクして eval / native 登録 /
 ハンドル / エラー報告が ABI 互換で動くことを C 側から検証（`C smoke test OK`）。
 
-残り: C 側差し替え（`script.c` / `ext.c` / `ifuto_pages.c` を `libakl_ffi.a` にリンクして
-`src/akl/akl.c` を撤去。Makefile 変更 + 全ゲート guismoke/golden/tlssmoke/html5lib/fuzz 緑）。
+### 6-c: Makefile 統合（ブラウザを Rust エンジンへ差し替え）
+
+- `Makefile` に `RUST_ENGINE ?= 1` を導入。既定で `libakl_ffi.a` をリンク
+  （`RUST_ENGINE=0` で旧 C エンジンに戻せる）。`cargo build --release -p akl-ffi` を
+  make 依存に追加（Rust ソース変更で再ビルド）
+- ブラウザ本体が実際に Rust エンジンで JS を実行することを確認:
+  `document.getElementById` / `console.log` / `document.title` 代入 / 文字列連結
+  （ROPE）が C の `AklHandleVTab`（doc_vt/elem_vt）と C ネイティブ（script_console_log）
+  経由で正しくディスパッチされる
+- `make guismoke` が **PASS**（フルブラウザの GUI/raster/session/focus/hover スモークが
+  Rust エンジンで全通過）。`-flto` と Rust 静的ライブラリの共存も確認
+
+検証: C スモークテスト + guismoke PASS + `make all`（RUST_ENGINE=1 既定）。
+
+残り（フェーズ 6 の完了条件 = 全ゲート緑）:
+1. **命令バジェット（無限ループ防止）**: Rust VM にステップカウンタが無く
+   `while(1){}` がハングする（C は `akl_set_insn_budget` で kill）。`tests/test_script.c`
+   の `test_script_failure_isolation` がこの経路を検査するため必須。
+2. `tests/test_script.c`（DOM 結合オラクル 522 行）を Rust エンジンにリンクして回帰突合
+   （textContent 設定 / SVG / skip 規則 / failure isolation 等）。
+3. `golden` / `conformance`（html5lib）/ `lodashsmoke` / parity を Rust 側で再現。
 
 ### フェーズ 4 追補 2: 制御フロー完全化
 
