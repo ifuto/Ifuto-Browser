@@ -229,6 +229,13 @@ pub enum Expr {
     Rest(String),
     /// 配列リテラルの空き要素 `[,,]`（elision = undefined）。
     Hole,
+    /// 正規表現リテラル `/pat/flags`。
+    Regex {
+        /// パターン文字列。
+        pattern: String,
+        /// フラグ文字列（"gim" 等）。
+        flags: String,
+    },
     /// 複合代入 `x += y`（`op` は二項演算子。変数のみサポート）。
     CompoundAssign {
         /// 代入先の変数名。
@@ -954,8 +961,59 @@ impl<'a> Parser<'a> {
                 self.expect_punct(Punct::RBracket, "']'")?;
                 Ok(Expr::Arr(items))
             }
+            Token::Punct(Punct::Slash) => {
+                // 正規表現リテラル /pat/flags（式の開始位置の '/' のみ）
+                self.parse_regex_literal()
+            }
             other => Err(ParseError(format!("unexpected token in expression: {other:?}"))),
         }
+    }
+
+    /// 正規表現リテラル `/pat/flags` をパース（`/` は消費済み）。
+    fn parse_regex_literal(&mut self) -> Result<Expr, ParseError> {
+        // パターン: エスケープを考慮して '/' までスキャン
+        let mut pattern = String::new();
+        let mut in_class = false;
+        loop {
+            let c = self.lx.cur_char();
+            if c == 0 {
+                return Err(ParseError("unterminated regexp literal".into()));
+            }
+            if c == b'\\' {
+                // エスケープ: 次文字もそのまま含める
+                self.lx.advance_raw();
+                pattern.push(c as char);
+                let e = self.lx.cur_char();
+                if e == 0 {
+                    return Err(ParseError("unterminated regexp literal".into()));
+                }
+                pattern.push(e as char);
+                self.lx.advance_raw();
+                continue;
+            }
+            if c == b'[' {
+                in_class = true;
+            } else if c == b']' {
+                in_class = false;
+            } else if c == b'/' && !in_class {
+                self.lx.advance_raw();
+                break;
+            }
+            pattern.push(c as char);
+            self.lx.advance_raw();
+        }
+        // フラグ
+        let mut flags = String::new();
+        loop {
+            let c = self.lx.cur_char();
+            if c != 0 && c.is_ascii_alphabetic() {
+                flags.push(c as char);
+                self.lx.advance_raw();
+            } else {
+                break;
+            }
+        }
+        Ok(Expr::Regex { pattern, flags })
     }
 
     /// パラメータ列をパース（`(...)` の内側）。rest パラメータ対応。
@@ -1759,6 +1817,21 @@ mod tests {
                 index: Box::new(Expr::Num(NumLit::Int(0))),
             })]
         );
+    }
+
+    #[test]
+    fn regex_literal() {
+        let stmts = parse("/abc/g;").unwrap();
+        assert_eq!(
+            stmts,
+            vec![Stmt::Expr(Expr::Regex {
+                pattern: "abc".into(),
+                flags: "g".into(),
+            })]
+        );
+        // エスケープと文字クラス
+        let stmts = parse("/a\\/b[0-9]+/i;").unwrap();
+        assert!(matches!(stmts[0], Stmt::Expr(Expr::Regex { .. })));
     }
 
     #[test]

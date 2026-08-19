@@ -184,6 +184,8 @@ pub enum Op {
     MCall(u8),
     /// コンストラクタ呼び出し（`new`。argc 個の引数 + callee を pop。this=新オブジェクト）。
     New(u8),
+    /// 正規表現オブジェクトを生成して push（pattern 文字列 ObjId を pop、flags は即値）。
+    NewRegex(u32),
     /// 関数の prototype を設定（proto, fn を pop、fn を push。fn_protos テーブル登録）。
     SetFnProto,
     /// 戻る（TOS を返り値として pop）。
@@ -709,6 +711,22 @@ impl Runtime {
                         self.fn_protos.push((fid, proto.get_obj()));
                     }
                     stack.push(f);
+                }
+                Op::NewRegex(flags_id) => {
+                    let pat_id = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let pattern = match self.heap.get(pat_id.get_obj()) {
+                        Some(Obj::Str(s)) => s.clone(),
+                        _ => Box::from(""),
+                    };
+                    let flags = match self.heap.get(flags_id) {
+                        Some(Obj::Str(s)) => s.clone(),
+                        _ => Box::from(""),
+                    };
+                    let id = self
+                        .heap
+                        .alloc(Obj::RegExp { pattern, flags })
+                        .map_err(|_| VmError::Oom)?;
+                    stack.push(AklVal::mk_obj(id));
                 }
                 Op::Ret => {
                     let v = stack.pop().ok_or(VmError::StackUnderflow)?;

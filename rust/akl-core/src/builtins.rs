@@ -299,6 +299,10 @@ fn install_string_methods(rt: &mut Runtime) -> Result<(), VmError> {
         ("startsWith", str_starts_with),
         ("endsWith", str_ends_with),
         ("repeat", str_repeat),
+        ("match", str_match),
+        ("replace", str_replace),
+        ("search", str_search),
+        ("split", str_split),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -368,6 +372,108 @@ fn str_repeat(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
     let out = s.repeat(n);
     let id = rt.intern(&out).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
+}
+
+/// 正規表現オブジェクトを取得（引数が Obj::RegExp ならその pattern/flags）。
+fn regex_of(rt: &Runtime, v: AklVal) -> Option<(String, String)> {
+    if v.is_obj() {
+        if let Some(Obj::RegExp { pattern, flags }) = rt.heap.get(v.get_obj()) {
+            return Some((pattern.to_string(), flags.to_string()));
+        }
+    }
+    None
+}
+
+fn str_match(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let rx_v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if let Some((pattern, flags)) = regex_of(rt, rx_v) {
+        let flag_num = flags_to_num(&flags);
+        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+        match rx.find(&s) {
+            Some(caps) => {
+                // マッチ全体（または g フラグなら全マッチ配列）を返す
+                let items: Vec<AklVal> = vec![AklVal::mk_obj(
+                    rt.intern(&caps[0]).ok_or(VmError::Oom)?,
+                )];
+                let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
+                Ok(AklVal::mk_obj(id))
+            }
+            None => Ok(AklVal::NULL),
+        }
+    } else {
+        Ok(AklVal::NULL)
+    }
+}
+
+fn str_replace(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let rx_v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let repl = a
+        .get(1)
+        .map(|v| to_js_string(rt, *v))
+        .unwrap_or_default();
+    let out = if let Some((pattern, flags)) = regex_of(rt, rx_v) {
+        let flag_num = flags_to_num(&flags);
+        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+        crate::regex::replace_first(&s, &rx, &repl)
+    } else {
+        // 文字列置換（最初の 1 箇所）
+        let needle = to_js_string(rt, rx_v);
+        s.replacen(&needle, &repl, 1)
+    };
+    let id = rt.intern(&out).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn str_search(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let rx_v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if let Some((pattern, flags)) = regex_of(rt, rx_v) {
+        let flag_num = flags_to_num(&flags);
+        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+        match rx.find(&s) {
+            Some(caps) => {
+                let idx = s.find(&caps[0]).unwrap_or(0);
+                Ok(AklVal::mk_int(idx as i32))
+            }
+            None => Ok(AklVal::mk_int(-1)),
+        }
+    } else {
+        Ok(AklVal::mk_int(-1))
+    }
+}
+
+fn str_split(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let sep = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let parts: Vec<String> = if let Some((pattern, flags)) = regex_of(rt, sep) {
+        let flag_num = flags_to_num(&flags);
+        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+        crate::regex::split(&s, &rx)
+    } else {
+        let needle = to_js_string(rt, sep);
+        if needle.is_empty() {
+            s.chars().map(|c| c.to_string()).collect()
+        } else {
+            s.split(&needle).map(|p| p.to_string()).collect()
+        }
+    };
+    let items: Vec<AklVal> = parts
+        .iter()
+        .map(|p| rt.intern(p).map(AklVal::mk_obj).unwrap_or(AklVal::UNDEF))
+        .collect();
+    let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// フラグ文字列 → 数値（i=1）。
+fn flags_to_num(flags: &str) -> u32 {
+    let mut n = 0u32;
+    if flags.contains('i') {
+        n |= 1;
+    }
+    n
 }
 
 /// Array.prototype メソッドを登録（C の `arr_meth_vals` 相当）。`length` はプロパティなので除外。
@@ -1116,6 +1222,30 @@ mod tests {
         assert_eq!(
             run_src("var o = {a: 1}; Object.assign(o, {b: 2}); o.b;").unwrap().0,
             AklVal::mk_int(2)
+        );
+    }
+
+    #[test]
+    fn regex_methods() {
+        // マッチ
+        assert_eq!(
+            run_src("\"abc123\".match(/[0-9]+/)[0] === \"123\";").unwrap().0,
+            AklVal::TRUE
+        );
+        // search
+        assert_eq!(
+            run_src("\"abc123\".search(/[0-9]+/);").unwrap().0,
+            AklVal::mk_int(3)
+        );
+        // replace
+        assert_eq!(
+            run_src("\"hello world\".replace(/world/, \"there\") === \"hello there\";").unwrap().0,
+            AklVal::TRUE
+        );
+        // split
+        assert_eq!(
+            run_src("\"a,b,c\".split(/,/).length;").unwrap().0,
+            AklVal::mk_int(3)
         );
     }
 

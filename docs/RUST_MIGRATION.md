@@ -293,6 +293,14 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: cargo test 118 件 + clippy 緑（regex の e2e）。
 
+### フェーズ 2/3/4 追補 4: 正規表現リテラル + String.match/replace/search/split 接続
+
+- 正規表現リテラル `/pat/flags`（`Expr::Regex` + `Obj::RegExp` + `NewRegex` 命令）
+- `String.match` / `replace`（`$1` 展開） / `search` / `split` を regex.rs に接続
+  （regex 以外の文字列も `replacen`/`split` で対応）
+
+検証: cargo test 120 件 + clippy 緑（正規表現リテラル・String メソッドの e2e）。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）

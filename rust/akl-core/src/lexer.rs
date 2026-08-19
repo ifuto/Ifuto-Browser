@@ -418,6 +418,16 @@ impl<'a> Lexer<'a> {
         self.bytes.get(self.pos).copied().unwrap_or(0)
     }
 
+    /// 現在位置のバイト（正規表現リテラル用。pub 版）。
+    pub fn cur_char(&self) -> u8 {
+        self.cur()
+    }
+
+    /// 1 バイト前進（正規表現リテラル用。pub 版。改行は数えない）。
+    pub fn advance_raw(&mut self) {
+        self.pos += 1;
+    }
+
     /// 現在位置から `off` 進んだバイト（範囲外・EOF なら 0）。
     fn peek(&self, off: usize) -> u8 {
         self.bytes.get(self.pos + off).copied().unwrap_or(0)

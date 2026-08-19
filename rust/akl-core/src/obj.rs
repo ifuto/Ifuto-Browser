@@ -101,6 +101,13 @@ pub enum Obj {
         /// 解決値/拒否値。
         value: AklVal,
     },
+    /// 正規表現（C の `AKL_OK_REGEX` 相当）。pattern + flags を保持。
+    RegExp {
+        /// パターン文字列。
+        pattern: Box<str>,
+        /// フラグ文字列。
+        flags: Box<str>,
+    },
 }
 
 impl Obj {
@@ -165,6 +172,7 @@ impl Obj {
                     out.push(value.get_obj());
                 }
             }
+            Obj::RegExp { .. } => {}
         }
         out.into_iter()
     }

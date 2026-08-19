@@ -540,6 +540,20 @@ impl Compiler<'_> {
                 }
                 code.push(Op::New(args.len() as u8));
             }
+            Expr::Regex { pattern, flags } => {
+                // 正規表現オブジェクトを生成: パターン文字列 + flags 文字列を intern して
+                // NewRegex 命令で Obj::RegExp を生成
+                let pat_id = self
+                    .rt
+                    .intern(pattern)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                let flags_id = self
+                    .rt
+                    .intern(flags)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                code.push(Op::ConstStr(pat_id));
+                code.push(Op::NewRegex(flags_id));
+            }
             Expr::Spread(_) | Expr::Rest(_) | Expr::Hole => {
                 return Err(CompileError("spread/rest/hole outside valid context".into()))
             }
@@ -1318,6 +1332,7 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             }
         }
         Expr::Rest(_) | Expr::Hole => {}
+        Expr::Regex { .. } => {}
         Expr::This
         | Expr::Num(_)
         | Expr::Str(_)
