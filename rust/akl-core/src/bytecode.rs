@@ -178,8 +178,15 @@ pub enum Op {
     JmpF(u32),
     /// pop して真ならジャンプ（C の `JMPT`）。
     JmpT(u32),
+    /// pop して null/undefined でなければジャンプ（`??=` の短絡用）。
+    JmpNotNullish(u32),
     /// 関数呼び出し（argc 個の引数 + callee を pop）。
     Call(u8),
+    /// 配列を spread してスタックへ展開し、要素数をグローバル `name` のカウンタへ加算
+    /// （`f(...a, b)` の引数展開。C の `ARRSPREADC` 相当）。
+    ArrSpreadC(ObjId),
+    /// 動的 argc の呼び出し。argc はグローバル `name` のカウンタ（C の `CALLN` 相当）。
+    CallDyn(ObjId),
     /// メソッド呼び出し（`[receiver, callee, ...args]`。callee を this=receiver で呼ぶ）。
     MCall(u8),
     /// 名前指定のメソッド呼び出し（`[receiver, ...args]`。name を this=receiver で解決して呼ぶ）。
@@ -190,6 +197,14 @@ pub enum Op {
         name: ObjId,
         /// 引数の個数。
         argc: u8,
+    },
+    /// 名前指定・動的 argc のメソッド呼び出し（spread 引数用）。argc はグローバル
+    /// `argc_name` のカウンタ。
+    MCallDyn {
+        /// メソッド名（intern 済み文字列 ObjId）。
+        name: ObjId,
+        /// argc カウンタのグローバル名 ObjId。
+        argc_name: ObjId,
     },
     /// コンストラクタ呼び出し（`new`。argc 個の引数 + callee を pop。this=新オブジェクト）。
     New(u8),
@@ -215,6 +230,10 @@ pub enum Op {
     ArrPush,
     /// 配列へ別配列の全要素を追加（src, arr を pop、arr を push。C の `ARRPUSHALL` 相当）。
     ArrPushAll,
+    /// オブジェクト spread（pop src → TOS の OBJ に全プロパティをコピー。C の `OBJSPREAD`）。
+    ObjSpread,
+    /// オブジェクト rest（pop src → 全プロパティをコピーした新 OBJ を push。C の `OBJREST`）。
+    ObjRest,
     /// 配列の残り [start..n) を新配列に（start, arr を pop、新配列を push。C の `ARRREST` 相当）。
     ArrRest,
     /// 要素読み出し（idx, obj を pop、値を push。C の `AGET`）。
@@ -537,6 +556,54 @@ impl Runtime {
         self.prop_get_chain(id, name).unwrap_or(AklVal::UNDEF)
     }
 
+    /// プレーンオブジェクトのプロパティ取得（getter アクセサ対応）。
+    /// 通常プロパティ → getter（`get:\x01name`）の順。getter は this=obj で呼ぶ。
+    fn obj_prop_load(&mut self, id: ObjId, name: ObjId) -> Result<AklVal, VmError> {
+        if let Some(v) = self.prop_get_chain(id, name) {
+            return Ok(v);
+        }
+        let name_str = match self.heap.get(name) {
+            Some(Obj::Str(s)) => s.to_string(),
+            _ => return Ok(AklVal::UNDEF),
+        };
+        let special = format!("get:\x01{name_str}");
+        let sid = self.intern(&special).ok_or(VmError::Oom)?;
+        if let Some(g) = self.prop_get_chain(id, sid) {
+            if g.is_obj() {
+                return self.call_value(g, AklVal::mk_obj(id), &[]);
+            }
+        }
+        Ok(AklVal::UNDEF)
+    }
+
+    /// プレーンオブジェクトのプロパティ設定（setter アクセサ対応）。
+    /// setter（`set:\x01name`）があれば this=obj で呼ぶ。なければ通常の prop_set。
+    fn obj_prop_store(
+        &mut self,
+        id: ObjId,
+        name: ObjId,
+        val: AklVal,
+    ) -> Result<AklVal, VmError> {
+        let name_str = match self.heap.get(name) {
+            Some(Obj::Str(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        if !name_str.is_empty() {
+            let special = format!("set:\x01{name_str}");
+            let sid = self.intern(&special).ok_or(VmError::Oom)?;
+            if let Some(s) = self.prop_get_chain(id, sid) {
+                if s.is_obj() {
+                    self.call_value(s, AklVal::mk_obj(id), &[val])?;
+                    return Ok(val);
+                }
+            }
+        }
+        self.heap
+            .prop_set(id, name, val)
+            .map_err(|_| VmError::NotObject)?;
+        Ok(val)
+    }
+
     /// オブジェクトに [[Prototype]] を設定（C の `akl_obj_set_proto` 相当）。
     pub fn obj_set_proto(&mut self, id: ObjId, proto: ObjId) -> Result<(), VmError> {
         self.heap
@@ -638,14 +705,24 @@ impl Runtime {
         }
         if let Some(Obj::Func { fidx, .. }) = self.heap.get(id) {
             let fidx = *fidx;
-            return self.run(fidx, args);
+            return self.run_with_this(fidx, args, _this);
         }
         Err(VmError::NotCallable)
     }
 
     /// 関数表 index の関数を実行する（C の `vm_exec` 相当）。
-    /// 停止時（`Halt`）のスタック先頭。
+    /// 停止時（`Halt`）のスタック先頭。エントリの `this` は undefined。
     pub fn run(&mut self, func_idx: u32, args: &[AklVal]) -> Result<AklVal, VmError> {
+        self.run_with_this(func_idx, args, AklVal::UNDEF)
+    }
+
+    /// エントリの `this` を指定して実行する（getter/setter や `call_value` の再入用）。
+    pub fn run_with_this(
+        &mut self,
+        func_idx: u32,
+        args: &[AklVal],
+        this: AklVal,
+    ) -> Result<AklVal, VmError> {
         let mut stack: Vec<AklVal> = Vec::new();
         let mut frames: Vec<Frame> = Vec::new();
         let mut pc = 0usize;
@@ -661,7 +738,7 @@ impl Runtime {
             for (i, a) in args.iter().enumerate().take(f.n_params) {
                 locals[i] = *a;
             }
-            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this: AklVal::UNDEF, env: None, catch_pc: None, is_new: false });
+            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this, env: None, catch_pc: None, is_new: false });
         }
 
         loop {
@@ -842,6 +919,13 @@ impl Runtime {
                         continue;
                     }
                 }
+                Op::JmpNotNullish(t) => {
+                    let v = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    if !v.is_null() && !v.is_undef() {
+                        pc = t as usize;
+                        continue;
+                    }
+                }
                 Op::Call(argc) => {
                     let argc = argc as usize;
                     if stack.len() < argc + 1 {
@@ -923,6 +1007,65 @@ impl Runtime {
                         }
                     }
                     // 通常オブジェクト: プロパティを解決して this=receiver で呼ぶ
+                    let method = if receiver.is_obj() {
+                        self.prop_load(receiver.get_obj(), name)
+                    } else {
+                        AklVal::UNDEF
+                    };
+                    match self.do_call(&mut frames, &mut pc, method, receiver, &args) {
+                        Ok(Some(r)) => {
+                            stack.push(r);
+                            pc += 1;
+                            continue;
+                        }
+                        Ok(None) => continue,
+                        Err(VmError::Thrown(v)) => {
+                            self.unwind(&mut frames, &mut stack, &mut pc, v)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Op::MCallDyn { name, argc_name } => {
+                    let argc_v = self.global_get(argc_name).unwrap_or(AklVal::mk_int(0));
+                    let argc = if argc_v.is_int() && argc_v.get_int() >= 0 {
+                        argc_v.get_int() as usize
+                    } else {
+                        0
+                    };
+                    if argc > 4096 || stack.len() < argc + 1 {
+                        return Err(VmError::StackUnderflow);
+                    }
+                    let receiver = stack[stack.len() - argc - 1];
+                    let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
+                    stack.truncate(stack.len() - argc - 1);
+                    // ハンドルのメソッドは vtable call へ
+                    let handle = if receiver.is_obj() {
+                        match self.heap.get(receiver.get_obj()) {
+                            Some(Obj::Handle { vtab, data, ptr }) => Some((*vtab, *data, *ptr)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((vtab, data, ptr)) = handle {
+                        let name_str = match self.heap.get(name) {
+                            Some(Obj::Str(s)) => s.to_string(),
+                            _ => String::new(),
+                        };
+                        match (vtab.call)(self, data, ptr, &name_str, &args) {
+                            Some(v) => {
+                                stack.push(v);
+                                pc += 1;
+                                continue;
+                            }
+                            None => {
+                                let msg = self.intern("TypeError: not a function").unwrap_or(0);
+                                self.unwind(&mut frames, &mut stack, &mut pc, AklVal::mk_obj(msg))?;
+                                continue;
+                            }
+                        }
+                    }
                     let method = if receiver.is_obj() {
                         self.prop_load(receiver.get_obj(), name)
                     } else {
@@ -1120,6 +1263,10 @@ impl Runtime {
                         };
                         let v = (vtab.get)(self, data, ptr, &name_str).unwrap_or(AklVal::UNDEF);
                         stack.push(v);
+                    } else if matches!(self.heap.get(id), Some(Obj::Obj(_))) {
+                        // プレーンオブジェクトは getter アクセサ対応
+                        let v = self.obj_prop_load(id, name)?;
+                        stack.push(v);
                     } else {
                         stack.push(self.prop_load(id, name));
                     }
@@ -1162,9 +1309,14 @@ impl Runtime {
                         pc += 1;
                         continue;
                     }
-                    self.heap
-                        .prop_set(id, name, val)
-                        .map_err(|_| VmError::NotObject)?;
+                    // プレーンオブジェクトは setter アクセサ対応
+                    if matches!(self.heap.get(id), Some(Obj::Obj(_))) {
+                        self.obj_prop_store(id, name, val)?;
+                    } else {
+                        self.heap
+                            .prop_set(id, name, val)
+                            .map_err(|_| VmError::NotObject)?;
+                    }
                     stack.push(val);
                 }
                 Op::ArrNew(count) => {
@@ -1206,6 +1358,91 @@ impl Runtime {
                         _ => return Err(VmError::NotObject),
                     }
                     stack.push(arr);
+                }
+                Op::ArrSpreadC(name) => {
+                    // pop 配列 → 要素を順に push + グローバルカウンタ name へ要素数を加算
+                    let arr = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let items = if arr.is_obj() {
+                        match self.heap.get(arr.get_obj()) {
+                            Some(Obj::Arr(v)) => v.clone(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let n = items.len();
+                    let cur = self.global_get(name).unwrap_or(AklVal::mk_int(0));
+                    let newc = if cur.is_int() { cur.get_int() + n as i32 } else { n as i32 };
+                    self.global_set(name, AklVal::mk_int(newc));
+                    stack.extend(items);
+                }
+                Op::CallDyn(name) => {
+                    let argc_v = self
+                        .global_get(name)
+                        .unwrap_or(AklVal::mk_int(0));
+                    let argc = if argc_v.is_int() && argc_v.get_int() >= 0 {
+                        argc_v.get_int() as usize
+                    } else {
+                        0
+                    };
+                    if argc > 4096 || stack.len() < argc + 1 {
+                        return Err(VmError::StackUnderflow);
+                    }
+                    let callee = stack[stack.len() - argc - 1];
+                    let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
+                    stack.truncate(stack.len() - argc - 1);
+                    match self.do_call(&mut frames, &mut pc, callee, AklVal::UNDEF, &args) {
+                        Ok(Some(r)) => {
+                            stack.push(r);
+                            pc += 1;
+                            continue;
+                        }
+                        Ok(None) => continue,
+                        Err(VmError::Thrown(v)) => {
+                            self.unwind(&mut frames, &mut stack, &mut pc, v)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Op::ObjSpread => {
+                    // pop src → TOS の OBJ に全 props をコピー（\x00proto は除く）
+                    let src = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let dst = *stack.last().ok_or(VmError::StackUnderflow)?;
+                    if src.is_obj() && dst.is_obj() {
+                        let src_props = match self.heap.get(src.get_obj()) {
+                            Some(Obj::Obj(props)) => props.clone(),
+                            _ => Vec::new(),
+                        };
+                        if let Some(Obj::Obj(_)) = self.heap.get(dst.get_obj()) {
+                            for (n, v) in src_props {
+                                if n != self.proto_name {
+                                    let _ = self.heap.prop_set(dst.get_obj(), n, v);
+                                }
+                            }
+                        }
+                    }
+                }
+                Op::ObjRest => {
+                    let src = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let src_props = if src.is_obj() {
+                        match self.heap.get(src.get_obj()) {
+                            Some(Obj::Obj(props)) => props.clone(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    let id = self
+                        .heap
+                        .alloc(Obj::Obj(Vec::new()))
+                        .map_err(|_| VmError::Oom)?;
+                    for (n, v) in src_props {
+                        if n != self.proto_name {
+                            let _ = self.heap.prop_set(id, n, v);
+                        }
+                    }
+                    stack.push(AklVal::mk_obj(id));
                 }
                 Op::ArrRest => {
                     let start = stack.pop().ok_or(VmError::StackUnderflow)?;
@@ -1249,6 +1486,16 @@ impl Runtime {
                         pc += 1;
                         continue;
                     }
+                    // プレーンオブジェクトの計算済みプロパティ取得 `obj[key]`
+                    if let Some(Obj::Obj(_)) = self.heap.get(id) {
+                        let key = self.stringify(idx).ok();
+                        let v = key
+                            .and_then(|k| self.prop_get_chain(id, k))
+                            .unwrap_or(AklVal::UNDEF);
+                        stack.push(v);
+                        pc += 1;
+                        continue;
+                    }
                     let i = self.to_number(idx) as i64;
                     let v = if i >= 0 {
                         self.heap.arr_get(id, i as usize).unwrap_or(AklVal::UNDEF)
@@ -1264,9 +1511,18 @@ impl Runtime {
                     if !obj.is_obj() {
                         return Err(VmError::NotObject);
                     }
-                    let i = self.to_number(idx) as i64;
-                    if i >= 0 {
-                        self.arr_set(obj.get_obj(), i as usize, val)?;
+                    let id = obj.get_obj();
+                    if let Some(Obj::Arr(_)) = self.heap.get(id) {
+                        let i = self.to_number(idx) as i64;
+                        if i >= 0 {
+                            self.arr_set(id, i as usize, val)?;
+                        }
+                    } else if let Some(Obj::Obj(_)) = self.heap.get(id) {
+                        // 計算済みプロパティ設定 `obj[key] = v`
+                        let key = self.stringify(idx)?;
+                        self.heap
+                            .prop_set(id, key, val)
+                            .map_err(|_| VmError::NotObject)?;
                     }
                     stack.push(val);
                 }

@@ -85,6 +85,30 @@ pub enum BinOp {
     BUShr,
 }
 
+/// 論理代入演算子（`||=` / `&&=` / `??=`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LogicalOp {
+    /// `||=`（falsy なら代入）。
+    Or,
+    /// `&&=`（truthy なら代入）。
+    And,
+    /// `??=`（nullish なら代入）。
+    Nullish,
+}
+
+/// オブジェクトリテラルの 1 エントリ。
+#[derive(Clone, Debug, PartialEq)]
+pub enum ObjEntry {
+    /// 通常の `key: value`。
+    KeyValue(String, Expr),
+    /// getter `get name() { body }`。
+    Getter(String, Vec<Stmt>),
+    /// setter `set name(v) { body }`（パラメータ名 + 本体）。
+    Setter(String, String, Vec<Stmt>),
+    /// オブジェクト spread `...expr`。
+    Spread(Expr),
+}
+
 /// 式。
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -132,8 +156,8 @@ pub enum Expr {
     },
     /// 配列リテラル `[e, ...]`。
     Arr(Vec<Expr>),
-    /// オブジェクトリテラル `{ k: v, ... }`。
-    ObjLit(Vec<(String, Expr)>),
+    /// オブジェクトリテラル `{ k: v, get/set, ...spread }`。
+    ObjLit(Vec<ObjEntry>),
     /// メンバーアクセス `obj.prop`。
     Member {
         /// 対象。
@@ -254,6 +278,22 @@ pub enum Expr {
         /// true = 前置（`++x`）、false = 後置（`x++`）。
         prefix: bool,
     },
+    /// 論理代入 `x ||= y` / `x &&= y` / `x ??= y`。target は識別子 or メンバー。
+    LogicalAssign {
+        /// 代入先（`Ident` / `Member`）。
+        target: Box<Expr>,
+        /// 演算子。
+        op: LogicalOp,
+        /// 右辺。
+        rhs: Box<Expr>,
+    },
+    /// 分割代入（式文 `[a, b] = expr` / `({a} = expr)`）。`var` 宣言を伴わない形。
+    DestructureAssign {
+        /// 束縛パターン。
+        pattern: Pattern,
+        /// 右辺。
+        rhs: Box<Expr>,
+    },
 }
 
 /// 分割代入パターン。
@@ -263,10 +303,12 @@ pub enum Pattern {
     Ident(String),
     /// 配列パターン `[a, b, ...rest]`。
     Arr(Vec<Pattern>),
-    /// オブジェクトパターン `{a, b: x}`。
+    /// オブジェクトパターン `{a, b: x, ...rest}`。
     Obj(Vec<(String, Pattern)>),
     /// rest 要素（配列パターンの末尾 `...rest`）。
     Rest(String),
+    /// オブジェクト rest（`{a, ...rest}` の `rest`。残りのプロパティを束縛）。
+    ObjRest(String),
     /// 空き要素（elision。束縛しない）。
     Hole,
 }
@@ -402,6 +444,8 @@ pub enum Stmt {
         constructor: (Vec<String>, Option<String>, Vec<Stmt>),
         /// メソッド列（name, params, rest, body）。
         methods: Vec<ClassMethod>,
+        /// フィールド列（name, 初期化式）。
+        fields: Vec<(String, Expr)>,
     },
     /// `export` 宣言（簡易近似: 値式をエクスポートする）。
     Export {
@@ -538,6 +582,12 @@ impl<'a> Parser<'a> {
                 Expr::Member { obj, name } => {
                     Ok(Expr::MemberAssign { obj, name, rhs: Box::new(rhs) })
                 }
+                // 分割代入（式文 `[a, b] = expr` / `({a} = expr)`）
+                Expr::Arr(_) | Expr::ObjLit(_) => {
+                    let pattern = expr_to_pattern(lhs)
+                        .ok_or_else(|| ParseError("invalid destructuring pattern".into()))?;
+                    Ok(Expr::DestructureAssign { pattern, rhs: Box::new(rhs) })
+                }
                 _ => Err(ParseError("invalid assignment target".into())),
             };
         }
@@ -560,6 +610,28 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_expr()?;
             return match lhs {
                 Expr::Ident(name) => Ok(Expr::CompoundAssign { name, op, rhs: Box::new(rhs) }),
+                _ => Err(ParseError("invalid assignment target".into())),
+            };
+        }
+        // 論理代入 ||= &&= ??=
+        let logop = if self.at_punct(Punct::OrOrAss)? {
+            Some(LogicalOp::Or)
+        } else if self.at_punct(Punct::AndAndAss)? {
+            Some(LogicalOp::And)
+        } else if self.at_punct(Punct::NullishAss)? {
+            Some(LogicalOp::Nullish)
+        } else {
+            None
+        };
+        if let Some(op) = logop {
+            self.bump()?;
+            let rhs = self.parse_expr()?;
+            return match lhs {
+                Expr::Ident(_) | Expr::Member { .. } => Ok(Expr::LogicalAssign {
+                    target: Box::new(lhs),
+                    op,
+                    rhs: Box::new(rhs),
+                }),
                 _ => Err(ParseError("invalid assignment target".into())),
             };
         }
@@ -921,23 +993,69 @@ impl<'a> Parser<'a> {
                 Ok(e)
             }
             Token::Punct(Punct::LBrace) => {
-                // オブジェクトリテラル { k: v, ... }
+                // オブジェクトリテラル { k: v, get/set name(), ...spread }
                 let mut entries = Vec::new();
                 if !self.at_punct(Punct::RBrace)? {
                     loop {
-                        let key = match self.bump()? {
-                            Token::Ident(n) => n.to_string(),
-                            Token::Str(s) => s,
-                            Token::Kw(kw) => format!("{kw:?}").to_lowercase(),
-                            other => {
-                                return Err(ParseError(format!("expected property key, got {other:?}")))
+                        // spread
+                        if self.eat_punct(Punct::Ellipsis)? {
+                            let e = self.parse_expr()?;
+                            entries.push(ObjEntry::Spread(e));
+                        } else {
+                            // getter/setter 先読み（get/set は識別子。名前 + '(' ならアクセサ）
+                            let saved = self.save_state();
+                            let mut accessor: Option<(bool, String, String, Vec<Stmt>)> = None;
+                            if let Token::Ident(k) = self.peek()?.clone() {
+                                let k = k.to_string();
+                                if k == "get" || k == "set" {
+                                    let is_get = k == "get";
+                                    self.bump()?; // get/set
+                                    if let Token::Ident(name) = self.peek()?.clone() {
+                                        self.bump()?; // name
+                                        if self.at_punct(Punct::LParen)? {
+                                            self.bump()?; // (
+                                            let (params, _) = self.parse_params_list()?;
+                                            self.expect_punct(Punct::RParen, "')'")?;
+                                            let body = match self.parse_block()? {
+                                                Stmt::Block(s) => s,
+                                                _ => unreachable!(),
+                                            };
+                                            let param = if is_get {
+                                                String::new()
+                                            } else {
+                                                params.first().cloned().unwrap_or_default()
+                                            };
+                                            accessor = Some((is_get, name.to_string(), param, body));
+                                        }
+                                    }
+                                }
                             }
-                        };
-                        self.expect_punct(Punct::Colon, "':'")?;
-                        let val = self.parse_expr()?;
-                        entries.push((key, val));
+                            match accessor {
+                                Some((true, name, _p, body)) => entries.push(ObjEntry::Getter(name, body)),
+                                Some((false, name, p, body)) => entries.push(ObjEntry::Setter(name, p, body)),
+                                None => {
+                                    self.restore_state(saved);
+                                    let key = match self.bump()? {
+                                        Token::Ident(n) => n.to_string(),
+                                        Token::Str(s) => s,
+                                        Token::Kw(kw) => format!("{kw:?}").to_lowercase(),
+                                        other => {
+                                            return Err(ParseError(format!(
+                                                "expected property key, got {other:?}"
+                                            )))
+                                        }
+                                    };
+                                    self.expect_punct(Punct::Colon, "':'")?;
+                                    let val = self.parse_expr()?;
+                                    entries.push(ObjEntry::KeyValue(key, val));
+                                }
+                            }
+                        }
                         if !self.eat_punct(Punct::Comma)? {
                             break;
+                        }
+                        if self.at_punct(Punct::RBrace)? {
+                            break; // trailing comma
                         }
                     }
                 }
@@ -1319,6 +1437,15 @@ impl<'a> Parser<'a> {
             let mut items = Vec::new();
             if !self.at_punct(Punct::RBrace)? {
                 loop {
+                    // オブジェクト rest `...rest`
+                    if self.eat_punct(Punct::Ellipsis)? {
+                        let name = match self.bump()? {
+                            Token::Ident(n) => n.to_string(),
+                            other => return Err(ParseError(format!("expected rest name, got {other:?}"))),
+                        };
+                        items.push((String::new(), Pattern::ObjRest(name)));
+                        break;
+                    }
                     let key = match self.bump()? {
                         Token::Ident(n) => n.to_string(),
                         Token::Str(s) => s,
@@ -1572,13 +1699,27 @@ impl<'a> Parser<'a> {
         self.expect_punct(Punct::LBrace, "'{'")?;
         let mut constructor = (Vec::new(), None, Vec::new());
         let mut methods = Vec::new();
+        let mut fields = Vec::new();
         while !self.at_punct(Punct::RBrace)? && !self.at_eof()? {
-            // メソッド名
+            // `static` は簡易近似（無視してインスタンスメンバーとして扱う）
+            if self.at_kw(Keyword::Static)? {
+                self.bump()?;
+            }
+            // メンバー名
             let mname = match self.bump()? {
                 Token::Ident(n) => n.to_string(),
                 Token::Kw(kw) => format!("{kw:?}").to_lowercase(),
-                other => return Err(ParseError(format!("expected method name, got {other:?}"))),
+                other => return Err(ParseError(format!("expected member name, got {other:?}"))),
             };
+            // フィールド（`name = expr;`）
+            if self.eat_punct(Punct::Assign)? {
+                let init = self.parse_expr()?;
+                if self.at_punct(Punct::Semi)? {
+                    self.bump()?;
+                }
+                fields.push((mname, init));
+                continue;
+            }
             // パラメータ
             self.expect_punct(Punct::LParen, "'('")?;
             let (params, rest) = self.parse_params_list()?;
@@ -1595,7 +1736,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(Punct::RBrace, "'}'")?;
-        Ok(Stmt::ClassDecl { name, constructor, methods })
+        Ok(Stmt::ClassDecl { name, constructor, methods, fields })
     }
 
     /// `import name from "spec"`（簡易近似）。
@@ -1685,6 +1826,43 @@ impl<'a> Parser<'a> {
             _ => unreachable!(),
         };
         Ok(Stmt::FuncDecl { name, params, rest, body })
+    }
+}
+
+/// 配列/オブジェクトリテラル式を分割代入パターンへ変換する（式文の分割代入用）。
+/// 対応外（spread 等）は None。
+fn expr_to_pattern(expr: Expr) -> Option<Pattern> {
+    match expr {
+        Expr::Arr(items) => {
+            let mut pats = Vec::new();
+            for it in items {
+                match it {
+                    Expr::Ident(name) => pats.push(Pattern::Ident(name)),
+                    Expr::Arr(_) | Expr::ObjLit(_) => pats.push(expr_to_pattern(it)?),
+                    Expr::Hole => pats.push(Pattern::Hole),
+                    _ => return None,
+                }
+            }
+            Some(Pattern::Arr(pats))
+        }
+        Expr::ObjLit(entries) => {
+            let mut pats = Vec::new();
+            for e in entries {
+                match e {
+                    ObjEntry::KeyValue(key, val) => {
+                        let p = match val {
+                            Expr::Ident(name) => Pattern::Ident(name),
+                            Expr::Arr(_) | Expr::ObjLit(_) => expr_to_pattern(val)?,
+                            _ => return None,
+                        };
+                        pats.push((key, p));
+                    }
+                    _ => return None,
+                }
+            }
+            Some(Pattern::Obj(pats))
+        }
+        _ => None,
     }
 }
 
@@ -1896,8 +2074,8 @@ mod tests {
         assert_eq!(
             parse("({a: 1, b: \"x\"});").unwrap(),
             vec![Stmt::Expr(Expr::ObjLit(vec![
-                ("a".into(), Expr::Num(NumLit::Int(1))),
-                ("b".into(), Expr::Str("x".into())),
+                ObjEntry::KeyValue("a".into(), Expr::Num(NumLit::Int(1))),
+                ObjEntry::KeyValue("b".into(), Expr::Str("x".into())),
             ]))]
         );
     }

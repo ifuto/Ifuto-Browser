@@ -2282,6 +2282,104 @@ mod tests {
     }
 
     #[test]
+    fn logical_assignment() {
+        assert_eq!(
+            run_src("var x = 0; x ||= 5; x;").unwrap().0,
+            AklVal::mk_int(5)
+        );
+        assert_eq!(
+            run_src("var x = 7; x ||= 5; x;").unwrap().0,
+            AklVal::mk_int(7)
+        );
+        assert_eq!(
+            run_src("var x; x ??= 3; x;").unwrap().0,
+            AklVal::mk_int(3)
+        );
+        assert_eq!(
+            run_src("var x = 0; x ??= 3; x;").unwrap().0,
+            AklVal::mk_int(0)
+        );
+        assert_eq!(
+            run_src("var x = 1; x &&= 9; x;").unwrap().0,
+            AklVal::mk_int(9)
+        );
+    }
+
+    #[test]
+    fn class_fields() {
+        assert_eq!(
+            run_src("class Item { name = 'unnamed'; count = 0; } var it = new Item(); it.count;")
+                .unwrap()
+                .0,
+            AklVal::mk_int(0)
+        );
+        assert_eq!(
+            run_src("class Item { name = 'unnamed'; } var it = new Item(); it.name === 'unnamed';")
+                .unwrap()
+                .0,
+            AklVal::TRUE
+        );
+    }
+
+    #[test]
+    fn getter_setter_objlit() {
+        // `x / 2` は double を返すため、数値比較は `===`（int/double 統一）で確認する
+        assert_eq!(
+            run_src("var o = { v: 10, get d() { return this.v * 2; }, set d(x) { this.v = x / 2; } }; o.d = 20; o.d === 20;")
+                .unwrap()
+                .0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("var o = { v: 10, get d() { return this.v * 2; }, set d(x) { this.v = x / 2; } }; o.d = 20; o.v === 10;")
+                .unwrap()
+                .0,
+            AklVal::TRUE
+        );
+    }
+
+    #[test]
+    fn object_spread() {
+        assert_eq!(
+            run_src("var b = {w: 100, h: 50}; var o = {w: 0, h: 60, z: 1}; o;").unwrap().0.is_obj(),
+            true
+        );
+        // {...b, h: 60} で h が上書きされる
+        assert_eq!(
+            run_src("var b = {w: 100, h: 50}; var o = {...b, h: 60}; o.h;").unwrap().0,
+            AklVal::mk_int(60)
+        );
+        assert_eq!(
+            run_src("var b = {w: 100, h: 50}; var o = {...b, h: 60}; o.w;").unwrap().0,
+            AklVal::mk_int(100)
+        );
+    }
+
+    #[test]
+    fn call_spread() {
+        assert_eq!(
+            run_src("function f(a, b, c) { return a + b + c; } var xs = [1, 2]; f(...xs, 3);")
+                .unwrap()
+                .0,
+            AklVal::mk_int(6)
+        );
+    }
+
+    #[test]
+    fn destructure_assign() {
+        assert_eq!(
+            run_src("var r; [r] = [9, 8, 7]; r;").unwrap().0,
+            AklVal::mk_int(9)
+        );
+        assert_eq!(
+            run_src("var f; var r2; var o = {first: 1, second: 2, third: 3}; var {first: f, ...r2} = o; r2.second + r2.third;")
+                .unwrap()
+                .0,
+            AklVal::mk_int(5)
+        );
+    }
+
+    #[test]
     fn date_basic() {
         // Date.UTC(1970, 0, 1) = 0
         assert_eq!(

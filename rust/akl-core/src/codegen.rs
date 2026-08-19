@@ -31,7 +31,7 @@ use std::collections::HashMap;
 
 use crate::bytecode::{FuncObj, Op, Runtime};
 use crate::lexer::NumLit;
-use crate::parser::{BinOp, Expr, ForInit, Stmt, UnaryOp};
+use crate::parser::{BinOp, Expr, ForInit, LogicalOp, ObjEntry, Stmt, UnaryOp};
 
 /// コード生成エラー。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -388,6 +388,12 @@ impl Compiler<'_> {
                 self.gen_store(name, code)?;
             }
             Expr::Call { callee, args } => {
+                // spread 引数があるか（`f(...a, b)`）
+                let has_spread = args.iter().any(|a| matches!(a, Expr::Spread(_)));
+                let argc_name = self
+                    .rt
+                    .intern("\x01spread_argc")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
                 // メソッド呼び出し `obj.method(...)` は this=obj で呼ぶ（MCallName）。
                 // ハンドル（DOM 等）は vtable の call へ直接ディスパッチし、プロパティ
                 // 取得（PLoad）と構文的に分離する（C の OP_MCALL と同型）。
@@ -397,22 +403,55 @@ impl Compiler<'_> {
                         .rt
                         .intern(name)
                         .ok_or_else(|| CompileError("intern failed".into()))?;
-                    for a in args {
-                        self.gen_expr(a, code)?;
+                    if has_spread {
+                        // 固定引数数をカウンタに設定 → spread 引数を展開 → MCallDyn
+                        let fixed = args.iter().filter(|a| !matches!(a, Expr::Spread(_))).count();
+                        code.push(Op::ConstI(fixed as i32));
+                        code.push(Op::GStore(argc_name));
+                        for a in args {
+                            match a {
+                                Expr::Spread(e) => {
+                                    self.gen_expr(e, code)?;
+                                    code.push(Op::ArrSpreadC(argc_name));
+                                }
+                                _ => self.gen_expr(a, code)?,
+                            }
+                        }
+                        code.push(Op::MCallDyn { name: name_id, argc_name });
+                    } else {
+                        for a in args {
+                            self.gen_expr(a, code)?;
+                        }
+                        if args.len() > u8::MAX as usize {
+                            return Err(CompileError("too many arguments".into()));
+                        }
+                        code.push(Op::MCallName { name: name_id, argc: args.len() as u8 });
                     }
-                    if args.len() > u8::MAX as usize {
-                        return Err(CompileError("too many arguments".into()));
-                    }
-                    code.push(Op::MCallName { name: name_id, argc: args.len() as u8 });
                 } else {
                     self.gen_expr(callee, code)?;
-                    for a in args {
-                        self.gen_expr(a, code)?;
+                    if has_spread {
+                        let fixed = args.iter().filter(|a| !matches!(a, Expr::Spread(_))).count();
+                        code.push(Op::ConstI(fixed as i32));
+                        code.push(Op::GStore(argc_name));
+                        for a in args {
+                            match a {
+                                Expr::Spread(e) => {
+                                    self.gen_expr(e, code)?;
+                                    code.push(Op::ArrSpreadC(argc_name));
+                                }
+                                _ => self.gen_expr(a, code)?,
+                            }
+                        }
+                        code.push(Op::CallDyn(argc_name));
+                    } else {
+                        for a in args {
+                            self.gen_expr(a, code)?;
+                        }
+                        if args.len() > u8::MAX as usize {
+                            return Err(CompileError("too many arguments".into()));
+                        }
+                        code.push(Op::Call(args.len() as u8));
                     }
-                    if args.len() > u8::MAX as usize {
-                        return Err(CompileError("too many arguments".into()));
-                    }
-                    code.push(Op::Call(args.len() as u8));
                 }
             }
             Expr::Arr(items) => {
@@ -450,15 +489,58 @@ impl Compiler<'_> {
             }
             Expr::ObjLit(entries) => {
                 code.push(Op::ObjNew);
-                for (key, val) in entries {
-                    code.push(Op::Dup);
-                    self.gen_expr(val, code)?;
-                    let key_id = self
-                        .rt
-                        .intern(key)
-                        .ok_or_else(|| CompileError("intern failed".into()))?;
-                    code.push(Op::PStore(key_id));
-                    code.push(Op::Pop); // PStore が返す val を捨て、obj を残す
+                for entry in entries {
+                    match entry {
+                        ObjEntry::KeyValue(key, val) => {
+                            code.push(Op::Dup);
+                            self.gen_expr(val, code)?;
+                            let key_id = self
+                                .rt
+                                .intern(key)
+                                .ok_or_else(|| CompileError("intern failed".into()))?;
+                            code.push(Op::PStore(key_id));
+                            code.push(Op::Pop); // PStore が返す val を捨て、obj を残す
+                        }
+                        ObjEntry::Spread(e) => {
+                            self.gen_expr(e, code)?; // [obj, src]
+                            code.push(Op::ObjSpread); // src の全 props を obj へコピー
+                        }
+                        ObjEntry::Getter(name, body) => {
+                            let enclosing = self.captures.clone();
+                            let empty = HashMap::new();
+                            let fidx =
+                                self.compile_function_anon(&[], None, body, &empty, &enclosing)?;
+                            code.push(Op::Dup);
+                            code.push(Op::MakeF(fidx));
+                            let sid = self
+                                .rt
+                                .intern(&format!("get:\x01{name}"))
+                                .ok_or_else(|| CompileError("intern failed".into()))?;
+                            code.push(Op::PStore(sid));
+                            code.push(Op::Pop);
+                        }
+                        ObjEntry::Setter(name, param, body) => {
+                            let enclosing = self.captures.clone();
+                            let empty = HashMap::new();
+                            let params: Vec<String> =
+                                if param.is_empty() { vec![] } else { vec![param.clone()] };
+                            let fidx = self.compile_function_anon(
+                                &params,
+                                None,
+                                body,
+                                &empty,
+                                &enclosing,
+                            )?;
+                            code.push(Op::Dup);
+                            code.push(Op::MakeF(fidx));
+                            let sid = self
+                                .rt
+                                .intern(&format!("set:\x01{name}"))
+                                .ok_or_else(|| CompileError("intern failed".into()))?;
+                            code.push(Op::PStore(sid));
+                            code.push(Op::Pop);
+                        }
+                    }
                 }
             }
             Expr::Member { obj, name } => {
@@ -588,6 +670,73 @@ impl Compiler<'_> {
                     code.push(if *inc { Op::Add } else { Op::Sub });
                     self.gen_store(name, code)?;
                 }
+            }
+            Expr::LogicalAssign { target, op, rhs } => {
+                // x ||= y → falsy なら x = y（値は新 x）。&&= は truthy、??= は nullish。
+                let jmp = |op: &LogicalOp| match op {
+                    LogicalOp::Or => Op::JmpT(0),
+                    LogicalOp::And => Op::JmpF(0),
+                    LogicalOp::Nullish => Op::JmpNotNullish(0),
+                };
+                match &**target {
+                    Expr::Ident(name) => {
+                        self.gen_load(name, code)?; // [x]
+                        code.push(Op::Dup); // [x, x]
+                        let jmp_idx = code.len();
+                        code.push(jmp(op));
+                        code.push(Op::Pop); // 条件不成立: x を捨てる
+                        self.gen_expr(rhs, code)?; // [y]
+                        code.push(Op::Dup); // [y, y]
+                        self.gen_store(name, code)?; // [y]
+                        let skip = code.len();
+                        code[jmp_idx] = match op {
+                            LogicalOp::Or => Op::JmpT(skip as u32),
+                            LogicalOp::And => Op::JmpF(skip as u32),
+                            LogicalOp::Nullish => Op::JmpNotNullish(skip as u32),
+                        };
+                    }
+                    Expr::Member { obj, name } => {
+                        // obj.name op= rhs。obj は一時グローバルに退避して評価を 1 回に。
+                        let tmp = self
+                            .rt
+                            .intern("\x01la_obj")
+                            .ok_or_else(|| CompileError("intern failed".into()))?;
+                        let tmpv = self
+                            .rt
+                            .intern("\x01la_val")
+                            .ok_or_else(|| CompileError("intern failed".into()))?;
+                        let name_id = self
+                            .rt
+                            .intern(name)
+                            .ok_or_else(|| CompileError("intern failed".into()))?;
+                        self.gen_expr(obj, code)?; // [obj]
+                        code.push(Op::GStore(tmp)); // []
+                        code.push(Op::GLoad(tmp)); // [obj]
+                        code.push(Op::PLoad(name_id)); // [prop]
+                        code.push(Op::Dup); // [prop, prop]
+                        let jmp_idx = code.len();
+                        code.push(jmp(op)); // pop 1。条件成立なら skip（[prop] が値）
+                        code.push(Op::Pop); // 条件不成立: prop を捨てる
+                        self.gen_expr(rhs, code)?; // [rhs]
+                        code.push(Op::GStore(tmpv)); // []
+                        code.push(Op::GLoad(tmp)); // [obj]
+                        code.push(Op::GLoad(tmpv)); // [obj, rhs]
+                        code.push(Op::PStore(name_id)); // [rhs]
+                        let skip = code.len();
+                        code[jmp_idx] = match op {
+                            LogicalOp::Or => Op::JmpT(skip as u32),
+                            LogicalOp::And => Op::JmpF(skip as u32),
+                            LogicalOp::Nullish => Op::JmpNotNullish(skip as u32),
+                        };
+                    }
+                    _ => return Err(CompileError("invalid logical assignment target".into())),
+                }
+            }
+            Expr::DestructureAssign { pattern, rhs } => {
+                // 右辺の値を式の値として残す（JS の分割代入式の値は右辺）。
+                self.gen_expr(rhs, code)?; // [rhs]
+                code.push(Op::Dup); // [rhs, rhs]
+                self.gen_destructure(pattern, code)?; // [rhs]（束縛は 2 個目を消費）
             }
             Expr::This => {
                 code.push(Op::This);
@@ -870,7 +1019,7 @@ impl Compiler<'_> {
                 self.gen_expr(init, code)?;
                 self.gen_destructure(pattern, code)?;
             }
-            Stmt::ClassDecl { name, constructor, methods } => {
+            Stmt::ClassDecl { name, constructor, methods, fields } => {
                 // メソッドを先にコンパイル
                 let enclosing_env = self.captures.clone();
                 let empty_boxed = HashMap::new();
@@ -885,11 +1034,21 @@ impl Compiler<'_> {
                     )?;
                     method_fidxs.push((mname.clone(), fidx));
                 }
+                // フィールド初期化を constructor 本体の先頭に前置（`this.name = init`）
+                let mut ctor_body = Vec::new();
+                for (fname, finit) in fields {
+                    ctor_body.push(Stmt::Expr(Expr::MemberAssign {
+                        obj: Box::new(Expr::This),
+                        name: fname.clone(),
+                        rhs: Box::new(finit.clone()),
+                    }));
+                }
+                ctor_body.extend(constructor.2.iter().cloned());
                 // constructor をコンパイル
                 let ctor_fidx = self.compile_function_anon(
                     &constructor.0,
                     constructor.1.as_deref(),
-                    &constructor.2,
+                    &ctor_body,
                     &empty_boxed,
                     &enclosing_env,
                 )?;
@@ -1052,20 +1211,46 @@ impl Compiler<'_> {
                 code.push(Op::Pop); // arr を消費
             }
             crate::parser::Pattern::Obj(items) => {
-                // スタックトップはオブジェクト。各キーを取り出して束縛。
+                // スタックトップはオブジェクト。各キーを取り出して束縛。rest は残り。
+                let mut rest_name: Option<String> = None;
+                let mut explicit_keys: Vec<String> = Vec::new();
                 for (key, item) in items {
+                    match item {
+                        crate::parser::Pattern::ObjRest(name) => {
+                            rest_name = Some(name.clone());
+                        }
+                        _ => {
+                            explicit_keys.push(key.clone());
+                            code.push(Op::Dup); // [obj, obj]
+                            let key_id = self
+                                .rt
+                                .intern(key)
+                                .ok_or_else(|| CompileError("intern failed".into()))?;
+                            code.push(Op::PLoad(key_id)); // [obj, val]
+                            self.gen_destructure(item, code)?; // [obj]
+                        }
+                    }
+                }
+                if let Some(rname) = rest_name {
+                    // 残りのプロパティをコピーした新 OBJ を作り、明示キーを削除
                     code.push(Op::Dup); // [obj, obj]
-                    let key_id = self
-                        .rt
-                        .intern(key)
-                        .ok_or_else(|| CompileError("intern failed".into()))?;
-                    code.push(Op::PLoad(key_id)); // [obj, val]
-                    self.gen_destructure(item, code)?; // [obj]
+                    code.push(Op::ObjRest); // [obj, copy]
+                    for key in &explicit_keys {
+                        code.push(Op::Dup); // [obj, copy, copy]
+                        let key_id = self
+                            .rt
+                            .intern(key)
+                            .ok_or_else(|| CompileError("intern failed".into()))?;
+                        code.push(Op::ConstStr(key_id)); // [obj, copy, copy, key]
+                        code.push(Op::Delete); // [obj, copy, bool]
+                        code.push(Op::Pop); // [obj, copy]
+                    }
+                    self.gen_store(&rname, code)?; // [obj]
                 }
                 code.push(Op::Pop); // obj を消費
             }
-            crate::parser::Pattern::Rest(_) => {
-                return Err(CompileError("rest outside array pattern".into()))
+            crate::parser::Pattern::Rest(_) | crate::parser::Pattern::ObjRest(_) => {
+                return Err(CompileError("rest outside pattern".into()))
             }
             crate::parser::Pattern::Hole => {}
         }
@@ -1180,10 +1365,34 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
     }
 }
 
+/// 分割代入パターンから参照される識別子名を収集（自由変数解析用）。
+fn collect_pattern_refs(pattern: &crate::parser::Pattern, out: &mut std::collections::HashSet<String>) {
+    match pattern {
+        crate::parser::Pattern::Ident(name)
+        | crate::parser::Pattern::Rest(name)
+        | crate::parser::Pattern::ObjRest(name) => {
+            out.insert(name.clone());
+        }
+        crate::parser::Pattern::Arr(items) => {
+            for item in items {
+                collect_pattern_refs(item, out);
+            }
+        }
+        crate::parser::Pattern::Obj(items) => {
+            for (_, item) in items {
+                collect_pattern_refs(item, out);
+            }
+        }
+        crate::parser::Pattern::Hole => {}
+    }
+}
+
 /// 分割代入パターンから変数名を収集。
 fn collect_pattern_vars(pattern: &crate::parser::Pattern, locals: &mut HashMap<String, u32>) {
     match pattern {
-        crate::parser::Pattern::Ident(name) | crate::parser::Pattern::Rest(name) => {
+        crate::parser::Pattern::Ident(name)
+        | crate::parser::Pattern::Rest(name)
+        | crate::parser::Pattern::ObjRest(name) => {
             if !locals.contains_key(name) {
                 locals.insert(name.clone(), locals.len() as u32);
             }
@@ -1318,9 +1527,22 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             }
         }
         Expr::ObjLit(entries) => {
-            for (_, v) in entries {
-                collect_expr_refs(v, out);
+            for e in entries {
+                match e {
+                    crate::parser::ObjEntry::KeyValue(_, v) => collect_expr_refs(v, out),
+                    crate::parser::ObjEntry::Spread(v) => collect_expr_refs(v, out),
+                    crate::parser::ObjEntry::Getter(_, body) => collect_refs(body, out),
+                    crate::parser::ObjEntry::Setter(_, _, body) => collect_refs(body, out),
+                }
             }
+        }
+        Expr::LogicalAssign { target, rhs, .. } => {
+            collect_expr_refs(target, out);
+            collect_expr_refs(rhs, out);
+        }
+        Expr::DestructureAssign { pattern, rhs } => {
+            collect_expr_refs(rhs, out);
+            collect_pattern_refs(pattern, out);
         }
         Expr::Member { obj, .. } => collect_expr_refs(obj, out),
         Expr::Index { obj, index } => {
