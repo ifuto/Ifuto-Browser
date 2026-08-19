@@ -442,6 +442,14 @@ impl Runtime {
         rt.ctor_name = rt.intern("constructor").unwrap_or(0);
         // 命令バジェット既定（C の insn_budget_def = 10M と同値）。
         rt.insn_budget = 10_000_000;
+        // JS の非予約グローバル（`undefined` は識別子として参照可能 = shadowable）。
+        // これにより `function (undefined) {}` 等の慣用句がパース可能になる。
+        let undef_id = rt.intern("undefined").unwrap_or(0);
+        rt.global_set(undef_id, AklVal::UNDEF);
+        let nan_id = rt.intern("NaN").unwrap_or(0);
+        rt.global_set(nan_id, AklVal::from_f64(f64::NAN));
+        let inf_id = rt.intern("Infinity").unwrap_or(0);
+        rt.global_set(inf_id, AklVal::from_f64(f64::INFINITY));
         rt
     }
 

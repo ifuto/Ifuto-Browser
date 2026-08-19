@@ -430,6 +430,28 @@ class 継承、BigInt、generator 等）→ `test_script.c` 全緑 → `golden`/
 --offline --workspace -- -D warnings` 緑、`build/run_script_rust`（139 checks）全緑、
 `make all` + `make guismoke` PASS。
 
+### フェーズ 6 追補 3: lodash 互換の ES5 パーサ拡張（lodash 壁への着手）
+
+lodash 4.17.21（`tests/lodash_smoke.js` 320 checks）を通すための ES5 慣用句を実装。
+`build/akl_rust`（Rust エンジン CLI）で lodash 本体が**全文パース**に到達（従来は
+先頭 9 行で失敗）:
+
+- `undefined` / `NaN` / `Infinity` を非予約グローバル化（`undefined` は識別子として
+  参照可能 = shadowable。`function (undefined) {}` 等の慣用句が通る）
+- 複数宣言子 `var a = 1, b = 2;`
+- シーケンス式（コンマ演算子）`(a, b, c)`（括弧内。引数区切りと衝突回避）
+- メンバー/インデックスへの複合代入 `obj.x op= y` / `obj[i] op= y`（`obj` は 1 回評価）
+- ビット複合代入 `&= |= ^= <<= >>= >>>=`
+- メンバー/インデックスの前置・後置インクリメント `--obj.x` / `obj[i]++`
+- ラベル文 `label: while(...)` + `break label` / `continue label`（codegen の
+  break/continue patch リストをラベル名で深さ指定して解決）
+- `new Foo(...).method(...)` / `new Foo(...)[i]` の後置連鎖
+
+残る lodash の壁: **深いネストのクロージャ**（3 段以上の関数宣言。`compile_nested` が
+「deeply nested closures」で打ち切り。env チェーンの複数段対応が必要）。以降は
+`arguments` オブジェクト・`Function.prototype.call/apply/bind`・文字列の `===` 等の
+ランタイム差異が続く見込み。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）

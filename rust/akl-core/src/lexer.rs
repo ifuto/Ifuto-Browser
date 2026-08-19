@@ -55,8 +55,6 @@ pub enum Keyword {
     False,
     /// `null`
     Null,
-    /// `undefined`
-    Undefined,
     /// `typeof`
     Typeof,
     /// `throw`
@@ -130,7 +128,6 @@ impl Keyword {
         ("true", Keyword::True),
         ("false", Keyword::False),
         ("null", Keyword::Null),
-        ("undefined", Keyword::Undefined),
         ("typeof", Keyword::Typeof),
         ("throw", Keyword::Throw),
         ("try", Keyword::Try),

@@ -269,6 +269,28 @@ pub enum Expr {
         /// 右辺。
         rhs: Box<Expr>,
     },
+    /// 複合代入 `obj.prop op= rhs`（メンバー対象。`obj` は 1 回だけ評価）。
+    MemberCompoundAssign {
+        /// 対象オブジェクト。
+        obj: Box<Expr>,
+        /// プロパティ名。
+        name: String,
+        /// 演算子。
+        op: BinOp,
+        /// 右辺。
+        rhs: Box<Expr>,
+    },
+    /// 複合代入 `obj[index] op= rhs`（インデックス対象。`obj`/`index` は 1 回評価）。
+    IndexCompoundAssign {
+        /// 対象オブジェクト。
+        obj: Box<Expr>,
+        /// インデックス式。
+        index: Box<Expr>,
+        /// 演算子。
+        op: BinOp,
+        /// 右辺。
+        rhs: Box<Expr>,
+    },
     /// 前置/後置インクリメント・デクリメント（変数のみサポート）。
     IncDec {
         /// 対象の変数名。
@@ -276,6 +298,28 @@ pub enum Expr {
         /// true = `++`、false = `--`。
         inc: bool,
         /// true = 前置（`++x`）、false = 後置（`x++`）。
+        prefix: bool,
+    },
+    /// メンバーの前置/後置インクリメント・デクリメント `obj.name++` / `--obj.name`。
+    MemberIncDec {
+        /// 対象オブジェクト。
+        obj: Box<Expr>,
+        /// プロパティ名。
+        name: String,
+        /// true = `++`、false = `--`。
+        inc: bool,
+        /// true = 前置、false = 後置。
+        prefix: bool,
+    },
+    /// インデックスの前置/後置インクリメント・デクリメント `obj[i]++` / `--obj[i]`。
+    IndexIncDec {
+        /// 対象オブジェクト。
+        obj: Box<Expr>,
+        /// インデックス式。
+        index: Box<Expr>,
+        /// true = `++`、false = `--`。
+        inc: bool,
+        /// true = 前置、false = 後置。
         prefix: bool,
     },
     /// 論理代入 `x ||= y` / `x &&= y` / `x ??= y`。target は識別子 or メンバー。
@@ -305,6 +349,8 @@ pub enum Expr {
     Yield(Option<Box<Expr>>),
     /// `await expr`（async 関数。解決済み Promise を unwrap する）。
     Await(Box<Expr>),
+    /// シーケンス式 `(a, b, c)`（コンマ演算子。左から評価して最後の値を返す）。
+    Seq(Vec<Expr>),
 }
 
 /// 分割代入パターン。
@@ -422,10 +468,17 @@ pub enum Stmt {
         /// true = `of`（値で回す）、false = `in`（キーで回す）。
         is_of: bool,
     },
-    /// `break;`。
-    Break,
-    /// `continue;`。
-    Continue,
+    /// `break [label];`（label は無ければ None）。
+    Break(Option<String>),
+    /// `continue [label];`（label は無ければ None）。
+    Continue(Option<String>),
+    /// ラベル文 `label: statement`（`break label` / `continue label` の対象）。
+    Labeled {
+        /// ラベル名。
+        label: String,
+        /// 本体（通常はループ）。
+        body: Box<Stmt>,
+    },
     /// `switch (disc) { case x: ...; default: ... }`。
     Switch {
         /// 判別式。
@@ -621,6 +674,18 @@ impl<'a> Parser<'a> {
             Some(BinOp::Div)
         } else if self.at_punct(Punct::ModAss)? {
             Some(BinOp::Mod)
+        } else if self.at_punct(Punct::ShlAss)? {
+            Some(BinOp::BShl)
+        } else if self.at_punct(Punct::ShrAss)? {
+            Some(BinOp::BShr)
+        } else if self.at_punct(Punct::UShrAss)? {
+            Some(BinOp::BUShr)
+        } else if self.at_punct(Punct::AndAss)? {
+            Some(BinOp::BAnd)
+        } else if self.at_punct(Punct::OrAss)? {
+            Some(BinOp::BOr)
+        } else if self.at_punct(Punct::XorAss)? {
+            Some(BinOp::BXor)
         } else {
             None
         };
@@ -629,6 +694,12 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_expr()?;
             return match lhs {
                 Expr::Ident(name) => Ok(Expr::CompoundAssign { name, op, rhs: Box::new(rhs) }),
+                Expr::Member { obj, name } => {
+                    Ok(Expr::MemberCompoundAssign { obj, name, op, rhs: Box::new(rhs) })
+                }
+                Expr::Index { obj, index } => {
+                    Ok(Expr::IndexCompoundAssign { obj, index, op, rhs: Box::new(rhs) })
+                }
                 _ => Err(ParseError("invalid assignment target".into())),
             };
         }
@@ -907,7 +978,9 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_punct(Punct::RParen, "')'")?;
             }
-            return Ok(Expr::New { callee: Box::new(callee), args });
+            let base = Expr::New { callee: Box::new(callee), args };
+            // `new Foo(...).method(...)` / `new Foo(...)[i]` の後置連鎖
+            return self.parse_postfix_suffix(base);
         }
         // 前置 ++ / --
         let incdec = if self.at_punct(Punct::Inc)? {
@@ -922,6 +995,12 @@ impl<'a> Parser<'a> {
             let operand = self.parse_unary()?;
             return match operand {
                 Expr::Ident(name) => Ok(Expr::IncDec { name, inc, prefix: true }),
+                Expr::Member { obj, name } => {
+                    Ok(Expr::MemberIncDec { obj, name, inc, prefix: true })
+                }
+                Expr::Index { obj, index } => {
+                    Ok(Expr::IndexIncDec { obj, index, inc, prefix: true })
+                }
                 _ => Err(ParseError("invalid increment/decrement target".into())),
             };
         }
@@ -930,7 +1009,13 @@ impl<'a> Parser<'a> {
 
     /// 後置（呼び出し `()`・メンバー `.prop`・インデックス `[i]`）。
     fn parse_postfix(&mut self) -> Result<Expr, ParseError> {
-        let mut base = self.parse_primary()?;
+        let base = self.parse_primary()?;
+        self.parse_postfix_suffix(base)
+    }
+
+    /// 後置演算の連鎖（`base` に対する `.prop` / `[i]` / 呼び出し / `++`/`--`）。
+    /// `new` 式の結果にも適用できるよう `parse_postfix` から分離。
+    fn parse_postfix_suffix(&mut self, mut base: Expr) -> Result<Expr, ParseError> {
         loop {
             if self.at_punct(Punct::LParen)? {
                 self.bump()?;
@@ -971,6 +1056,12 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 return match base {
                     Expr::Ident(name) => Ok(Expr::IncDec { name, inc, prefix: false }),
+                    Expr::Member { obj, name } => {
+                        Ok(Expr::MemberIncDec { obj, name, inc, prefix: false })
+                    }
+                    Expr::Index { obj, index } => {
+                        Ok(Expr::IndexIncDec { obj, index, inc, prefix: false })
+                    }
                     _ => Err(ParseError("invalid increment/decrement target".into())),
                 };
             } else {
@@ -989,7 +1080,6 @@ impl<'a> Parser<'a> {
             Token::Kw(Keyword::True) => Ok(Expr::Bool(true)),
             Token::Kw(Keyword::False) => Ok(Expr::Bool(false)),
             Token::Kw(Keyword::Null) => Ok(Expr::Null),
-            Token::Kw(Keyword::Undefined) => Ok(Expr::Undef),
             Token::Kw(Keyword::This) => Ok(Expr::This),
             Token::Kw(Keyword::Super) => {
                 // super(args): 親コンストラクタ呼び出し（this で呼ぶ）
@@ -1049,6 +1139,16 @@ impl<'a> Parser<'a> {
                 // ロールバックしてグループ式
                 self.restore_state(saved);
                 let e = self.parse_expr()?;
+                // シーケンス式 `(a, b, c)`（コンマ演算子。括弧内のみ。関数呼び出しの
+                // 引数区切りと衝突しないよう、グループ式の内側に限定する）。
+                if self.at_punct(Punct::Comma)? {
+                    let mut items = vec![e];
+                    while self.eat_punct(Punct::Comma)? {
+                        items.push(self.parse_expr()?);
+                    }
+                    self.expect_punct(Punct::RParen, "')'")?;
+                    return Ok(Expr::Seq(items));
+                }
                 self.expect_punct(Punct::RParen, "')'")?;
                 Ok(e)
             }
@@ -1335,6 +1435,20 @@ impl<'a> Parser<'a> {
 
     /// 文をパースする。
     fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+        // ラベル文 `label: statement`（識別子 + ':'。キーワードは識別子ではないため
+        // 衝突しない。`break label` / `continue label` の対象）。
+        if let Token::Ident(_) = self.peek()? {
+            let saved = self.save_state();
+            let label = match self.bump()? {
+                Token::Ident(n) => n.to_string(),
+                _ => unreachable!(),
+            };
+            if self.eat_punct(Punct::Colon)? {
+                let body = self.parse_stmt()?;
+                return Ok(Stmt::Labeled { label, body: Box::new(body) });
+            }
+            self.restore_state(saved);
+        }
         // 空文
         if self.at_punct(Punct::Semi)? {
             self.bump()?;
@@ -1368,17 +1482,32 @@ impl<'a> Parser<'a> {
         }
         if self.at_kw(Keyword::Break)? {
             self.bump()?;
+            // ラベル付き break（改行を挟む場合はラベルとみなさない簡易近似）
+            let label = if let Token::Ident(n) = self.peek()? {
+                let n = n.to_string();
+                self.bump()?;
+                Some(n)
+            } else {
+                None
+            };
             if self.at_punct(Punct::Semi)? {
                 self.bump()?;
             }
-            return Ok(Stmt::Break);
+            return Ok(Stmt::Break(label));
         }
         if self.at_kw(Keyword::Continue)? {
             self.bump()?;
+            let label = if let Token::Ident(n) = self.peek()? {
+                let n = n.to_string();
+                self.bump()?;
+                Some(n)
+            } else {
+                None
+            };
             if self.at_punct(Punct::Semi)? {
                 self.bump()?;
             }
-            return Ok(Stmt::Continue);
+            return Ok(Stmt::Continue(label));
         }
         if self.at_kw(Keyword::Async)? {
             self.bump()?; // async
@@ -1446,19 +1575,31 @@ impl<'a> Parser<'a> {
             }
             return Ok(Stmt::Destructure { pattern, init });
         }
-        let name = match self.bump()? {
-            Token::Ident(n) => n.to_string(),
-            other => return Err(ParseError(format!("expected identifier, got {other:?}"))),
-        };
-        let init = if self.eat_punct(Punct::Assign)? {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+        // 複数の宣言子 `var a = 1, b = 2, c;`（ES5 慣用。lodash 等が依存）。
+        let mut decls: Vec<Stmt> = Vec::new();
+        loop {
+            let name = match self.bump()? {
+                Token::Ident(n) => n.to_string(),
+                other => return Err(ParseError(format!("expected identifier, got {other:?}"))),
+            };
+            let init = if self.eat_punct(Punct::Assign)? {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            decls.push(Stmt::Var { name, init });
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
         if self.at_punct(Punct::Semi)? {
             self.bump()?;
         }
-        Ok(Stmt::Var { name, init })
+        if decls.len() == 1 {
+            Ok(decls.pop().unwrap())
+        } else {
+            Ok(Stmt::Block(decls))
+        }
     }
 
     /// 分割代入パターン（配列 `[a, b, ...r]` / オブジェクト `{a, b: x}`）。

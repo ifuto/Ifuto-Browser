@@ -56,6 +56,7 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
         break_patches: Vec::new(),
         continue_patches: Vec::new(),
         cur_is_async: false,
+        labels: HashMap::new(),
     };
 
     // パス 1: トップレベル関数宣言を収集・登録（box 化ローカルを解析してから）
@@ -111,6 +112,8 @@ struct Compiler<'a> {
     continue_patches: Vec<Vec<usize>>,
     /// 現在コンパイル中の関数が async か（`return` を Promise で包む）。
     cur_is_async: bool,
+    /// ラベル名 → break/continue patch リストの深さ（`break label` / `continue label` 用）。
+    labels: HashMap<String, usize>,
 }
 
 impl Compiler<'_> {
@@ -663,16 +666,45 @@ impl Compiler<'_> {
                 // x op= y  →  x = x op y（値は新値）
                 self.gen_load(name, code)?;
                 self.gen_expr(rhs, code)?;
-                code.push(match op {
-                    BinOp::Add => Op::Add,
-                    BinOp::Sub => Op::Sub,
-                    BinOp::Mul => Op::Mul,
-                    BinOp::Div => Op::Div,
-                    BinOp::Mod => Op::Mod,
-                    _ => return Err(CompileError("invalid compound assignment operator".into())),
-                });
+                code.push(self.binop_op(op)?);
                 code.push(Op::Dup);
                 self.gen_store(name, code)?;
+            }
+            Expr::MemberCompoundAssign { obj, name, op, rhs } => {
+                // obj.name op= rhs → obj.name = obj.name op rhs（obj は 1 回評価）
+                let tobj = self.rt.intern("\x01mca_obj").ok_or_else(|| CompileError("intern failed".into()))?;
+                let tval = self.rt.intern("\x01mca_val").ok_or_else(|| CompileError("intern failed".into()))?;
+                let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+                self.gen_expr(obj, code)?;
+                code.push(Op::GStore(tobj));
+                code.push(Op::GLoad(tobj));
+                code.push(Op::PLoad(name_id));
+                self.gen_expr(rhs, code)?;
+                code.push(self.binop_op(op)?);
+                code.push(Op::GStore(tval));
+                code.push(Op::GLoad(tobj));
+                code.push(Op::GLoad(tval));
+                code.push(Op::PStore(name_id));
+            }
+            Expr::IndexCompoundAssign { obj, index, op, rhs } => {
+                // obj[idx] op= rhs → obj[idx] = obj[idx] op rhs（obj/index は 1 回評価）
+                let tobj = self.rt.intern("\x01ica_obj").ok_or_else(|| CompileError("intern failed".into()))?;
+                let tidx = self.rt.intern("\x01ica_idx").ok_or_else(|| CompileError("intern failed".into()))?;
+                let tval = self.rt.intern("\x01ica_val").ok_or_else(|| CompileError("intern failed".into()))?;
+                self.gen_expr(obj, code)?;
+                code.push(Op::GStore(tobj));
+                self.gen_expr(index, code)?;
+                code.push(Op::GStore(tidx));
+                code.push(Op::GLoad(tobj));
+                code.push(Op::GLoad(tidx));
+                code.push(Op::AGet);
+                self.gen_expr(rhs, code)?;
+                code.push(self.binop_op(op)?);
+                code.push(Op::GStore(tval));
+                code.push(Op::GLoad(tobj));
+                code.push(Op::GLoad(tidx));
+                code.push(Op::GLoad(tval));
+                code.push(Op::ASet);
             }
             Expr::IncDec { name, inc, prefix } => {
                 if *prefix {
@@ -690,6 +722,12 @@ impl Compiler<'_> {
                     code.push(if *inc { Op::Add } else { Op::Sub });
                     self.gen_store(name, code)?;
                 }
+            }
+            Expr::MemberIncDec { obj, name, inc, prefix } => {
+                self.gen_member_incdec(obj, name, *inc, *prefix, code)?;
+            }
+            Expr::IndexIncDec { obj, index, inc, prefix } => {
+                self.gen_index_incdec(obj, index, *inc, *prefix, code)?;
             }
             Expr::LogicalAssign { target, op, rhs } => {
                 // x ||= y → falsy なら x = y（値は新 x）。&&= は truthy、??= は nullish。
@@ -784,6 +822,15 @@ impl Compiler<'_> {
             Expr::Await(operand) => {
                 self.gen_expr(operand, code)?;
                 code.push(Op::Await);
+            }
+            Expr::Seq(items) => {
+                // 左から順に評価し、最後の値だけ残す（コンマ演算子の値）。
+                for (i, e) in items.iter().enumerate() {
+                    self.gen_expr(e, code)?;
+                    if i + 1 < items.len() {
+                        code.push(Op::Pop);
+                    }
+                }
             }
             Expr::This => {
                 code.push(Op::This);
@@ -1040,23 +1087,62 @@ impl Compiler<'_> {
                     code[idx] = Op::Jmp(cond_target as u32);
                 }
             }
-            Stmt::Break => {
-                let patches = self
-                    .break_patches
-                    .last_mut()
-                    .ok_or_else(|| CompileError("break outside loop".into()))?;
+            Stmt::Break(label) => {
                 let idx = code.len();
                 code.push(Op::Jmp(0)); // プレースホルダ
-                patches.push(idx);
+                match label {
+                    Some(l) => {
+                        let depth = *self
+                            .labels
+                            .get(l)
+                            .ok_or_else(|| CompileError(format!("undefined label: {l}")))?;
+                        let patches = self
+                            .break_patches
+                            .get_mut(depth)
+                            .ok_or_else(|| CompileError("break outside loop".into()))?;
+                        patches.push(idx);
+                    }
+                    None => {
+                        let patches = self
+                            .break_patches
+                            .last_mut()
+                            .ok_or_else(|| CompileError("break outside loop".into()))?;
+                        patches.push(idx);
+                    }
+                }
             }
-            Stmt::Continue => {
-                let patches = self
-                    .continue_patches
-                    .last_mut()
-                    .ok_or_else(|| CompileError("continue outside loop".into()))?;
+            Stmt::Continue(label) => {
                 let idx = code.len();
                 code.push(Op::Jmp(0)); // プレースホルダ
-                patches.push(idx);
+                match label {
+                    Some(l) => {
+                        let depth = *self
+                            .labels
+                            .get(l)
+                            .ok_or_else(|| CompileError(format!("undefined label: {l}")))?;
+                        let patches = self
+                            .continue_patches
+                            .get_mut(depth)
+                            .ok_or_else(|| CompileError("continue outside loop".into()))?;
+                        patches.push(idx);
+                    }
+                    None => {
+                        let patches = self
+                            .continue_patches
+                            .last_mut()
+                            .ok_or_else(|| CompileError("continue outside loop".into()))?;
+                        patches.push(idx);
+                    }
+                }
+            }
+            Stmt::Labeled { label, body } => {
+                // ラベル付きループ: ループの break/continue patch リストの深さを記録。
+                // ループは gen_stmt(body) 内で break_patches.push するため、その push 先の
+                // index（= 現在の深さ）をラベルに紐付ける。
+                let depth = self.break_patches.len();
+                self.labels.insert(label.clone(), depth);
+                self.gen_stmt(body, code)?;
+                self.labels.remove(label);
             }
             Stmt::FuncDecl { name, params, rest, body, is_gen, is_async } => {
                 // ネスト関数宣言: 現在フレームの env を共有するクロージャを生成して束縛
@@ -1347,6 +1433,115 @@ impl Compiler<'_> {
         }
         Ok(())
     }
+
+    /// 複合代入の演算子 `BinOp` → 対応する `Op`（対応外は Err）。
+    fn binop_op(&self, op: &BinOp) -> Result<Op, CompileError> {
+        Ok(match op {
+            BinOp::Add => Op::Add,
+            BinOp::Sub => Op::Sub,
+            BinOp::Mul => Op::Mul,
+            BinOp::Div => Op::Div,
+            BinOp::Mod => Op::Mod,
+            BinOp::BShl => Op::BShl,
+            BinOp::BShr => Op::BShr,
+            BinOp::BUShr => Op::BUShr,
+            BinOp::BAnd => Op::BAnd,
+            BinOp::BOr => Op::BOr,
+            BinOp::BXor => Op::BXor,
+            _ => return Err(CompileError("invalid compound assignment operator".into())),
+        })
+    }
+
+    /// `obj.name++` / `--obj.name` のコード生成（`obj` は 1 回評価）。
+    fn gen_member_incdec(
+        &mut self,
+        obj: &Expr,
+        name: &str,
+        inc: bool,
+        prefix: bool,
+        code: &mut Vec<Op>,
+    ) -> Result<(), CompileError> {
+        let tobj = self.rt.intern("\x01mio_obj").ok_or_else(|| CompileError("intern failed".into()))?;
+        let tval = self.rt.intern("\x01mio_val").ok_or_else(|| CompileError("intern failed".into()))?;
+        let told = self.rt.intern("\x01mio_old").ok_or_else(|| CompileError("intern failed".into()))?;
+        let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+        let op = if inc { Op::Add } else { Op::Sub };
+        self.gen_expr(obj, code)?;
+        code.push(Op::GStore(tobj));
+        if prefix {
+            code.push(Op::GLoad(tobj));
+            code.push(Op::PLoad(name_id));
+            code.push(Op::ConstI(1));
+            code.push(op);
+            code.push(Op::GStore(tval));
+            code.push(Op::GLoad(tobj));
+            code.push(Op::GLoad(tval));
+            code.push(Op::PStore(name_id));
+        } else {
+            code.push(Op::GLoad(tobj));
+            code.push(Op::PLoad(name_id));
+            code.push(Op::Dup);
+            code.push(Op::GStore(told));
+            code.push(Op::ConstI(1));
+            code.push(op);
+            code.push(Op::GStore(tval));
+            code.push(Op::GLoad(tobj));
+            code.push(Op::GLoad(tval));
+            code.push(Op::PStore(name_id));
+            code.push(Op::Pop);
+            code.push(Op::GLoad(told));
+        }
+        Ok(())
+    }
+
+    /// `obj[i]++` / `--obj[i]` のコード生成（`obj`/`index` は 1 回評価）。
+    #[allow(clippy::too_many_arguments)]
+    fn gen_index_incdec(
+        &mut self,
+        obj: &Expr,
+        index: &Expr,
+        inc: bool,
+        prefix: bool,
+        code: &mut Vec<Op>,
+    ) -> Result<(), CompileError> {
+        let tobj = self.rt.intern("\x01iio_obj").ok_or_else(|| CompileError("intern failed".into()))?;
+        let tidx = self.rt.intern("\x01iio_idx").ok_or_else(|| CompileError("intern failed".into()))?;
+        let tval = self.rt.intern("\x01iio_val").ok_or_else(|| CompileError("intern failed".into()))?;
+        let told = self.rt.intern("\x01iio_old").ok_or_else(|| CompileError("intern failed".into()))?;
+        let op = if inc { Op::Add } else { Op::Sub };
+        self.gen_expr(obj, code)?;
+        code.push(Op::GStore(tobj));
+        self.gen_expr(index, code)?;
+        code.push(Op::GStore(tidx));
+        if prefix {
+            code.push(Op::GLoad(tobj));
+            code.push(Op::GLoad(tidx));
+            code.push(Op::AGet);
+            code.push(Op::ConstI(1));
+            code.push(op);
+            code.push(Op::GStore(tval));
+            code.push(Op::GLoad(tobj));
+            code.push(Op::GLoad(tidx));
+            code.push(Op::GLoad(tval));
+            code.push(Op::ASet);
+        } else {
+            code.push(Op::GLoad(tobj));
+            code.push(Op::GLoad(tidx));
+            code.push(Op::AGet);
+            code.push(Op::Dup);
+            code.push(Op::GStore(told));
+            code.push(Op::ConstI(1));
+            code.push(op);
+            code.push(Op::GStore(tval));
+            code.push(Op::GLoad(tobj));
+            code.push(Op::GLoad(tidx));
+            code.push(Op::GLoad(tval));
+            code.push(Op::ASet);
+            code.push(Op::Pop);
+            code.push(Op::GLoad(told));
+        }
+        Ok(())
+    }
 }
 
 /// 関数本体（ブロック）内の `var`/`let`/`const` 宣言名を収集してローカルスロットに割り当てる。
@@ -1367,6 +1562,7 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
                 }
             }
             Stmt::Block(inner) => collect_vars(inner, locals),
+            Stmt::Labeled { body, .. } => collect_vars(std::slice::from_ref(body), locals),
             Stmt::If { then, else_, .. } => {
                 collect_vars(std::slice::from_ref(then), locals);
                 if let Some(e) = else_ {
@@ -1550,9 +1746,10 @@ fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
             }
             Stmt::Import { .. } => {}
             Stmt::Block(inner) => collect_refs(inner, out),
+            Stmt::Labeled { body, .. } => collect_refs(std::slice::from_ref(body), out),
             // ネスト関数宣言の中身は、その関数自身の自由変数として別途解析されるため
             // ここでは名前（束縛先）だけを参照扱いしない（locals で解決される）。
-            Stmt::FuncDecl { .. } | Stmt::Empty | Stmt::Break | Stmt::Continue => {}
+            Stmt::FuncDecl { .. } | Stmt::Empty | Stmt::Break(_) | Stmt::Continue(_) => {}
         }
     }
 }
@@ -1571,8 +1768,22 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             out.insert(name.clone());
             collect_expr_refs(rhs, out);
         }
+        Expr::MemberCompoundAssign { obj, rhs, .. } => {
+            collect_expr_refs(obj, out);
+            collect_expr_refs(rhs, out);
+        }
+        Expr::IndexCompoundAssign { obj, index, rhs, .. } => {
+            collect_expr_refs(obj, out);
+            collect_expr_refs(index, out);
+            collect_expr_refs(rhs, out);
+        }
         Expr::IncDec { name, .. } => {
             out.insert(name.clone());
+        }
+        Expr::MemberIncDec { obj, .. } => collect_expr_refs(obj, out),
+        Expr::IndexIncDec { obj, index, .. } => {
+            collect_expr_refs(obj, out);
+            collect_expr_refs(index, out);
         }
         Expr::Unary { operand, .. } => collect_expr_refs(operand, out),
         Expr::Bin { lhs, rhs, .. } => {
@@ -1657,6 +1868,11 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             }
         }
         Expr::Await(operand) => collect_expr_refs(operand, out),
+        Expr::Seq(items) => {
+            for e in items {
+                collect_expr_refs(e, out);
+            }
+        }
         Expr::New { callee, args } => {
             collect_expr_refs(callee, out);
             for a in args {
@@ -1685,6 +1901,7 @@ fn collect_nested_funcs(
                 out.push((name.clone(), params.clone(), body.clone()));
             }
             Stmt::Block(inner) => collect_nested_funcs(inner, out),
+            Stmt::Labeled { body, .. } => collect_nested_funcs(std::slice::from_ref(body), out),
             Stmt::If { then, else_, .. } => {
                 collect_nested_funcs(std::slice::from_ref(then), out);
                 if let Some(e) = else_ {
