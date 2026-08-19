@@ -41,6 +41,9 @@ pub mod codegen;
 /// 組み込み（フェーズ 5）。console / Math / String / Array メソッド。
 pub mod builtins;
 
+/// 簡易正規表現エンジン（フェーズ 2/3 の RegExp 相当）。
+pub mod regex;
+
 /// タグ空間マスク（上位 16 bit が 0xFFFF）。
 pub const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
 

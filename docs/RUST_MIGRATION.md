@@ -284,6 +284,15 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: cargo test 112 件 + clippy 緑（rest パラメータ・for-of/for-in の e2e）。
 
+### フェーズ 2/3 追補: 簡易正規表現エンジン（regex.rs）
+
+- 依存ゼロの自前 RegExp（C の akl_regex.c 相当のサブセット）: リテラル・`.`・
+  `*`/`+`/`?`・文字クラス `[...]`・`^`/`$`・代替 `|`・グループ `(...)`・`i` フラグ
+- バックトラッキング付き連結マッチ（`match_concat`）
+- `replace_first`（`$1` 展開）・`split` ヘルパ
+
+検証: cargo test 118 件 + clippy 緑（regex の e2e）。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）
