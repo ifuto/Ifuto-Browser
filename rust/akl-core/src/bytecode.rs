@@ -226,6 +226,8 @@ pub enum Op {
     MakeF(u32),
     /// 現在フレームの `this` を push。
     This,
+    /// 現在フレームの `arguments`（全引数の配列）を push。
+    Arguments,
     /// 空のプレーンオブジェクトを push（C の `OBJNEW`）。
     ObjNew,
     /// プロパティ読み出し（name 指定。obj を pop、値を push。C の `PLOAD`）。
@@ -369,6 +371,8 @@ struct Frame {
     locals: Vec<AklVal>,
     /// このフレームの `this`。
     this: AklVal,
+    /// このフレームの全引数（`arguments` オブジェクト用）。
+    args: Vec<AklVal>,
     /// クロージャ捕捉環境（無ければ None）。
     env: Option<ObjId>,
     /// 現在の try ブロックの catch 位置（無ければ None）。
@@ -469,6 +473,20 @@ impl Runtime {
     /// エラー文言を設定（C の `akl_errf` 相当）。
     pub fn set_err(&mut self, msg: impl Into<String>) {
         self.err = msg.into();
+    }
+
+    /// `TypeError: <msg>` を投げる（try/catch で捕捉可能な例外として）。
+    fn type_error(&mut self, msg: &str) -> VmError {
+        let text = format!("TypeError: {msg}");
+        let id = self.intern(&text).unwrap_or(0);
+        VmError::Thrown(AklVal::mk_obj(id))
+    }
+
+    /// `ReferenceError: <msg>` を投げる。
+    fn reference_error(&mut self, msg: &str) -> VmError {
+        let text = format!("ReferenceError: {msg}");
+        let id = self.intern(&text).unwrap_or(0);
+        VmError::Thrown(AklVal::mk_obj(id))
     }
 
     /// グローバル変数を name で読む（未宣言は None）。
@@ -620,6 +638,10 @@ impl Runtime {
                 | Some(Obj::ForeignNative { .. })
                 | Some(Obj::BoundMethod { .. })
         ) {
+            // 関数自身のプロパティ（`prototype` / `_.VERSION` 等）を優先
+            if let Some(v) = self.heap.prop_get(id, name) {
+                return v;
+            }
             return self
                 .func_methods
                 .iter()
@@ -685,19 +707,33 @@ impl Runtime {
             .map_err(|_| VmError::NotObject)
     }
 
+    /// 関数に既定の `prototype` オブジェクト（`constructor` が自身を指す）を付与する。
+    /// JS の `function foo(){}` は暗黙に `foo.prototype = { constructor: foo }` を持つ。
+    fn attach_default_proto(&mut self, fid: ObjId) -> Result<(), VmError> {
+        let pname = self.intern("prototype").ok_or(VmError::Oom)?;
+        // 既に prototype があれば何もしない
+        if self.heap.prop_get(fid, pname).is_some() {
+            return Ok(());
+        }
+        let proto = self.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+        // constructor を自身へ
+        let cname = self.intern("constructor").ok_or(VmError::Oom)?;
+        self.heap.prop_set(proto, cname, AklVal::mk_obj(fid)).map_err(|_| VmError::Oom)?;
+        self.heap.prop_set(fid, pname, AklVal::mk_obj(proto)).map_err(|_| VmError::Oom)?;
+        Ok(())
+    }
+
     /// 関数の prototype オブジェクトを取得（無ければ生成。C の `akl_fn_proto_get` 相当）。
     pub fn func_proto(&mut self, f: AklVal) -> Option<ObjId> {
         if !f.is_obj() {
             return None;
         }
         let fid = f.get_obj();
-        // 既存の "prototype" プロパティ（Obj の場合）
+        // 既存の "prototype" プロパティ（Obj / Func の場合）
         let pname = self.intern("prototype")?;
-        if let Some(Obj::Obj(props)) = self.heap.get(fid) {
-            if let Some((_, v)) = props.iter().find(|(n, _)| *n == pname) {
-                if v.is_obj() {
-                    return Some(v.get_obj());
-                }
+        if let Some(v) = self.heap.prop_get(fid, pname) {
+            if v.is_obj() {
+                return Some(v.get_obj());
             }
         }
         // fn_protos テーブルから探す
@@ -777,7 +813,7 @@ impl Runtime {
             let f = *f;
             return f(self, _this, args);
         }
-        if let Some(Obj::Func { fidx, env }) = self.heap.get(id) {
+        if let Some(Obj::Func { fidx, env, .. }) = self.heap.get(id) {
             let (fidx, env) = (*fidx, *env);
             // ジェネレータ関数は実行せずに Obj::Gen を返す（`call_value` は FFI 再入。
             // 通常の JS 呼び出しは do_call が処理）。
@@ -789,7 +825,7 @@ impl Runtime {
                 }
                 let gen_id = self
                     .heap
-                    .alloc(Obj::Gen { fidx, pc: 0, locals, env, this: _this, done: false })
+                    .alloc(Obj::Gen { fidx, pc: 0, locals, args: args.to_vec(), env, this: _this, done: false })
                     .map_err(|_| VmError::Oom)?;
                 return Ok(AklVal::mk_obj(gen_id));
             }
@@ -822,7 +858,7 @@ impl Runtime {
             for (i, a) in args.iter().enumerate().take(f.n_params) {
                 locals[i] = *a;
             }
-            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this, env: None, catch_pc: None, is_new: false });
+            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this, args: args.to_vec(), env: None, catch_pc: None, is_new: false });
         }
         match self.run_loop(stack, frames, pc, None)? {
             RunEnd::Value(v) => Ok(v),
@@ -995,8 +1031,13 @@ impl Runtime {
                     *dst = v;
                 }
                 Op::GLoad(name) => {
-                    let v = self.global_get(name).ok_or(VmError::GlobalNotFound)?;
-                    stack.push(v);
+                    // 未宣言グローバルは ReferenceError（JS 準拠。try/catch で捕捉可能）。
+                    match self.global_get(name) {
+                        Some(v) => stack.push(v),
+                        None => {
+                            return Err(self.reference_error("identifier is not defined"));
+                        }
+                    }
                 }
                 Op::GLoadSafe(name) => {
                     let v = self.global_get(name).unwrap_or(AklVal::UNDEF);
@@ -1249,6 +1290,10 @@ impl Runtime {
                     } else {
                         self.fn_protos.push((fid, proto.get_obj()));
                     }
+                    // 関数自身の `prototype` プロパティも差し替え（attach_default_proto の
+                    // 既定 proto を上書き。new が func_proto で正しい proto を得るため）
+                    let pname = self.intern("prototype").unwrap_or(0);
+                    let _ = self.heap.prop_set(fid, pname, proto);
                     stack.push(f);
                 }
                 Op::LinkSuper => {
@@ -1296,8 +1341,9 @@ impl Runtime {
                 Op::MakeF(fidx) => {
                     let id = self
                         .heap
-                        .alloc(Obj::Func { fidx, env: None })
+                        .alloc(Obj::Func { fidx, env: None, props: Vec::new() })
                         .map_err(|_| VmError::Oom)?;
+                    self.attach_default_proto(id)?;
                     stack.push(AklVal::mk_obj(id));
                 }
                 Op::Throw => {
@@ -1331,8 +1377,9 @@ impl Runtime {
                     let env = frames.last().and_then(|f| f.env);
                     let id = self
                         .heap
-                        .alloc(Obj::Func { fidx, env })
+                        .alloc(Obj::Func { fidx, env, props: Vec::new() })
                         .map_err(|_| VmError::Oom)?;
+                    self.attach_default_proto(id)?;
                     stack.push(AklVal::mk_obj(id));
                 }
                 Op::CeLoad(depth, idx) => {
@@ -1375,6 +1422,14 @@ impl Runtime {
                     let this = frames.last().ok_or(VmError::StackUnderflow)?.this;
                     stack.push(this);
                 }
+                Op::Arguments => {
+                    let args = frames.last().ok_or(VmError::StackUnderflow)?.args.clone();
+                    let id = self
+                        .heap
+                        .alloc(Obj::Arr(args))
+                        .map_err(|_| VmError::Oom)?;
+                    stack.push(AklVal::mk_obj(id));
+                }
                 Op::ObjNew => {
                     let id = self
                         .heap
@@ -1385,7 +1440,7 @@ impl Runtime {
                 Op::PLoad(name) => {
                     let obj = stack.pop().ok_or(VmError::StackUnderflow)?;
                     if !obj.is_obj() {
-                        return Err(VmError::NotObject);
+                        return Err(self.type_error("not an object"));
                     }
                     let id = obj.get_obj();
                     // ホストハンドル（DOM 要素等）のプロパティ解決。未知プロパティは
@@ -1410,7 +1465,7 @@ impl Runtime {
                     let val = stack.pop().ok_or(VmError::StackUnderflow)?;
                     let obj = stack.pop().ok_or(VmError::StackUnderflow)?;
                     if !obj.is_obj() {
-                        return Err(VmError::NotObject);
+                        return Err(self.type_error("not an object"));
                     }
                     let id = obj.get_obj();
                     // 配列の length セッター（`arr.length = n` で伸縮）
@@ -1603,7 +1658,7 @@ impl Runtime {
                     let idx = stack.pop().ok_or(VmError::StackUnderflow)?;
                     let obj = stack.pop().ok_or(VmError::StackUnderflow)?;
                     if !obj.is_obj() {
-                        return Err(VmError::NotObject);
+                        return Err(self.type_error("not an object"));
                     }
                     let id = obj.get_obj();
                     // ホストハンドルのブラケットアクセス（キー文字列で get）
@@ -1644,7 +1699,7 @@ impl Runtime {
                     let idx = stack.pop().ok_or(VmError::StackUnderflow)?;
                     let obj = stack.pop().ok_or(VmError::StackUnderflow)?;
                     if !obj.is_obj() {
-                        return Err(VmError::NotObject);
+                        return Err(self.type_error("not an object"));
                     }
                     let id = obj.get_obj();
                     if let Some(Obj::Arr(_)) = self.heap.get(id) {
@@ -1825,7 +1880,7 @@ impl Runtime {
         // OBJ コンストラクタのフォールバック（Date 等）
         let callee = self.ctor_of(callee);
         if !callee.is_obj() {
-            return Err(VmError::NotCallable);
+            return Err(self.type_error("not a function"));
         }
         let id = callee.get_obj();
         // ハンドル束縛メソッド: vtable の call へディスパッチ
@@ -1865,8 +1920,8 @@ impl Runtime {
             return Ok(Some(r));
         }
         let (fidx, env) = match self.heap.get(id) {
-            Some(Obj::Func { fidx, env }) => (*fidx, *env),
-            _ => return Err(VmError::NotCallable),
+            Some(Obj::Func { fidx, env, .. }) => (*fidx, *env),
+            _ => return Err(self.type_error("not a function")),
         };
         let (n_params, n_locals, rest_slot, is_gen) = {
             let f = self.funcs.get(fidx as usize).ok_or(VmError::NotCallable)?;
@@ -1894,12 +1949,12 @@ impl Runtime {
         if is_gen {
             let gen_id = self
                 .heap
-                .alloc(Obj::Gen { fidx, pc: 0, locals, env, this: this_v, done: false })
+                .alloc(Obj::Gen { fidx, pc: 0, locals, args: args.to_vec(), env, this: this_v, done: false })
                 .map_err(|_| VmError::Oom)?;
             return Ok(Some(AklVal::mk_obj(gen_id)));
         }
         let ret_pc = *pc + 1;
-        frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env, catch_pc: None, is_new: false });
+        frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, args: args.to_vec(), env, catch_pc: None, is_new: false });
         *pc = 0;
         Ok(None)
     }
@@ -1907,9 +1962,9 @@ impl Runtime {
     /// ジェネレータを 1 段進める（`gen.next()`）。戻り値は `{ value, done }` の
     /// プレーンオブジェクト。C の `AKL_OK_GEN` の `gen_next` 相当。
     pub fn gen_resume(&mut self, gen_id: ObjId) -> Result<AklVal, VmError> {
-        let (fidx, pc, locals, env, this, done) = match self.heap.get(gen_id) {
-            Some(Obj::Gen { fidx, pc, locals, env, this, done }) => {
-                (*fidx, *pc, locals.clone(), *env, *this, *done)
+        let (fidx, pc, locals, args, env, this, done) = match self.heap.get(gen_id) {
+            Some(Obj::Gen { fidx, pc, locals, args, env, this, done }) => {
+                (*fidx, *pc, locals.clone(), args.clone(), *env, *this, *done)
             }
             _ => return Err(VmError::NotCallable),
         };
@@ -1921,6 +1976,7 @@ impl Runtime {
             ret_pc: 0,
             locals,
             this,
+            args,
             env,
             catch_pc: None,
             is_new: false,
@@ -2561,7 +2617,7 @@ mod tests {
                 *op = Op::GLoad(fib_name);
             }
         }
-        let fib_obj = rt.heap.alloc(Obj::Func { fidx, env: None }).unwrap();
+        let fib_obj = rt.heap.alloc(Obj::Func { fidx, env: None, props: Vec::new() }).unwrap();
         rt.global_set(fib_name, AklVal::mk_obj(fib_obj));
         (rt, fidx)
     }
@@ -2681,7 +2737,8 @@ mod tests {
         let code = vec![Op::ConstI(5), Op::Call(0), Op::Ret];
         let fidx = rt.funcs.len() as u32;
         rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
-        assert_eq!(rt.run(fidx, &[]), Err(VmError::NotCallable));
+        // 非呼び出し対象の呼び出しは TypeError を投げる（try/catch で捕捉可能）
+        assert!(matches!(rt.run(fidx, &[]), Err(VmError::Thrown(_))));
     }
 
     #[test]

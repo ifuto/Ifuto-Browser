@@ -327,7 +327,23 @@ pub unsafe extern "C" fn akl_eval(rt: *mut AklRT, src: *const c_char, out: *mut 
             true
         }
         Err(e) => {
-            set_err(rt, &vm_err_string(&e));
+            // Thrown（例外値）は文字列なら内容を、それ以外は汎用文言を返す。
+            let msg = match &e {
+                VmError::Thrown(v) => {
+                    if v.is_obj() {
+                        let s = rt.rt.flatten_str(*v);
+                        if !s.is_empty() {
+                            s
+                        } else {
+                            vm_err_string(&e)
+                        }
+                    } else {
+                        vm_err_string(&e)
+                    }
+                }
+                _ => vm_err_string(&e),
+            };
+            set_err(rt, &msg);
             false
         }
     }

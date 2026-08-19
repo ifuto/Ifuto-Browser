@@ -21,7 +21,7 @@
 #![warn(missing_docs)]
 
 use crate::bytecode::{Runtime, VmError};
-use crate::obj::Obj;
+use crate::obj::{Obj, ObjId};
 use crate::AklVal;
 
 /// 全組み込みをランタイムに登録する（C の `akl_builtins_install` 相当）。
@@ -63,7 +63,16 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     rt.register_global_native("parseFloat", parse_float)?;
     rt.register_global_native("isNaN", is_nan)?;
     rt.register_global_native("Number", number_ctor)?;
-    rt.register_global_native("String", string_ctor)?;
+    // String はコンストラクタオブジェクト（constructor + prototype）として登録
+    // （lodash が `String.prototype.replace` 等を使うため）。install_string_methods で
+    // prototype を構築する。
+    {
+        let s_id = rt.intern("String").ok_or(VmError::Oom)?;
+        let s_obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+        let ctor = rt.register_native(string_ctor)?;
+        rt.heap.prop_set(s_obj, rt.ctor_name, ctor).map_err(|_| VmError::Oom)?;
+        rt.global_set(s_id, AklVal::mk_obj(s_obj));
+    }
 
     // globalThis ハンドル + 基本コンストラクタ（lodash の root 検出・環境判定用）
     install_global_this_and_ctors(rt)?;
@@ -368,6 +377,26 @@ fn is_finite(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     Ok(AklVal::from_bool(d.is_finite()))
 }
 
+/// `Function.prototype.toString.call(fn)` → 関数ソース近似（lodash の native 検出用）。
+fn function_to_string(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = if this.is_obj()
+        && matches!(rt.heap.get(this.get_obj()), Some(Obj::Func { .. }) | Some(Obj::Native(_)))
+    {
+        "function () { [native code] }"
+    } else {
+        "function () {}"
+    };
+    let id = rt.intern(s).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Function.prototype.bind(thisArg, ...)`：束縛関数を返す簡易近似（thisArg を無視し、
+/// 元関数をそのまま返す。lodash は bind を直接は使わないが API を揃える）。
+fn function_bind(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let _ = rt;
+    Ok(this)
+}
+
 /// globalThis ハンドル + `Function` / `Array` / `Boolean` コンストラクタを登録。
 fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
     // globalThis（プロパティアクセスをグローバル解決に写像するハンドル）
@@ -378,8 +407,28 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
     let gt_name = rt.intern("globalThis").ok_or(VmError::Oom)?;
     rt.global_set(gt_name, AklVal::mk_obj(gt));
 
-    // Function / Boolean
-    rt.register_global_native("Function", function_ctor)?;
+    // Function: constructor + prototype（call/apply/bind/toString）。lodash の
+    // `funcProto = Function.prototype; funcProto.toString.call(...)` に必要。
+    let fn_id = rt.intern("Function").ok_or(VmError::Oom)?;
+    let fn_obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let ctor = rt.register_native(function_ctor)?;
+    rt.heap.prop_set(fn_obj, rt.ctor_name, ctor).map_err(|_| VmError::Oom)?;
+    let fn_proto = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    for (name, f) in [
+        ("toString", function_to_string as crate::bytecode::NativeFn),
+        ("call", func_call),
+        ("apply", func_apply),
+        ("bind", function_bind),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(fn_proto, nid, v).map_err(|_| VmError::Oom)?;
+    }
+    let proto_name = rt.intern("prototype").ok_or(VmError::Oom)?;
+    rt.heap.prop_set(fn_obj, proto_name, AklVal::mk_obj(fn_proto)).map_err(|_| VmError::Oom)?;
+    rt.global_set(fn_id, AklVal::mk_obj(fn_obj));
+
+    // Boolean
     rt.register_global_native("Boolean", boolean_ctor)?;
     // RegExp / Symbol / isFinite（lodash の環境判定・正規表現生成用）
     rt.register_global_native("RegExp", regexp_ctor)?;
@@ -406,6 +455,7 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
 /// String.prototype メソッドを登録（C の `str_meth_vals` 相当。文字列リテラルの
 /// メソッド解決用に `rt.str_methods` へ登録）。`length` はプロパティなので除外。
 fn install_string_methods(rt: &mut Runtime) -> Result<(), VmError> {
+    let mut prototype = Vec::new();
     for (name, f) in [
         ("toUpperCase", str_to_upper as crate::bytecode::NativeFn),
         ("toLowerCase", str_to_lower),
@@ -426,6 +476,14 @@ fn install_string_methods(rt: &mut Runtime) -> Result<(), VmError> {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
         rt.str_methods.push((nid, v));
+        prototype.push((nid, v));
+    }
+    // String.prototype を構築して String コンストラクタに設定
+    let s_id = rt.intern("String").ok_or(VmError::Oom)?;
+    if let Some(sv) = rt.global_get(s_id) {
+        if sv.is_obj() {
+            attach_prototype(rt, sv.get_obj(), &prototype)?;
+        }
     }
     Ok(())
 }
@@ -552,7 +610,10 @@ fn str_match(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     let rx_v = a.first().copied().unwrap_or(AklVal::UNDEF);
     if let Some((pattern, flags)) = regex_of(rt, rx_v) {
         let flag_num = flags_to_num(&flags);
-        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
+        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
+        VmError::Thrown(AklVal::mk_obj(msg))
+    })?;
         if flags.contains('g') {
             // g フラグ: 全マッチの配列
             let matches = rx.find_all(&s);
@@ -600,7 +661,10 @@ fn str_replace(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, V
     let callable = is_callable(rt, repl_v);
     let out = if let Some((pattern, flags)) = regex_of(rt, rx_v) {
         let flag_num = flags_to_num(&flags);
-        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
+        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
+        VmError::Thrown(AklVal::mk_obj(msg))
+    })?;
         let global = flags.contains('g');
         if callable {
             replace_regex_fn(rt, &s, &rx, repl_v, global)?
@@ -693,7 +757,10 @@ fn regex_exec(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
         return Ok(AklVal::NULL);
     };
     let flag_num = flags_to_num(&flags);
-    let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+    let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
+        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
+        VmError::Thrown(AklVal::mk_obj(msg))
+    })?;
     match rx.find(&s) {
         Some(caps) => {
             let items: Vec<AklVal> = caps
@@ -714,7 +781,10 @@ fn regex_test(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
         return Ok(AklVal::FALSE);
     };
     let flag_num = flags_to_num(&flags);
-    let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+    let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
+        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
+        VmError::Thrown(AklVal::mk_obj(msg))
+    })?;
     Ok(AklVal::from_bool(rx.find(&s).is_some()))
 }
 
@@ -723,7 +793,10 @@ fn str_search(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
     let rx_v = a.first().copied().unwrap_or(AklVal::UNDEF);
     if let Some((pattern, flags)) = regex_of(rt, rx_v) {
         let flag_num = flags_to_num(&flags);
-        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
+        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
+        VmError::Thrown(AklVal::mk_obj(msg))
+    })?;
         match rx.find(&s) {
             Some(caps) => {
                 let idx = s.find(&caps[0]).unwrap_or(0);
@@ -741,7 +814,10 @@ fn str_split(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     let sep = a.first().copied().unwrap_or(AklVal::UNDEF);
     let parts: Vec<String> = if let Some((pattern, flags)) = regex_of(rt, sep) {
         let flag_num = flags_to_num(&flags);
-        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
+        let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
+        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
+        VmError::Thrown(AklVal::mk_obj(msg))
+    })?;
         crate::regex::split(&s, &rx)
     } else {
         let needle = to_js_string(rt, sep);
@@ -770,6 +846,7 @@ fn flags_to_num(flags: &str) -> u32 {
 
 /// Array.prototype メソッドを登録（C の `arr_meth_vals` 相当）。`length` はプロパティなので除外。
 fn install_array_methods(rt: &mut Runtime) -> Result<(), VmError> {
+    let mut prototype = Vec::new();
     for (name, f) in [
         ("push", arr_push as crate::bytecode::NativeFn),
         ("pop", arr_pop),
@@ -797,7 +874,28 @@ fn install_array_methods(rt: &mut Runtime) -> Result<(), VmError> {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
         rt.arr_methods.push((nid, v));
+        prototype.push((nid, v));
     }
+    // Array.prototype を構築して Array コンストラクタに設定
+    let a_id = rt.intern("Array").ok_or(VmError::Oom)?;
+    if let Some(av) = rt.global_get(a_id) {
+        if av.is_obj() {
+            attach_prototype(rt, av.get_obj(), &prototype)?;
+        }
+    }
+    Ok(())
+}
+
+/// メソッド表（name → native）から prototype オブジェクトを構築し、コンストラクタ
+/// オブジェクト `ctor` の `prototype` プロパティに設定する（`Array.prototype.slice`
+/// 等の `.prototype.X` 参照用。インスタンスメソッド解決はメソッド表経由で別に行う）。
+fn attach_prototype(rt: &mut Runtime, ctor: ObjId, methods: &[(ObjId, AklVal)]) -> Result<(), VmError> {
+    let proto = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    for (n, v) in methods {
+        rt.heap.prop_set(proto, *n, *v).map_err(|_| VmError::Oom)?;
+    }
+    let proto_name = rt.intern("prototype").ok_or(VmError::Oom)?;
+    rt.heap.prop_set(ctor, proto_name, AklVal::mk_obj(proto)).map_err(|_| VmError::Oom)?;
     Ok(())
 }
 
@@ -1344,11 +1442,26 @@ fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
         rt.heap.prop_set(obj, nid, v).map_err(|_| VmError::Oom)?;
     }
-    // Object.prototype（toString / hasOwnProperty。lodash の getTag / hasOwnProperty.call 用）
+    // Object 静的メソッド（lodash の環境判定・baseCreate 用）
+    for (name, f) in [
+        ("create", obj_create as crate::bytecode::NativeFn),
+        ("getPrototypeOf", obj_get_prototype_of),
+        ("getOwnPropertySymbols", obj_get_own_property_symbols),
+        ("getOwnPropertyNames", obj_keys),
+        ("defineProperty", obj_define_property),
+        ("setPrototypeOf", obj_set_prototype_of),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(obj, nid, v).map_err(|_| VmError::Oom)?;
+    }
+    // Object.prototype（toString / hasOwnProperty / propertyIsEnumerable。
+    // lodash の getTag / hasOwnProperty.call 用）
     let proto = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
     for (name, f) in [
         ("toString", object_proto_to_string as crate::bytecode::NativeFn),
         ("hasOwnProperty", object_proto_has_own_property),
+        ("propertyIsEnumerable", object_proto_property_is_enumerable),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -1402,6 +1515,82 @@ fn object_proto_to_string(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Resu
     let tag = object_tag(rt, this);
     let id = rt.intern(&format!("[object {tag}]")).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
+}
+
+/// `Object.create(proto)` → 新オブジェクト（`[[Prototype]]` = proto）。
+fn obj_create(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let proto = a.first().copied().unwrap_or(AklVal::NULL);
+    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    if proto.is_obj() {
+        rt.obj_set_proto(id, proto.get_obj())?;
+    }
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Object.getPrototypeOf(obj)` → `[[Prototype]]`（無ければ null）。
+fn obj_get_prototype_of(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let obj = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if obj.is_obj() {
+        if let Some(Obj::Obj(props)) = rt.heap.get(obj.get_obj()) {
+            if let Some((_, v)) = props.iter().find(|(n, _)| *n == rt.proto_name) {
+                if v.is_obj() {
+                    return Ok(*v);
+                }
+            }
+        }
+    }
+    Ok(AklVal::NULL)
+}
+
+/// `Object.getOwnPropertySymbols(obj)` → 空配列（Symbol 未実装の近似）。
+fn obj_get_own_property_symbols(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = rt.heap.alloc(Obj::Arr(Vec::new())).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Object.defineProperty(obj, key, desc)` → プロパティ設定（value 記述子のみ）。
+fn obj_define_property(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let obj = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let key = rt.flatten_str(a.get(1).copied().unwrap_or(AklVal::UNDEF));
+    let desc = a.get(2).copied().unwrap_or(AklVal::UNDEF);
+    let vname = rt.intern("value").ok_or(VmError::Oom)?;
+    let val = if desc.is_obj() {
+        if let Some(Obj::Obj(props)) = rt.heap.get(desc.get_obj()) {
+            props.iter().find(|(n, _)| *n == vname).map(|(_, v)| *v).unwrap_or(AklVal::UNDEF)
+        } else {
+            AklVal::UNDEF
+        }
+    } else {
+        AklVal::UNDEF
+    };
+    if obj.is_obj() {
+        let key_id = rt.intern(&key).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(obj.get_obj(), key_id, val).map_err(|_| VmError::Oom)?;
+    }
+    Ok(obj)
+}
+
+/// `Object.setPrototypeOf(obj, proto)`。
+fn obj_set_prototype_of(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let obj = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let proto = a.get(1).copied().unwrap_or(AklVal::UNDEF);
+    if obj.is_obj() && proto.is_obj() {
+        rt.obj_set_proto(obj.get_obj(), proto.get_obj())?;
+    }
+    Ok(obj)
+}
+
+/// `Object.prototype.propertyIsEnumerable.call(obj, key)` → own プロパティなら true。
+fn object_proto_property_is_enumerable(
+    rt: &mut Runtime,
+    this: AklVal,
+    a: &[AklVal],
+) -> Result<AklVal, VmError> {
+    let key = rt.flatten_str(a.first().copied().unwrap_or(AklVal::UNDEF));
+    let key_id = rt.intern(&key).ok_or(VmError::Oom)?;
+    let has = this.is_obj()
+        && matches!(rt.heap.get(this.get_obj()), Some(Obj::Obj(props)) if props.iter().any(|(n, _)| *n == key_id && *n != rt.proto_name));
+    Ok(AklVal::from_bool(has))
 }
 
 /// `Object.prototype.hasOwnProperty.call(obj, key)`。
@@ -1931,7 +2120,7 @@ fn call_native(rt: &mut Runtime, f: AklVal, this: AklVal, args: &[AklVal]) -> Re
         let nf = *nf;
         return nf(rt, this, args);
     }
-    if let Some(Obj::Func { fidx, env: _ }) = rt.heap.get(id) {
+    if let Some(Obj::Func { fidx, .. }) = rt.heap.get(id) {
         let fidx = *fidx;
         return rt.run(fidx, args);
     }

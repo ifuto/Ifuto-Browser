@@ -44,6 +44,8 @@ enum RegexNode {
     Repeat(Box<RegexNode>, u32, Option<u32>),
     /// グループ（index=捕捉番号）。
     Group(usize, Box<RegexNode>),
+    /// 先読み `(?=...)` / `(?!...)`（ゼロ幅。positive=true なら肯定）。
+    LookAhead { positive: bool, inner: Box<RegexNode> },
     /// 行頭 `^`。
     Start,
     /// 行末 `$`。
@@ -185,21 +187,118 @@ impl Parser {
     }
 
     fn parse_quantifier(&mut self, node: RegexNode) -> Result<RegexNode, String> {
-        match self.peek() {
+        let result = match self.peek() {
             Some('*') => {
                 self.pos += 1;
-                Ok(RegexNode::Repeat(Box::new(node), 0, None))
+                Some(RegexNode::Repeat(Box::new(node.clone()), 0, None))
             }
             Some('+') => {
                 self.pos += 1;
-                Ok(RegexNode::Repeat(Box::new(node), 1, None))
+                Some(RegexNode::Repeat(Box::new(node.clone()), 1, None))
             }
             Some('?') => {
                 self.pos += 1;
-                Ok(RegexNode::Repeat(Box::new(node), 0, Some(1)))
+                Some(RegexNode::Repeat(Box::new(node.clone()), 0, Some(1)))
             }
-            _ => Ok(node),
+            // `{m}` / `{m,}` / `{m,n}`
+            Some('{') => {
+                // 先読み: `{` の直後に数字が無ければリテラルとして扱う（`{` を消費しない）
+                let save = self.pos;
+                self.pos += 1;
+                if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                    self.pos = save;
+                    return Ok(node);
+                }
+                let m = self.parse_decimal()?;
+                let (min, max) = match self.peek() {
+                    Some('}') => {
+                        self.pos += 1;
+                        (m, Some(m))
+                    }
+                    Some(',') => {
+                        self.pos += 1;
+                        if self.peek() == Some('}') {
+                            self.pos += 1;
+                            (m, None)
+                        } else {
+                            let n = self.parse_decimal()?;
+                            self.pos += 1; // '}'
+                            (m, Some(n))
+                        }
+                    }
+                    _ => return Err("bad quantifier".to_string()),
+                };
+                Some(RegexNode::Repeat(Box::new(node.clone()), min, max))
+            }
+            _ => None,
+        };
+        // 遅延修飾子 `?`（`*?` `+?` `??` `{m,n}?`）は貪欲として近似（`?` を消費）。
+        if self.peek() == Some('?') {
+            self.pos += 1;
         }
+        Ok(result.unwrap_or(node))
+    }
+
+    /// 10 進整数を読む（数字が無ければ Err）。
+    fn parse_decimal(&mut self) -> Result<u32, String> {
+        let mut v = 0u32;
+        let mut any = false;
+        while let Some(c) = self.peek() {
+            if let Some(d) = c.to_digit(10) {
+                v = v.saturating_mul(10).saturating_add(d);
+                self.pos += 1;
+                any = true;
+            } else {
+                break;
+            }
+        }
+        if any {
+            Ok(v)
+        } else {
+            Err("expected digit".to_string())
+        }
+    }
+
+    /// `\uXXXX`（`\u` は消費済み）を読んで文字を返す。`\u{XXXX}` にも対応。
+    fn parse_unicode_escape(&mut self) -> Result<char, String> {
+        if self.peek() == Some('{') {
+            self.pos += 1;
+            let mut v = 0u32;
+            let mut any = false;
+            while let Some(c) = self.peek() {
+                if let Some(d) = c.to_digit(16) {
+                    v = v.saturating_mul(16).saturating_add(d);
+                    self.pos += 1;
+                    any = true;
+                } else {
+                    break;
+                }
+            }
+            if self.peek() == Some('}') {
+                self.pos += 1;
+            }
+            if any {
+                return Ok(char::from_u32(v).unwrap_or('?'));
+            }
+            return Err("bad \\u escape".to_string());
+        }
+        let mut v = 0u32;
+        for _ in 0..4 {
+            let c = self.peek().ok_or("bad \\u escape")?;
+            let d = c.to_digit(16).ok_or("bad \\u escape")?;
+            v = v * 16 + d;
+            self.pos += 1;
+        }
+        Ok(char::from_u32(v).unwrap_or('?'))
+    }
+
+    /// グループの閉じ `)` を期待（無ければ Err）。
+    fn expect_close_group(&mut self) -> Result<(), String> {
+        if self.peek() != Some(')') {
+            return Err("unclosed group".to_string());
+        }
+        self.pos += 1;
+        Ok(())
     }
 
     fn parse_atom(&mut self) -> Result<RegexNode, String> {
@@ -207,6 +306,31 @@ impl Parser {
         match c {
             '(' => {
                 self.pos += 1;
+                // 非捕捉グループ `(?:...)` / 先読み `(?=...)` / `(?!...)`
+                if self.peek() == Some('?') {
+                    self.pos += 1;
+                    match self.peek() {
+                        Some(':') => {
+                            self.pos += 1;
+                            let inner = self.parse_alt()?;
+                            self.expect_close_group()?;
+                            return Ok(inner);
+                        }
+                        Some('=') => {
+                            self.pos += 1;
+                            let inner = self.parse_alt()?;
+                            self.expect_close_group()?;
+                            return Ok(RegexNode::LookAhead { positive: true, inner: Box::new(inner) });
+                        }
+                        Some('!') => {
+                            self.pos += 1;
+                            let inner = self.parse_alt()?;
+                            self.expect_close_group()?;
+                            return Ok(RegexNode::LookAhead { positive: false, inner: Box::new(inner) });
+                        }
+                        _ => return Err("unsupported group construct".to_string()),
+                    }
+                }
                 self.group_count += 1;
                 let idx = self.group_count;
                 let inner = self.parse_alt()?;
@@ -257,6 +381,24 @@ impl Parser {
                         chars: vec![' ', '\t', '\n', '\r', '\u{0b}', '\u{0c}'],
                         ranges: vec![],
                     }),
+                    // `\uXXXX` / `\u{XXXX}` Unicode エスケープ → リテラル文字
+                    'u' => Ok(RegexNode::Literal(self.parse_unicode_escape()?)),
+                    // `\xXX` 16 進エスケープ → リテラル文字
+                    'x' => {
+                        let hi = self.peek().ok_or("trailing \\x")?;
+                        self.pos += 1;
+                        let lo = self.peek().ok_or("trailing \\x")?;
+                        self.pos += 1;
+                        let h = hi.to_digit(16).ok_or("bad \\x escape")?;
+                        let l = lo.to_digit(16).ok_or("bad \\x escape")?;
+                        Ok(RegexNode::Literal(char::from_u32(h * 16 + l).unwrap_or('?')))
+                    }
+                    'n' => Ok(RegexNode::Literal('\n')),
+                    't' => Ok(RegexNode::Literal('\t')),
+                    'r' => Ok(RegexNode::Literal('\r')),
+                    'f' => Ok(RegexNode::Literal('\u{0c}')),
+                    'v' => Ok(RegexNode::Literal('\u{0b}')),
+                    '0' => Ok(RegexNode::Literal('\0')),
                     _ => Ok(RegexNode::Literal(e)),
                 }
             }
@@ -282,7 +424,55 @@ impl Parser {
                 self.pos += 1;
                 return Ok(RegexNode::Class { negated, chars, ranges });
             }
-            self.pos += 1;
+            // エスケープ（`\uXXXX` / `\xXX` / `\\` / `\-` 等）
+            let c = if c == '\\' {
+                self.pos += 1;
+                let e = self.peek().ok_or("trailing backslash in class")?;
+                match e {
+                    'u' => {
+                        self.pos += 1;
+                        self.parse_unicode_escape()?
+                    }
+                    'x' => {
+                        self.pos += 1;
+                        let hi = self.peek().ok_or("trailing \\x")?;
+                        self.pos += 1;
+                        let lo = self.peek().ok_or("trailing \\x")?;
+                        self.pos += 1;
+                        let h = hi.to_digit(16).ok_or("bad \\x")?;
+                        let l = lo.to_digit(16).ok_or("bad \\x")?;
+                        char::from_u32(h * 16 + l).unwrap_or('?')
+                    }
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    'f' => '\u{0c}',
+                    'd' => {
+                        // `\d` は範囲 [0-9] に展開
+                        self.pos += 1;
+                        ranges.push(('0', '9'));
+                        continue;
+                    }
+                    's' => {
+                        self.pos += 1;
+                        chars.extend([' ', '\t', '\n', '\r', '\u{0b}', '\u{0c}']);
+                        continue;
+                    }
+                    'w' => {
+                        self.pos += 1;
+                        chars.push('_');
+                        ranges.extend([('0', '9'), ('A', 'Z'), ('a', 'z')]);
+                        continue;
+                    }
+                    _ => {
+                        self.pos += 1;
+                        e
+                    }
+                }
+            } else {
+                self.pos += 1;
+                c
+            };
             // 範囲 a-z
             if self.peek() == Some('-') {
                 let next = self.chars.get(self.pos + 1).copied();
@@ -394,6 +584,20 @@ fn match_at(
                 caps[gidx] = saved;
             }
             ok
+        }
+        RegexNode::LookAhead { positive, inner } => {
+            // ゼロ幅の先読み: inner が pos でマッチするかを確認して継続する（消費しない）。
+            let mut matched = false;
+            let mut tmp = caps.clone();
+            let _ = match_at(inner, chars, pos, ignore, &mut tmp, &mut |_end, _c| {
+                matched = true;
+                true
+            });
+            if matched == *positive {
+                k(pos, caps)
+            } else {
+                false
+            }
         }
     }
 }

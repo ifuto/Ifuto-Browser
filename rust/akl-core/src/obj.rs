@@ -89,11 +89,15 @@ pub enum Obj {
     /// - `fidx`: 関数表（`Runtime.funcs`）の index。コード本体はそこにあり、
     ///   ヒープからは index だけを参照する（C の `code_off` と同型）。
     /// - `env`: クロージャ捕捉環境（無ければ None）。
+    /// - `props`: 関数はオブジェクトなので任意のプロパティを保持できる
+    ///   （`_.VERSION = ...` / `object.prototype = proto` 等。C の FUNC の props 相当）。
     Func {
         /// 関数表 index。
         fidx: u32,
         /// 捕捉環境（クロージャ）。無ければ None。
         env: Option<ObjId>,
+        /// 関数自身のプロパティ（name は intern 済み文字列 ObjId）。
+        props: Vec<(ObjId, AklVal)>,
     },
     /// ネイティブ関数（C の `AKL_OK_NATIVE` 相当）。index はランタイムの
     /// `native_fns` 表を指す（C の fn ポインタ + udata と同型）。
@@ -161,6 +165,8 @@ pub enum Obj {
         pc: usize,
         /// ジェネレータフレームのローカル（yield を跨いで保持）。
         locals: Vec<AklVal>,
+        /// 全引数（`arguments` オブジェクト用）。
+        args: Vec<AklVal>,
         /// クロージャ捕捉環境（無ければ None）。
         env: Option<ObjId>,
         /// ジェネレータの `this`。
@@ -208,9 +214,15 @@ impl Obj {
                     }
                 }
             }
-            Obj::Func { fidx: _, env } => {
+            Obj::Func { fidx: _, env, props } => {
                 if let Some(e) = env {
                     out.push(*e);
+                }
+                for (name, v) in props {
+                    out.push(*name);
+                    if v.is_obj() {
+                        out.push(v.get_obj());
+                    }
                 }
             }
             Obj::Native(_) => {}
@@ -426,10 +438,14 @@ impl ObjTable {
         }
     }
 
-    /// プレーンオブジェクトのプロパティを name で読む（無ければ None）。
+    /// プレーンオブジェクト（または関数）のプロパティを name で読む（無ければ None）。
     pub fn prop_get(&self, id: ObjId, name: ObjId) -> Option<AklVal> {
         match self.get(id) {
             Some(Obj::Obj(props)) => props
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v),
+            Some(Obj::Func { props, .. }) => props
                 .iter()
                 .find(|(n, _)| *n == name)
                 .map(|(_, v)| *v),
@@ -437,11 +453,19 @@ impl ObjTable {
         }
     }
 
-    /// プレーンオブジェクトにプロパティを設定（既存は上書き、新規は追加）。
-    /// 対象がプレーンオブジェクトでなければ `Err(ObjError::NotObject)`。
+    /// プレーンオブジェクト（または関数）にプロパティを設定（既存は上書き、新規は追加）。
+    /// 対象がプレーンオブジェクト/関数でなければ `Err(ObjError::NotObject)`。
     pub fn prop_set(&mut self, id: ObjId, name: ObjId, value: AklVal) -> Result<(), ObjError> {
         match self.get_mut(id) {
             Some(Obj::Obj(props)) => {
+                if let Some(slot) = props.iter_mut().find(|(n, _)| *n == name) {
+                    slot.1 = value;
+                } else {
+                    props.push((name, value));
+                }
+                Ok(())
+            }
+            Some(Obj::Func { props, .. }) => {
                 if let Some(slot) = props.iter_mut().find(|(n, _)| *n == name) {
                     slot.1 = value;
                 } else {
@@ -523,7 +547,7 @@ mod tests {
     fn func_env_is_child() {
         let mut t = ObjTable::new();
         let env = t.alloc(Obj::Env { vals: vec![AklVal::mk_int(1)], parent: None }).unwrap();
-        let f = t.alloc(Obj::Func { fidx: 0, env: Some(env) }).unwrap();
+        let f = t.alloc(Obj::Func { fidx: 0, env: Some(env), props: Vec::new() }).unwrap();
         // f をルート → env も生存（Func の env 参照を辿る）
         t.gc(&[vec![AklVal::mk_obj(f)]]);
         assert_eq!(t.live(), 2);

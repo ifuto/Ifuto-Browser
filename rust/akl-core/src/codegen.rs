@@ -173,6 +173,8 @@ impl Compiler<'_> {
                 }
             }
         }
+        // ネスト関数宣言の hoist（JS の関数宣言ホイスティング）
+        self.hoist_func_decls(body, &mut code)?;
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
         }
@@ -280,6 +282,8 @@ impl Compiler<'_> {
                 }
             }
         }
+        // ネスト関数宣言の hoist
+        self.hoist_func_decls(body, &mut code)?;
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
         }
@@ -310,8 +314,10 @@ impl Compiler<'_> {
     /// 外側 env の捕捉）を参照する＝ MakeClosure で env を束縛する必要がある」か。
     /// 自由変数は `enclosing_env`（外側の捕捉 env）に解決されたら CeLoad/CeStore、
     /// なければグローバル。`boxed` は自ローカルのうちネスト関数に捕捉されるもの。
+    #[allow(clippy::too_many_arguments)]
     fn compile_function_anon(
         &mut self,
+        name: Option<&str>,
         params: &[String],
         rest: Option<&str>,
         body: &[Stmt],
@@ -372,6 +378,8 @@ impl Compiler<'_> {
                 }
             }
         }
+        // ネスト関数宣言の hoist
+        self.hoist_func_decls(body, &mut code)?;
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
         }
@@ -382,7 +390,8 @@ impl Compiler<'_> {
         let n_params = params.len();
         let needs_closure = !self.captures.is_empty();
         let fidx = self.rt.funcs.len() as u32;
-        self.rt.funcs.push(FuncObj { code, name: None, n_params, rest_slot, n_locals, is_gen: false });
+        let name_id = name.and_then(|n| self.rt.intern(n));
+        self.rt.funcs.push(FuncObj { code, name: name_id, n_params, rest_slot, n_locals, is_gen: false });
 
         self.locals = saved_locals;
         self.captures = saved_captures;
@@ -391,6 +400,23 @@ impl Compiler<'_> {
         self.continue_patches = saved_continues;
 
         Ok((fidx, needs_closure))
+    }
+
+    /// ネスト関数宣言を hoist（JS の関数宣言ホイスティング。本体の先頭で束縛する）。
+    /// `lodash` のように「使用が宣言より前」の関数宣言（`var x = baseProperty('length')`
+    /// の `baseProperty` が後方で `function baseProperty(...)`）に必須。
+    fn hoist_func_decls(&mut self, body: &[Stmt], code: &mut Vec<Op>) -> Result<(), CompileError> {
+        let mut decls = Vec::new();
+        collect_func_decls(body, &mut decls);
+        for d in &decls {
+            if let Stmt::FuncDecl { name, params, rest, body, is_gen, is_async } = d {
+                let enclosing_env = self.captures.clone();
+                let fidx = self.compile_nested(name, params, rest.as_deref(), body, &enclosing_env, *is_gen, *is_async)?;
+                code.push(Op::MakeClosure(fidx));
+                self.gen_store(name, code)?;
+            }
+        }
+        Ok(())
     }
 
     /// 式をコード生成（結果をスタックに残す）。
@@ -609,7 +635,7 @@ impl Compiler<'_> {
                             let enclosing = self.captures.clone();
                             let empty = HashMap::new();
                             let (fidx, needs_closure) =
-                                self.compile_function_anon(&[], None, body, &empty, &enclosing)?;
+                                self.compile_function_anon(None, &[], None, body, &empty, &enclosing)?;
                             code.push(Op::Dup);
                             if needs_closure {
                                 code.push(Op::MakeClosure(fidx));
@@ -629,6 +655,7 @@ impl Compiler<'_> {
                             let params: Vec<String> =
                                 if param.is_empty() { vec![] } else { vec![param.clone()] };
                             let (fidx, needs_closure) = self.compile_function_anon(
+                                None,
                                 &params,
                                 None,
                                 body,
@@ -925,7 +952,7 @@ impl Compiler<'_> {
                 let enclosing_env = self.captures.clone();
                 let boxed = compute_boxed(params, body);
                 let (fidx, needs_closure) =
-                    self.compile_function_anon(params, rest.as_deref(), body, &boxed, &enclosing_env)?;
+                    self.compile_function_anon(name.as_deref(), params, rest.as_deref(), body, &boxed, &enclosing_env)?;
                 // 名前付き関数式は自分自身を束縛（簡易: グローバルに置く近似は避け、
                 // ローカルスコープの自己参照は未対応のため名前は無視）
                 let _ = name;
@@ -941,7 +968,7 @@ impl Compiler<'_> {
                 let enclosing_env = self.captures.clone();
                 let boxed = compute_boxed(params, &stmts);
                 let (fidx, needs_closure) =
-                    self.compile_function_anon(params, rest.as_deref(), &stmts, &boxed, &enclosing_env)?;
+                    self.compile_function_anon(None, params, rest.as_deref(), &stmts, &boxed, &enclosing_env)?;
                 if needs_closure {
                     code.push(Op::MakeClosure(fidx));
                 } else {
@@ -1231,12 +1258,8 @@ impl Compiler<'_> {
                 self.gen_stmt(body, code)?;
                 self.labels.remove(label);
             }
-            Stmt::FuncDecl { name, params, rest, body, is_gen, is_async } => {
-                // ネスト関数宣言: 現在フレームの env を共有するクロージャを生成して束縛
-                let enclosing_env = self.captures.clone();
-                let fidx = self.compile_nested(name, params, rest.as_deref(), body, &enclosing_env, *is_gen, *is_async)?;
-                code.push(Op::MakeClosure(fidx));
-                self.gen_store(name, code)?;
+            Stmt::FuncDecl { .. } => {
+                // ネスト関数宣言は hoist（関数本体の先頭で束縛済み）。ここでは no-op。
             }
             Stmt::Throw(e) => {
                 self.gen_expr(e, code)?;
@@ -1254,6 +1277,7 @@ impl Compiler<'_> {
                 let mut method_fidxs: Vec<(String, u32, bool)> = Vec::new();
                 for (mname, mparams, mrest, mbody) in methods {
                     let (fidx, needs_closure) = self.compile_function_anon(
+                        Some(mname),
                         mparams,
                         mrest.as_deref(),
                         mbody,
@@ -1274,6 +1298,7 @@ impl Compiler<'_> {
                 ctor_body.extend(constructor.2.iter().cloned());
                 // constructor をコンパイル
                 let (ctor_fidx, ctor_needs_closure) = self.compile_function_anon(
+                    None,
                     &constructor.0,
                     constructor.1.as_deref(),
                     &ctor_body,
@@ -1509,6 +1534,9 @@ impl Compiler<'_> {
             code.push(Op::CeLoad(*depth, *idx));
         } else if let Some(slot) = self.locals.get(name) {
             code.push(Op::LLoad(*slot));
+        } else if name == "arguments" {
+            // `arguments` は関数の全引数（配列）。local/param に無ければマジック参照。
+            code.push(Op::Arguments);
         } else {
             let id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
             code.push(Op::GLoad(id));
@@ -1765,6 +1793,39 @@ fn collect_pattern_vars(pattern: &crate::parser::Pattern, locals: &mut HashMap<S
             }
         }
         crate::parser::Pattern::Hole => {}
+    }
+}
+
+/// 文列から直接の関数宣言（`function name() {...}`）を収集する（hoist 用）。
+/// 制御フロー（ブロック / if / while / for / do-while / switch / try / labeled）を
+/// 横断するが、ネスト関数の本体には降りない（それらは compile_nested が再帰処理）。
+fn collect_func_decls(stmts: &[Stmt], out: &mut Vec<Stmt>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::FuncDecl { .. } => out.push(stmt.clone()),
+            Stmt::Block(inner) => collect_func_decls(inner, out),
+            Stmt::Labeled { body, .. } => collect_func_decls(std::slice::from_ref(body), out),
+            Stmt::If { then, else_, .. } => {
+                collect_func_decls(std::slice::from_ref(then), out);
+                if let Some(e) = else_ {
+                    collect_func_decls(std::slice::from_ref(e), out);
+                }
+            }
+            Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } => {
+                collect_func_decls(std::slice::from_ref(body), out);
+            }
+            Stmt::ForIn { body, .. } => collect_func_decls(std::slice::from_ref(body), out),
+            Stmt::Switch { cases, .. } => {
+                for (_, cbody) in cases {
+                    collect_func_decls(cbody, out);
+                }
+            }
+            Stmt::Try { try_body, catch_body, .. } => {
+                collect_func_decls(try_body, out);
+                collect_func_decls(catch_body, out);
+            }
+            _ => {}
+        }
     }
 }
 
