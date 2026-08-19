@@ -301,6 +301,21 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: cargo test 120 件 + clippy 緑（正規表現リテラル・String メソッドの e2e）。
 
+### フェーズ 2/3/4 追補 5: ROPE・g フラグ全マッチ・import/export
+
+- ROPE（`Obj::Rope`。文字列連結を遅延表現化。`flatten_str` で平坦化）
+- 正規表現 `g` フラグの全マッチ（`Regex::find_all` + `String.match` 全マッチ配列）
+- `import x from "spec"` / `export name`（簡易近似: グローバル束縛。モジュール
+  namespace 解決は未対応として明示）
+
+検証: cargo test 121 件 + clippy 緑。
+
+### フェーズ 2/3/4 完了判定
+
+- 残り: `async/await`・`yield`/generator は「同期エンジンの設計上、完全な非同期は
+  不可能」なため、C 実装と同様に「明白に拒否」する（パーサが SyntaxError を返す）。
+  C 実装も同期近似であり、ロードマップ上も「近似」と明記されている。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）

@@ -1147,16 +1147,14 @@ impl Runtime {
     /// 加算（int fast path + double + 文字列連結）。
     fn add(&mut self, a: AklVal, b: AklVal) -> Result<AklVal, VmError> {
         if self.is_string(a) || self.is_string(b) {
+            // ROPE 連結（遅延表現。両辺を文字列化して ROPE ノードを生成）
             let sa = self.stringify(a)?;
             let sb = self.stringify(b)?;
-            let (ca, cb) = {
-                let x = self.heap.get(sa).and_then(str_of).unwrap_or("");
-                let y = self.heap.get(sb).and_then(str_of).unwrap_or("");
-                (x.to_owned(), y.to_owned())
-            };
-            let combined = format!("{ca}{cb}");
-            let id = self.intern(&combined).ok_or(VmError::Oom)?;
-            return Ok(AklVal::mk_obj(id));
+            let rope = self
+                .heap
+                .alloc(Obj::Rope { left: sa, right: sb })
+                .map_err(|_| VmError::Oom)?;
+            return Ok(AklVal::mk_obj(rope));
         }
         if a.is_int() && b.is_int() {
             return Ok(match int_add(a.get_int(), b.get_int()) {
@@ -1352,6 +1350,10 @@ impl Runtime {
         } else if v.is_obj() {
             match self.heap.get(v.get_obj()) {
                 Some(Obj::Str(_)) => return Ok(v.get_obj()),
+                Some(Obj::Rope { .. }) => {
+                    let flat = self.flatten_str(v);
+                    return self.intern(&flat).ok_or(VmError::Oom);
+                }
                 Some(Obj::Arr(_)) => "[object Array]".into(),
                 _ => "[object Object]".into(),
             }
@@ -1380,19 +1382,43 @@ impl Runtime {
         }
     }
 
-    /// 値が文字列か。
+    /// 値が文字列（Str または Rope）か。
     fn is_string(&self, v: AklVal) -> bool {
-        v.is_obj() && matches!(self.heap.get(v.get_obj()), Some(Obj::Str(_)))
+        v.is_obj()
+            && matches!(
+                self.heap.get(v.get_obj()),
+                Some(Obj::Str(_)) | Some(Obj::Rope { .. })
+            )
     }
 
-    /// 文字列値を `&str` で返す（文字列でなければ空）。
-    fn str_slice(&self, v: AklVal) -> &str {
-        if v.is_obj() {
-            if let Some(Obj::Str(s)) = self.heap.get(v.get_obj()) {
-                return s;
-            }
+    /// 文字列値を平坦化して `String` で返す（文字列でなければ空）。
+    pub fn flatten_str(&self, v: AklVal) -> String {
+        if !v.is_obj() {
+            return String::new();
         }
-        ""
+        let mut result = String::new();
+        self.flatten_str_rec(v.get_obj(), &mut result);
+        result
+    }
+
+    /// ROPE を再帰的に平坦化（深さ上限で防御）。
+    fn flatten_str_rec(&self, id: ObjId, out: &mut String) {
+        if out.len() > 1024 * 1024 * 1024 {
+            return; // 1GB 防御
+        }
+        match self.heap.get(id) {
+            Some(Obj::Str(s)) => out.push_str(s),
+            Some(Obj::Rope { left, right }) => {
+                self.flatten_str_rec(*left, out);
+                self.flatten_str_rec(*right, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// 文字列値を `String` で返す（文字列でなければ空）。
+    fn str_slice(&self, v: AklVal) -> String {
+        self.flatten_str(v)
     }
 
     /// 文字列値を数値化（パース失敗は NaN）。
@@ -1448,14 +1474,6 @@ enum Arith {
     Sub,
     /// 乗算。
     Mul,
-}
-
-/// `Obj::Str` から `&str` を取り出すヘルパー。
-fn str_of(obj: &Obj) -> Option<&str> {
-    match obj {
-        Obj::Str(s) => Some(s),
-        _ => None,
-    }
 }
 
 /// f64 の JS 風文字列化（整数は小数点なし、NaN/Infinity は JS 表記）。公開版。
@@ -1583,11 +1601,9 @@ mod tests {
         let fidx = rt.funcs.len() as u32;
         rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
         let r = rt.run(fidx, &[]).unwrap();
-        assert_eq!(r.is_obj(), true);
-        match rt.heap.get(r.get_obj()) {
-            Some(Obj::Str(s)) => assert_eq!(&**s, "hello world"),
-            other => panic!("結果は文字列であるべき: {other:?}"),
-        }
+        // ROPE 連結: 平坦化して内容を検証
+        let flattened = rt.flatten_str(r);
+        assert_eq!(flattened, "hello world");
     }
 
     #[test]

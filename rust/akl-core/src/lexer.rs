@@ -109,6 +109,8 @@ pub enum Keyword {
     Import,
     /// `export`
     Export,
+    /// `from`（import 文用）
+    From,
 }
 
 impl Keyword {
@@ -155,6 +157,7 @@ impl Keyword {
         ("yield", Keyword::Yield),
         ("import", Keyword::Import),
         ("export", Keyword::Export),
+        ("from", Keyword::From),
     ];
 
     /// 文字列がキーワードなら対応する [`Keyword`] を返す。

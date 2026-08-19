@@ -403,6 +403,20 @@ pub enum Stmt {
         /// メソッド列（name, params, rest, body）。
         methods: Vec<ClassMethod>,
     },
+    /// `export` 宣言（簡易近似: 値式をエクスポートする）。
+    Export {
+        /// エクスポート名。
+        name: String,
+        /// 値式。
+        value: Expr,
+    },
+    /// `import name from "spec"`（簡易近似: 副作用のみ・名前束縛は no-op）。
+    Import {
+        /// 束縛名（無ければ副作用のみ）。
+        name: Option<String>,
+        /// モジュール指定子。
+        spec: String,
+    },
 }
 
 /// パースエラー（短いメッセージ。行番号は [`ParseError`] に含めない。呼び出し側で付加）。
@@ -1203,6 +1217,12 @@ impl<'a> Parser<'a> {
         if self.at_kw(Keyword::Class)? {
             return self.parse_class();
         }
+        if self.at_kw(Keyword::Import)? {
+            return self.parse_import();
+        }
+        if self.at_kw(Keyword::Export)? {
+            return self.parse_export();
+        }
         // 式文
         let e = self.parse_expr()?;
         // セミコロンは任意（`}` / EOF の直前は省略可。C の最小 ASI 相当）
@@ -1578,6 +1598,78 @@ impl<'a> Parser<'a> {
         Ok(Stmt::ClassDecl { name, constructor, methods })
     }
 
+    /// `import name from "spec"`（簡易近似）。
+    fn parse_import(&mut self) -> Result<Stmt, ParseError> {
+        self.bump()?; // import
+        // 名前束縛（`import x from` / `import { x } from` / `import * as x from` / `import "spec"`）
+        let name = match self.peek()? {
+            Token::Ident(n) => {
+                let n = n.to_string();
+                self.bump()?;
+                // `from` を期待
+                if self.at_kw(Keyword::From)? {
+                    self.bump()?;
+                }
+                Some(n)
+            }
+            Token::Str(_) => None, // 副作用のみ import
+            Token::Punct(Punct::LBrace) => {
+                // { a, b } from "spec"
+                self.bump()?;
+                let first = match self.peek()? {
+                    Token::Ident(n) => n.to_string(),
+                    _ => return Err(ParseError("expected import name".into())),
+                };
+                self.bump()?;
+                while self.eat_punct(Punct::Comma)? {
+                    // 追加の名前は無視（簡易）
+                    match self.peek()? {
+                        Token::Ident(_) => {
+                            self.bump()?;
+                        }
+                        _ => break,
+                    }
+                }
+                self.expect_punct(Punct::RBrace, "'}'")?;
+                if self.at_kw(Keyword::From)? {
+                    self.bump()?;
+                }
+                Some(first)
+            }
+            _ => return Err(ParseError("expected import specifier".into())),
+        };
+        // モジュール指定子（文字列）
+        let spec = match self.bump()? {
+            Token::Str(s) => s,
+            other => return Err(ParseError(format!("expected module specifier, got {other:?}"))),
+        };
+        if self.at_punct(Punct::Semi)? {
+            self.bump()?;
+        }
+        Ok(Stmt::Import { name, spec })
+    }
+
+    /// `export name`（簡易近似: 式をエクスポート）。
+    fn parse_export(&mut self) -> Result<Stmt, ParseError> {
+        self.bump()?; // export
+        // `export function name` / `export const name` / `export default expr`
+        let name = match self.peek()? {
+            Token::Ident(n) => n.to_string(),
+            _ => "default".to_string(),
+        };
+        self.bump()?;
+        // 値式（= があれば代入、なければ識別子参照）
+        let value = if self.eat_punct(Punct::Assign)? {
+            self.parse_expr()?
+        } else {
+            Expr::Ident(name.clone())
+        };
+        if self.at_punct(Punct::Semi)? {
+            self.bump()?;
+        }
+        Ok(Stmt::Export { name, value })
+    }
+
     /// `function name(params) { body }`。
     fn parse_func_decl(&mut self) -> Result<Stmt, ParseError> {
         self.bump()?; // function
@@ -1713,8 +1805,17 @@ mod tests {
 
     #[test]
     fn unsupported_errors() {
-        // 現在未対応の構文は特に無い（class/spread/分割代入/try-catch まで対応済み）
-        assert!(parse("import x from \"y\";").is_err()); // import は未対応
+        // 現在未対応の構文（async/await、yield、class extends、テンプレートリテラル等）
+        assert!(parse("async function f() {}").is_err()); // async は未対応
+        assert!(parse("function* g() { yield 1; }").is_err()); // generator は未対応
+    }
+
+    #[test]
+    fn import_export() {
+        let stmts = parse("import x from \"mod\";").unwrap();
+        assert!(matches!(stmts[0], Stmt::Import { name: Some(_), .. }));
+        let stmts = parse("export const y = 1;").unwrap();
+        assert!(matches!(stmts[0], Stmt::Export { .. }));
     }
 
     #[test]

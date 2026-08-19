@@ -941,6 +941,24 @@ impl Compiler<'_> {
                 let end_pos = code.len();
                 code[jmp_idx] = Op::Jmp(end_pos as u32);
             }
+            Stmt::Import { name, spec: _ } => {
+                // 簡易近似: import は no-op（名前束縛はグローバルに委ねる）。
+                // モジュール解決は未対応。name があれば undefined で初期化する。
+                if let Some(n) = name {
+                    // グローバルに undefined を束縛（未解決参照を防ぐ）
+                    let id = self.rt.intern(n).ok_or_else(|| CompileError("intern failed".into()))?;
+                    if self.rt.global_get(id).is_none() {
+                        code.push(Op::Undef);
+                        code.push(Op::GStore(id));
+                    }
+                }
+            }
+            Stmt::Export { name, value } => {
+                // 簡易近似: export は値式をグローバルに束縛する（モジュール namespace は未対応）
+                self.gen_expr(value, code)?;
+                let id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+                code.push(Op::GStore(id));
+            }
             Stmt::Switch { disc, cases } => {
                 // switch を if/else-if チェーンにコンパイル（=== 比較、break 前提で
                 // フォールスルー無し）。disc はグローバル一時に退避して各 case で比較。
@@ -1145,6 +1163,18 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
                     locals.insert(name.clone(), locals.len() as u32);
                 }
             }
+            Stmt::Export { name, .. } => {
+                if !locals.contains_key(name) {
+                    locals.insert(name.clone(), locals.len() as u32);
+                }
+            }
+            Stmt::Import { name, .. } => {
+                if let Some(n) = name {
+                    if !locals.contains_key(n) {
+                        locals.insert(n.clone(), locals.len() as u32);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1242,6 +1272,10 @@ fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
                 // メソッド内の自由変数は compile_function_anon が別途解析するため
                 // ここでは何もしない（クラス名は locals で解決される）。
             }
+            Stmt::Export { value, .. } => {
+                collect_expr_refs(value, out);
+            }
+            Stmt::Import { .. } => {}
             Stmt::Block(inner) => collect_refs(inner, out),
             // ネスト関数宣言の中身は、その関数自身の自由変数として別途解析されるため
             // ここでは名前（束縛先）だけを参照扱いしない（locals で解決される）。
@@ -1471,15 +1505,13 @@ mod tests {
 
     #[test]
     fn string_concat() {
-        // 文字列連結の結果が "ab" であることを内容で確認（intern id は非決定的なので値比較しない）
+        // 文字列連結の結果が "ab" であることを内容で確認（ROPE 連結。intern id は非決定的）
         let program = crate::parser::Parser::new("\"a\" + \"b\";").parse_program().unwrap();
         let mut rt = Runtime::new();
         let fidx = compile(&mut rt, &program).unwrap();
         let v = rt.run(fidx, &[]).unwrap();
-        match rt.heap.get(v.get_obj()) {
-            Some(crate::obj::Obj::Str(s)) => assert_eq!(&**s, "ab"),
-            other => panic!("expected string, got {other:?}"),
-        }
+        let flattened = rt.flatten_str(v);
+        assert_eq!(flattened, "ab");
     }
 
     #[test]

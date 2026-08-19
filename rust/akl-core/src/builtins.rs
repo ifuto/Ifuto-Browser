@@ -390,16 +390,28 @@ fn str_match(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     if let Some((pattern, flags)) = regex_of(rt, rx_v) {
         let flag_num = flags_to_num(&flags);
         let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|_| VmError::Oom)?;
-        match rx.find(&s) {
-            Some(caps) => {
-                // マッチ全体（または g フラグなら全マッチ配列）を返す
-                let items: Vec<AklVal> = vec![AklVal::mk_obj(
-                    rt.intern(&caps[0]).ok_or(VmError::Oom)?,
-                )];
-                let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
-                Ok(AklVal::mk_obj(id))
+        if flags.contains('g') {
+            // g フラグ: 全マッチの配列
+            let matches = rx.find_all(&s);
+            let items: Vec<AklVal> = matches
+                .iter()
+                .map(|m| rt.intern(m).map(AklVal::mk_obj).unwrap_or(AklVal::UNDEF))
+                .collect();
+            let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
+            Ok(AklVal::mk_obj(id))
+        } else {
+            match rx.find(&s) {
+                Some(caps) => {
+                    // マッチ全体 + 捕捉グループの配列
+                    let items: Vec<AklVal> = caps
+                        .iter()
+                        .map(|c| rt.intern(c).map(AklVal::mk_obj).unwrap_or(AklVal::UNDEF))
+                        .collect();
+                    let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
+                    Ok(AklVal::mk_obj(id))
+                }
+                None => Ok(AklVal::NULL),
             }
-            None => Ok(AklVal::NULL),
         }
     } else {
         Ok(AklVal::NULL)

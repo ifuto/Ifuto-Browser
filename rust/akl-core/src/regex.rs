@@ -110,6 +110,32 @@ impl Regex {
             None
         }
     }
+
+    /// 全マッチを返す（`g` フラグ用）。各要素はマッチ全体文字列。
+    pub fn find_all(&self, text: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut rest = text;
+        let mut guard = 0;
+        loop {
+            if guard > 10000 {
+                break;
+            }
+            guard += 1;
+            match self.find(rest) {
+                Some(caps) => {
+                    let full = &caps[0];
+                    if full.is_empty() {
+                        break;
+                    }
+                    let start = rest.find(full).unwrap_or(0);
+                    result.push(full.clone());
+                    rest = &rest[start + full.len()..];
+                }
+                None => break,
+            }
+        }
+        result
+    }
 }
 
 /// パーサ。

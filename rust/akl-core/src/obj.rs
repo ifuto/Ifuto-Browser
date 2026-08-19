@@ -65,6 +65,13 @@ pub enum ObjError {
 pub enum Obj {
     /// 文字列（intern 済み文字列は [`crate::string::Interner`] が索引を持つ）。
     Str(Box<str>),
+    /// ROPE 文字列（連結の遅延表現。左右の子 ObjId を持つ。C の `AKL_OK_ROPE` 相当）。
+    Rope {
+        /// 左の子（ObjId）。
+        left: ObjId,
+        /// 右の子（ObjId）。
+        right: ObjId,
+    },
     /// 配列（要素列）。
     Arr(Vec<AklVal>),
     /// クロージャ環境（キャプチャ済みローカル + 親環境）。
@@ -117,6 +124,10 @@ impl Obj {
         let mut out: Vec<ObjId> = Vec::new();
         match self {
             Obj::Str(_) => {}
+            Obj::Rope { left, right } => {
+                out.push(*left);
+                out.push(*right);
+            }
             Obj::Arr(items) => {
                 for v in items {
                     if v.is_obj() {
