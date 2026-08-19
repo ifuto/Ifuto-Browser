@@ -335,6 +335,29 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: cargo test 126 件 + clippy 緑（JSON.parse・Date・sort 比較関数・Object メソッドの e2e）。
 
+## フェーズ 6（進行中）: ブラウザ統合（script.c / DOM 配線）
+
+ブラウザ本体（`src/ext.c` / `ifuto_pages.c` / `script.c`）は `akl.h` の公開 API を直接
+呼ぶ。Rust 化は「エンジン拡張 → FFI クレート → C 側を差し替え」の順で進める。
+
+### 6-a: エンジン拡張（ホスト統合の基盤）
+
+- `Runtime.err: String` + `set_err`（C の `rt->err` / `akl_errf` 相当。`akl_error` 用）
+- `HandleVTab`（安全 Rust の fn ポインタ vtable: get/set/call。`ptr` はホスト側
+  オブジェクトの不透明アドレスを u64 で保持し、unsafe は FFI 層に隔離）
+- `Obj::Handle { vtab, ptr }`（C の `AKL_OK_HANDLE` 相当）+ `Obj::BoundMethod`
+  （`obj.method` の method 値を表現。`PLoad` がハンドルの未知プロパティを
+  BoundMethod に解決し、`do_call` が vtable の `call` へディスパッチ）
+- ディスパッチ配線: `PLoad`（get → 未知は BoundMethod）/ `PStore`（set）/
+  `AGet`（ブラケット = キー文字列で get）/ `do_call`（BoundMethod → call。
+  未定義メソッドは TypeError を throw）
+
+検証: cargo test 127 件 + clippy 緑（Handle の get/set/call・ブラケット・未知メソッド throw の e2e）。
+
+残り: FFI クレート（`rust/akl-ffi`。unsafe 境界を 1 ファイルに集約して `akl.h` 互換の
+C ABI を公開）、C ネイティブ登録のブリッジ（`AklNativeFn` → Rust `NativeFn`）、
+`akl_call` 再入（ホストからの JS 関数呼び出し）、C 側 `script.c` 等の差し替え。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）

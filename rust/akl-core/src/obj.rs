@@ -38,6 +38,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use crate::bytecode::HandleVTab;
 use crate::AklVal;
 
 /// オブジェクト表の index（C の obj index。u32 なので AklVal の obj タグに乗る）。
@@ -121,6 +122,23 @@ pub enum Obj {
         /// エポック（1970-01-01T00:00:00Z）からのミリ秒。
         ms: f64,
     },
+    /// ホストハンドル（C の `AKL_OK_HANDLE` 相当。DOM 要素等の不透明参照）。
+    /// `ptr` はホスト側オブジェクトの不透明アドレス（u64 で保持。unsafe は FFI 層）。
+    Handle {
+        /// ディスパッチ vtable。
+        vtab: &'static HandleVTab,
+        /// ホスト側オブジェクトの不透明アドレス。
+        ptr: u64,
+    },
+    /// ハンドルに束縛されたメソッド（`obj.method` の `method` 値を表現。
+    /// `PLoad` がハンドルの未知プロパティを解決する際に生成し、`do_call` が
+    /// ハンドルの vtable `call` へディスパッチする）。
+    BoundMethod {
+        /// 対象ハンドルの ObjId。
+        handle: ObjId,
+        /// メソッド名（intern 済み文字列 ObjId）。
+        name: ObjId,
+    },
 }
 
 impl Obj {
@@ -191,6 +209,10 @@ impl Obj {
             }
             Obj::RegExp { .. } => {}
             Obj::Date { .. } => {}
+            Obj::Handle { .. } => {}
+            Obj::BoundMethod { handle, .. } => {
+                out.push(*handle);
+            }
         }
         out.into_iter()
     }

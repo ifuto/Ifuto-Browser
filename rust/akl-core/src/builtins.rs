@@ -1764,12 +1764,50 @@ fn date_set_time(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bytecode::HandleVTab;
     use crate::codegen::compile;
+
+    // ---- ハンドル（DOM 等）ディスパッチのテスト用 vtable ----
+    fn h_get(rt: &mut Runtime, _ptr: u64, name: &str) -> Option<AklVal> {
+        if name == "title" {
+            let id = rt.intern("Hello")?;
+            Some(AklVal::mk_obj(id))
+        } else {
+            None
+        }
+    }
+    fn h_set(rt: &mut Runtime, _ptr: u64, name: &str, v: AklVal) -> bool {
+        let s = rt.flatten_str(v);
+        rt.console_out.push(format!("set {name} = {s}"));
+        true
+    }
+    fn h_call(rt: &mut Runtime, _ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal> {
+        if name == "getElementById" {
+            let arg = args.first().map(|v| rt.flatten_str(*v)).unwrap_or_default();
+            let id = rt.intern(&format!("found:{arg}"))?;
+            Some(AklVal::mk_obj(id))
+        } else {
+            None
+        }
+    }
+    static H_VT: HandleVTab = HandleVTab {
+        tag: "TestDoc",
+        get: h_get,
+        set: h_set,
+        call: h_call,
+    };
 
     fn run_src(src: &str) -> Result<(AklVal, Vec<String>), String> {
         let program = crate::parser::Parser::new(src).parse_program().map_err(|e| e.0)?;
         let mut rt = Runtime::new();
         install_builtins(&mut rt).map_err(|e| format!("{e:?}"))?;
+        // テスト用に document ハンドルを束縛
+        let handle = rt
+            .heap
+            .alloc(Obj::Handle { vtab: &H_VT, ptr: 0x1234 })
+            .map_err(|e| format!("{e:?}"))?;
+        let doc_name = rt.intern("document").unwrap();
+        rt.global_set(doc_name, AklVal::mk_obj(handle));
         let fidx = compile(&mut rt, &program).map_err(|e| e.0)?;
         let v = rt.run(fidx, &[]).map_err(|e| format!("{e:?}"))?;
         Ok((v, rt.console_out.clone()))
@@ -2029,6 +2067,39 @@ mod tests {
         assert_eq!(
             run_src("Object.fromEntries([[\"a\", 1], [\"b\", 2]]).b;").unwrap().0,
             AklVal::mk_int(2)
+        );
+    }
+
+    #[test]
+    fn handle_dispatch() {
+        // プロパティ取得 → vtable.get
+        assert_eq!(
+            run_src("document.title === \"Hello\";").unwrap().0,
+            AklVal::TRUE
+        );
+        // メソッド呼び出し → vtable.call
+        assert_eq!(
+            run_src("document.getElementById(\"a\") === \"found:a\";").unwrap().0,
+            AklVal::TRUE
+        );
+        // ブラケットアクセス → vtable.get（文字列キー）
+        assert_eq!(
+            run_src("document[\"title\"] === \"Hello\";").unwrap().0,
+            AklVal::TRUE
+        );
+        // プロパティ設定 → vtable.set（console_out で観測）
+        let (_, out) = run_src("document.title = \"Bye\";").unwrap();
+        assert_eq!(out, vec!["set title = Bye".to_string()]);
+        // typeof handle = object / 未知メソッドは throw
+        assert_eq!(
+            run_src("typeof document === \"object\";").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("var r = 0; try { document.noSuchMethod(); } catch (e) { r = 1; } r;")
+                .unwrap()
+                .0,
+            AklVal::mk_int(1)
         );
     }
 

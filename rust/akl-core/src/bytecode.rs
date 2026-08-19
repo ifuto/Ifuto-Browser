@@ -263,6 +263,35 @@ pub enum VmError {
 /// （失敗は実行を停止させる）。
 pub type NativeFn = fn(&mut Runtime, AklVal, &[AklVal]) -> Result<AklVal, VmError>;
 
+/// ホストハンドル（DOM 要素等の不透明参照）の vtable。
+///
+/// コールバックは全て安全 Rust の `fn` ポインタ。`ptr`（ホスト側オブジェクトの
+/// 不透明アドレスを `u64` で保持）の参照解除・生ポインタ生成などの `unsafe` は
+/// FFI 層（`rust/akl-ffi`）が担い、本クレート（`#![forbid(unsafe_code)]`）には
+/// unsafe を持ち込まない。C 実装の `AklHandleVTab` 相当。
+#[derive(Clone, Copy, Debug)]
+pub struct HandleVTab {
+    /// `[object TAG]` 用のタグ名（診断・文字列化）。
+    pub tag: &'static str,
+    /// プロパティ取得。`None` = 未知プロパティ（undefined / メソッド扱い）。
+    pub get: fn(&mut Runtime, ptr: u64, name: &str) -> Option<AklVal>,
+    /// プロパティ設定。`false` = 拒否（TypeError）。
+    pub set: fn(&mut Runtime, ptr: u64, name: &str, v: AklVal) -> bool,
+    /// メソッド呼び出し。`None` = 未定義メソッド（TypeError: not a function）。
+    pub call: fn(&mut Runtime, ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal>,
+}
+
+impl PartialEq for HandleVTab {
+    /// 関数ポインタの等値比較（`fn_addr_eq`。コード生成ユニット間でアドレスが
+    /// 異なり得るため derive では誤判定し得る）。
+    fn eq(&self, other: &Self) -> bool {
+        self.tag == other.tag
+            && std::ptr::fn_addr_eq(self.get, other.get)
+            && std::ptr::fn_addr_eq(self.set, other.set)
+            && std::ptr::fn_addr_eq(self.call, other.call)
+    }
+}
+
 /// 呼び出しフレーム。locals を明示的に保持する（C の `base` オフセット方式より安全）。
 #[derive(Clone, Debug)]
 struct Frame {
@@ -299,6 +328,8 @@ pub struct Runtime {
     pub native_fns: Vec<NativeFn>,
     /// `console.log` の出力先バッファ（テストで検証可能に。None なら無視）。
     pub console_out: Vec<String>,
+    /// 直近のエラー文言（C の `rt->err` 相当。`akl_error` 用）。
+    pub err: String,
     /// 文字列メソッド表（name → native）。`PLoad` が文字列リテラルで解決する。
     /// C の `str_meth_vals` 相当。
     pub str_methods: Vec<(ObjId, AklVal)>,
@@ -336,6 +367,11 @@ impl Runtime {
     /// 文字列を intern してヒープ上の文字列 ObjId を返す（失敗時 None）。
     pub fn intern(&mut self, s: &str) -> Option<ObjId> {
         self.interner.intern(&mut self.heap, s)
+    }
+
+    /// エラー文言を設定（C の `akl_errf` 相当）。
+    pub fn set_err(&mut self, msg: impl Into<String>) {
+        self.err = msg.into();
     }
 
     /// グローバル変数を name で読む（未宣言は None）。
@@ -924,6 +960,28 @@ impl Runtime {
                         pc += 1;
                         continue;
                     }
+                    // ホストハンドル（DOM 要素等）のプロパティ解決
+                    if let Some(Obj::Handle { vtab, ptr }) = self.heap.get(id) {
+                        let (vtab, ptr) = (*vtab, *ptr);
+                        let name_str = match self.heap.get(name) {
+                            Some(Obj::Str(s)) => s.to_string(),
+                            _ => String::new(),
+                        };
+                        let v = match (vtab.get)(self, ptr, &name_str) {
+                            Some(v) => v,
+                            None => {
+                                // 未知プロパティ → メソッド呼び出し用の BoundMethod
+                                let bm = self
+                                    .heap
+                                    .alloc(Obj::BoundMethod { handle: id, name })
+                                    .map_err(|_| VmError::Oom)?;
+                                AklVal::mk_obj(bm)
+                            }
+                        };
+                        stack.push(v);
+                        pc += 1;
+                        continue;
+                    }
                     let v = self.prop_get_chain(id, name).unwrap_or(AklVal::UNDEF);
                     stack.push(v);
                 }
@@ -933,8 +991,23 @@ impl Runtime {
                     if !obj.is_obj() {
                         return Err(VmError::NotObject);
                     }
+                    let id = obj.get_obj();
+                    // ホストハンドルのプロパティ設定
+                    if let Some(Obj::Handle { vtab, ptr }) = self.heap.get(id) {
+                        let (vtab, ptr) = (*vtab, *ptr);
+                        let name_str = match self.heap.get(name) {
+                            Some(Obj::Str(s)) => s.to_string(),
+                            _ => String::new(),
+                        };
+                        if !(vtab.set)(self, ptr, &name_str, val) {
+                            return Err(VmError::NotObject);
+                        }
+                        stack.push(val);
+                        pc += 1;
+                        continue;
+                    }
                     self.heap
-                        .prop_set(obj.get_obj(), name, val)
+                        .prop_set(id, name, val)
                         .map_err(|_| VmError::NotObject)?;
                     stack.push(val);
                 }
@@ -1004,9 +1077,25 @@ impl Runtime {
                     if !obj.is_obj() {
                         return Err(VmError::NotObject);
                     }
+                    let id = obj.get_obj();
+                    // ホストハンドルのブラケットアクセス（キー文字列で get）
+                    if let Some(Obj::Handle { vtab, ptr }) = self.heap.get(id) {
+                        let (vtab, ptr) = (*vtab, *ptr);
+                        let key_str = match self.stringify(idx) {
+                            Ok(k) => match self.heap.get(k) {
+                                Some(Obj::Str(s)) => s.to_string(),
+                                _ => String::new(),
+                            },
+                            Err(_) => String::new(),
+                        };
+                        let v = (vtab.get)(self, ptr, &key_str).unwrap_or(AklVal::UNDEF);
+                        stack.push(v);
+                        pc += 1;
+                        continue;
+                    }
                     let i = self.to_number(idx) as i64;
                     let v = if i >= 0 {
-                        self.heap.arr_get(obj.get_obj(), i as usize).unwrap_or(AklVal::UNDEF)
+                        self.heap.arr_get(id, i as usize).unwrap_or(AklVal::UNDEF)
                     } else {
                         AklVal::UNDEF
                     };
@@ -1148,6 +1237,26 @@ impl Runtime {
             return Err(VmError::NotCallable);
         }
         let id = callee.get_obj();
+        // ハンドル束縛メソッド: vtable の call へディスパッチ
+        if let Some(Obj::BoundMethod { handle, name }) = self.heap.get(id) {
+            let (handle, name) = (*handle, *name);
+            let (vtab, ptr) = match self.heap.get(handle) {
+                Some(Obj::Handle { vtab, ptr }) => (*vtab, *ptr),
+                _ => return Err(VmError::NotCallable),
+            };
+            let name_str = match self.heap.get(name) {
+                Some(Obj::Str(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            let r = match (vtab.call)(self, ptr, &name_str, args) {
+                Some(v) => v,
+                None => {
+                    let msg = self.intern("TypeError: not a function").unwrap_or(0);
+                    return Err(VmError::Thrown(AklVal::mk_obj(msg)));
+                }
+            };
+            return Ok(Some(r));
+        }
         // ネイティブ関数なら直接呼んで結果を返す
         if let Some(Obj::Native(nidx)) = self.heap.get(id) {
             let nidx = *nidx;
@@ -1344,7 +1453,9 @@ impl Runtime {
         } else if v.is_obj() {
             match self.heap.get(v.get_obj()) {
                 Some(Obj::Str(_)) => "string",
-                Some(Obj::Func { .. }) | Some(Obj::Native(_)) => "function",
+                Some(Obj::Func { .. }) | Some(Obj::Native(_)) | Some(Obj::BoundMethod { .. }) => {
+                    "function"
+                }
                 _ => "object",
             }
         } else {
@@ -1401,6 +1512,8 @@ impl Runtime {
                 }
                 Some(Obj::Arr(_)) => "[object Array]".into(),
                 Some(Obj::Date { ms }) => date_to_string(*ms),
+                Some(Obj::Handle { vtab, .. }) => format!("[object {}]", vtab.tag),
+                Some(Obj::BoundMethod { .. }) => "[object Function]".into(),
                 _ => "[object Object]".into(),
             }
         } else {
