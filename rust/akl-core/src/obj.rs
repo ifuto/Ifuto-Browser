@@ -115,6 +115,12 @@ pub enum Obj {
         /// フラグ文字列。
         flags: Box<str>,
     },
+    /// Date（C の `\x01ms` を持つ OBJ 相当。エポックからのミリ秒を保持）。
+    /// 子参照を持たない（ms はスカラ値）。
+    Date {
+        /// エポック（1970-01-01T00:00:00Z）からのミリ秒。
+        ms: f64,
+    },
 }
 
 impl Obj {
@@ -184,6 +190,7 @@ impl Obj {
                 }
             }
             Obj::RegExp { .. } => {}
+            Obj::Date { .. } => {}
         }
         out.into_iter()
     }

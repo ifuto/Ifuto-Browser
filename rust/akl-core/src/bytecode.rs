@@ -308,8 +308,12 @@ pub struct Runtime {
     pub map_methods: Vec<(ObjId, AklVal)>,
     /// Set メソッド表（name → native）。
     pub set_methods: Vec<(ObjId, AklVal)>,
+    /// Date メソッド表（name → native）。`PLoad` が `Obj::Date` で解決する。
+    pub date_methods: Vec<(ObjId, AklVal)>,
     /// `length` プロパティ名の ObjId（install_builtins で設定。文字列/配列の length 用）。
     pub length_id: ObjId,
+    /// `constructor` プロパティ名の ObjId（コンストラクタ解決フォールバック用）。
+    pub ctor_name: ObjId,
     /// `\x00proto` プロパティ名の ObjId（プロトタイプチェーン用。C の `proto_name` 相当）。
     pub proto_name: ObjId,
     /// 関数 → prototype オブジェクト（C の `fn_protos` 相当。new/instanceof 用）。
@@ -324,6 +328,8 @@ impl Runtime {
         rt.length_id = rt.intern("length").unwrap_or(0);
         // `\x00proto` プロパティ名（プロトタイプチェーン）。
         rt.proto_name = rt.intern("\x00proto").unwrap_or(0);
+        // `constructor` プロパティ名（コンストラクタ解決フォールバック用）。
+        rt.ctor_name = rt.intern("constructor").unwrap_or(0);
         rt
     }
 
@@ -418,9 +424,30 @@ impl Runtime {
         Some(proto)
     }
 
+    /// コンストラクタ解決: callee が `Obj::Obj` で `constructor` プロパティ
+    /// （callable）を持つ場合、その値を返す（C の CALL ハンドラの「OBJ の
+    /// constructor を呼ぶ」フォールバック相当。Date 等の OBJ コンストラクタ用）。
+    /// それ以外は callee をそのまま返す。
+    fn ctor_of(&self, callee: AklVal) -> AklVal {
+        if !callee.is_obj() {
+            return callee;
+        }
+        if let Some(Obj::Obj(props)) = self.heap.get(callee.get_obj()) {
+            if let Some((_, v)) = props.iter().find(|(n, _)| *n == self.ctor_name) {
+                if v.is_obj()
+                    && matches!(
+                        self.heap.get(v.get_obj()),
+                        Some(Obj::Func { .. }) | Some(Obj::Native(_))
+                    )
+                {
+                    return *v;
+                }
+            }
+        }
+        callee
+    }
+
     /// 関数表 index の関数を実行する（C の `vm_exec` 相当）。
-    ///
-    /// `args` はエントリ関数の引数。戻り値は関数の返り値（`Ret`）または
     /// 停止時（`Halt`）のスタック先頭。
     pub fn run(&mut self, func_idx: u32, args: &[AklVal]) -> Result<AklVal, VmError> {
         let mut stack: Vec<AklVal> = Vec::new();
@@ -665,6 +692,8 @@ impl Runtime {
                     let f = stack[stack.len() - argc - 1];
                     let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
                     stack.truncate(stack.len() - argc - 1);
+                    // OBJ コンストラクタのフォールバック（Date 等）
+                    let f = self.ctor_of(f);
                     // 新オブジェクト
                     let obj_id = self
                         .heap
@@ -875,6 +904,18 @@ impl Runtime {
                     if matches!(self.heap.get(id), Some(Obj::Set(_))) {
                         let v = self
                             .set_methods
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, v)| *v)
+                            .unwrap_or(AklVal::UNDEF);
+                        stack.push(v);
+                        pc += 1;
+                        continue;
+                    }
+                    // Date のメソッド
+                    if matches!(self.heap.get(id), Some(Obj::Date { .. })) {
+                        let v = self
+                            .date_methods
                             .iter()
                             .find(|(n, _)| *n == name)
                             .map(|(_, v)| *v)
@@ -1101,6 +1142,8 @@ impl Runtime {
         this_v: AklVal,
         args: &[AklVal],
     ) -> Result<Option<AklVal>, VmError> {
+        // OBJ コンストラクタのフォールバック（Date 等）
+        let callee = self.ctor_of(callee);
         if !callee.is_obj() {
             return Err(VmError::NotCallable);
         }
@@ -1326,6 +1369,8 @@ impl Runtime {
         } else if v.is_obj() {
             match self.heap.get(v.get_obj()) {
                 Some(Obj::Str(s)) => s.parse::<f64>().unwrap_or(f64::NAN),
+                // Date は valueOf（エポック ms）に数値化
+                Some(Obj::Date { ms }) => *ms,
                 _ => f64::NAN,
             }
         } else {
@@ -1355,6 +1400,7 @@ impl Runtime {
                     return self.intern(&flat).ok_or(VmError::Oom);
                 }
                 Some(Obj::Arr(_)) => "[object Array]".into(),
+                Some(Obj::Date { ms }) => date_to_string(*ms),
                 _ => "[object Object]".into(),
             }
         } else {
@@ -1496,6 +1542,111 @@ fn fmt_num(d: f64) -> String {
     } else {
         format!("{d}")
     }
+}
+
+/// Date の UTC 分解フィールド。
+#[derive(Clone, Copy, Debug)]
+pub struct DateFields {
+    /// 年（グレゴリオ暦、正数/負数）。
+    pub year: i32,
+    /// 月（1-12。JS の 0-based ではない）。
+    pub month: u32,
+    /// 日（1-31）。
+    pub day: u32,
+    /// 曜日（0=日曜 .. 6=土曜）。
+    pub weekday: u32,
+    /// 時（0-23）。
+    pub hour: u32,
+    /// 分（0-59）。
+    pub minute: u32,
+    /// 秒（0-59）。
+    pub second: u32,
+    /// ミリ秒（0-999）。
+    pub millisecond: u32,
+}
+
+/// プロレプティック・グレゴリオ暦: 1970-01-01 からの日数 → (年, 月, 日)
+/// （Howard Hinnant の `civil_from_days` アルゴリズム。seccomp 下の gmtime_r 代替）。
+pub fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y as i32 + 1 } else { y as i32 }, m as u32, d)
+}
+
+/// (年, 月, 日) → 1970-01-01 からの日数（グレゴリオ暦。月は 1-based）。
+pub fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+    let y = y - i32::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { (m - 3) as u64 } else { (m + 9) as u64 };
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era as i64 * 146_097 + doe as i64 - 719_468
+}
+
+/// エポック ms → UTC フィールド（C の `akl_date_utc_fields` 相当）。
+pub fn date_utc_fields(ms: f64) -> DateFields {
+    let total_ms = ms as i64;
+    let days = if total_ms >= 0 {
+        total_ms / 86_400_000
+    } else {
+        (total_ms - 86_399_999) / 86_400_000
+    };
+    let mut rem = total_ms - days * 86_400_000;
+    let days = if rem < 0 {
+        rem += 86_400_000;
+        days - 1
+    } else {
+        days
+    };
+    let (year, month, day) = civil_from_days(days);
+    // 1970-01-01 は木曜(4)。(days % 7 + 4) を正規化して曜日 0..6。
+    let weekday = ((days % 7) + 4).rem_euclid(7) as u32;
+    DateFields {
+        year,
+        month,
+        day,
+        weekday,
+        hour: (rem / 3_600_000) as u32,
+        minute: ((rem / 60_000) % 60) as u32,
+        second: ((rem / 1_000) % 60) as u32,
+        millisecond: (rem % 1_000) as u32,
+    }
+}
+
+/// エポック ms → ISO 8601 文字列（`YYYY-MM-DDTHH:MM:SS.sssZ`）。
+pub fn date_to_iso_string(ms: f64) -> String {
+    let f = date_utc_fields(ms);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        f.year, f.month, f.day, f.hour, f.minute, f.second, f.millisecond
+    )
+}
+
+/// エポック ms → `Date.prototype.toString` 相当（UTC 固定近似）。
+pub fn date_to_string(ms: f64) -> String {
+    const W: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const M: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let f = date_utc_fields(ms);
+    format!(
+        "{} {} {:02} {:04} {:02}:{:02}:{:02} GMT+0000",
+        W[f.weekday as usize],
+        M[(f.month as usize).saturating_sub(1)],
+        f.day,
+        f.year,
+        f.hour,
+        f.minute,
+        f.second
+    )
 }
 
 #[cfg(test)]

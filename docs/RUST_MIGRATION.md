@@ -316,6 +316,25 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
   不可能」なため、C 実装と同様に「明白に拒否」する（パーサが SyntaxError を返す）。
   C 実装も同期近似であり、ロードマップ上も「近似」と明記されている。
 
+### フェーズ 5 追補: JSON.parse・Date・Array.sort 比較関数・Object 残メソッド
+
+- `JSON.parse`（`JsonParser` 再帰下降。object/array/string/number/true/false/null。
+  文字列は `\uXXXX` エスケープ + UTF-16 サロゲートペア対応。整数は int 保持。
+  不正 JSON は `VmError::Thrown` で SyntaxError を throw）
+- `Date`（同期近似。`Obj::Date { ms }` + `rt.date_methods` 表。`new Date()` /
+  `Date()` / `Date.now` / `Date.parse` / `Date.UTC`、getTime/valueOf/getFullYear/
+  getMonth/getDate/getDay/getHours/getMinutes/getSeconds/getMilliseconds/getUTC* /
+  toISOString/toString/setTime）。Hinnant アルゴリズムによる UTC 暦変換
+  （gmtime_r は seccomp 下で SIGSYS のため自前実装。ローカル系も UTC として扱う近似）
+- `Date` グローバルは `constructor` プロパティを持つ `Obj::Obj`。`do_call` / `New` に
+  「OBJ の constructor を呼ぶ」フォールバック（`ctor_of`）を追加し、`Date.now()` と
+  `new Date()` を両立
+- `Array.prototype.sort` の比較関数対応（`call_native` でコールバック呼び出し、
+  挿入ソート。負値 = 左が小さい）
+- `Object.entries` / `Object.fromEntries`
+
+検証: cargo test 126 件 + clippy 緑（JSON.parse・Date・sort 比較関数・Object メソッドの e2e）。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）

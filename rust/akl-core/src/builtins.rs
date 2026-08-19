@@ -71,10 +71,12 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     install_array_methods(rt)?;
     // Object 静的メソッド（keys/values/assign）
     install_object_methods(rt)?;
-    // JSON.stringify
+    // JSON.stringify / JSON.parse
     install_json(rt)?;
     // Map / Set / Promise
     install_map_set(rt)?;
+    // Date（同期近似）
+    install_date(rt)?;
 
     Ok(())
 }
@@ -745,16 +747,39 @@ fn arr_every(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     Ok(AklVal::TRUE)
 }
 
-fn arr_sort(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+fn arr_sort(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
     let mut items = this_arr(rt, this);
-    // デフォルトは文字列化比較（JS の sort 既定）。借用回避のため文字列キーを先に作る。
-    let mut keyed: Vec<(String, AklVal)> = items
-        .iter()
-        .map(|v| (to_js_string(rt, *v), *v))
-        .collect();
-    keyed.sort_by(|x, y| x.0.cmp(&y.0));
-    items = keyed.into_iter().map(|(_, v)| v).collect();
+    let cmp = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let has_cmp = cmp.is_obj()
+        && matches!(
+            rt.heap.get(cmp.get_obj()),
+            Some(Obj::Native(_)) | Some(Obj::Func { .. })
+        );
+    if has_cmp {
+        // 比較関数付き: 挿入ソート（借用回避のため比較関数呼び出しをループ内で行う）。
+        for i in 1..items.len() {
+            let mut j = i;
+            while j > 0 {
+                let args = vec![items[j], items[j - 1]];
+                let r = call_native(rt, cmp, AklVal::UNDEF, &args)?;
+                if to_number(rt, r) < 0.0 {
+                    items.swap(j, j - 1);
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    } else {
+        // デフォルトは文字列化比較（JS の sort 既定）。借用回避のため文字列キーを先に作る。
+        let mut keyed: Vec<(String, AklVal)> = items
+            .iter()
+            .map(|v| (to_js_string(rt, *v), *v))
+            .collect();
+        keyed.sort_by(|x, y| x.0.cmp(&y.0));
+        items = keyed.into_iter().map(|(_, v)| v).collect();
+    }
     if let Some(Obj::Arr(v)) = rt.heap.get_mut(id) {
         *v = items;
     }
@@ -921,6 +946,8 @@ fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
         ("keys", obj_keys as crate::bytecode::NativeFn),
         ("values", obj_values),
         ("assign", obj_assign),
+        ("entries", obj_entries),
+        ("fromEntries", obj_from_entries),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -969,13 +996,64 @@ fn obj_assign(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmEr
     Ok(target)
 }
 
-/// JSON.stringify を登録（簡易版）。
+/// `Object.entries(obj)` → `[[key, value], ...]` の配列。
+fn obj_entries(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let mut out = Vec::new();
+    for (k, val) in obj_props(rt, v) {
+        let pair = vec![k, val];
+        let pid = rt.heap.alloc(Obj::Arr(pair)).map_err(|_| VmError::Oom)?;
+        out.push(AklVal::mk_obj(pid));
+    }
+    let id = rt.heap.alloc(Obj::Arr(out)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Object.fromEntries([[key, value], ...])` → オブジェクト。
+fn obj_from_entries(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let obj_id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    // 借用回避: エントリ列を値コピーしてから再構築
+    let entries: Vec<AklVal> = if v.is_obj() {
+        match rt.heap.get(v.get_obj()) {
+            Some(Obj::Arr(e)) => e.clone(),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    for entry in entries {
+        let pair: Vec<AklVal> = if entry.is_obj() {
+            match rt.heap.get(entry.get_obj()) {
+                Some(Obj::Arr(p)) => p.clone(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        if pair.is_empty() {
+            continue;
+        }
+        let k = pair.first().copied().unwrap_or(AklVal::UNDEF);
+        let val = pair.get(1).copied().unwrap_or(AklVal::UNDEF);
+        // キーを文字列化して intern
+        let ks = to_js_string(rt, k);
+        let kid = rt.intern(&ks).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(obj_id, kid, val).map_err(|_| VmError::Oom)?;
+    }
+    Ok(AklVal::mk_obj(obj_id))
+}
+
+/// JSON.stringify / JSON.parse を登録（簡易版）。
 fn install_json(rt: &mut Runtime) -> Result<(), VmError> {
     let json_id = rt.intern("JSON").ok_or(VmError::Oom)?;
     let json = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
     let f = rt.register_native(json_stringify)?;
     let nid = rt.intern("stringify").ok_or(VmError::Oom)?;
     rt.heap.prop_set(json, nid, f).map_err(|_| VmError::Oom)?;
+    let p = rt.register_native(json_parse)?;
+    let pid = rt.intern("parse").ok_or(VmError::Oom)?;
+    rt.heap.prop_set(json, pid, p).map_err(|_| VmError::Oom)?;
     rt.global_set(json_id, AklVal::mk_obj(json));
     Ok(())
 }
@@ -1083,6 +1161,304 @@ fn json_quote(s: &str) -> String {
     out
 }
 
+/// `JSON.parse`（再帰下降。文字列 → AklVal）。
+fn json_parse(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = str_of(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+    let mut p = JsonParser {
+        s: s.as_bytes(),
+        pos: 0,
+    };
+    let v = p.value(rt, 0).map_err(|_| json_syntax_error(rt))?;
+    p.ws();
+    if p.pos != p.s.len() {
+        return Err(json_syntax_error(rt));
+    }
+    Ok(v)
+}
+
+/// JSON 構文エラーを `Thrown` として返す。
+fn json_syntax_error(rt: &mut Runtime) -> VmError {
+    let msg = rt.intern("SyntaxError: invalid JSON").unwrap_or(0);
+    VmError::Thrown(AklVal::mk_obj(msg))
+}
+
+/// JSON 再帰下降パーサ（バイト列をスキャンして AklVal を構築）。
+struct JsonParser<'a> {
+    /// 入力バイト列。
+    s: &'a [u8],
+    /// 現在位置。
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    /// 空白を読み飛ばす。
+    fn ws(&mut self) {
+        while self.pos < self.s.len() {
+            let c = self.s[self.pos];
+            if c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// リテラル（true/false/null）を照合。
+    fn lit(&mut self, lit: &[u8]) -> bool {
+        if self.pos + lit.len() > self.s.len() {
+            return false;
+        }
+        if &self.s[self.pos..self.pos + lit.len()] == lit {
+            self.pos += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 4 桁の 16 進を読む。
+    fn hex4(&mut self) -> Option<u32> {
+        if self.pos + 4 > self.s.len() {
+            return None;
+        }
+        let mut v = 0u32;
+        for i in 0..4 {
+            let c = self.s[self.pos + i];
+            let d = match c {
+                b'0'..=b'9' => (c - b'0') as u32,
+                b'a'..=b'f' => (c - b'a' + 10) as u32,
+                b'A'..=b'F' => (c - b'A' + 10) as u32,
+                _ => return None,
+            };
+            v = v * 16 + d;
+        }
+        self.pos += 4;
+        Some(v)
+    }
+
+    /// 文字列（エスケープ込み。UTF-16 サロゲートペア対応）。
+    fn string(&mut self) -> Option<String> {
+        if self.pos >= self.s.len() || self.s[self.pos] != b'"' {
+            return None;
+        }
+        self.pos += 1;
+        let mut out = String::new();
+        while self.pos < self.s.len() {
+            let c = self.s[self.pos];
+            self.pos += 1;
+            match c {
+                b'"' => return Some(out),
+                b'\\' => {
+                    if self.pos >= self.s.len() {
+                        return None;
+                    }
+                    let e = self.s[self.pos];
+                    self.pos += 1;
+                    match e {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\u{0008}'),
+                        b'f' => out.push('\u{000c}'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let mut cp = self.hex4()?;
+                            // サロゲートペア
+                            if (0xD800..=0xDBFF).contains(&cp)
+                                && self.pos + 2 <= self.s.len()
+                                && self.s[self.pos] == b'\\'
+                                && self.s[self.pos + 1] == b'u'
+                            {
+                                let save = self.pos;
+                                self.pos += 2;
+                                if let Some(lo) = self.hex4() {
+                                    if (0xDC00..=0xDFFF).contains(&lo) {
+                                        cp = 0x10000
+                                            + ((cp - 0xD800) << 10)
+                                            + (lo - 0xDC00);
+                                    } else {
+                                        self.pos = save;
+                                    }
+                                } else {
+                                    self.pos = save;
+                                }
+                            }
+                            out.push(char::from_u32(cp)?);
+                        }
+                        _ => return None,
+                    }
+                }
+                c if c < 0x20 => return None,
+                c => {
+                    // マルチバイト UTF-8 は生バイト列をそのまま複製
+                    let seq = if c < 0x80 {
+                        1
+                    } else if (c & 0xE0) == 0xC0 {
+                        2
+                    } else if (c & 0xF0) == 0xE0 {
+                        3
+                    } else if (c & 0xF8) == 0xF0 {
+                        4
+                    } else {
+                        1
+                    };
+                    let start = self.pos - 1;
+                    if start + seq > self.s.len() {
+                        return None;
+                    }
+                    let bytes = &self.s[start..start + seq];
+                    out.push_str(std::str::from_utf8(bytes).ok()?);
+                    self.pos += seq - 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// 数値（先頭の `0` のみの整数は JSON では不正）。
+    fn number(&mut self) -> Option<AklVal> {
+        let st = self.pos;
+        let mut is_int = true;
+        if self.pos < self.s.len() && self.s[self.pos] == b'-' {
+            self.pos += 1;
+        }
+        let intst = self.pos;
+        let mut any = false;
+        while self.pos < self.s.len() && self.s[self.pos].is_ascii_digit() {
+            self.pos += 1;
+            any = true;
+        }
+        if !any {
+            self.pos = st;
+            return None;
+        }
+        // 先頭 0 の複数桁は不正（-01 等）
+        if self.pos - intst > 1 && self.s[intst] == b'0' {
+            self.pos = st;
+            return None;
+        }
+        if self.pos < self.s.len() && self.s[self.pos] == b'.' {
+            is_int = false;
+            self.pos += 1;
+            while self.pos < self.s.len() && self.s[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+        }
+        if self.pos < self.s.len() && (self.s[self.pos] == b'e' || self.s[self.pos] == b'E') {
+            is_int = false;
+            self.pos += 1;
+            if self.pos < self.s.len()
+                && (self.s[self.pos] == b'+' || self.s[self.pos] == b'-')
+            {
+                self.pos += 1;
+            }
+            while self.pos < self.s.len() && self.s[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+        }
+        let text = std::str::from_utf8(&self.s[st..self.pos]).ok()?;
+        if is_int {
+            if let Ok(i) = text.parse::<i64>() {
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    return Some(AklVal::mk_int(i as i32));
+                }
+                return Some(AklVal::from_f64(i as f64));
+            }
+            return Some(AklVal::from_f64(text.parse::<f64>().unwrap_or(f64::NAN)));
+        }
+        Some(AklVal::from_f64(text.parse::<f64>().unwrap_or(f64::NAN)))
+    }
+
+    /// 値（object / array / string / number / true / false / null）。
+    fn value(&mut self, rt: &mut Runtime, depth: u32) -> Result<AklVal, ()> {
+        if depth > 256 {
+            return Err(());
+        }
+        self.ws();
+        if self.pos >= self.s.len() {
+            return Err(());
+        }
+        let c = self.s[self.pos];
+        if c == b'{' {
+            self.pos += 1;
+            let obj_id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| ())?;
+            self.ws();
+            if self.pos < self.s.len() && self.s[self.pos] == b'}' {
+                self.pos += 1;
+                return Ok(AklVal::mk_obj(obj_id));
+            }
+            loop {
+                self.ws();
+                let key = self.string().ok_or(())?;
+                let kid = rt.intern(&key).ok_or(())?;
+                self.ws();
+                if self.pos >= self.s.len() || self.s[self.pos] != b':' {
+                    return Err(());
+                }
+                self.pos += 1;
+                let v = self.value(rt, depth + 1)?;
+                rt.heap.prop_set(obj_id, kid, v).map_err(|_| ())?;
+                self.ws();
+                if self.pos < self.s.len() && self.s[self.pos] == b',' {
+                    self.pos += 1;
+                    continue;
+                }
+                if self.pos < self.s.len() && self.s[self.pos] == b'}' {
+                    self.pos += 1;
+                    return Ok(AklVal::mk_obj(obj_id));
+                }
+                return Err(());
+            }
+        }
+        if c == b'[' {
+            self.pos += 1;
+            let mut items = Vec::new();
+            self.ws();
+            if self.pos < self.s.len() && self.s[self.pos] == b']' {
+                self.pos += 1;
+                let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| ())?;
+                return Ok(AklVal::mk_obj(id));
+            }
+            loop {
+                self.ws();
+                let v = self.value(rt, depth + 1)?;
+                items.push(v);
+                self.ws();
+                if self.pos < self.s.len() && self.s[self.pos] == b',' {
+                    self.pos += 1;
+                    continue;
+                }
+                if self.pos < self.s.len() && self.s[self.pos] == b']' {
+                    self.pos += 1;
+                    let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| ())?;
+                    return Ok(AklVal::mk_obj(id));
+                }
+                return Err(());
+            }
+        }
+        if c == b'"' {
+            let s = self.string().ok_or(())?;
+            let id = rt.intern(&s).ok_or(())?;
+            return Ok(AklVal::mk_obj(id));
+        }
+        if c == b't' && self.lit(b"true") {
+            return Ok(AklVal::TRUE);
+        }
+        if c == b'f' && self.lit(b"false") {
+            return Ok(AklVal::FALSE);
+        }
+        if c == b'n' && self.lit(b"null") {
+            return Ok(AklVal::NULL);
+        }
+        if let Some(n) = self.number() {
+            return Ok(n);
+        }
+        Err(())
+    }
+}
+
 /// 値（関数）を呼ぶ（native またはバイトコード関数）。簡易実装。
 fn call_native(rt: &mut Runtime, f: AklVal, this: AklVal, args: &[AklVal]) -> Result<AklVal, VmError> {
     if !f.is_obj() {
@@ -1100,6 +1476,289 @@ fn call_native(rt: &mut Runtime, f: AklVal, this: AklVal, args: &[AklVal]) -> Re
         return rt.run(fidx, args);
     }
     Ok(AklVal::UNDEF)
+}
+
+/// 現在時刻（エポック ms。f64）。
+fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
+
+/// Date 値を ms として読む（非 Date は None）。
+fn date_ms(rt: &Runtime, this: AklVal) -> Option<f64> {
+    if this.is_obj() {
+        if let Some(Obj::Date { ms }) = rt.heap.get(this.get_obj()) {
+            return Some(*ms);
+        }
+    }
+    None
+}
+
+/// ISO 8601 簡易パース（`YYYY-MM-DDTHH:MM:SS.sssZ` / 日付のみ / 年月のみ / 年のみ）。
+fn parse_iso_date(s: &str) -> f64 {
+    let s = s.trim();
+    let b = s.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    let mut neg = false;
+    if i < n && (b[i] == b'-' || b[i] == b'+') {
+        neg = b[i] == b'-';
+        i += 1;
+    }
+    let read_uint = |i: &mut usize| -> Option<i64> {
+        let st = *i;
+        let mut v = 0i64;
+        while *i < n && b[*i].is_ascii_digit() {
+            v = v * 10 + (b[*i] - b'0') as i64;
+            *i += 1;
+        }
+        if *i == st {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    let year = match read_uint(&mut i) {
+        Some(v) => if neg { -v } else { v },
+        None => return f64::NAN,
+    };
+    let mut month = 1i64;
+    let mut day = 1i64;
+    let mut hour = 0i64;
+    let mut minute = 0i64;
+    let mut second = 0i64;
+    let mut ms = 0i64;
+    if i < n && b[i] == b'-' {
+        i += 1;
+        month = match read_uint(&mut i) {
+            Some(v) => v,
+            None => return f64::NAN,
+        };
+        if i < n && b[i] == b'-' {
+            i += 1;
+            day = match read_uint(&mut i) {
+                Some(v) => v,
+                None => return f64::NAN,
+            };
+        }
+    }
+    if i < n && (b[i] == b'T' || b[i] == b't' || b[i] == b' ') {
+        i += 1;
+        hour = match read_uint(&mut i) {
+            Some(v) => v,
+            None => return f64::NAN,
+        };
+        if i < n && b[i] == b':' {
+            i += 1;
+            minute = match read_uint(&mut i) {
+                Some(v) => v,
+                None => return f64::NAN,
+            };
+        }
+        if i < n && b[i] == b':' {
+            i += 1;
+            second = match read_uint(&mut i) {
+                Some(v) => v,
+                None => return f64::NAN,
+            };
+        }
+        if i < n && b[i] == b'.' {
+            i += 1;
+            // 小数秒（ms 桁まで）
+            let mut scale = 100;
+            while i < n && b[i].is_ascii_digit() && scale > 0 {
+                ms += (b[i] - b'0') as i64 * scale;
+                scale /= 10;
+                i += 1;
+            }
+            while i < n && b[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+    }
+    // 末尾 Z 等は無視（UTC 近似）
+    let days = crate::bytecode::days_from_civil(year as i32, month as u32, day as u32);
+    days as f64 * 86_400_000.0
+        + ((hour * 3600 + minute * 60 + second) as f64) * 1000.0
+        + ms as f64
+}
+
+/// `Date` を登録。Date グローバルは `constructor` + `now`/`parse`/`UTC` を持つ
+/// `Obj::Obj`。インスタンスは `Obj::Date`、メソッドは `rt.date_methods` 経由。
+fn install_date(rt: &mut Runtime) -> Result<(), VmError> {
+    let date_id = rt.intern("Date").ok_or(VmError::Oom)?;
+    let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    // constructor（new Date() / Date() 用のフォールバック解決対象）
+    let ctor = rt.register_native(date_ctor)?;
+    rt.heap
+        .prop_set(obj, rt.ctor_name, ctor)
+        .map_err(|_| VmError::Oom)?;
+    // 静的メソッド
+    for (name, f) in [
+        ("now", date_now as crate::bytecode::NativeFn),
+        ("parse", date_parse),
+        ("UTC", date_utc),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(obj, nid, v).map_err(|_| VmError::Oom)?;
+    }
+    rt.global_set(date_id, AklVal::mk_obj(obj));
+    // インスタンスメソッド
+    for (name, f) in [
+        ("getTime", date_get_time as crate::bytecode::NativeFn),
+        ("valueOf", date_get_time),
+        ("getFullYear", date_get_full_year),
+        ("getMonth", date_get_month),
+        ("getDate", date_get_date),
+        ("getDay", date_get_day),
+        ("getHours", date_get_hours),
+        ("getMinutes", date_get_minutes),
+        ("getSeconds", date_get_seconds),
+        ("getMilliseconds", date_get_milliseconds),
+        ("getUTCFullYear", date_get_full_year),
+        ("getUTCMonth", date_get_month),
+        ("getUTCDate", date_get_date),
+        ("getUTCDay", date_get_day),
+        ("getUTCHours", date_get_hours),
+        ("getUTCMinutes", date_get_minutes),
+        ("getUTCSeconds", date_get_seconds),
+        ("getUTCMilliseconds", date_get_milliseconds),
+        ("toISOString", date_to_iso),
+        ("toString", date_to_str),
+        ("setTime", date_set_time),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.date_methods.push((nid, v));
+    }
+    Ok(())
+}
+
+/// `new Date()` / `Date(...)` のコンストラクタ。
+fn date_ctor(rt: &mut Runtime, _this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let ms = if a.is_empty() {
+        now_ms()
+    } else if a.len() == 1 {
+        let v = a[0];
+        if v.is_int() || v.as_f64().is_some() {
+            to_number(rt, v)
+        } else {
+            parse_iso_date(&to_js_string(rt, v))
+        }
+    } else {
+        // new Date(y, m, d, h, mi, s, ms): UTC として解釈（TZ 非依存近似）
+        let y = to_number(rt, a[0]) as i32;
+        let m = to_number(rt, a.get(1).copied().unwrap_or(AklVal::UNDEF)) as i32;
+        let d = to_number(rt, a.get(2).copied().unwrap_or(AklVal::mk_int(1))) as i32;
+        let h = to_number(rt, a.get(3).copied().unwrap_or(AklVal::mk_int(0))) as i64;
+        let mi = to_number(rt, a.get(4).copied().unwrap_or(AklVal::mk_int(0))) as i64;
+        let s = to_number(rt, a.get(5).copied().unwrap_or(AklVal::mk_int(0))) as i64;
+        let msd = to_number(rt, a.get(6).copied().unwrap_or(AklVal::mk_int(0)));
+        let days = crate::bytecode::days_from_civil(y, (m + 1) as u32, d as u32);
+        days as f64 * 86_400_000.0 + ((h * 3600 + mi * 60 + s) as f64) * 1000.0 + msd
+    };
+    let id = rt.heap.alloc(Obj::Date { ms }).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn date_now(_rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(AklVal::from_f64(now_ms()))
+}
+
+fn date_parse(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = str_of(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+    Ok(AklVal::from_f64(parse_iso_date(&s)))
+}
+
+fn date_utc(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let y = to_number(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) as i32;
+    let m = to_number(rt, a.get(1).copied().unwrap_or(AklVal::UNDEF)) as i32;
+    let d = to_number(rt, a.get(2).copied().unwrap_or(AklVal::mk_int(1))) as i32;
+    let h = to_number(rt, a.get(3).copied().unwrap_or(AklVal::mk_int(0))) as i64;
+    let mi = to_number(rt, a.get(4).copied().unwrap_or(AklVal::mk_int(0))) as i64;
+    let s = to_number(rt, a.get(5).copied().unwrap_or(AklVal::mk_int(0))) as i64;
+    let msd = to_number(rt, a.get(6).copied().unwrap_or(AklVal::mk_int(0)));
+    let days = crate::bytecode::days_from_civil(y, (m + 1) as u32, d as u32);
+    Ok(AklVal::from_f64(
+        days as f64 * 86_400_000.0 + ((h * 3600 + mi * 60 + s) as f64) * 1000.0 + msd,
+    ))
+}
+
+fn date_get_time(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    match date_ms(rt, this) {
+        Some(ms) => Ok(AklVal::from_f64(ms)),
+        None => Ok(AklVal::from_f64(f64::NAN)),
+    }
+}
+
+fn date_field(rt: &Runtime, this: AklVal, f: impl Fn(crate::bytecode::DateFields) -> i32) -> AklVal {
+    match date_ms(rt, this) {
+        Some(ms) => {
+            let fields = crate::bytecode::date_utc_fields(ms);
+            AklVal::mk_int(f(fields))
+        }
+        None => AklVal::from_f64(f64::NAN),
+    }
+}
+
+fn date_get_full_year(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(date_field(rt, this, |f| f.year))
+}
+fn date_get_month(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(date_field(rt, this, |f| f.month as i32 - 1))
+}
+fn date_get_date(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(date_field(rt, this, |f| f.day as i32))
+}
+fn date_get_day(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(date_field(rt, this, |f| f.weekday as i32))
+}
+fn date_get_hours(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(date_field(rt, this, |f| f.hour as i32))
+}
+fn date_get_minutes(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(date_field(rt, this, |f| f.minute as i32))
+}
+fn date_get_seconds(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(date_field(rt, this, |f| f.second as i32))
+}
+fn date_get_milliseconds(
+    rt: &mut Runtime,
+    this: AklVal,
+    _a: &[AklVal],
+) -> Result<AklVal, VmError> {
+    Ok(date_field(rt, this, |f| f.millisecond as i32))
+}
+
+fn date_to_iso(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = match date_ms(rt, this) {
+        Some(ms) => crate::bytecode::date_to_iso_string(ms),
+        None => "Invalid Date".to_string(),
+    };
+    let id = rt.intern(&s).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn date_to_str(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = match date_ms(rt, this) {
+        Some(ms) => crate::bytecode::date_to_string(ms),
+        None => "Invalid Date".to_string(),
+    };
+    let id = rt.intern(&s).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn date_set_time(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let ms = to_number(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+    if this.is_obj() {
+        if let Some(Obj::Date { ms: slot }) = rt.heap.get_mut(this.get_obj()) {
+            *slot = ms;
+        }
+    }
+    Ok(AklVal::from_f64(ms))
 }
 
 #[cfg(test)]
@@ -1298,6 +1957,130 @@ mod tests {
         assert_eq!(
             run_src("JSON.stringify({a: 1}) === \"{\\\"a\\\":1}\";").unwrap().0,
             AklVal::TRUE
+        );
+    }
+
+    #[test]
+    fn json_parse() {
+        assert_eq!(run_src("JSON.parse(\"42\");").unwrap().0, AklVal::mk_int(42));
+        assert_eq!(
+            run_src("JSON.parse(\"1.5\") === 1.5;").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(run_src("JSON.parse(\"true\");").unwrap().0, AklVal::TRUE);
+        assert_eq!(run_src("JSON.parse(\"null\");").unwrap().0, AklVal::NULL);
+        assert_eq!(
+            run_src("JSON.parse(\"\\\"hi\\\"\") === \"hi\";").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("JSON.parse(\"[1, 2, 3]\")[1];").unwrap().0,
+            AklVal::mk_int(2)
+        );
+        assert_eq!(
+            run_src("JSON.parse(\"{\\\"a\\\": 1}\").a;").unwrap().0,
+            AklVal::mk_int(1)
+        );
+        // ネスト
+        assert_eq!(
+            run_src("JSON.parse(\"{\\\"a\\\": [1, {\\\"b\\\": 2}]}\").a[1].b;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+        // エスケープ
+        assert_eq!(
+            run_src("JSON.parse(\"\\\"a\\\\nb\\\"\") === \"a\\nb\";").unwrap().0,
+            AklVal::TRUE
+        );
+    }
+
+    #[test]
+    fn json_parse_invalid_throws() {
+        // 不正 JSON は SyntaxError を throw（catch で捕捉できる）
+        assert_eq!(
+            run_src("var r = 0; try { JSON.parse(\"{bad}\"); } catch (e) { r = 1; } r;")
+                .unwrap()
+                .0,
+            AklVal::mk_int(1)
+        );
+    }
+
+    #[test]
+    fn array_sort_comparator() {
+        assert_eq!(
+            run_src("var a = [3, 1, 2]; a.sort(function(x, y) { return x - y; }); a[0];")
+                .unwrap()
+                .0,
+            AklVal::mk_int(1)
+        );
+        assert_eq!(
+            run_src("var a = [1, 2, 3]; a.sort(function(x, y) { return y - x; }); a[0];")
+                .unwrap()
+                .0,
+            AklVal::mk_int(3)
+        );
+    }
+
+    #[test]
+    fn object_entries_from_entries() {
+        assert_eq!(
+            run_src("Object.entries({a: 1, b: 2}).length;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+        assert_eq!(
+            run_src("Object.fromEntries([[\"a\", 1], [\"b\", 2]]).b;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+    }
+
+    #[test]
+    fn date_basic() {
+        // Date.UTC(1970, 0, 1) = 0
+        assert_eq!(
+            run_src("Date.UTC(1970, 0, 1) === 0;").unwrap().0,
+            AklVal::TRUE
+        );
+        // Date.parse("1970-01-01") = 0
+        assert_eq!(
+            run_src("Date.parse(\"1970-01-01\") === 0;").unwrap().0,
+            AklVal::TRUE
+        );
+        // getTime / getUTCFullYear / getUTCDate / getUTCSeconds
+        assert_eq!(
+            run_src("var d = new Date(0); d.getTime() === 0;").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("var d = new Date(0); d.getUTCFullYear();").unwrap().0,
+            AklVal::mk_int(1970)
+        );
+        assert_eq!(
+            run_src("var d = new Date(0); d.getUTCDate();").unwrap().0,
+            AklVal::mk_int(1)
+        );
+        // toISOString
+        assert_eq!(
+            run_src("var d = new Date(0); d.toISOString() === \"1970-01-01T00:00:00.000Z\";")
+                .unwrap()
+                .0,
+            AklVal::TRUE
+        );
+        // valueOf による数値化（+new Date(0)）
+        assert_eq!(
+            run_src("var d = new Date(0); +d === 0;").unwrap().0,
+            AklVal::TRUE
+        );
+        // 時刻フィールド（3661 秒 = 01:01:01）
+        assert_eq!(
+            run_src("var d = new Date(3661000); d.getUTCSeconds();").unwrap().0,
+            AklVal::mk_int(1)
+        );
+        assert_eq!(
+            run_src("var d = new Date(3661000); d.getUTCMinutes();").unwrap().0,
+            AklVal::mk_int(1)
+        );
+        assert_eq!(
+            run_src("var d = new Date(3661000); d.getUTCHours();").unwrap().0,
+            AklVal::mk_int(1)
         );
     }
 }
