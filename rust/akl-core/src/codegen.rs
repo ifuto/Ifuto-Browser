@@ -434,31 +434,53 @@ impl Compiler<'_> {
                 });
             }
             Expr::Bin { op, lhs, rhs } => {
-                self.gen_expr(lhs, code)?;
-                self.gen_expr(rhs, code)?;
-                code.push(match op {
-                    BinOp::Add => Op::Add,
-                    BinOp::Sub => Op::Sub,
-                    BinOp::Mul => Op::Mul,
-                    BinOp::Div => Op::Div,
-                    BinOp::Mod => Op::Mod,
-                    BinOp::Eq => Op::Eq,
-                    BinOp::Ne => Op::Ne,
-                    BinOp::Seq => Op::Seq,
-                    BinOp::Sne => Op::Sne,
-                    BinOp::Lt => Op::Lt,
-                    BinOp::Le => Op::Le,
-                    BinOp::Gt => Op::Gt,
-                    BinOp::Ge => Op::Ge,
-                    BinOp::And => Op::And,
-                    BinOp::Or => Op::Or,
-                    BinOp::BAnd => Op::BAnd,
-                    BinOp::BOr => Op::BOr,
-                    BinOp::BXor => Op::BXor,
-                    BinOp::BShl => Op::BShl,
-                    BinOp::BShr => Op::BShr,
-                    BinOp::BUShr => Op::BUShr,
-                });
+                // `&&` / `||` は JS の値返し短絡（オペランドを値として返す）。
+                // lodash の環境検出 `typeof x == 'object' && x` は右辺評価を短絡に依存。
+                if *op == BinOp::And {
+                    self.gen_expr(lhs, code)?;
+                    code.push(Op::Dup);
+                    let jmpf_idx = code.len();
+                    code.push(Op::JmpF(0)); // falsy → 結果は lhs（Dup 側）
+                    code.push(Op::Pop); // truthy → lhs を捨てて rhs を評価
+                    self.gen_expr(rhs, code)?;
+                    let end = code.len();
+                    code[jmpf_idx] = Op::JmpF(end as u32);
+                } else if *op == BinOp::Or {
+                    self.gen_expr(lhs, code)?;
+                    code.push(Op::Dup);
+                    let jmpt_idx = code.len();
+                    code.push(Op::JmpT(0)); // truthy → 結果は lhs（Dup 側）
+                    code.push(Op::Pop); // falsy → lhs を捨てて rhs を評価
+                    self.gen_expr(rhs, code)?;
+                    let end = code.len();
+                    code[jmpt_idx] = Op::JmpT(end as u32);
+                } else {
+                    self.gen_expr(lhs, code)?;
+                    self.gen_expr(rhs, code)?;
+                    code.push(match op {
+                        BinOp::Add => Op::Add,
+                        BinOp::Sub => Op::Sub,
+                        BinOp::Mul => Op::Mul,
+                        BinOp::Div => Op::Div,
+                        BinOp::Mod => Op::Mod,
+                        BinOp::Eq => Op::Eq,
+                        BinOp::Ne => Op::Ne,
+                        BinOp::Seq => Op::Seq,
+                        BinOp::Sne => Op::Sne,
+                        BinOp::Lt => Op::Lt,
+                        BinOp::Le => Op::Le,
+                        BinOp::Gt => Op::Gt,
+                        BinOp::Ge => Op::Ge,
+                        BinOp::BAnd => Op::BAnd,
+                        BinOp::BOr => Op::BOr,
+                        BinOp::BXor => Op::BXor,
+                        BinOp::BShl => Op::BShl,
+                        BinOp::BShr => Op::BShr,
+                        BinOp::BUShr => Op::BUShr,
+                        // And / Or は上の短絡分岐で処理済み（ここには到達しない）
+                        BinOp::And | BinOp::Or => unreachable!(),
+                    });
+                }
             }
             Expr::Assign { name, rhs } => {
                 self.gen_expr(rhs, code)?;

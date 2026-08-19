@@ -2095,6 +2095,10 @@ impl Runtime {
             let (da, db) = (self.to_number(a), self.to_number(b));
             return !da.is_nan() && !db.is_nan() && da.to_bits() == db.to_bits();
         }
+        // 文字列は内容比較（JS の `===`。ROPE と Str は異なる ObjId でも同一内容なら等値）
+        if self.is_string(a) && self.is_string(b) {
+            return self.str_slice(a) == self.str_slice(b);
+        }
         if a.is_obj() && b.is_obj() {
             return a.get_obj() == b.get_obj();
         }
@@ -2342,6 +2346,38 @@ impl Runtime {
         }
     }
 }
+
+/// `globalThis` ハンドルの get（グローバル名の解決）。C の `akl_global_this_get` 相当。
+fn global_this_get(rt: &mut Runtime, _data: u64, _ptr: u64, name: &str) -> Option<AklVal> {
+    let id = rt.intern(name)?;
+    rt.global_get(id)
+}
+
+/// `globalThis` ハンドルの set（グローバル束縛）。`root._ = _` 等がグローバルに届く。
+fn global_this_set(rt: &mut Runtime, _data: u64, _ptr: u64, name: &str, v: AklVal) -> bool {
+    match rt.intern(name) {
+        Some(id) => {
+            rt.global_set(id, v);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `globalThis` ハンドルの call（グローバル関数の呼び出し。`root.fn(...)`）。
+fn global_this_call(rt: &mut Runtime, _data: u64, _ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal> {
+    let id = rt.intern(name)?;
+    let f = rt.global_get(id)?;
+    rt.call_value(f, AklVal::UNDEF, args).ok()
+}
+
+/// `globalThis` の vtable（プロパティアクセスをグローバル解決に写像する）。
+pub static GLOBAL_THIS_VT: HandleVTab = HandleVTab {
+    tag: "globalThis",
+    get: global_this_get,
+    set: global_this_set,
+    call: global_this_call,
+};
 
 /// 二項算術の種類（`arith_bin` 用）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

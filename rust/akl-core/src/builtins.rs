@@ -65,6 +65,9 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     rt.register_global_native("Number", number_ctor)?;
     rt.register_global_native("String", string_ctor)?;
 
+    // globalThis ハンドル + 基本コンストラクタ（lodash の root 検出・環境判定用）
+    install_global_this_and_ctors(rt)?;
+
     // String.prototype メソッド（プレーンオブジェクトに native を載せる）
     install_string_methods(rt)?;
     // Array.prototype メソッド
@@ -292,6 +295,112 @@ fn string_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     let s = to_js_string(rt, v);
     let id = rt.intern(&s).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
+}
+
+/// `Function('return this')()` が返す native（`this` が undefined なら globalThis）。
+fn fn_return_this(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    if !this.is_undef() {
+        return Ok(this);
+    }
+    let name = rt.intern("globalThis").ok_or(VmError::Oom)?;
+    Ok(rt.global_get(name).unwrap_or(AklVal::UNDEF))
+}
+
+/// `Function(body)`：'return this' のみ対応（lodash の root 検出）。C 実装と同型。
+fn function_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let body = a.last().copied().unwrap_or(AklVal::UNDEF);
+    if rt.flatten_str(body).trim() == "return this" {
+        return rt.register_native(fn_return_this);
+    }
+    let msg = rt
+        .intern("TypeError: Function constructor is not supported")
+        .unwrap_or(0);
+    Err(VmError::Thrown(AklVal::mk_obj(msg)))
+}
+
+/// `Array(...)` コンストラクタ（`Array(n)` / `Array.isArray` 用）。
+fn array_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    // Array(len) → 空配列。Array(v) → [v]。簡易近似。
+    let items: Vec<AklVal> = if a.len() == 1 && !a[0].is_obj() {
+        Vec::new()
+    } else {
+        a.to_vec()
+    };
+    let id = rt.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Array.isArray(x)` 用の静的メソッド。
+fn array_is_array(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let is = v.is_obj() && matches!(rt.heap.get(v.get_obj()), Some(Obj::Arr(_)));
+    Ok(AklVal::from_bool(is))
+}
+
+/// `Boolean(v)` コンストラクタ。
+fn boolean_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    Ok(AklVal::from_bool(truthy_builtin(rt, v)))
+}
+
+/// `RegExp(pattern[, flags])` コンストラクタ。
+fn regexp_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let pattern = rt.flatten_str(a.first().copied().unwrap_or(AklVal::UNDEF));
+    let flags = rt.flatten_str(a.get(1).copied().unwrap_or(AklVal::UNDEF));
+    let id = rt
+        .heap
+        .alloc(Obj::RegExp { pattern: pattern.into_boxed_str(), flags: flags.into_boxed_str() })
+        .map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Symbol([desc])` コンストラクタ（一意値を返す簡易近似。well-known symbol は未対応）。
+fn symbol_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    // 一意な文字列で近似（`typeof` が "symbol" にはならないが、lodash は `typeof Symbol`
+    // を環境判定に使うだけなので関数であれば十分）。
+    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `isFinite(v)`。
+fn is_finite(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let d = to_number(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+    Ok(AklVal::from_bool(d.is_finite()))
+}
+
+/// globalThis ハンドル + `Function` / `Array` / `Boolean` コンストラクタを登録。
+fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
+    // globalThis（プロパティアクセスをグローバル解決に写像するハンドル）
+    let gt = rt
+        .heap
+        .alloc(Obj::Handle { vtab: &crate::bytecode::GLOBAL_THIS_VT, data: 0, ptr: 0 })
+        .map_err(|_| VmError::Oom)?;
+    let gt_name = rt.intern("globalThis").ok_or(VmError::Oom)?;
+    rt.global_set(gt_name, AklVal::mk_obj(gt));
+
+    // Function / Boolean
+    rt.register_global_native("Function", function_ctor)?;
+    rt.register_global_native("Boolean", boolean_ctor)?;
+    // RegExp / Symbol / isFinite（lodash の環境判定・正規表現生成用）
+    rt.register_global_native("RegExp", regexp_ctor)?;
+    rt.register_global_native("Symbol", symbol_ctor)?;
+    rt.register_global_native("isFinite", is_finite)?;
+
+    // Array（constructor + isArray）
+    let arr_id = rt.intern("Array").ok_or(VmError::Oom)?;
+    let arr = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let ctor = rt.register_native(array_ctor)?;
+    rt.heap
+        .prop_set(arr, rt.ctor_name, ctor)
+        .map_err(|_| VmError::Oom)?;
+    let is_arr = rt.register_native(array_is_array)?;
+    let is_arr_name = rt.intern("isArray").ok_or(VmError::Oom)?;
+    rt.heap
+        .prop_set(arr, is_arr_name, is_arr)
+        .map_err(|_| VmError::Oom)?;
+    rt.global_set(arr_id, AklVal::mk_obj(arr));
+
+    Ok(())
 }
 
 /// String.prototype メソッドを登録（C の `str_meth_vals` 相当。文字列リテラルの
