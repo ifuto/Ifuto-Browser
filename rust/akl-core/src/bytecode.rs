@@ -212,6 +212,9 @@ pub enum Op {
     NewRegex(u32),
     /// 関数の prototype を設定（proto, fn を pop、fn を push。fn_protos テーブル登録）。
     SetFnProto,
+    /// 親クラス継承（pop proto, pop parent_ctor → proto の [[Prototype]] = parent.prototype。
+    /// class extends のメソッド継承チェーン構築）。
+    LinkSuper,
     /// 戻る（TOS を返り値として pop）。
     Ret,
     /// 関数オブジェクトを生成して push（C の `MAKEF`。fidx = 関数表 index）。
@@ -1141,6 +1144,17 @@ impl Runtime {
                         self.fn_protos.push((fid, proto.get_obj()));
                     }
                     stack.push(f);
+                }
+                Op::LinkSuper => {
+                    // pop parent_ctor → TOS の proto に [[Prototype]] = parent.prototype を設定
+                    // （proto は pop せず SetFnProto 用に残す）
+                    let parent = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let proto = *stack.last().ok_or(VmError::StackUnderflow)?;
+                    if proto.is_obj() && parent.is_obj() {
+                        if let Some(pp) = self.func_proto(parent) {
+                            self.obj_set_proto(proto.get_obj(), pp)?;
+                        }
+                    }
                 }
                 Op::NewRegex(flags_id) => {
                     let pat_id = stack.pop().ok_or(VmError::StackUnderflow)?;

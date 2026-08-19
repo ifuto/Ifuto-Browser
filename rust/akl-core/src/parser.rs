@@ -294,6 +294,13 @@ pub enum Expr {
         /// 右辺。
         rhs: Box<Expr>,
     },
+    /// `super(args)`（派生クラスのコンストラクタで親コンストラクタを this で呼ぶ）。
+    SuperCall {
+        /// 親クラス名（グローバル名）。
+        parent: String,
+        /// 引数列。
+        args: Vec<Expr>,
+    },
 }
 
 /// 分割代入パターン。
@@ -436,10 +443,12 @@ pub enum Stmt {
         /// 右辺。
         init: Expr,
     },
-    /// class 宣言 `class C { constructor() {...} method() {...} }`。
+    /// class 宣言 `class C extends P { constructor() {...} method() {...} }`。
     ClassDecl {
         /// クラス名。
         name: String,
+        /// 親クラス名（`extends P`。無ければ None）。
+        parent: Option<String>,
         /// コンストラクタ（params, rest, body）。
         constructor: (Vec<String>, Option<String>, Vec<Stmt>),
         /// メソッド列（name, params, rest, body）。
@@ -483,12 +492,14 @@ impl From<LexError> for ParseError {
 pub struct Parser<'a> {
     lx: Lexer<'a>,
     peeked: Option<Token>,
+    /// 現在パース中の class の親クラス名（`super(...)` 解決用）。
+    super_class: Option<String>,
 }
 
 impl<'a> Parser<'a> {
     /// ソースからパーサを作る。
     pub fn new(src: &'a str) -> Self {
-        Self { lx: Lexer::new(src), peeked: None }
+        Self { lx: Lexer::new(src), peeked: None, super_class: None }
     }
 
     /// 現在の行番号（エラー報告用）。
@@ -966,6 +977,29 @@ impl<'a> Parser<'a> {
             Token::Kw(Keyword::Null) => Ok(Expr::Null),
             Token::Kw(Keyword::Undefined) => Ok(Expr::Undef),
             Token::Kw(Keyword::This) => Ok(Expr::This),
+            Token::Kw(Keyword::Super) => {
+                // super(args): 親コンストラクタ呼び出し（this で呼ぶ）
+                let parent = self
+                    .super_class
+                    .clone()
+                    .ok_or_else(|| ParseError("super outside class".into()))?;
+                self.expect_punct(Punct::LParen, "'('")?;
+                let mut args = Vec::new();
+                if !self.at_punct(Punct::RParen)? {
+                    loop {
+                        if self.eat_punct(Punct::Ellipsis)? {
+                            args.push(Expr::Spread(Box::new(self.parse_expr()?)));
+                        } else {
+                            args.push(self.parse_expr()?);
+                        }
+                        if !self.eat_punct(Punct::Comma)? {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(Punct::RParen, "')'")?;
+                Ok(Expr::SuperCall { parent, args })
+            }
             Token::Ident(name) => {
                 // アロー関数の単一引数形: `x => body`
                 if self.at_punct(Punct::Arrow)? {
@@ -1689,13 +1723,37 @@ impl<'a> Parser<'a> {
         Ok(Stmt::While { cond, body: Box::new(body) })
     }
 
-    /// `class C { constructor() {...} method() {...} }`。
+    /// `class C extends P { constructor() {...} method() {...} }`。
     fn parse_class(&mut self) -> Result<Stmt, ParseError> {
         self.bump()?; // class
         let name = match self.bump()? {
             Token::Ident(n) => n.to_string(),
             other => return Err(ParseError(format!("expected class name, got {other:?}"))),
         };
+        // `extends Parent`
+        let parent = if self.at_kw(Keyword::Extends)? {
+            self.bump()?;
+            match self.bump()? {
+                Token::Ident(n) => Some(n.to_string()),
+                other => return Err(ParseError(format!("expected parent class, got {other:?}"))),
+            }
+        } else {
+            None
+        };
+        // メソッド/コンストラクタ本体のパース中は super を親名に解決する
+        let saved_super = self.super_class.clone();
+        self.super_class = parent.clone();
+        let result = self.parse_class_body(name, parent);
+        self.super_class = saved_super;
+        result
+    }
+
+    /// class 本体 `{ ... }` をパースする（`super_class` は呼び出し側が設定済み）。
+    fn parse_class_body(
+        &mut self,
+        name: String,
+        parent: Option<String>,
+    ) -> Result<Stmt, ParseError> {
         self.expect_punct(Punct::LBrace, "'{'")?;
         let mut constructor = (Vec::new(), None, Vec::new());
         let mut methods = Vec::new();
@@ -1736,7 +1794,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(Punct::RBrace, "'}'")?;
-        Ok(Stmt::ClassDecl { name, constructor, methods, fields })
+        Ok(Stmt::ClassDecl { name, parent, constructor, methods, fields })
     }
 
     /// `import name from "spec"`（簡易近似）。

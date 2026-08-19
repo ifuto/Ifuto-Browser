@@ -738,6 +738,22 @@ impl Compiler<'_> {
                 code.push(Op::Dup); // [rhs, rhs]
                 self.gen_destructure(pattern, code)?; // [rhs]（束縛は 2 個目を消費）
             }
+            Expr::SuperCall { parent, args } => {
+                // super(args) → this で親コンストラクタを呼ぶ（MCall は this=receiver）
+                code.push(Op::This); // [this]
+                let parent_id = self
+                    .rt
+                    .intern(parent)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                code.push(Op::GLoad(parent_id)); // [this, parent]
+                for a in args {
+                    self.gen_expr(a, code)?;
+                }
+                if args.len() > u8::MAX as usize {
+                    return Err(CompileError("too many arguments".into()));
+                }
+                code.push(Op::MCall(args.len() as u8));
+            }
             Expr::This => {
                 code.push(Op::This);
             }
@@ -1019,7 +1035,7 @@ impl Compiler<'_> {
                 self.gen_expr(init, code)?;
                 self.gen_destructure(pattern, code)?;
             }
-            Stmt::ClassDecl { name, constructor, methods, fields } => {
+            Stmt::ClassDecl { name, parent, constructor, methods, fields } => {
                 // メソッドを先にコンパイル
                 let enclosing_env = self.captures.clone();
                 let empty_boxed = HashMap::new();
@@ -1070,6 +1086,15 @@ impl Compiler<'_> {
                         .ok_or_else(|| CompileError("intern failed".into()))?;
                     code.push(Op::PStore(mname_id)); // proto.mname = method → [ctor, ctor, proto, method]
                     code.push(Op::Pop); // [ctor, ctor, proto]
+                }
+                // extends: proto の [[Prototype]] を親クラスの prototype に繋ぐ
+                if let Some(p) = parent {
+                    let p_id = self
+                        .rt
+                        .intern(p)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::GLoad(p_id)); // [ctor, ctor, proto, parent]
+                    code.push(Op::LinkSuper); // [ctor, ctor]
                 }
                 code.push(Op::SetFnProto); // ctor.prototype = proto（fn_protos 登録）→ [ctor]
                 self.gen_store(name, code)?; // []
@@ -1581,6 +1606,12 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             collect_expr_refs(target, out);
         }
         Expr::Spread(e) => collect_expr_refs(e, out),
+        Expr::SuperCall { args, .. } => {
+            // parent はグローバル名（GLoad で解決）。引数のみ収集。
+            for a in args {
+                collect_expr_refs(a, out);
+            }
+        }
         Expr::New { callee, args } => {
             collect_expr_refs(callee, out);
             for a in args {
