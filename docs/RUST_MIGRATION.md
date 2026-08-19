@@ -475,6 +475,44 @@ lodash 本体が**全文パース → コンパイル → 実行**に到達（�
 のプロトタイプメソッド解決、`Function.prototype.toString`、および各関数の実行時差異。
 C エンジンは `lodash-smoke ok=320 ng=0` を維持（比較基準）。
 
+### フェーズ 6 完了（ブラウザ統合全ゲート緑）
+
+フェーズ 6 の完了条件（ロードマップ表の「全ゲート緑」）を確認。ブラウザ本体
+（`build/ifuto` / `build/ifuto-asan`）は `RUST_ENGINE=1` 既定で `libakl_ffi.a`
+（Rust エンジン）をリンクしており、以下のブラウザゲートが全て緑:
+
+- **guismoke**: PASS（GUI/raster/session/focus/hover スモーク全通過）
+- **golden**: 1/1 PASS（`tests/golden/doc` の描画出力が expected と厳密一致）
+- **tlssmoke**: 3/3 PASS（https-ok / https-badca / https-ip-addr）
+- **conformance（html5lib）**: **1922/1922 PASS（100.0%, skip 12）**
+- **fuzz**: 5 fuzzer（html/akl/net/store/ext）×500 iter 全て 0 crashes
+- **test_script.c**（DOM 結合オラクル）: 139/139 全緑
+
+Rust 側ゲートも維持: `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6）
+緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+補足: `fuzz_html` / `fuzz_akl` ターゲットは旧 C エンジン（`src/akl/*.c`）を直接
+リンクする（Makefile が `$(AKLSRC)` をハードコード）。C エンジンは比較検証用に
+保持しているため、これは仕様どおり。ブラウザ本体（ifuto）の JS 実行は Rust エンジン
+経由である。
+
+### フェーズ 6 追補 5: lodash ランタイム（= フェーズ 5 組み込みの残り）
+
+lodash 320/320 はロードマップ上「フェーズ 5（組み込み）」の完了条件であり、
+フェーズ 6（ブラウザ統合）のゲートではない。上記のとおりフェーズ 6 は完了。\nlodash 側は以下の追加実装で前進（未完了。次フェーズの組み込みパリティで継続）:
+
+- 関数宣言ホイスティング（ネスト関数の先頭束縛）、正規表現の先読み/非捕捉/
+  `\u`/`\x`/`{m,n}`/遅延量指定子
+- `NotCallable`/`NotObject`/`GlobalNotFound` を catch 可能な TypeError/ReferenceError に
+- `Function/Array/String.prototype`、`Object.create/getPrototypeOf/defineProperty/
+  getOwnPropertySymbols/setPrototypeOf/propertyIsEnumerable/Object(x)`
+- `Obj::Func` にプロパティ保持（`_.VERSION` 等）+ 既定 prototype + `length`/`name`
+- `arguments` オブジェクト、名前付き関数式の自己参照（`runInContext`）
+
+lodash は `runInContext` 本体の `createWrap`/`createRecurry` 機構の深部まで到達。
+残る壁は `WeakMap`/`WeakSet` と well-known Symbol（`setData`/`getData` のメタデータ
+保持に使用）など。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）
