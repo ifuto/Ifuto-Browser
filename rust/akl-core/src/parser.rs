@@ -212,6 +212,13 @@ pub enum Expr {
         /// 削除対象（メンバー/インデックス）。
         target: Box<Expr>,
     },
+    /// `new Callee(args)` コンストラクタ呼び出し。
+    New {
+        /// コンストラクタ式。
+        callee: Box<Expr>,
+        /// 引数列。
+        args: Vec<Expr>,
+    },
     /// spread 要素 `...expr`（配列リテラル・関数呼び出し引数）。
     Spread(Box<Expr>),
     /// rest 要素（関数パラメータ・分割代入）。
@@ -356,6 +363,15 @@ pub enum Stmt {
         pattern: Pattern,
         /// 右辺。
         init: Expr,
+    },
+    /// class 宣言 `class C { constructor() {...} method() {...} }`。
+    ClassDecl {
+        /// クラス名。
+        name: String,
+        /// コンストラクタ（params, body）。
+        constructor: (Vec<String>, Vec<Stmt>),
+        /// メソッド列（name, params, body）。
+        methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
     },
 }
 
@@ -727,6 +743,31 @@ impl<'a> Parser<'a> {
             let target = self.parse_unary()?;
             return Ok(Expr::Delete { target: Box::new(target) });
         }
+        // new 演算子
+        if self.at_kw(Keyword::New)? {
+            self.bump()?;
+            // callee: メンバーアクセスまで（呼び出しは含まない）
+            let callee = self.parse_new_callee()?;
+            let mut args = Vec::new();
+            if self.at_punct(Punct::LParen)? {
+                self.bump()?;
+                if !self.at_punct(Punct::RParen)? {
+                    loop {
+                        if self.eat_punct(Punct::Ellipsis)? {
+                            let e = self.parse_expr()?;
+                            args.push(Expr::Spread(Box::new(e)));
+                        } else {
+                            args.push(self.parse_expr()?);
+                        }
+                        if !self.eat_punct(Punct::Comma)? {
+                            break;
+                        }
+                    }
+                }
+                self.expect_punct(Punct::RParen, "')'")?;
+            }
+            return Ok(Expr::New { callee: Box::new(callee), args });
+        }
         // 前置 ++ / --
         let incdec = if self.at_punct(Punct::Inc)? {
             Some(true)
@@ -926,6 +967,30 @@ impl<'a> Parser<'a> {
         Ok(Expr::FuncExpr { name, params, body })
     }
 
+    /// `new` の callee をパース（メンバーアクセスの連鎖。呼び出しは含まない）。
+    fn parse_new_callee(&mut self) -> Result<Expr, ParseError> {
+        let mut base = self.parse_primary()?;
+        // メンバーアクセスのみ畳む（`.` `[ ]`）。呼び出しは含めない
+        loop {
+            if self.at_punct(Punct::Dot)? {
+                self.bump()?;
+                let name = match self.bump()? {
+                    Token::Ident(n) => n.to_string(),
+                    other => return Err(ParseError(format!("expected property name, got {other:?}"))),
+                };
+                base = Expr::Member { obj: Box::new(base), name };
+            } else if self.at_punct(Punct::LBracket)? {
+                self.bump()?;
+                let index = self.parse_expr()?;
+                self.expect_punct(Punct::RBracket, "']'")?;
+                base = Expr::Index { obj: Box::new(base), index: Box::new(index) };
+            } else {
+                break;
+            }
+        }
+        Ok(base)
+    }
+
     /// `=> body` の本体（`=>` は消費済み）。式なら暗黙 return、ブロックは文列。
     fn parse_arrow_body(&mut self) -> Result<Expr, ParseError> {
         if self.at_punct(Punct::LBrace)? {
@@ -1028,6 +1093,9 @@ impl<'a> Parser<'a> {
         }
         if self.at_kw(Keyword::Try)? {
             return self.parse_try();
+        }
+        if self.at_kw(Keyword::Class)? {
+            return self.parse_class();
         }
         // 式文
         let e = self.parse_expr()?;
@@ -1332,6 +1400,53 @@ impl<'a> Parser<'a> {
         Ok(Stmt::While { cond, body: Box::new(body) })
     }
 
+    /// `class C { constructor() {...} method() {...} }`。
+    fn parse_class(&mut self) -> Result<Stmt, ParseError> {
+        self.bump()?; // class
+        let name = match self.bump()? {
+            Token::Ident(n) => n.to_string(),
+            other => return Err(ParseError(format!("expected class name, got {other:?}"))),
+        };
+        self.expect_punct(Punct::LBrace, "'{'")?;
+        let mut constructor = (Vec::new(), Vec::new());
+        let mut methods = Vec::new();
+        while !self.at_punct(Punct::RBrace)? && !self.at_eof()? {
+            // メソッド名
+            let mname = match self.bump()? {
+                Token::Ident(n) => n.to_string(),
+                Token::Kw(kw) => format!("{kw:?}").to_lowercase(),
+                other => return Err(ParseError(format!("expected method name, got {other:?}"))),
+            };
+            // パラメータ
+            self.expect_punct(Punct::LParen, "'('")?;
+            let mut params = Vec::new();
+            if !self.at_punct(Punct::RParen)? {
+                loop {
+                    match self.bump()? {
+                        Token::Ident(p) => params.push(p.to_string()),
+                        other => return Err(ParseError(format!("expected parameter, got {other:?}"))),
+                    }
+                    if !self.eat_punct(Punct::Comma)? {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(Punct::RParen, "')'")?;
+            // 本体
+            let body = match self.parse_block()? {
+                Stmt::Block(s) => s,
+                _ => unreachable!(),
+            };
+            if mname == "constructor" {
+                constructor = (params, body);
+            } else {
+                methods.push((mname, params, body));
+            }
+        }
+        self.expect_punct(Punct::RBrace, "'}'")?;
+        Ok(Stmt::ClassDecl { name, constructor, methods })
+    }
+
     /// `function name(params) { body }`。
     fn parse_func_decl(&mut self) -> Result<Stmt, ParseError> {
         self.bump()?; // function
@@ -1477,7 +1592,8 @@ mod tests {
 
     #[test]
     fn unsupported_errors() {
-        assert!(parse("class C {}").is_err()); // class は未対応
+        // 現在未対応の構文は特に無い（class/spread/分割代入/try-catch まで対応済み）
+        assert!(parse("import x from \"y\";").is_err()); // import は未対応
     }
 
     #[test]

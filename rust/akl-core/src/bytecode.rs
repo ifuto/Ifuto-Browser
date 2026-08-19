@@ -180,6 +180,10 @@ pub enum Op {
     Call(u8),
     /// メソッド呼び出し（`[receiver, callee, ...args]`。callee を this=receiver で呼ぶ）。
     MCall(u8),
+    /// コンストラクタ呼び出し（`new`。argc 個の引数 + callee を pop。this=新オブジェクト）。
+    New(u8),
+    /// 関数の prototype を設定（proto, fn を pop、fn を push。fn_protos テーブル登録）。
+    SetFnProto,
     /// 戻る（TOS を返り値として pop）。
     Ret,
     /// 関数オブジェクトを生成して push（C の `MAKEF`。fidx = 関数表 index）。
@@ -270,6 +274,8 @@ struct Frame {
     env: Option<ObjId>,
     /// 現在の try ブロックの catch 位置（無ければ None）。
     catch_pc: Option<usize>,
+    /// new 呼び出しか（true なら戻り値が非オブジェクトの場合 this を返す）。
+    is_new: bool,
 }
 
 /// ランタイム（C の `AklRT` 相当）。ヒープ・文字列インターン・関数表・グローバルを束ねる。
@@ -296,6 +302,10 @@ pub struct Runtime {
     pub arr_methods: Vec<(ObjId, AklVal)>,
     /// `length` プロパティ名の ObjId（install_builtins で設定。文字列/配列の length 用）。
     pub length_id: ObjId,
+    /// `\x00proto` プロパティ名の ObjId（プロトタイプチェーン用。C の `proto_name` 相当）。
+    pub proto_name: ObjId,
+    /// 関数 → prototype オブジェクト（C の `fn_protos` 相当。new/instanceof 用）。
+    pub fn_protos: Vec<(ObjId, ObjId)>,
 }
 
 impl Runtime {
@@ -304,6 +314,8 @@ impl Runtime {
         let mut rt = Self::default();
         // `length` プロパティ名を設定（文字列/配列の length 解決用。install_builtins 前でも有効）。
         rt.length_id = rt.intern("length").unwrap_or(0);
+        // `\x00proto` プロパティ名（プロトタイプチェーン）。
+        rt.proto_name = rt.intern("\x00proto").unwrap_or(0);
         rt
     }
 
@@ -342,6 +354,62 @@ impl Runtime {
         Ok(())
     }
 
+    /// プロパティをプロトタイプチェーン込みで解決（C の `obj_proto_find` 相当）。
+    /// own → proto チェーンの順。深さ 64 で有界。
+    pub fn prop_get_chain(&self, id: ObjId, name: ObjId) -> Option<AklVal> {
+        let mut cur = id;
+        for _ in 0..64 {
+            let obj = self.heap.get(cur)?;
+            match obj {
+                Obj::Obj(props) => {
+                    if let Some((_, v)) = props.iter().find(|(n, _)| *n == name) {
+                        return Some(*v);
+                    }
+                    // proto チェーンを辿る
+                    let proto = props
+                        .iter()
+                        .find(|(n, _)| *n == self.proto_name)
+                        .and_then(|(_, v)| if v.is_obj() { Some(v.get_obj()) } else { None });
+                    cur = proto?;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// オブジェクトに [[Prototype]] を設定（C の `akl_obj_set_proto` 相当）。
+    pub fn obj_set_proto(&mut self, id: ObjId, proto: ObjId) -> Result<(), VmError> {
+        self.heap
+            .prop_set(id, self.proto_name, AklVal::mk_obj(proto))
+            .map_err(|_| VmError::NotObject)
+    }
+
+    /// 関数の prototype オブジェクトを取得（無ければ生成。C の `akl_fn_proto_get` 相当）。
+    pub fn func_proto(&mut self, f: AklVal) -> Option<ObjId> {
+        if !f.is_obj() {
+            return None;
+        }
+        let fid = f.get_obj();
+        // 既存の "prototype" プロパティ（Obj の場合）
+        let pname = self.intern("prototype")?;
+        if let Some(Obj::Obj(props)) = self.heap.get(fid) {
+            if let Some((_, v)) = props.iter().find(|(n, _)| *n == pname) {
+                if v.is_obj() {
+                    return Some(v.get_obj());
+                }
+            }
+        }
+        // fn_protos テーブルから探す
+        if let Some((_, p)) = self.fn_protos.iter().find(|(f, _)| *f == fid) {
+            return Some(*p);
+        }
+        // 生成
+        let proto = self.heap.alloc(Obj::Obj(Vec::new())).ok()?;
+        self.fn_protos.push((fid, proto));
+        Some(proto)
+    }
+
     /// 関数表 index の関数を実行する（C の `vm_exec` 相当）。
     ///
     /// `args` はエントリ関数の引数。戻り値は関数の返り値（`Ret`）または
@@ -359,7 +427,7 @@ impl Runtime {
             for (i, a) in args.iter().enumerate().take(f.n_params) {
                 locals[i] = *a;
             }
-            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this: AklVal::UNDEF, env: None, catch_pc: None });
+            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this: AklVal::UNDEF, env: None, catch_pc: None, is_new: false });
         }
 
         loop {
@@ -581,12 +649,69 @@ impl Runtime {
                         Err(e) => return Err(e),
                     }
                 }
+                Op::New(argc) => {
+                    let argc = argc as usize;
+                    if stack.len() < argc + 1 {
+                        return Err(VmError::StackUnderflow);
+                    }
+                    let f = stack[stack.len() - argc - 1];
+                    let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
+                    stack.truncate(stack.len() - argc - 1);
+                    // 新オブジェクト
+                    let obj_id = self
+                        .heap
+                        .alloc(Obj::Obj(Vec::new()))
+                        .map_err(|_| VmError::Oom)?;
+                    // [[Prototype]] = f.prototype
+                    if let Some(fp) = self.func_proto(f) {
+                        self.obj_set_proto(obj_id, fp)?;
+                    }
+                    let this = AklVal::mk_obj(obj_id);
+                    match self.do_call(&mut frames, &mut pc, f, this, &args) {
+                        Ok(Some(r)) => {
+                            // ネイティブ関数の new: 戻り値がオブジェクトならそれ、非オブジェクトなら this
+                            let result = if r.is_obj() { r } else { this };
+                            stack.push(result);
+                            pc += 1;
+                            continue;
+                        }
+                        Ok(None) => {
+                            // バイトコード関数の new: is_new を立てる（Ret で this を返す）
+                            if let Some(frame) = frames.last_mut() {
+                                frame.is_new = true;
+                            }
+                            continue;
+                        }
+                        Err(VmError::Thrown(v)) => {
+                            self.unwind(&mut frames, &mut stack, &mut pc, v)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Op::SetFnProto => {
+                    let proto = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let f = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    if !proto.is_obj() || !f.is_obj() {
+                        return Err(VmError::NotObject);
+                    }
+                    let fid = f.get_obj();
+                    // 既存の登録を置き換え
+                    if let Some(slot) = self.fn_protos.iter_mut().find(|(x, _)| *x == fid) {
+                        slot.1 = proto.get_obj();
+                    } else {
+                        self.fn_protos.push((fid, proto.get_obj()));
+                    }
+                    stack.push(f);
+                }
                 Op::Ret => {
                     let v = stack.pop().ok_or(VmError::StackUnderflow)?;
                     // 戻るフレーム自身の ret_pc（呼び出し元の再開位置）を使う。
                     // 呼び出し元フレームの ret_pc（= その呼び出し元への再開位置）では
                     // 誤って直上の呼び出し元へ戻ってしまう（実測で特定）。
                     let frame = frames.pop().ok_or(VmError::StackUnderflow)?;
+                    // new 呼び出し: 戻り値が非オブジェクトなら this（新オブジェクト）を返す
+                    let v = if frame.is_new && !v.is_obj() { frame.this } else { v };
                     if frames.is_empty() {
                         return Ok(v);
                     }
@@ -710,7 +835,7 @@ impl Runtime {
                         pc += 1;
                         continue;
                     }
-                    let v = self.heap.prop_get(id, name).unwrap_or(AklVal::UNDEF);
+                    let v = self.prop_get_chain(id, name).unwrap_or(AklVal::UNDEF);
                     stack.push(v);
                 }
                 Op::PStore(name) => {
@@ -812,10 +937,40 @@ impl Runtime {
                     stack.push(val);
                 }
                 Op::Instanceof => {
-                    // obj instanceof f（簡易: 常に false 近似。プロトタイプチェーン未対応）
-                    let _f = stack.pop().ok_or(VmError::StackUnderflow)?;
-                    let _obj = stack.pop().ok_or(VmError::StackUnderflow)?;
-                    stack.push(AklVal::FALSE);
+                    // obj instanceof f（プロトタイプチェーンを辿る）
+                    let f = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let obj = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let mut r = false;
+                    if f.is_obj() && obj.is_obj() {
+                        // f の prototype を取得（f が Obj なら "prototype" プロパティ、
+                        // f が Func/Native なら fn_protos テーブル）
+                        let f_proto = self.func_proto(f);
+                        if let Some(fp) = f_proto {
+                            // obj の [[Prototype]] チェーンを辿って fp と比較
+                            let mut cur = obj.get_obj();
+                            for _ in 0..64 {
+                                if cur == fp {
+                                    r = true;
+                                    break;
+                                }
+                                // cur の [[Prototype]] を取得
+                                match self.heap.get(cur) {
+                                    Some(Obj::Obj(props)) => {
+                                        let parent = props
+                                            .iter()
+                                            .find(|(n, _)| *n == self.proto_name)
+                                            .and_then(|(_, v)| if v.is_obj() { Some(v.get_obj()) } else { None });
+                                        match parent {
+                                            Some(p) => cur = p,
+                                            None => break,
+                                        }
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                    }
+                    stack.push(AklVal::from_bool(r));
                 }
                 Op::In => {
                     // key in obj
@@ -924,7 +1079,7 @@ impl Runtime {
             locals[i] = *a;
         }
         let ret_pc = *pc + 1;
-        frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env, catch_pc: None });
+        frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env, catch_pc: None, is_new: false });
         *pc = 0;
         Ok(None)
     }

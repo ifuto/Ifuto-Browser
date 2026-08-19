@@ -504,6 +504,16 @@ impl Compiler<'_> {
                     _ => return Err(CompileError("invalid delete target".into())),
                 }
             }
+            Expr::New { callee, args } => {
+                self.gen_expr(callee, code)?;
+                for a in args {
+                    self.gen_expr(a, code)?;
+                }
+                if args.len() > u8::MAX as usize {
+                    return Err(CompileError("too many arguments".into()));
+                }
+                code.push(Op::New(args.len() as u8));
+            }
             Expr::Spread(_) | Expr::Rest(_) | Expr::Hole => {
                 return Err(CompileError("spread/rest/hole outside valid context".into()))
             }
@@ -738,6 +748,49 @@ impl Compiler<'_> {
                 self.gen_expr(init, code)?;
                 self.gen_destructure(pattern, code)?;
             }
+            Stmt::ClassDecl { name, constructor, methods } => {
+                // メソッドを先にコンパイル
+                let enclosing_env = self.captures.clone();
+                let empty_boxed = HashMap::new();
+                let mut method_fidxs = Vec::new();
+                for (mname, mparams, mbody) in methods {
+                    let fidx = self.compile_function_anon(
+                        mparams,
+                        mbody,
+                        &empty_boxed,
+                        &enclosing_env,
+                    )?;
+                    method_fidxs.push((mname.clone(), fidx));
+                }
+                // constructor をコンパイル
+                let ctor_fidx = self.compile_function_anon(
+                    &constructor.0,
+                    &constructor.1,
+                    &empty_boxed,
+                    &enclosing_env,
+                )?;
+                // 実行時コード生成:
+                //   MakeF(ctor); Dup; ObjNew  → [ctor, ctor, proto]
+                //   各メソッド: Dup; MakeF(m); PStore(name); Pop  → [ctor, ctor, proto]
+                //   PStore(prototype)  → ctor.prototype = proto → [ctor, proto]
+                //   Pop → [ctor]
+                //   gen_store(name) → []
+                code.push(Op::MakeF(ctor_fidx));
+                code.push(Op::Dup);
+                code.push(Op::ObjNew);
+                for (mname, mfidx) in &method_fidxs {
+                    code.push(Op::Dup); // [ctor, ctor, proto, proto]
+                    code.push(Op::MakeF(*mfidx)); // [ctor, ctor, proto, proto, method]
+                    let mname_id = self
+                        .rt
+                        .intern(mname)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::PStore(mname_id)); // proto.mname = method → [ctor, ctor, proto, method]
+                    code.push(Op::Pop); // [ctor, ctor, proto]
+                }
+                code.push(Op::SetFnProto); // ctor.prototype = proto（fn_protos 登録）→ [ctor]
+                self.gen_store(name, code)?; // []
+            }
             Stmt::Try { try_body, catch_param, catch_body } => {
                 // TryPush(catch_pc) を発行 → try 本体 → TryPop → Jmp(end)
                 // catch_pc: 例外値がスタックに積まれている → catch 変数に束縛 → catch 本体
@@ -907,6 +960,7 @@ impl Compiler<'_> {
 
 /// 関数本体（ブロック）内の `var`/`let`/`const` 宣言名を収集してローカルスロットに割り当てる。
 /// ネスト関数の中身は走査しない（ネスト関数は未対応）。
+#[allow(clippy::collapsible_match)]
 fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
     for stmt in stmts {
         match stmt {
@@ -955,6 +1009,11 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
             Stmt::Throw(_) => {}
             Stmt::Destructure { pattern, .. } => {
                 collect_pattern_vars(pattern, locals);
+            }
+            Stmt::ClassDecl { name, .. } => {
+                if !locals.contains_key(name) {
+                    locals.insert(name.clone(), locals.len() as u32);
+                }
             }
             _ => {}
         }
@@ -1045,6 +1104,10 @@ fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
             Stmt::Destructure { init, .. } => {
                 collect_expr_refs(init, out);
             }
+            Stmt::ClassDecl { .. } => {
+                // メソッド内の自由変数は compile_function_anon が別途解析するため
+                // ここでは何もしない（クラス名は locals で解決される）。
+            }
             Stmt::Block(inner) => collect_refs(inner, out),
             // ネスト関数宣言の中身は、その関数自身の自由変数として別途解析されるため
             // ここでは名前（束縛先）だけを参照扱いしない（locals で解決される）。
@@ -1128,6 +1191,12 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
             collect_expr_refs(target, out);
         }
         Expr::Spread(e) => collect_expr_refs(e, out),
+        Expr::New { callee, args } => {
+            collect_expr_refs(callee, out);
+            for a in args {
+                collect_expr_refs(a, out);
+            }
+        }
         Expr::Rest(_) | Expr::Hole => {}
         Expr::This
         | Expr::Num(_)
@@ -1661,5 +1730,41 @@ mod tests {
             }
         ";
         assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(2));
+    }
+
+    #[test]
+    fn class_basic() {
+        let src = "
+            class Point {
+                constructor(x, y) { this.x = x; this.y = y; }
+                sum() { return this.x + this.y; }
+            }
+            var p = new Point(3, 4);
+            p.sum();
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(7));
+    }
+
+    #[test]
+    fn class_field_access() {
+        let src = "
+            class C {
+                constructor(v) { this.value = v; }
+                get() { return this.value; }
+            }
+            var c = new C(42);
+            c.value;
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(42));
+    }
+
+    #[test]
+    fn instanceof_class() {
+        let src = "
+            class A {}
+            var a = new A();
+            a instanceof A;
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::TRUE);
     }
 }
