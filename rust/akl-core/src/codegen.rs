@@ -94,7 +94,7 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
 
     let n_locals = c.locals.len();
     let fidx = rt.funcs.len() as u32;
-    rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals, is_gen: false });
+    rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals, is_gen: false, self_slot: None });
     Ok(fidx)
 }
 
@@ -196,6 +196,7 @@ impl Compiler<'_> {
             rest_slot,
             n_locals,
             is_gen,
+            self_slot: None,
         });
 
         self.locals = saved_locals;
@@ -297,7 +298,7 @@ impl Compiler<'_> {
         let n_params = params.len();
         let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
         let fidx = self.rt.funcs.len() as u32;
-        self.rt.funcs.push(FuncObj { code, name: Some(name_id), n_params, rest_slot, n_locals, is_gen });
+        self.rt.funcs.push(FuncObj { code, name: Some(name_id), n_params, rest_slot, n_locals, is_gen, self_slot: None });
 
         self.locals = saved_locals;
         self.captures = saved_captures;
@@ -336,6 +337,22 @@ impl Compiler<'_> {
             None
         };
         collect_vars(body, &mut locals);
+
+        // 名前付き関数式: 自身の名前をローカルスロットに束縛（`function name(){}` の
+        // `name` が関数自身を指す自己参照。lodash の `runInContext` 等）。
+        let self_slot = match name {
+            Some(n) => {
+                let slot = if let Some(s) = locals.get(n) {
+                    *s
+                } else {
+                    let s = locals.len() as u32;
+                    locals.insert(n.to_string(), s);
+                    s
+                };
+                Some(slot)
+            }
+            None => None,
+        };
 
         // 自由変数（参照されるが自ローカルでない名前。ネスト関数の参照は再帰的に伝播）
         let bound: HashSet<String> = locals.keys().cloned().collect();
@@ -391,7 +408,7 @@ impl Compiler<'_> {
         let needs_closure = !self.captures.is_empty();
         let fidx = self.rt.funcs.len() as u32;
         let name_id = name.and_then(|n| self.rt.intern(n));
-        self.rt.funcs.push(FuncObj { code, name: name_id, n_params, rest_slot, n_locals, is_gen: false });
+        self.rt.funcs.push(FuncObj { code, name: name_id, n_params, rest_slot, n_locals, is_gen: false, self_slot });
 
         self.locals = saved_locals;
         self.captures = saved_captures;

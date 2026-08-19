@@ -1427,10 +1427,27 @@ fn set_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     }
 }
 
+/// `Object(v)`（関数として呼ぶ）→ v をオブジェクト化（オブジェクトはそのまま、
+/// null/undefined は `{}`、プリミティブはそのまま返す簡易近似）。
+fn object_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if v.is_obj() {
+        return Ok(v);
+    }
+    if v.is_null() || v.is_undef() {
+        let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+        return Ok(AklVal::mk_obj(id));
+    }
+    Ok(v)
+}
+
 /// Object 静的メソッド（keys/values/assign）+ Object.prototype を登録。
 fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
     let obj_id = rt.intern("Object").ok_or(VmError::Oom)?;
     let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    // constructor（`Object(x)` の関数呼び出し用）
+    let ctor = rt.register_native(object_ctor)?;
+    rt.heap.prop_set(obj, rt.ctor_name, ctor).map_err(|_| VmError::Oom)?;
     for (name, f) in [
         ("keys", obj_keys as crate::bytecode::NativeFn),
         ("values", obj_values),

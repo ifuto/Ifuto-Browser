@@ -86,6 +86,9 @@ pub struct FuncObj {
     pub n_locals: usize,
     /// ジェネレータ関数（`function*`）か。呼び出しは `Obj::Gen` を生成する。
     pub is_gen: bool,
+    /// 名前付き関数式の自己参照スロット（`function name(){}` の `name` が自身を指す）。
+    /// `Some(slot)` なら呼び出し時に `locals[slot] = 関数オブジェクト` を束縛する。
+    pub self_slot: Option<u32>,
 }
 
 /// VM 命令（C の `OP_*` のコア部分。融合命令・CoJIT 特化は未移植）。
@@ -1923,14 +1926,20 @@ impl Runtime {
             Some(Obj::Func { fidx, env, .. }) => (*fidx, *env),
             _ => return Err(self.type_error("not a function")),
         };
-        let (n_params, n_locals, rest_slot, is_gen) = {
+        let (n_params, n_locals, rest_slot, is_gen, self_slot) = {
             let f = self.funcs.get(fidx as usize).ok_or(VmError::NotCallable)?;
-            (f.n_params, f.n_locals, f.rest_slot, f.is_gen)
+            (f.n_params, f.n_locals, f.rest_slot, f.is_gen, f.self_slot)
         };
         let n = n_locals.max(n_params);
         let mut locals = vec![AklVal::UNDEF; n];
         for (i, a) in args.iter().enumerate().take(n_params) {
             locals[i] = *a;
+        }
+        // 名前付き関数式の自己参照（`function name(){}` の `name` = 関数自身）
+        if let Some(ss) = self_slot {
+            if (ss as usize) < locals.len() {
+                locals[ss as usize] = AklVal::mk_obj(id);
+            }
         }
         // rest パラメータ: 余剰引数を配列で rest_slot に束縛
         if let Some(rs) = rest_slot {
@@ -2609,7 +2618,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 1, rest_slot: None, n_locals: 2, is_gen: false });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 1, rest_slot: None, n_locals: 2, is_gen: false, self_slot: None });
         let fib_name = rt.intern("fib").unwrap();
         // 仮置きの GLoad(ObjId::MAX) を fib_name に差し替える
         for op in &mut rt.funcs[fidx as usize].code {
@@ -2661,7 +2670,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 2, is_gen: false });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 2, is_gen: false, self_slot: None });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(45));
     }
 
@@ -2672,7 +2681,7 @@ mod tests {
         let b = rt.intern("world").unwrap();
         let code = vec![Op::ConstStr(a), Op::ConstStr(b), Op::Add, Op::Ret];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false, self_slot: None });
         let r = rt.run(fidx, &[]).unwrap();
         // ROPE 連結: 平坦化して内容を検証
         let flattened = rt.flatten_str(r);
@@ -2693,7 +2702,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false, self_slot: None });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(42));
     }
 
@@ -2711,7 +2720,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false, self_slot: None });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(2));
     }
 
@@ -2727,7 +2736,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false, self_slot: None });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::TRUE);
     }
 
@@ -2736,7 +2745,7 @@ mod tests {
         let mut rt = Runtime::new();
         let code = vec![Op::ConstI(5), Op::Call(0), Op::Ret];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false, self_slot: None });
         // 非呼び出し対象の呼び出しは TypeError を投げる（try/catch で捕捉可能）
         assert!(matches!(rt.run(fidx, &[]), Err(VmError::Thrown(_))));
     }
@@ -2752,7 +2761,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false, self_slot: None });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(7));
         assert_eq!(rt.global_get(g), Some(AklVal::mk_int(7)));
     }
