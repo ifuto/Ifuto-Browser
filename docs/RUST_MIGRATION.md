@@ -404,6 +404,32 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 class 継承、BigInt、generator 等）→ `test_script.c` 全緑 → `golden`/`conformance`/
 `lodashsmoke`/parity を Rust 側で再現。
 
+### フェーズ 6 追補 2: JS 機能パリティ完了（test_script 全緑）
+
+`tests/test_script.c`（DOM 結合オラクル 139 checks）が Rust エンジンで **全緑** に
+達した。残っていた FAIL 3 機能（BigInt / generator / arrow・Promise・async）を実装:
+
+- **BigInt**: `Obj::BigInt(i64)`（C の `AKL_OK_BIGINT` と同様の i64 保持近似）+
+  `Op::BigInt` 命令。`+`/`-`/`*`（i64 wrapping）、`==`（数値との比較は数値化）、
+  `typeof` = "bigint"、`stringify`（`n` 無し 10 進）、`truthy`/`to_number` 対応。
+  リテラルは lexer が既に `NumLit::BigInt(i64)` を生成（64bit 超は明白に lex エラー）。
+- **generator**: `function* name() { yield ...; }`。パーサ（`Stmt::FuncDecl.is_gen` /
+  `Expr::Yield`）、codegen（`Op::Yield`）、`Obj::Gen { fidx, pc, locals, env, this, done }`
+  （再開状態を保持）。`do_call` は is_gen 関数を呼ぶと実行せず `Obj::Gen` を返し、
+  `gen.next()`（`rt.gen_resume`）が VM ループを再開して `{ value, done }` を返す。
+  `run_with_this` のループを `run_loop`（`RunEnd::Value | Yield`）に抽出し、
+  再開位置（pc+1）とローカルを `yield` 命令内で保存する。
+- **async/await + Promise**: パーサ（`async function` / `await`）。`await` は解決済み
+  Promise を unwrap する `Op::Await`、async 関数の `return` は `Op::PromiseWrap` で
+  解決済み Promise に包む。`Promise` グローバルを `constructor` + `resolve` を持つ
+  プレーンオブジェクトに変更し、インスタンスメソッド `then`/`catch` を
+  `rt.promise_methods` に登録（マイクロタスク近似で **no-op** = スクリプト本体内で
+  読む値は 0 のまま。V8 準拠のオラクルと一致）。
+
+検証: `cargo test --offline --workspace`（akl-core 137 + akl-ffi 6）緑、`cargo clippy
+--offline --workspace -- -D warnings` 緑、`build/run_script_rust`（139 checks）全緑、
+`make all` + `make guismoke` PASS。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）

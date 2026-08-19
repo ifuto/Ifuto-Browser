@@ -84,6 +84,8 @@ pub struct FuncObj {
     pub rest_slot: Option<u32>,
     /// ローカル変数数（パラメータ含む）。
     pub n_locals: usize,
+    /// ジェネレータ関数（`function*`）か。呼び出しは `Obj::Gen` を生成する。
+    pub is_gen: bool,
 }
 
 /// VM 命令（C の `OP_*` のコア部分。融合命令・CoJIT 特化は未移植）。
@@ -263,6 +265,15 @@ pub enum Op {
     CeLoad(u32),
     /// 捕捉変数への書き込み（pop → frame.env.vals[idx]。C の `CESTORE` 簡略版）。
     CeStore(u32),
+    /// BigInt 定数を push（i64 保持近似。`Obj::BigInt` を生成）。
+    BigInt(i64),
+    /// `yield expr`（ジェネレータ。TOS の値を yield し、再開位置を保存する）。
+    Yield,
+    /// `await expr`（TOS が解決済み Promise なら値を unwrap して push）。
+    Await,
+    /// TOS の値を解決済み Promise（`Obj::Promise { state: 1, .. }`）で包む
+    /// （async 関数の戻り値ラップ用）。
+    PromiseWrap,
     /// 停止（C の `HALT`）。
     Halt,
 }
@@ -288,6 +299,16 @@ pub enum VmError {
     Thrown(AklVal),
     /// 命令バジェット枯渇（無限ループ等の打ち切り。C の `instruction budget exhausted`）。
     BudgetExhausted,
+}
+
+/// VM 実行ループの終了理由（[`Runtime::run_loop`] の戻り値）。
+/// 通常の関数実行は [`RunEnd::Value`] のみ。ジェネレータの `yield` は
+/// [`RunEnd::Yield`]（再開位置は `yield` 命令内で保存済み）。
+enum RunEnd {
+    /// 関数が return / 暗黙終端した（TOS が返り値）。
+    Value(AklVal),
+    /// ジェネレータが yield した（値は yield した値）。
+    Yield(AklVal),
 }
 
 /// ネイティブ関数（C の `AklNativeFn` 相当）。
@@ -391,6 +412,10 @@ pub struct Runtime {
     pub date_methods: Vec<(ObjId, AklVal)>,
     /// 正規表現メソッド表（name → native）。`PLoad` が `Obj::RegExp` で解決する。
     pub regex_methods: Vec<(ObjId, AklVal)>,
+    /// ジェネレータメソッド表（name → native）。`PLoad` が `Obj::Gen` で解決する。
+    pub gen_methods: Vec<(ObjId, AklVal)>,
+    /// Promise メソッド表（name → native）。`PLoad` が `Obj::Promise` で解決する。
+    pub promise_methods: Vec<(ObjId, AklVal)>,
     /// `length` プロパティ名の ObjId（install_builtins で設定。文字列/配列の length 用）。
     pub length_id: ObjId,
     /// `size` プロパティ名の ObjId（Map/Set の size 用）。
@@ -556,6 +581,22 @@ impl Runtime {
                 .map(|(_, v)| *v)
                 .unwrap_or(AklVal::UNDEF);
         }
+        if let Some(Obj::Gen { .. }) = self.heap.get(id) {
+            return self
+                .gen_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
+        if let Some(Obj::Promise { .. }) = self.heap.get(id) {
+            return self
+                .promise_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
         self.prop_get_chain(id, name).unwrap_or(AklVal::UNDEF)
     }
 
@@ -706,8 +747,22 @@ impl Runtime {
             let f = *f;
             return f(self, _this, args);
         }
-        if let Some(Obj::Func { fidx, .. }) = self.heap.get(id) {
-            let fidx = *fidx;
+        if let Some(Obj::Func { fidx, env }) = self.heap.get(id) {
+            let (fidx, env) = (*fidx, *env);
+            // ジェネレータ関数は実行せずに Obj::Gen を返す（`call_value` は FFI 再入。
+            // 通常の JS 呼び出しは do_call が処理）。
+            if self.funcs.get(fidx as usize).is_some_and(|f| f.is_gen) {
+                let n = self.funcs[fidx as usize].n_locals.max(self.funcs[fidx as usize].n_params);
+                let mut locals = vec![AklVal::UNDEF; n];
+                for (i, a) in args.iter().enumerate().take(self.funcs[fidx as usize].n_params) {
+                    locals[i] = *a;
+                }
+                let gen_id = self
+                    .heap
+                    .alloc(Obj::Gen { fidx, pc: 0, locals, env, this: _this, done: false })
+                    .map_err(|_| VmError::Oom)?;
+                return Ok(AklVal::mk_obj(gen_id));
+            }
             return self.run_with_this(fidx, args, _this);
         }
         Err(VmError::NotCallable)
@@ -726,13 +781,9 @@ impl Runtime {
         args: &[AklVal],
         this: AklVal,
     ) -> Result<AklVal, VmError> {
-        let mut stack: Vec<AklVal> = Vec::new();
+        let stack: Vec<AklVal> = Vec::new();
         let mut frames: Vec<Frame> = Vec::new();
-        let mut pc = 0usize;
-        // 命令バジェット（無限ループ等の打ち切り。C の vm_exec の budget 相当）。
-        // 再入（call_value → run）はそれぞれ新規に初期化される（C の akl_call と同じ）。
-        let mut remaining = self.insn_budget;
-
+        let pc = 0usize;
         // エントリフレーム
         {
             let f = self.funcs.get(func_idx as usize).ok_or(VmError::NotCallable)?;
@@ -743,6 +794,27 @@ impl Runtime {
             }
             frames.push(Frame { func: func_idx, ret_pc: 0, locals, this, env: None, catch_pc: None, is_new: false });
         }
+        match self.run_loop(stack, frames, pc, None)? {
+            RunEnd::Value(v) => Ok(v),
+            // 非ジェネレータコンテキストの Yield は起きない（Yield 命令は
+            // ジェネレータ関数のコードにのみ現れる）。
+            RunEnd::Yield(_) => Err(VmError::StackUnderflow),
+        }
+    }
+
+    /// VM 実行ループ本体（C の `vm_exec` 相当）。`stack` / `frames` / `pc` を初期
+    /// 状態として実行し、[`RunEnd`] を返す。`gen` が `Some(id)` なら `yield` 命令で
+    /// そのジェネレータの再開位置を保存して [`RunEnd::Yield`] を返す。
+    fn run_loop(
+        &mut self,
+        mut stack: Vec<AklVal>,
+        mut frames: Vec<Frame>,
+        mut pc: usize,
+        gen: Option<ObjId>,
+    ) -> Result<RunEnd, VmError> {
+        // 命令バジェット（無限ループ等の打ち切り。C の vm_exec の budget 相当）。
+        // 再入（call_value → run）はそれぞれ新規に初期化される（C の akl_call と同じ）。
+        let mut remaining = self.insn_budget;
 
         loop {
             if remaining == 0 {
@@ -759,7 +831,7 @@ impl Runtime {
                 if pc >= func.code.len() {
                     // 暗黙の終端（Halt 無し）。スタック先頭を返す。
                     let v = stack.last().copied().unwrap_or(AklVal::UNDEF);
-                    return Ok(v);
+                    return Ok(RunEnd::Value(v));
                 }
                 func.code[pc]
             };
@@ -1181,7 +1253,7 @@ impl Runtime {
                     // new 呼び出し: 戻り値が非オブジェクトなら this（新オブジェクト）を返す
                     let v = if frame.is_new && !v.is_obj() { frame.this } else { v };
                     if frames.is_empty() {
-                        return Ok(v);
+                        return Ok(RunEnd::Value(v));
                     }
                     stack.push(v);
                     pc = frame.ret_pc;
@@ -1612,7 +1684,51 @@ impl Runtime {
                     stack.push(AklVal::from_bool(deleted));
                 }
                 Op::Halt => {
-                    return Ok(self.last_val);
+                    return Ok(RunEnd::Value(self.last_val));
+                }
+                Op::BigInt(v) => {
+                    let id = self
+                        .heap
+                        .alloc(Obj::BigInt(v))
+                        .map_err(|_| VmError::Oom)?;
+                    stack.push(AklVal::mk_obj(id));
+                }
+                Op::Yield => {
+                    let v = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    if let Some(gen_id) = gen {
+                        // 再開位置（次の命令）と現在フレームのローカルを保存する。
+                        let frame = frames.last().ok_or(VmError::StackUnderflow)?;
+                        let locals = frame.locals.clone();
+                        if let Some(Obj::Gen { pc: gpc, locals: glocals, .. }) =
+                            self.heap.get_mut(gen_id)
+                        {
+                            *gpc = pc + 1;
+                            *glocals = locals;
+                        }
+                        return Ok(RunEnd::Yield(v));
+                    }
+                    return Err(VmError::StackUnderflow);
+                }
+                Op::Await => {
+                    let v = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    // 解決済み Promise なら値を unwrap。それ以外はそのまま。
+                    let out = if v.is_obj() {
+                        match self.heap.get(v.get_obj()) {
+                            Some(Obj::Promise { state: 1, value }) => *value,
+                            _ => v,
+                        }
+                    } else {
+                        v
+                    };
+                    stack.push(out);
+                }
+                Op::PromiseWrap => {
+                    let v = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let id = self
+                        .heap
+                        .alloc(Obj::Promise { state: 1, value: v })
+                        .map_err(|_| VmError::Oom)?;
+                    stack.push(AklVal::mk_obj(id));
                 }
             }
             pc += 1;
@@ -1703,9 +1819,9 @@ impl Runtime {
             Some(Obj::Func { fidx, env }) => (*fidx, *env),
             _ => return Err(VmError::NotCallable),
         };
-        let (n_params, n_locals, rest_slot) = {
+        let (n_params, n_locals, rest_slot, is_gen) = {
             let f = self.funcs.get(fidx as usize).ok_or(VmError::NotCallable)?;
-            (f.n_params, f.n_locals, f.rest_slot)
+            (f.n_params, f.n_locals, f.rest_slot, f.is_gen)
         };
         let n = n_locals.max(n_params);
         let mut locals = vec![AklVal::UNDEF; n];
@@ -1724,14 +1840,78 @@ impl Runtime {
                 locals[rs as usize] = AklVal::mk_obj(arr_id);
             }
         }
+        // ジェネレータ関数: 実行せずに実行状態（Obj::Gen）を生成して返す。
+        // 実際の実行は `next()`（gen_resume）で行う。
+        if is_gen {
+            let gen_id = self
+                .heap
+                .alloc(Obj::Gen { fidx, pc: 0, locals, env, this: this_v, done: false })
+                .map_err(|_| VmError::Oom)?;
+            return Ok(Some(AklVal::mk_obj(gen_id)));
+        }
         let ret_pc = *pc + 1;
         frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env, catch_pc: None, is_new: false });
         *pc = 0;
         Ok(None)
     }
 
+    /// ジェネレータを 1 段進める（`gen.next()`）。戻り値は `{ value, done }` の
+    /// プレーンオブジェクト。C の `AKL_OK_GEN` の `gen_next` 相当。
+    pub fn gen_resume(&mut self, gen_id: ObjId) -> Result<AklVal, VmError> {
+        let (fidx, pc, locals, env, this, done) = match self.heap.get(gen_id) {
+            Some(Obj::Gen { fidx, pc, locals, env, this, done }) => {
+                (*fidx, *pc, locals.clone(), *env, *this, *done)
+            }
+            _ => return Err(VmError::NotCallable),
+        };
+        if done {
+            return self.gen_result(AklVal::UNDEF, true);
+        }
+        let frames = vec![Frame {
+            func: fidx,
+            ret_pc: 0,
+            locals,
+            this,
+            env,
+            catch_pc: None,
+            is_new: false,
+        }];
+        let stack = Vec::new();
+        match self.run_loop(stack, frames, pc, Some(gen_id))? {
+            RunEnd::Value(v) => {
+                if let Some(Obj::Gen { done, .. }) = self.heap.get_mut(gen_id) {
+                    *done = true;
+                }
+                self.gen_result(v, true)
+            }
+            RunEnd::Yield(v) => self.gen_result(v, false),
+        }
+    }
+
+    /// `{ value, done }` のプレーンオブジェクトを生成する（`gen.next()` の戻り値）。
+    fn gen_result(&mut self, value: AklVal, done: bool) -> Result<AklVal, VmError> {
+        let value_id = self.intern("value").ok_or(VmError::Oom)?;
+        let done_id = self.intern("done").ok_or(VmError::Oom)?;
+        let id = self
+            .heap
+            .alloc(Obj::Obj(vec![
+                (value_id, value),
+                (done_id, AklVal::from_bool(done)),
+            ]))
+            .map_err(|_| VmError::Oom)?;
+        Ok(AklVal::mk_obj(id))
+    }
+
     /// 加算（int fast path + double + 文字列連結）。
     fn add(&mut self, a: AklVal, b: AklVal) -> Result<AklVal, VmError> {
+        // BigInt + BigInt（i64 近似。オーバーフローは wrapping）
+        if let (Some(x), Some(y)) = (self.bigint_of(a), self.bigint_of(b)) {
+            let id = self
+                .heap
+                .alloc(Obj::BigInt(x.wrapping_add(y)))
+                .map_err(|_| VmError::Oom)?;
+            return Ok(AklVal::mk_obj(id));
+        }
         if self.is_string(a) || self.is_string(b) {
             // ROPE 連結（遅延表現。両辺を文字列化して ROPE ノードを生成）
             let sa = self.stringify(a)?;
@@ -1752,7 +1932,16 @@ impl Runtime {
     }
 
     /// 二項算術（`-` `*`。int fast path + double）。
-    fn arith_bin(&self, a: AklVal, b: AklVal, kind: Arith) -> Result<AklVal, VmError> {
+    fn arith_bin(&mut self, a: AklVal, b: AklVal, kind: Arith) -> Result<AklVal, VmError> {
+        // BigInt op BigInt（i64 近似。オーバーフローは wrapping）
+        if let (Some(x), Some(y)) = (self.bigint_of(a), self.bigint_of(b)) {
+            let r = match kind {
+                Arith::Sub => x.wrapping_sub(y),
+                Arith::Mul => x.wrapping_mul(y),
+            };
+            let id = self.heap.alloc(Obj::BigInt(r)).map_err(|_| VmError::Oom)?;
+            return Ok(AklVal::mk_obj(id));
+        }
         if a.is_int() && b.is_int() {
             let (x, y) = (a.get_int() as i64, b.get_int() as i64);
             let r = match kind {
@@ -1805,6 +1994,16 @@ impl Runtime {
         if (a.is_null() && b.is_undef()) || (a.is_undef() && b.is_null()) {
             return true;
         }
+        // BigInt == BigInt（i64 比較）/ BigInt == 数値（数値化して比較）
+        if let (Some(x), Some(y)) = (self.bigint_of(a), self.bigint_of(b)) {
+            return x == y;
+        }
+        if let Some(x) = self.bigint_of(a) {
+            return self.is_number(b) && x as f64 == self.to_number(b);
+        }
+        if let Some(y) = self.bigint_of(b) {
+            return self.is_number(a) && self.to_number(a) == y as f64;
+        }
         // 数値（int/double）同士・数値 vs 真偽値・数値 vs 数値文字列
         if self.is_number(a) && self.is_number(b) {
             return self.to_number(a) == self.to_number(b);
@@ -1837,6 +2036,9 @@ impl Runtime {
 
     /// 厳密等値 `===`（数値は int/double を統一して比較。NaN は自身と非等値）。
     fn strict_eq(&self, a: AklVal, b: AklVal) -> bool {
+        if let (Some(x), Some(y)) = (self.bigint_of(a), self.bigint_of(b)) {
+            return x == y;
+        }
         if a.is_int() && b.is_int() {
             return a.get_int() == b.get_int();
         }
@@ -1868,6 +2070,7 @@ impl Runtime {
         if v.is_obj() {
             return match self.heap.get(v.get_obj()) {
                 Some(Obj::Str(s)) => !s.is_empty(),
+                Some(Obj::BigInt(x)) => *x != 0,
                 _ => true,
             };
         }
@@ -1887,6 +2090,7 @@ impl Runtime {
         } else if v.is_obj() {
             match self.heap.get(v.get_obj()) {
                 Some(Obj::Str(_)) => "string",
+                Some(Obj::BigInt(_)) => "bigint",
                 Some(Obj::Func { .. })
                 | Some(Obj::Native(_))
                 | Some(Obj::ForeignNative { .. })
@@ -1917,6 +2121,8 @@ impl Runtime {
                 Some(Obj::Str(s)) => s.parse::<f64>().unwrap_or(f64::NAN),
                 // Date は valueOf（エポック ms）に数値化
                 Some(Obj::Date { ms }) => *ms,
+                // BigInt は数値化（`==` 比較・単項 `+` 等）
+                Some(Obj::BigInt(x)) => *x as f64,
                 _ => f64::NAN,
             }
         } else {
@@ -1949,6 +2155,7 @@ impl Runtime {
                 }
                 Some(Obj::Arr(_)) => "[object Array]".into(),
                 Some(Obj::Date { ms }) => date_to_string(*ms),
+                Some(Obj::BigInt(x)) => x.to_string(),
                 Some(Obj::Handle { vtab, .. }) => format!("[object {}]", vtab.tag),
                 Some(Obj::BoundMethod { .. }) => "[object Function]".into(),
                 _ => "[object Object]".into(),
@@ -1962,6 +2169,17 @@ impl Runtime {
     /// 値が数値（int または double）か。
     fn is_number(&self, v: AklVal) -> bool {
         v.is_int() || !v.is_tagged()
+    }
+
+    /// 値が BigInt（`Obj::BigInt`）ならその i64 を返す。
+    fn bigint_of(&self, v: AklVal) -> Option<i64> {
+        if !v.is_obj() {
+            return None;
+        }
+        match self.heap.get(v.get_obj()) {
+            Some(Obj::BigInt(x)) => Some(*x),
+            _ => None,
+        }
     }
 
     /// 値が真偽値か。
@@ -2250,7 +2468,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 1, rest_slot: None, n_locals: 2 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 1, rest_slot: None, n_locals: 2, is_gen: false });
         let fib_name = rt.intern("fib").unwrap();
         // 仮置きの GLoad(ObjId::MAX) を fib_name に差し替える
         for op in &mut rt.funcs[fidx as usize].code {
@@ -2302,7 +2520,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 2 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 2, is_gen: false });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(45));
     }
 
@@ -2313,7 +2531,7 @@ mod tests {
         let b = rt.intern("world").unwrap();
         let code = vec![Op::ConstStr(a), Op::ConstStr(b), Op::Add, Op::Ret];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
         let r = rt.run(fidx, &[]).unwrap();
         // ROPE 連結: 平坦化して内容を検証
         let flattened = rt.flatten_str(r);
@@ -2334,7 +2552,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(42));
     }
 
@@ -2352,7 +2570,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(2));
     }
 
@@ -2368,7 +2586,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::TRUE);
     }
 
@@ -2377,7 +2595,7 @@ mod tests {
         let mut rt = Runtime::new();
         let code = vec![Op::ConstI(5), Op::Call(0), Op::Ret];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
         assert_eq!(rt.run(fidx, &[]), Err(VmError::NotCallable));
     }
 
@@ -2392,7 +2610,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0, is_gen: false });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(7));
         assert_eq!(rt.global_get(g), Some(AklVal::mk_int(7)));
     }

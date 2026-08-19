@@ -301,6 +301,10 @@ pub enum Expr {
         /// 引数列。
         args: Vec<Expr>,
     },
+    /// `yield [expr]`（ジェネレータ。operand は無ければ None = undefined）。
+    Yield(Option<Box<Expr>>),
+    /// `await expr`（async 関数。解決済み Promise を unwrap する）。
+    Await(Box<Expr>),
 }
 
 /// 分割代入パターン。
@@ -382,6 +386,10 @@ pub enum Stmt {
         rest: Option<String>,
         /// 本体。
         body: Vec<Stmt>,
+        /// ジェネレータ関数（`function*`）か。
+        is_gen: bool,
+        /// async 関数（`async function`）か。
+        is_async: bool,
     },
     /// 空文（`;`）。
     Empty,
@@ -844,8 +852,14 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// 単項 `! - + typeof` + 前置 `++`/`--`。
+    /// 単項 `! - + typeof` + 前置 `++`/`--` + `await`。
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
+        // await（単項と同じ優先順位。右結合）
+        if self.at_kw(Keyword::Await)? {
+            self.bump()?;
+            let operand = self.parse_unary()?;
+            return Ok(Expr::Await(Box::new(operand)));
+        }
         let op = if self.at_punct(Punct::Bang)? {
             Some(UnaryOp::Not)
         } else if self.at_punct(Punct::Minus)? {
@@ -999,6 +1013,18 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_punct(Punct::RParen, "')'")?;
                 Ok(Expr::SuperCall { parent, args })
+            }
+            Token::Kw(Keyword::Yield) => {
+                // yield [expr]（operand 省略時は undefined）
+                let operand = if self.at_punct(Punct::Semi)?
+                    || self.at_punct(Punct::RBrace)?
+                    || self.at_eof()?
+                {
+                    None
+                } else {
+                    Some(Box::new(self.parse_expr()?))
+                };
+                Ok(Expr::Yield(operand))
             }
             Token::Ident(name) => {
                 // アロー関数の単一引数形: `x => body`
@@ -1354,8 +1380,18 @@ impl<'a> Parser<'a> {
             }
             return Ok(Stmt::Continue);
         }
+        if self.at_kw(Keyword::Async)? {
+            self.bump()?; // async
+            if self.at_kw(Keyword::Function)? {
+                self.bump()?; // function
+                return self.parse_func_decl_rest(false, true);
+            }
+            return Err(ParseError("async only supports function declarations".into()));
+        }
         if self.at_kw(Keyword::Function)? {
-            return self.parse_func_decl();
+            self.bump()?; // function
+            let is_gen = self.eat_punct(Punct::Star)?;
+            return self.parse_func_decl_rest(is_gen, false);
         }
         if self.at_kw(Keyword::Switch)? {
             return self.parse_switch();
@@ -1869,9 +1905,9 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Export { name, value })
     }
 
-    /// `function name(params) { body }`。
-    fn parse_func_decl(&mut self) -> Result<Stmt, ParseError> {
-        self.bump()?; // function
+    /// `name(params) { body }`（`function` / `function*` / `async function` の
+    /// `function` キーワードは呼び出し側が消費済み。`is_gen` / `is_async` は呼び出し側が判定）。
+    fn parse_func_decl_rest(&mut self, is_gen: bool, is_async: bool) -> Result<Stmt, ParseError> {
         let name = match self.bump()? {
             Token::Ident(n) => n.to_string(),
             other => return Err(ParseError(format!("expected function name, got {other:?}"))),
@@ -1883,7 +1919,7 @@ impl<'a> Parser<'a> {
             Stmt::Block(s) => s,
             _ => unreachable!(),
         };
-        Ok(Stmt::FuncDecl { name, params, rest, body })
+        Ok(Stmt::FuncDecl { name, params, rest, body, is_gen, is_async })
     }
 }
 
@@ -1984,7 +2020,7 @@ mod tests {
         let stmts = parse("function f(a) { return a; } f(1);").unwrap();
         assert_eq!(stmts.len(), 2);
         match &stmts[0] {
-            Stmt::FuncDecl { name, params, rest, body } => {
+            Stmt::FuncDecl { name, params, rest, body, .. } => {
                 assert_eq!(name, "f");
                 assert_eq!(params, &vec!["a".to_string()]);
                 assert_eq!(rest, &None);
@@ -2041,9 +2077,31 @@ mod tests {
 
     #[test]
     fn unsupported_errors() {
-        // 現在未対応の構文（async/await、yield、class extends、テンプレートリテラル等）
-        assert!(parse("async function f() {}").is_err()); // async は未対応
-        assert!(parse("function* g() { yield 1; }").is_err()); // generator は未対応
+        // 現在未対応の構文（テンプレートリテラル等）
+        assert!(parse("`hello ${name}`;").is_err()); // テンプレートリテラルは未対応
+    }
+
+    #[test]
+    fn generator_and_async_decl() {
+        // function* 宣言（yield 付き）
+        let stmts = parse("function* g() { yield 1; yield 2; }").unwrap();
+        match &stmts[0] {
+            Stmt::FuncDecl { is_gen, is_async, body, .. } => {
+                assert!(*is_gen);
+                assert!(!*is_async);
+                assert_eq!(body.len(), 2);
+            }
+            other => panic!("expected FuncDecl, got {other:?}"),
+        }
+        // async function 宣言（await 付き）
+        let stmts = parse("async function f() { return await 7; }").unwrap();
+        match &stmts[0] {
+            Stmt::FuncDecl { is_gen, is_async, .. } => {
+                assert!(!*is_gen);
+                assert!(*is_async);
+            }
+            other => panic!("expected FuncDecl, got {other:?}"),
+        }
     }
 
     #[test]

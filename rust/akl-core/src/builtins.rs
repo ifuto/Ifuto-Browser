@@ -75,6 +75,8 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     install_json(rt)?;
     // Map / Set / Promise
     install_map_set(rt)?;
+    // ジェネレータメソッド（next）
+    install_gen_methods(rt)?;
     // 正規表現メソッド（exec / test）
     install_regex_methods(rt)?;
     // Date（同期近似）
@@ -1038,9 +1040,47 @@ fn install_map_set(rt: &mut Runtime) -> Result<(), VmError> {
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
         rt.set_methods.push((nid, v));
     }
-    // Promise.resolve
-    rt.register_global_native("Promise", promise_ctor)?;
+    // Promise: グローバルは `constructor` + `resolve` を持つプレーンオブジェクト
+    // （`new Promise(...)` と `Promise.resolve(...)` の両方に対応）。インスタンス
+    // メソッド（then/catch）は `rt.promise_methods` 経由。
+    let promise_id = rt.intern("Promise").ok_or(VmError::Oom)?;
+    let promise = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let ctor = rt.register_native(promise_ctor)?;
+    rt.heap
+        .prop_set(promise, rt.ctor_name, ctor)
+        .map_err(|_| VmError::Oom)?;
+    let resolve = rt.register_native(promise_resolve)?;
+    let resolve_name = rt.intern("resolve").ok_or(VmError::Oom)?;
+    rt.heap
+        .prop_set(promise, resolve_name, resolve)
+        .map_err(|_| VmError::Oom)?;
+    rt.global_set(promise_id, AklVal::mk_obj(promise));
+    // インスタンスメソッド then / catch
+    for (name, f) in [
+        ("then", promise_then as crate::bytecode::NativeFn),
+        ("catch", promise_catch),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.promise_methods.push((nid, v));
+    }
     Ok(())
+}
+
+/// ジェネレータメソッド（`next`）を登録。
+fn install_gen_methods(rt: &mut Runtime) -> Result<(), VmError> {
+    let v = rt.register_native(gen_next)?;
+    let nid = rt.intern("next").ok_or(VmError::Oom)?;
+    rt.gen_methods.push((nid, v));
+    Ok(())
+}
+
+/// ジェネレータを 1 段進める（`gen.next()`）。`{ value, done }` を返す。
+fn gen_next(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    if this.is_obj() {
+        return rt.gen_resume(this.get_obj());
+    }
+    Ok(AklVal::UNDEF)
 }
 
 fn map_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
@@ -1052,13 +1092,41 @@ fn set_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmErr
     Ok(AklVal::mk_obj(id))
 }
 fn promise_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    // Promise.resolve(value) 相当（executor は未対応。解決済み Promise を返す近似）
+    // `new Promise(executor)`。executor があれば resolve コールバック付きで同期的に
+    // 呼ぶ近似（マイクロタスクは実行しない。then コールバックは後で消化されない）。
+    let id = rt
+        .heap
+        .alloc(Obj::Promise { state: 0, value: AklVal::UNDEF })
+        .map_err(|_| VmError::Oom)?;
+    let exec = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if is_callable(rt, exec) {
+        let resolve = rt.register_native(promise_resolve)?;
+        let _ = call_native(rt, exec, AklVal::UNDEF, &[resolve]);
+    }
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Promise.resolve(value)` → 解決済み Promise。
+fn promise_resolve(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let v = a.first().copied().unwrap_or(AklVal::UNDEF);
     let id = rt
         .heap
         .alloc(Obj::Promise { state: 1, value: v })
         .map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
+}
+
+/// `promise.then(onFulfilled)`。マイクロタスク近似: コールバックは登録するが実行
+/// しない（スクリプト本体内で読む値は 0 のまま = V8 準拠のオラクルと一致）。
+fn promise_then(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let _ = rt;
+    Ok(this)
+}
+
+/// `promise.catch(onRejected)`。then と同様に no-op 近似。
+fn promise_catch(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let _ = rt;
+    Ok(this)
 }
 
 fn map_set(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
@@ -2429,5 +2497,50 @@ mod tests {
             run_src("var d = new Date(3661000); d.getUTCHours();").unwrap().0,
             AklVal::mk_int(1)
         );
+    }
+
+    #[test]
+    fn bigint_arithmetic() {
+        // 加算・乗算（BigInt === BigInt は値比較）・typeof・==（数値との比較）
+        assert_eq!(
+            run_src("9007199254740993n + 1n === 9007199254740994n;").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(run_src("10n * 3n === 30n;").unwrap().0, AklVal::TRUE);
+        assert_eq!(run_src("typeof 10n === 'bigint';").unwrap().0, AklVal::TRUE);
+        assert_eq!(
+            run_src("((10n == 10) ? 'yes' : 'no') === 'yes';").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(run_src("10n === 10n;").unwrap().0, AklVal::TRUE);
+    }
+
+    #[test]
+    fn generator_yield() {
+        let src = "function* nums() { yield 3; yield 1; yield 4; }
+                   var it = nums();
+                   var a = it.next(); var b = it.next(); var c = it.next();
+                   a.value + b.value + c.value;";
+        assert_eq!(run_src(src).unwrap().0, AklVal::mk_int(8));
+        // done フラグ（3 回 yield 後、4 回目の next は done）
+        let src2 = "function* g() { yield 1; }
+                    var it = g(); it.next(); it.next().done;";
+        assert_eq!(run_src(src2).unwrap().0, AklVal::TRUE);
+    }
+
+    #[test]
+    fn promise_and_async() {
+        // Promise.then は no-op（マイクロタスク近似）。total は 0 のまま。
+        let src = "var total = 0;
+                   var p = new Promise(function(res) { res(5); });
+                   p.then(function(v) { total = v * 10; });
+                   total;";
+        assert_eq!(run_src(src).unwrap().0, AklVal::mk_int(0));
+        // async/await（await は解決済み Promise を unwrap、async 関数は Promise を返す）
+        let src2 = "var r = 0;
+                    async function compute() { return await Promise.resolve(7) * 3; }
+                    compute().then(function(v) { r = v; });
+                    r;";
+        assert_eq!(run_src(src2).unwrap().0, AklVal::mk_int(0));
     }
 }

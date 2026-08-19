@@ -55,14 +55,15 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
         capture_order: Vec::new(),
         break_patches: Vec::new(),
         continue_patches: Vec::new(),
+        cur_is_async: false,
     };
 
     // パス 1: トップレベル関数宣言を収集・登録（box 化ローカルを解析してから）
     let mut funcs: Vec<(String, u32)> = Vec::new();
     for stmt in program {
-        if let Stmt::FuncDecl { name, params, rest, body } = stmt {
+        if let Stmt::FuncDecl { name, params, rest, body, is_gen, is_async } = stmt {
             let boxed = compute_boxed(params, body);
-            let fidx = c.compile_function(name, params, rest.as_deref(), body, &boxed)?;
+            let fidx = c.compile_function(name, params, rest.as_deref(), body, &boxed, *is_gen, *is_async)?;
             funcs.push((name.clone(), fidx));
         }
     }
@@ -92,7 +93,7 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
 
     let n_locals = c.locals.len();
     let fidx = rt.funcs.len() as u32;
-    rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals });
+    rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals, is_gen: false });
     Ok(fidx)
 }
 
@@ -108,11 +109,14 @@ struct Compiler<'a> {
     break_patches: Vec<Vec<usize>>,
     /// `continue` のジャンプ先パッチ位置（ループごとのスタック）。
     continue_patches: Vec<Vec<usize>>,
+    /// 現在コンパイル中の関数が async か（`return` を Promise で包む）。
+    cur_is_async: bool,
 }
 
 impl Compiler<'_> {
     /// 関数をコンパイルして関数表に登録し、index を返す。
     /// `boxed` は「ネスト関数に捕捉される自ローカル」の集合（共有セルとして env に box 化）。
+    #[allow(clippy::too_many_arguments)]
     fn compile_function(
         &mut self,
         name: &str,
@@ -120,6 +124,8 @@ impl Compiler<'_> {
         rest: Option<&str>,
         body: &[Stmt],
         boxed: &HashMap<String, u32>,
+        is_gen: bool,
+        is_async: bool,
     ) -> Result<u32, CompileError> {
         let mut locals = HashMap::new();
         for p in params {
@@ -142,11 +148,13 @@ impl Compiler<'_> {
         let saved_order = std::mem::take(&mut self.capture_order);
         let saved_breaks = std::mem::take(&mut self.break_patches);
         let saved_continues = std::mem::take(&mut self.continue_patches);
+        let saved_async = self.cur_is_async;
         self.locals = locals;
         self.captures = boxed.clone();
         self.capture_order = Vec::new();
         self.break_patches = Vec::new();
         self.continue_patches = Vec::new();
+        self.cur_is_async = is_async;
 
         let mut code = Vec::new();
         // 関数入口で自前 env（box 化ローカル）を生成（C の frame_hidden 相当）
@@ -156,8 +164,11 @@ impl Compiler<'_> {
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
         }
-        // 暗黙の return undefined
+        // 暗黙の return undefined（async は Promise で包む）
         code.push(Op::Undef);
+        if is_async {
+            code.push(Op::PromiseWrap);
+        }
         code.push(Op::Ret);
 
         let n_locals = self.locals.len();
@@ -170,6 +181,7 @@ impl Compiler<'_> {
             n_params,
             rest_slot,
             n_locals,
+            is_gen,
         });
 
         self.locals = saved_locals;
@@ -177,11 +189,13 @@ impl Compiler<'_> {
         self.capture_order = saved_order;
         self.break_patches = saved_breaks;
         self.continue_patches = saved_continues;
+        self.cur_is_async = saved_async;
         Ok(fidx)
     }
 
     /// ネスト関数をコンパイルして関数表に登録し、fidx を返す。
     /// 自由変数は「外側の env（captures）に解決」されたら CeLoad/CeStore、なければグローバル。
+    #[allow(clippy::too_many_arguments)]
     fn compile_nested(
         &mut self,
         name: &str,
@@ -189,6 +203,8 @@ impl Compiler<'_> {
         rest: Option<&str>,
         body: &[Stmt],
         enclosing_env: &HashMap<String, u32>,
+        is_gen: bool,
+        is_async: bool,
     ) -> Result<u32, CompileError> {
         // 深いネスト（3 段以上）は未対応（env チェーンが必要。明白に失敗させる）
         if body.iter().any(|s| matches!(s, Stmt::FuncDecl { .. })) {
@@ -228,30 +244,36 @@ impl Compiler<'_> {
         let saved_order = std::mem::take(&mut self.capture_order);
         let saved_breaks = std::mem::take(&mut self.break_patches);
         let saved_continues = std::mem::take(&mut self.continue_patches);
+        let saved_async = self.cur_is_async;
         self.locals = locals;
         self.captures = captures;
         self.capture_order = Vec::new();
         self.break_patches = Vec::new();
         self.continue_patches = Vec::new();
+        self.cur_is_async = is_async;
 
         let mut code = Vec::new();
         for stmt in body {
             self.gen_stmt(stmt, &mut code)?;
         }
         code.push(Op::Undef);
+        if is_async {
+            code.push(Op::PromiseWrap);
+        }
         code.push(Op::Ret);
 
         let n_locals = self.locals.len();
         let n_params = params.len();
         let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
         let fidx = self.rt.funcs.len() as u32;
-        self.rt.funcs.push(FuncObj { code, name: Some(name_id), n_params, rest_slot, n_locals });
+        self.rt.funcs.push(FuncObj { code, name: Some(name_id), n_params, rest_slot, n_locals, is_gen });
 
         self.locals = saved_locals;
         self.captures = saved_captures;
         self.capture_order = saved_order;
         self.break_patches = saved_breaks;
         self.continue_patches = saved_continues;
+        self.cur_is_async = saved_async;
 
         Ok(fidx)
     }
@@ -317,7 +339,7 @@ impl Compiler<'_> {
         let n_locals = self.locals.len();
         let n_params = params.len();
         let fidx = self.rt.funcs.len() as u32;
-        self.rt.funcs.push(FuncObj { code, name: None, n_params, rest_slot, n_locals });
+        self.rt.funcs.push(FuncObj { code, name: None, n_params, rest_slot, n_locals, is_gen: false });
 
         self.locals = saved_locals;
         self.captures = saved_captures;
@@ -333,9 +355,7 @@ impl Compiler<'_> {
         match expr {
             Expr::Num(NumLit::Int(v)) => code.push(Op::ConstI(*v)),
             Expr::Num(NumLit::Float(d)) => code.push(Op::ConstD(*d)),
-            Expr::Num(NumLit::BigInt(_)) => {
-                return Err(CompileError("BigInt literals are not yet supported".into()))
-            }
+            Expr::Num(NumLit::BigInt(v)) => code.push(Op::BigInt(*v)),
             Expr::Str(s) => {
                 let id = self.rt.intern(s).ok_or_else(|| CompileError("intern failed".into()))?;
                 code.push(Op::ConstStr(id));
@@ -754,6 +774,17 @@ impl Compiler<'_> {
                 }
                 code.push(Op::MCall(args.len() as u8));
             }
+            Expr::Yield(operand) => {
+                match operand {
+                    Some(e) => self.gen_expr(e, code)?,
+                    None => code.push(Op::Undef),
+                }
+                code.push(Op::Yield);
+            }
+            Expr::Await(operand) => {
+                self.gen_expr(operand, code)?;
+                code.push(Op::Await);
+            }
             Expr::This => {
                 code.push(Op::This);
             }
@@ -793,7 +824,11 @@ impl Compiler<'_> {
             Stmt::Empty => {}
             Stmt::Expr(e) => {
                 self.gen_expr(e, code)?;
-                code.push(Op::PopV); // 式文の値を last_val に保存（C の POPV）
+                // `yield expr;` は Yield 命令が即座に戻る（再開は Yield の次から）。
+                // PopV を出すと再開時に空スタックを pop してしまうため省略する。
+                if !matches!(e, Expr::Yield(_)) {
+                    code.push(Op::PopV); // 式文の値を last_val に保存（C の POPV）
+                }
             }
             Stmt::Var { name, init } => {
                 match init {
@@ -806,6 +841,10 @@ impl Compiler<'_> {
                 match e {
                     Some(e) => self.gen_expr(e, code)?,
                     None => code.push(Op::Undef),
+                }
+                // async 関数は戻り値を解決済み Promise で包む
+                if self.cur_is_async {
+                    code.push(Op::PromiseWrap);
                 }
                 code.push(Op::Ret);
             }
@@ -1019,10 +1058,10 @@ impl Compiler<'_> {
                 code.push(Op::Jmp(0)); // プレースホルダ
                 patches.push(idx);
             }
-            Stmt::FuncDecl { name, params, rest, body } => {
+            Stmt::FuncDecl { name, params, rest, body, is_gen, is_async } => {
                 // ネスト関数宣言: 現在フレームの env を共有するクロージャを生成して束縛
                 let enclosing_env = self.captures.clone();
-                let fidx = self.compile_nested(name, params, rest.as_deref(), body, &enclosing_env)?;
+                let fidx = self.compile_nested(name, params, rest.as_deref(), body, &enclosing_env, *is_gen, *is_async)?;
                 code.push(Op::MakeClosure(fidx));
                 self.gen_store(name, code)?;
             }
@@ -1612,6 +1651,12 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
                 collect_expr_refs(a, out);
             }
         }
+        Expr::Yield(operand) => {
+            if let Some(e) = operand {
+                collect_expr_refs(e, out);
+            }
+        }
+        Expr::Await(operand) => collect_expr_refs(operand, out),
         Expr::New { callee, args } => {
             collect_expr_refs(callee, out);
             for a in args {

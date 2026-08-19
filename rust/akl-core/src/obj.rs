@@ -150,6 +150,24 @@ pub enum Obj {
         /// メソッド名（intern 済み文字列 ObjId）。
         name: ObjId,
     },
+    /// BigInt（C の `AKL_OK_BIGINT` 相当。i64 保持近似。`typeof` は "bigint"、
+    /// 文字列化は `n` 接尾辞無しの 10 進）。
+    BigInt(i64),
+    /// ジェネレータ（`function*` の実行状態。`next()` が再開する）。
+    Gen {
+        /// ジェネレータ関数の関数表 index。
+        fidx: u32,
+        /// 再開位置（次の命令 index）。
+        pc: usize,
+        /// ジェネレータフレームのローカル（yield を跨いで保持）。
+        locals: Vec<AklVal>,
+        /// クロージャ捕捉環境（無ければ None）。
+        env: Option<ObjId>,
+        /// ジェネレータの `this`。
+        this: AklVal,
+        /// 完了済みか（true なら以後の `next()` は `{value: undefined, done: true}`）。
+        done: bool,
+    },
 }
 
 impl Obj {
@@ -224,6 +242,17 @@ impl Obj {
             Obj::Handle { .. } => {}
             Obj::BoundMethod { handle, .. } => {
                 out.push(*handle);
+            }
+            Obj::BigInt(_) => {}
+            Obj::Gen { locals, env, .. } => {
+                for v in locals {
+                    if v.is_obj() {
+                        out.push(v.get_obj());
+                    }
+                }
+                if let Some(e) = env {
+                    out.push(*e);
+                }
             }
         }
         out.into_iter()
