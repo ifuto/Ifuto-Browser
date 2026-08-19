@@ -276,6 +276,14 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: cargo test 108 件 + clippy 緑（分割代入・spread・class/new/instanceof・Map/Set の e2e）。
 
+### フェーズ 4 追補 3: rest パラメータ・for-in/for-of
+
+- rest パラメータ `function f(a, ...rest)`（`FuncObj.rest_slot`。余剰引数を配列で束縛）
+- for-of（配列イテレート）/ for-in（Object.keys でキーイテレート）— `Stmt::ForIn`
+- 呼び出し引数の spread パース（`f(...args)` の基盤）
+
+検証: cargo test 112 件 + clippy 緑（rest パラメータ・for-of/for-in の e2e）。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）

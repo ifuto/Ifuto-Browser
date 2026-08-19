@@ -60,9 +60,9 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
     // パス 1: トップレベル関数宣言を収集・登録（box 化ローカルを解析してから）
     let mut funcs: Vec<(String, u32)> = Vec::new();
     for stmt in program {
-        if let Stmt::FuncDecl { name, params, body } = stmt {
+        if let Stmt::FuncDecl { name, params, rest, body } = stmt {
             let boxed = compute_boxed(params, body);
-            let fidx = c.compile_function(name, params, body, &boxed)?;
+            let fidx = c.compile_function(name, params, rest.as_deref(), body, &boxed)?;
             funcs.push((name.clone(), fidx));
         }
     }
@@ -92,7 +92,7 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
 
     let n_locals = c.locals.len();
     let fidx = rt.funcs.len() as u32;
-    rt.funcs.push(FuncObj { code, name: None, n_params: 0, n_locals });
+    rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals });
     Ok(fidx)
 }
 
@@ -117,6 +117,7 @@ impl Compiler<'_> {
         &mut self,
         name: &str,
         params: &[String],
+        rest: Option<&str>,
         body: &[Stmt],
         boxed: &HashMap<String, u32>,
     ) -> Result<u32, CompileError> {
@@ -124,6 +125,14 @@ impl Compiler<'_> {
         for p in params {
             locals.insert(p.clone(), locals.len() as u32);
         }
+        // rest パラメータはローカルスロットに束縛（余剰引数が配列で入る）
+        let rest_slot = if let Some(r) = rest {
+            let slot = locals.len() as u32;
+            locals.insert(r.to_string(), slot);
+            Some(slot)
+        } else {
+            None
+        };
         collect_vars(body, &mut locals);
         // box 化されたローカルは locals に残したまま、参照時に captures を優先する
         // （スロット番号の穴を避ける。box 化ローカルは未使用の locals スロットが残るが無害）
@@ -159,6 +168,7 @@ impl Compiler<'_> {
             code,
             name: Some(name_id),
             n_params,
+            rest_slot,
             n_locals,
         });
 
@@ -176,6 +186,7 @@ impl Compiler<'_> {
         &mut self,
         name: &str,
         params: &[String],
+        rest: Option<&str>,
         body: &[Stmt],
         enclosing_env: &HashMap<String, u32>,
     ) -> Result<u32, CompileError> {
@@ -189,6 +200,13 @@ impl Compiler<'_> {
         for p in params {
             locals.insert(p.clone(), locals.len() as u32);
         }
+        let rest_slot = if let Some(r) = rest {
+            let slot = locals.len() as u32;
+            locals.insert(r.to_string(), slot);
+            Some(slot)
+        } else {
+            None
+        };
         collect_vars(body, &mut locals);
 
         // 自由変数（参照されるがローカルでない名前）
@@ -227,7 +245,7 @@ impl Compiler<'_> {
         let n_params = params.len();
         let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
         let fidx = self.rt.funcs.len() as u32;
-        self.rt.funcs.push(FuncObj { code, name: Some(name_id), n_params, n_locals });
+        self.rt.funcs.push(FuncObj { code, name: Some(name_id), n_params, rest_slot, n_locals });
 
         self.locals = saved_locals;
         self.captures = saved_captures;
@@ -244,6 +262,7 @@ impl Compiler<'_> {
     fn compile_function_anon(
         &mut self,
         params: &[String],
+        rest: Option<&str>,
         body: &[Stmt],
         boxed: &HashMap<String, u32>,
         enclosing_env: &HashMap<String, u32>,
@@ -252,6 +271,13 @@ impl Compiler<'_> {
         for p in params {
             locals.insert(p.clone(), locals.len() as u32);
         }
+        let rest_slot = if let Some(r) = rest {
+            let slot = locals.len() as u32;
+            locals.insert(r.to_string(), slot);
+            Some(slot)
+        } else {
+            None
+        };
         collect_vars(body, &mut locals);
 
         // 自由変数（参照されるが自ローカルでない名前）を捕捉解決
@@ -291,7 +317,7 @@ impl Compiler<'_> {
         let n_locals = self.locals.len();
         let n_params = params.len();
         let fidx = self.rt.funcs.len() as u32;
-        self.rt.funcs.push(FuncObj { code, name: None, n_params, n_locals });
+        self.rt.funcs.push(FuncObj { code, name: None, n_params, rest_slot, n_locals });
 
         self.locals = saved_locals;
         self.captures = saved_captures;
@@ -552,11 +578,11 @@ impl Compiler<'_> {
             Expr::This => {
                 code.push(Op::This);
             }
-            Expr::FuncExpr { name, params, body } => {
+            Expr::FuncExpr { name, params, rest, body } => {
                 // 関数式: 関数をコンパイルして MakeF/MakeClosure で生成
                 let enclosing_env = self.captures.clone();
                 let boxed = compute_boxed(params, body);
-                let fidx = self.compile_function_anon(params, body, &boxed, &enclosing_env)?;
+                let fidx = self.compile_function_anon(params, rest.as_deref(), body, &boxed, &enclosing_env)?;
                 // 名前付き関数式は自分自身を束縛（簡易: グローバルに置く近似は避け、
                 // ローカルスコープの自己参照は未対応のため名前は無視）
                 let _ = name;
@@ -566,12 +592,12 @@ impl Compiler<'_> {
                     code.push(Op::MakeClosure(fidx));
                 }
             }
-            Expr::Arrow { params, body } => {
+            Expr::Arrow { params, rest, body } => {
                 // アロー関数: 式本体を暗黙 return に包んでコンパイル
                 let stmts = vec![Stmt::Return(Some((**body).clone()))];
                 let enclosing_env = self.captures.clone();
                 let boxed = compute_boxed(params, &stmts);
-                let fidx = self.compile_function_anon(params, &stmts, &boxed, &enclosing_env)?;
+                let fidx = self.compile_function_anon(params, rest.as_deref(), &stmts, &boxed, &enclosing_env)?;
                 if boxed.is_empty() {
                     code.push(Op::MakeF(fidx));
                 } else {
@@ -692,6 +718,88 @@ impl Compiler<'_> {
                     code[idx] = Op::Jmp(step_target as u32);
                 }
             }
+            Stmt::ForIn { name, obj, body, is_of } => {
+                // for-of: 配列をイテレート / for-in: オブジェクトのキーをイテレート。
+                // 対象を一時グローバルに退避し、インデックス i で回す。
+                self.gen_expr(obj, code)?;
+                let tmp_obj = self
+                    .rt
+                    .intern("\x01forin_obj")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                code.push(Op::GStore(tmp_obj));
+
+                // for-in の場合は Object.keys(obj) でキー配列を取得
+                if !*is_of {
+                    let keys_obj = self
+                        .rt
+                        .intern("\x01forin_keys")
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
+                    let obj_id = self.rt.intern("Object").ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::GLoad(obj_id)); // Object
+                    code.push(Op::Dup);
+                    let keys_name = self.rt.intern("keys").ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::PLoad(keys_name)); // Object.keys
+                    code.push(Op::GLoad(tmp_obj)); // obj
+                    code.push(Op::Call(1)); // Object.keys(obj)
+                    code.push(Op::GStore(keys_obj)); // keys = ...
+                    // 対象を keys 配列に差し替え
+                    let tmp_actual = self
+                        .rt
+                        .intern("\x01forin_actual")
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::GLoad(keys_obj));
+                    code.push(Op::GStore(tmp_actual));
+                } else {
+                    let tmp_actual = self
+                        .rt
+                        .intern("\x01forin_actual")
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::GLoad(tmp_obj));
+                    code.push(Op::GStore(tmp_actual));
+                }
+
+                let tmp_actual = self
+                    .rt
+                    .intern("\x01forin_actual")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                let i_name = "\x01forin_i";
+                let i_id = self.rt.intern(i_name).ok_or_else(|| CompileError("intern failed".into()))?;
+                code.push(Op::ConstI(0));
+                code.push(Op::GStore(i_id));
+                let loop_start = code.len();
+                // i < actual.length
+                code.push(Op::GLoad(i_id));
+                code.push(Op::GLoad(tmp_actual));
+                code.push(Op::PLoad(self.rt.length_id));
+                code.push(Op::Lt);
+                let jmpf_idx = code.len();
+                code.push(Op::JmpF(0));
+                // name = actual[i]
+                code.push(Op::GLoad(tmp_actual));
+                code.push(Op::GLoad(i_id));
+                code.push(Op::AGet);
+                self.gen_store(name, code)?;
+                self.break_patches.push(Vec::new());
+                self.continue_patches.push(Vec::new());
+                let continue_target = code.len();
+                self.gen_stmt(body, code)?;
+                // i = i + 1
+                code.push(Op::GLoad(i_id));
+                code.push(Op::ConstI(1));
+                code.push(Op::Add);
+                code.push(Op::GStore(i_id));
+                code.push(Op::Jmp(loop_start as u32));
+                let end_pos = code.len();
+                code[jmpf_idx] = Op::JmpF(end_pos as u32);
+                let breaks = self.break_patches.pop().unwrap();
+                let continues = self.continue_patches.pop().unwrap();
+                for idx in breaks {
+                    code[idx] = Op::Jmp(end_pos as u32);
+                }
+                for idx in continues {
+                    code[idx] = Op::Jmp(continue_target as u32);
+                }
+            }
             Stmt::DoWhile { body, cond } => {
                 let loop_start = code.len();
                 self.break_patches.push(Vec::new());
@@ -732,10 +840,10 @@ impl Compiler<'_> {
                 code.push(Op::Jmp(0)); // プレースホルダ
                 patches.push(idx);
             }
-            Stmt::FuncDecl { name, params, body } => {
+            Stmt::FuncDecl { name, params, rest, body } => {
                 // ネスト関数宣言: 現在フレームの env を共有するクロージャを生成して束縛
                 let enclosing_env = self.captures.clone();
-                let fidx = self.compile_nested(name, params, body, &enclosing_env)?;
+                let fidx = self.compile_nested(name, params, rest.as_deref(), body, &enclosing_env)?;
                 code.push(Op::MakeClosure(fidx));
                 self.gen_store(name, code)?;
             }
@@ -753,9 +861,10 @@ impl Compiler<'_> {
                 let enclosing_env = self.captures.clone();
                 let empty_boxed = HashMap::new();
                 let mut method_fidxs = Vec::new();
-                for (mname, mparams, mbody) in methods {
+                for (mname, mparams, mrest, mbody) in methods {
                     let fidx = self.compile_function_anon(
                         mparams,
+                        mrest.as_deref(),
                         mbody,
                         &empty_boxed,
                         &enclosing_env,
@@ -765,7 +874,8 @@ impl Compiler<'_> {
                 // constructor をコンパイル
                 let ctor_fidx = self.compile_function_anon(
                     &constructor.0,
-                    &constructor.1,
+                    constructor.1.as_deref(),
+                    &constructor.2,
                     &empty_boxed,
                     &enclosing_env,
                 )?;
@@ -992,6 +1102,12 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
                 collect_vars(std::slice::from_ref(body), locals);
             }
             Stmt::DoWhile { body, .. } => collect_vars(std::slice::from_ref(body), locals),
+            Stmt::ForIn { name, body, .. } => {
+                if !locals.contains_key(name) {
+                    locals.insert(name.clone(), locals.len() as u32);
+                }
+                collect_vars(std::slice::from_ref(body), locals);
+            }
             Stmt::Switch { cases, .. } => {
                 for (_, body) in cases {
                     collect_vars(body, locals);
@@ -1086,6 +1202,10 @@ fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
             Stmt::DoWhile { body, cond } => {
                 collect_refs(std::slice::from_ref(body), out);
                 collect_expr_refs(cond, out);
+            }
+            Stmt::ForIn { obj, body, .. } => {
+                collect_expr_refs(obj, out);
+                collect_refs(std::slice::from_ref(body), out);
             }
             Stmt::Switch { disc, cases } => {
                 collect_expr_refs(disc, out);
@@ -1214,7 +1334,7 @@ fn collect_nested_funcs(
 ) {
     for stmt in stmts {
         match stmt {
-            Stmt::FuncDecl { name, params, body } => {
+            Stmt::FuncDecl { name, params, body, .. } => {
                 out.push((name.clone(), params.clone(), body.clone()));
             }
             Stmt::Block(inner) => collect_nested_funcs(inner, out),
@@ -1766,5 +1886,60 @@ mod tests {
             a instanceof A;
         ";
         assert_eq!(run_src(src).unwrap(), crate::AklVal::TRUE);
+    }
+
+    #[test]
+    fn rest_parameter() {
+        let src = "
+            function sum(...nums) {
+                var total = 0;
+                for (var i = 0; i < nums.length; i = i + 1) {
+                    total = total + nums[i];
+                }
+                return total;
+            }
+            sum(1, 2, 3, 4);
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(10));
+    }
+
+    #[test]
+    fn rest_parameter_with_named() {
+        let src = "
+            function f(first, ...rest) {
+                return first + rest.length;
+            }
+            f(10, 1, 2, 3);
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(13));
+    }
+
+    #[test]
+    fn for_of_loop() {
+        let src = "
+            var sum = 0;
+            for (var x of [1, 2, 3, 4]) {
+                sum = sum + x;
+            }
+            sum;
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(10));
+    }
+
+    #[test]
+    fn for_in_loop() {
+        // for-in は Object.keys を使うため builtins が必要
+        let src = "
+            var keys = [];
+            for (var k in {a: 1, b: 2}) {
+                keys.push(k);
+            }
+            keys.length;
+        ";
+        let program = crate::parser::Parser::new(src).parse_program().unwrap();
+        let mut rt = Runtime::new();
+        crate::builtins::install_builtins(&mut rt).unwrap();
+        let fidx = compile(&mut rt, &program).unwrap();
+        assert_eq!(rt.run(fidx, &[]).unwrap(), crate::AklVal::mk_int(2));
     }
 }

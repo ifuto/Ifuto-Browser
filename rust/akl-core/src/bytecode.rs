@@ -80,6 +80,8 @@ pub struct FuncObj {
     pub name: Option<ObjId>,
     /// パラメータ数。
     pub n_params: usize,
+    /// rest パラメータのローカルスロット（無ければ None）。余剰引数はここに配列で束縛。
+    pub rest_slot: Option<u32>,
     /// ローカル変数数（パラメータ含む）。
     pub n_locals: usize,
 }
@@ -1097,14 +1099,26 @@ impl Runtime {
             Some(Obj::Func { fidx, env }) => (*fidx, *env),
             _ => return Err(VmError::NotCallable),
         };
-        let (n_params, n_locals) = {
+        let (n_params, n_locals, rest_slot) = {
             let f = self.funcs.get(fidx as usize).ok_or(VmError::NotCallable)?;
-            (f.n_params, f.n_locals)
+            (f.n_params, f.n_locals, f.rest_slot)
         };
         let n = n_locals.max(n_params);
         let mut locals = vec![AklVal::UNDEF; n];
         for (i, a) in args.iter().enumerate().take(n_params) {
             locals[i] = *a;
+        }
+        // rest パラメータ: 余剰引数を配列で rest_slot に束縛
+        if let Some(rs) = rest_slot {
+            let rest_items: Vec<AklVal> = if args.len() > n_params {
+                args[n_params..].to_vec()
+            } else {
+                Vec::new()
+            };
+            let arr_id = self.heap.alloc(Obj::Arr(rest_items)).map_err(|_| VmError::Oom)?;
+            if (rs as usize) < locals.len() {
+                locals[rs as usize] = AklVal::mk_obj(arr_id);
+            }
         }
         let ret_pc = *pc + 1;
         frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env, catch_pc: None, is_new: false });
@@ -1486,7 +1500,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 1, n_locals: 2 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 1, rest_slot: None, n_locals: 2 });
         let fib_name = rt.intern("fib").unwrap();
         // 仮置きの GLoad(ObjId::MAX) を fib_name に差し替える
         for op in &mut rt.funcs[fidx as usize].code {
@@ -1538,7 +1552,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, n_locals: 2 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 2 });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(45));
     }
 
@@ -1549,7 +1563,7 @@ mod tests {
         let b = rt.intern("world").unwrap();
         let code = vec![Op::ConstStr(a), Op::ConstStr(b), Op::Add, Op::Ret];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
         let r = rt.run(fidx, &[]).unwrap();
         assert_eq!(r.is_obj(), true);
         match rt.heap.get(r.get_obj()) {
@@ -1572,7 +1586,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(42));
     }
 
@@ -1590,7 +1604,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(2));
     }
 
@@ -1606,7 +1620,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::TRUE);
     }
 
@@ -1615,7 +1629,7 @@ mod tests {
         let mut rt = Runtime::new();
         let code = vec![Op::ConstI(5), Op::Call(0), Op::Ret];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
         assert_eq!(rt.run(fidx, &[]), Err(VmError::NotCallable));
     }
 
@@ -1630,7 +1644,7 @@ mod tests {
             Op::Ret,
         ];
         let fidx = rt.funcs.len() as u32;
-        rt.funcs.push(FuncObj { code, name: None, n_params: 0, n_locals: 0 });
+        rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals: 0 });
         assert_eq!(rt.run(fidx, &[]).unwrap(), AklVal::mk_int(7));
         assert_eq!(rt.global_get(g), Some(AklVal::mk_int(7)));
     }

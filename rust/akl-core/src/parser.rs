@@ -174,6 +174,8 @@ pub enum Expr {
         name: Option<String>,
         /// パラメータ名。
         params: Vec<String>,
+        /// rest パラメータ（末尾の `...name`）。
+        rest: Option<String>,
         /// 本体。
         body: Vec<Stmt>,
     },
@@ -181,6 +183,8 @@ pub enum Expr {
     Arrow {
         /// パラメータ名。
         params: Vec<String>,
+        /// rest パラメータ。
+        rest: Option<String>,
         /// 本体（式の場合は暗黙 return、ブロックは文列）。
         body: Box<Expr>,
     },
@@ -260,6 +264,12 @@ pub enum Pattern {
     Hole,
 }
 
+/// パラメータリスト（通常パラメータ + rest パラメータ）。
+pub type ParamList = (Vec<String>, Option<String>);
+
+/// クラスメソッド（name, params, rest, body）。
+pub type ClassMethod = (String, Vec<String>, Option<String>, Vec<Stmt>);
+
 /// `for` 文の初期化節。
 #[derive(Clone, Debug, PartialEq)]
 pub enum ForInit {
@@ -312,6 +322,8 @@ pub enum Stmt {
         name: String,
         /// パラメータ名。
         params: Vec<String>,
+        /// rest パラメータ。
+        rest: Option<String>,
         /// 本体。
         body: Vec<Stmt>,
     },
@@ -334,6 +346,17 @@ pub enum Stmt {
         body: Box<Stmt>,
         /// 条件式。
         cond: Expr,
+    },
+    /// `for (var x in obj) body` / `for (var x of iterable) body`。
+    ForIn {
+        /// ループ変数名。
+        name: String,
+        /// 対象式。
+        obj: Expr,
+        /// 本体。
+        body: Box<Stmt>,
+        /// true = `of`（値で回す）、false = `in`（キーで回す）。
+        is_of: bool,
     },
     /// `break;`。
     Break,
@@ -368,10 +391,10 @@ pub enum Stmt {
     ClassDecl {
         /// クラス名。
         name: String,
-        /// コンストラクタ（params, body）。
-        constructor: (Vec<String>, Vec<Stmt>),
-        /// メソッド列（name, params, body）。
-        methods: Vec<(String, Vec<String>, Vec<Stmt>)>,
+        /// コンストラクタ（params, rest, body）。
+        constructor: (Vec<String>, Option<String>, Vec<Stmt>),
+        /// メソッド列（name, params, rest, body）。
+        methods: Vec<ClassMethod>,
     },
 }
 
@@ -855,7 +878,7 @@ impl<'a> Parser<'a> {
                 if self.at_punct(Punct::Arrow)? {
                     self.bump()?;
                     let body = self.parse_arrow_body()?;
-                    return Ok(Expr::Arrow { params: vec![name.to_string()], body: Box::new(body) });
+                    return Ok(Expr::Arrow { params: vec![name.to_string()], rest: None, body: Box::new(body) });
                 }
                 Ok(Expr::Ident(name.to_string()))
             }
@@ -863,11 +886,11 @@ impl<'a> Parser<'a> {
             Token::Punct(Punct::LParen) => {
                 // アロー関数 `(params) => body` か、グループ式 `(expr)` かの先読み
                 let saved = self.save_state();
-                if let Some(params) = self.try_parse_params()? {
+                if let Some((params, rest)) = self.try_parse_params()? {
                     if self.at_punct(Punct::Arrow)? {
                         self.bump()?;
                         let body = self.parse_arrow_body()?;
-                        return Ok(Expr::Arrow { params, body: Box::new(body) });
+                        return Ok(Expr::Arrow { params, rest, body: Box::new(body) });
                     }
                 }
                 // ロールバックしてグループ式
@@ -935,6 +958,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// パラメータ列をパース（`(...)` の内側）。rest パラメータ対応。
+    /// 戻り値は (params, rest)。
+    fn parse_params_list(&mut self) -> Result<ParamList, ParseError> {
+        let mut params = Vec::new();
+        let mut rest = None;
+        if !self.at_punct(Punct::RParen)? {
+            loop {
+                if self.eat_punct(Punct::Ellipsis)? {
+                    match self.bump()? {
+                        Token::Ident(n) => {
+                            rest = Some(n.to_string());
+                        }
+                        other => return Err(ParseError(format!("expected rest name, got {other:?}"))),
+                    }
+                    break; // rest は末尾
+                }
+                match self.bump()? {
+                    Token::Ident(p) => params.push(p.to_string()),
+                    other => return Err(ParseError(format!("expected parameter, got {other:?}"))),
+                }
+                if !self.eat_punct(Punct::Comma)? {
+                    break;
+                }
+            }
+        }
+        Ok((params, rest))
+    }
+
     /// `function [name] (params) { body }`（関数式。`function` は消費済み）。
     fn parse_func_expr(&mut self) -> Result<Expr, ParseError> {
         // 省略可能な名前
@@ -947,24 +998,13 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         self.expect_punct(Punct::LParen, "'('")?;
-        let mut params = Vec::new();
-        if !self.at_punct(Punct::RParen)? {
-            loop {
-                match self.bump()? {
-                    Token::Ident(p) => params.push(p.to_string()),
-                    other => return Err(ParseError(format!("expected parameter, got {other:?}"))),
-                }
-                if !self.eat_punct(Punct::Comma)? {
-                    break;
-                }
-            }
-        }
+        let (params, rest) = self.parse_params_list()?;
         self.expect_punct(Punct::RParen, "')'")?;
         let body = match self.parse_block()? {
             Stmt::Block(s) => s,
             _ => unreachable!(),
         };
-        Ok(Expr::FuncExpr { name, params, body })
+        Ok(Expr::FuncExpr { name, params, rest, body })
     }
 
     /// `new` の callee をパース（メンバーアクセスの連鎖。呼び出しは含まない）。
@@ -1003,16 +1043,17 @@ impl<'a> Parser<'a> {
         self.parse_expr()
     }
 
-    /// `(params)` を試す（アロー関数用）。成功なら params、失敗（グループ式）なら None。
+    /// `(params)` を試す（アロー関数用）。成功なら (params, rest)、失敗（グループ式）なら None。
     /// 呼び出し時点で `(` は既に消費済み。
-    fn try_parse_params(&mut self) -> Result<Option<Vec<String>>, ParseError> {
+    fn try_parse_params(&mut self) -> Result<Option<ParamList>, ParseError> {
         // 空の `()` はアロー（params 空）にもグループ（空は不正）にもなり得るが、
         // `() => ...` のみ有効なので空でも params として扱う。
         if self.at_punct(Punct::RParen)? {
             self.bump()?;
-            return Ok(Some(Vec::new()));
+            return Ok(Some((Vec::new(), None)));
         }
         let mut params = Vec::new();
+        let mut rest = None;
         loop {
             match self.peek()? {
                 Token::Ident(_) => {
@@ -1022,6 +1063,13 @@ impl<'a> Parser<'a> {
                     };
                     params.push(p);
                 }
+                Token::Punct(Punct::Ellipsis) => {
+                    self.bump()?;
+                    match self.bump()? {
+                        Token::Ident(n) => rest = Some(n.to_string()),
+                        _ => return Ok(None),
+                    }
+                }
                 _ => return Ok(None), // グループ式（識別子でない）
             }
             if self.eat_punct(Punct::Comma)? {
@@ -1029,7 +1077,7 @@ impl<'a> Parser<'a> {
             }
             if self.at_punct(Punct::RParen)? {
                 self.bump()?;
-                return Ok(Some(params));
+                return Ok(Some((params, rest)));
             }
             return Ok(None);
         }
@@ -1254,30 +1302,66 @@ impl<'a> Parser<'a> {
         Ok(Stmt::If { cond, then: Box::new(then), else_ })
     }
 
-    /// `for (init; cond; step) body`。
+    /// `for (init; cond; step) body` / `for (var x in obj) body` / `for (var x of it) body`。
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
         self.bump()?; // for
         self.expect_punct(Punct::LParen, "'('")?;
-        // init
-        let init = if self.at_punct(Punct::Semi)? {
-            self.bump()?;
-            None
-        } else if self.at_kw(Keyword::Var)?
-            || self.at_kw(Keyword::Let)?
-            || self.at_kw(Keyword::Const)?
-        {
+        // for-in / for-of: `for (var x in obj)` / `for (var x of it)`
+        if self.at_kw(Keyword::Var)? || self.at_kw(Keyword::Let)? || self.at_kw(Keyword::Const)? {
             self.bump()?; // var/let/const
             let name = match self.bump()? {
                 Token::Ident(n) => n.to_string(),
                 other => return Err(ParseError(format!("expected identifier, got {other:?}"))),
             };
+            // in / of 判定
+            if self.at_kw(Keyword::In)? {
+                self.bump()?;
+                let obj = self.parse_expr()?;
+                self.expect_punct(Punct::RParen, "')'")?;
+                let body = self.parse_stmt()?;
+                return Ok(Stmt::ForIn { name, obj, body: Box::new(body), is_of: false });
+            }
+            if self.at_kw(Keyword::Of)? {
+                self.bump()?;
+                let obj = self.parse_expr()?;
+                self.expect_punct(Punct::RParen, "')'")?;
+                let body = self.parse_stmt()?;
+                return Ok(Stmt::ForIn { name, obj, body: Box::new(body), is_of: true });
+            }
+            // 通常の for の var init
             let init = if self.eat_punct(Punct::Assign)? {
                 Some(self.parse_expr()?)
             } else {
                 None
             };
             self.expect_punct(Punct::Semi, "';'")?;
-            Some(ForInit::Var { name, init })
+            let cond = if self.at_punct(Punct::Semi)? {
+                self.bump()?;
+                None
+            } else {
+                let c = self.parse_expr()?;
+                self.expect_punct(Punct::Semi, "';'")?;
+                Some(c)
+            };
+            let step = if self.at_punct(Punct::RParen)? {
+                None
+            } else {
+                let s = self.parse_expr()?;
+                Some(s)
+            };
+            self.expect_punct(Punct::RParen, "')'")?;
+            let body = self.parse_stmt()?;
+            return Ok(Stmt::For {
+                init: Some(ForInit::Var { name, init }),
+                cond,
+                step,
+                body: Box::new(body),
+            });
+        }
+        // init
+        let init = if self.at_punct(Punct::Semi)? {
+            self.bump()?;
+            None
         } else {
             let e = self.parse_expr()?;
             self.expect_punct(Punct::Semi, "';'")?;
@@ -1408,7 +1492,7 @@ impl<'a> Parser<'a> {
             other => return Err(ParseError(format!("expected class name, got {other:?}"))),
         };
         self.expect_punct(Punct::LBrace, "'{'")?;
-        let mut constructor = (Vec::new(), Vec::new());
+        let mut constructor = (Vec::new(), None, Vec::new());
         let mut methods = Vec::new();
         while !self.at_punct(Punct::RBrace)? && !self.at_eof()? {
             // メソッド名
@@ -1419,18 +1503,7 @@ impl<'a> Parser<'a> {
             };
             // パラメータ
             self.expect_punct(Punct::LParen, "'('")?;
-            let mut params = Vec::new();
-            if !self.at_punct(Punct::RParen)? {
-                loop {
-                    match self.bump()? {
-                        Token::Ident(p) => params.push(p.to_string()),
-                        other => return Err(ParseError(format!("expected parameter, got {other:?}"))),
-                    }
-                    if !self.eat_punct(Punct::Comma)? {
-                        break;
-                    }
-                }
-            }
+            let (params, rest) = self.parse_params_list()?;
             self.expect_punct(Punct::RParen, "')'")?;
             // 本体
             let body = match self.parse_block()? {
@@ -1438,9 +1511,9 @@ impl<'a> Parser<'a> {
                 _ => unreachable!(),
             };
             if mname == "constructor" {
-                constructor = (params, body);
+                constructor = (params, rest, body);
             } else {
-                methods.push((mname, params, body));
+                methods.push((mname, params, rest, body));
             }
         }
         self.expect_punct(Punct::RBrace, "'}'")?;
@@ -1455,24 +1528,13 @@ impl<'a> Parser<'a> {
             other => return Err(ParseError(format!("expected function name, got {other:?}"))),
         };
         self.expect_punct(Punct::LParen, "'('")?;
-        let mut params = Vec::new();
-        if !self.at_punct(Punct::RParen)? {
-            loop {
-                match self.bump()? {
-                    Token::Ident(p) => params.push(p.to_string()),
-                    other => return Err(ParseError(format!("expected parameter, got {other:?}"))),
-                }
-                if !self.eat_punct(Punct::Comma)? {
-                    break;
-                }
-            }
-        }
+        let (params, rest) = self.parse_params_list()?;
         self.expect_punct(Punct::RParen, "')'")?;
         let body = match self.parse_block()? {
             Stmt::Block(s) => s,
             _ => unreachable!(),
         };
-        Ok(Stmt::FuncDecl { name, params, body })
+        Ok(Stmt::FuncDecl { name, params, rest, body })
     }
 }
 
@@ -1536,9 +1598,10 @@ mod tests {
         let stmts = parse("function f(a) { return a; } f(1);").unwrap();
         assert_eq!(stmts.len(), 2);
         match &stmts[0] {
-            Stmt::FuncDecl { name, params, body } => {
+            Stmt::FuncDecl { name, params, rest, body } => {
                 assert_eq!(name, "f");
                 assert_eq!(params, &vec!["a".to_string()]);
+                assert_eq!(rest, &None);
                 assert_eq!(body, &vec![Stmt::Return(Some(Expr::Ident("a".into())))]);
             }
             other => panic!("expected FuncDecl, got {other:?}"),
