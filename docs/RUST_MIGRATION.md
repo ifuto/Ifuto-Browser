@@ -448,9 +448,32 @@ lodash 4.17.21（`tests/lodash_smoke.js` 320 checks）を通すための ES5 慣
 - `new Foo(...).method(...)` / `new Foo(...)[i]` の後置連鎖
 
 残る lodash の壁: **深いネストのクロージャ**（3 段以上の関数宣言。`compile_nested` が
-「deeply nested closures」で打ち切り。env チェーンの複数段対応が必要）。以降は
-`arguments` オブジェクト・`Function.prototype.call/apply/bind`・文字列の `===` 等の
-ランタイム差異が続く見込み。
+「deeply nested closures」で打ち切り。env チェーン対応が必要）。
+
+### フェーズ 6 追補 4: 多段クロージャ + lodash ランタイム前進
+
+lodash 本体が**全文パース → コンパイル → 実行**に到達（従来は先頭 9 行でパース失敗）。
+実装した主要ピース:
+
+- **多段クロージャ（env チェーン）**: `CeLoad`/`CeStore` に深さを導入し
+  `Obj::Env.parent` のチェーンを辿る。`compile_nested` の「deeply nested closures」
+  打ち切りを撤廃し、任意深度の関数宣言ネスト・関数式による外側ローカル捕捉に対応。
+  boxed パラメータの初期値を env セルへコピー、`MakeClosure` 判定を捕捉有無で正しく判定。
+- **`Function.prototype.call`/`apply`**（`fn.call(thisArg, ...)`）
+- **`&&` / `||` の値返し短絡**（オペランド値を返す。lodash の環境検出
+  `typeof x == 'object' && x` が右辺を短絡評価するために必須）
+- **`===` の文字列内容比較**（ROPE と Str の同一内容が等値に）
+- **`typeof` の安全化**（未宣言識別子で ReferenceError を投げない `GLoadSafe`）
+- **`globalThis` ハンドル**（get/set/call をグローバル解決へ写像）+ `Function('return this')`
+  + `Array`/`Boolean`/`RegExp`/`Symbol`/`isFinite` コンストラクタ
+- **`Object.prototype.toString`/`hasOwnProperty`**（lodash の `getTag` 用）
+
+検証: `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6）緑、`cargo clippy
+--offline --workspace -- -D warnings` 緑、`build/run_script_rust`（139 checks）全緑。
+
+残る lodash の壁（ロード完了まで）: `arguments` オブジェクト、`Array.prototype.slice` 等
+のプロトタイプメソッド解決、`Function.prototype.toString`、および各関数の実行時差異。
+C エンジンは `lodash-smoke ok=320 ng=0` を維持（比較基準）。
 
 ### フェーズ 4 追補 2: 制御フロー完全化
 
