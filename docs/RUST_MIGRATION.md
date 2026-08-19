@@ -386,13 +386,23 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: C スモークテスト + guismoke PASS + `make all`（RUST_ENGINE=1 既定）。
 
-残り（フェーズ 6 の完了条件 = 全ゲート緑）:
-1. **命令バジェット（無限ループ防止）**: Rust VM にステップカウンタが無く
-   `while(1){}` がハングする（C は `akl_set_insn_budget` で kill）。`tests/test_script.c`
-   の `test_script_failure_isolation` がこの経路を検査するため必須。
-2. `tests/test_script.c`（DOM 結合オラクル 522 行）を Rust エンジンにリンクして回帰突合
-   （textContent 設定 / SVG / skip 規則 / failure isolation 等）。
-3. `golden` / `conformance`（html5lib）/ `lodashsmoke` / parity を Rust 側で再現。
+### 6-d: 命令バジェット + DOM 結合オラクルの突合
+
+- **命令バジェット**: `Runtime::insn_budget`（既定 10M）+ `VmError::BudgetExhausted` を追加。
+  `run` のループ先頭でカウントダウンし、0 で打ち切る（C の `instruction budget exhausted`
+  相当）。`akl_set_insn_budget` が Rust 側へ反映。無限ループ `while(1){}` がハングしない
+- `tests/test_script.c`（DOM 結合オラクル）を `libakl_ffi.a` にリンクして実行し、機能差を
+  定量化した結果（基本系は PASS / 応用系は未実装で FAIL）:
+
+  - **PASS**: mutation（textContent）/ failure_isolation（破損構文・無限ループ kill・後続継続）/
+    skip 規則 / kill switch / svg/document shape / textcontent_and_globals / count_cap
+  - **FAIL（未実装機能）**: regex replace（`$1` 捕捉）/ class extends / spread・rest /
+    fields（getter 等）/ オブジェクトリテラルメソッド / Array HOF（map/filter の e2e）/
+    BigInt / generator（yield）/ Map・Set の高度用途
+
+残り（フェーズ 6 完了 = 全ゲート緑）: 上記 FAIL 機能の実装（正規表現捕捉グループの置換、
+class 継承、BigInt、generator 等）→ `test_script.c` 全緑 → `golden`/`conformance`/
+`lodashsmoke`/parity を Rust 側で再現。
 
 ### フェーズ 4 追補 2: 制御フロー完全化
 

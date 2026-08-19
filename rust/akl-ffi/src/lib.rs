@@ -114,6 +114,7 @@ fn vm_err_string(e: &VmError) -> String {
         VmError::JumpOob => "jump out of bounds".into(),
         VmError::Oom => "out of memory".into(),
         VmError::NotObject => "TypeError: not an object".into(),
+        VmError::BudgetExhausted => "instruction budget exhausted".into(),
         VmError::Thrown(v) => {
             // 例外値（文字列ならそのまま、それ以外は汎用文言）
             let mut s = String::new();
@@ -789,14 +790,17 @@ pub unsafe extern "C" fn akl_native_throw(rt: *mut AklRT, msg: *const c_char) {
 
 // ---- チューニング / モジュール（API 互換。Rust 側は近似のため一部 no-op） ----
 
-/// `akl_set_insn_budget`（保持のみ。Rust VM は命令カウント未実装）。
+/// `akl_set_insn_budget`: 1 回の eval で許す命令数（0 なら即枯渇。1 以上を渡すこと）。
 #[no_mangle]
 pub unsafe extern "C" fn akl_set_insn_budget(rt: *mut AklRT, budget: u64) {
     if rt.is_null() {
         return;
     }
     // SAFETY: rt は akl_new 由来。
-    unsafe { (*rt)._insn_budget = budget };
+    unsafe {
+        (*rt)._insn_budget = budget;
+        (*rt).rt.insn_budget = budget;
+    }
 }
 
 /// `akl_set_cojit`（no-op。Rust 実装に CoJIT 相当は無い）。
@@ -917,6 +921,20 @@ mod tests {
         assert!(!ok);
         let err = unsafe { std::ffi::CStr::from_ptr(akl_error(rt)) }.to_string_lossy().into_owned();
         assert!(!err.is_empty());
+        unsafe { akl_free(rt) };
+    }
+
+    #[test]
+    fn budget_kills_infinite_loop() {
+        let rt = unsafe { akl_new() };
+        // 小さいバジェットで while(1){} を打ち切る（ハングしない）
+        unsafe { akl_set_insn_budget(rt, 1000) };
+        let c = CString::new("while (1) {}").unwrap();
+        let mut out: CAklVal = 0;
+        let ok = unsafe { akl_eval(rt, c.as_ptr(), &mut out) };
+        assert!(!ok);
+        let err = unsafe { std::ffi::CStr::from_ptr(akl_error(rt)) }.to_string_lossy().into_owned();
+        assert!(err.contains("budget"), "err = {err}");
         unsafe { akl_free(rt) };
     }
 

@@ -255,6 +255,8 @@ pub enum VmError {
     NotObject,
     /// 未捕捉の例外（`throw` が catch されずに伝搬した）。
     Thrown(AklVal),
+    /// 命令バジェット枯渇（無限ループ等の打ち切り。C の `instruction budget exhausted`）。
+    BudgetExhausted,
 }
 
 /// ネイティブ関数（C の `AklNativeFn` 相当）。
@@ -342,6 +344,9 @@ pub struct Runtime {
     pub console_out: Vec<String>,
     /// 直近のエラー文言（C の `rt->err` 相当。`akl_error` 用）。
     pub err: String,
+    /// 1 回の `run` で許す命令数（C の `insn_budget_def` 相当。既定 10M。
+    /// 無限ループ等を打ち切る。FFI の `akl_set_insn_budget` が書き換える）。
+    pub insn_budget: u64,
     /// 文字列メソッド表（name → native）。`PLoad` が文字列リテラルで解決する。
     /// C の `str_meth_vals` 相当。
     pub str_methods: Vec<(ObjId, AklVal)>,
@@ -373,6 +378,8 @@ impl Runtime {
         rt.proto_name = rt.intern("\x00proto").unwrap_or(0);
         // `constructor` プロパティ名（コンストラクタ解決フォールバック用）。
         rt.ctor_name = rt.intern("constructor").unwrap_or(0);
+        // 命令バジェット既定（C の insn_budget_def = 10M と同値）。
+        rt.insn_budget = 10_000_000;
         rt
     }
 
@@ -560,6 +567,9 @@ impl Runtime {
         let mut stack: Vec<AklVal> = Vec::new();
         let mut frames: Vec<Frame> = Vec::new();
         let mut pc = 0usize;
+        // 命令バジェット（無限ループ等の打ち切り。C の vm_exec の budget 相当）。
+        // 再入（call_value → run）はそれぞれ新規に初期化される（C の akl_call と同じ）。
+        let mut remaining = self.insn_budget;
 
         // エントリフレーム
         {
@@ -573,6 +583,10 @@ impl Runtime {
         }
 
         loop {
+            if remaining == 0 {
+                return Err(VmError::BudgetExhausted);
+            }
+            remaining -= 1;
             // 命令フェッチ（Op は Copy。self.funcs の借用はこのブロックで終了）
             let op = {
                 let frame = frames.last().ok_or(VmError::StackUnderflow)?;
