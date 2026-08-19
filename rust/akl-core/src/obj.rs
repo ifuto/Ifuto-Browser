@@ -90,6 +90,17 @@ pub enum Obj {
     /// ネイティブ関数（C の `AKL_OK_NATIVE` 相当）。index はランタイムの
     /// `native_fns` 表を指す（C の fn ポインタ + udata と同型）。
     Native(u32),
+    /// Map（キーと値のペア列。C の `AKL_OK_MAP` 相当。簡易版は線形探索）。
+    Map(Vec<(AklVal, AklVal)>),
+    /// Set（値の集合。C の `AKL_OK_SET` 相当）。
+    Set(Vec<AklVal>),
+    /// Promise（C の `AKL_OK_PROMISE` 相当）。
+    Promise {
+        /// 状態（0=pending 1=resolved 2=rejected）。
+        state: u8,
+        /// 解決値/拒否値。
+        value: AklVal,
+    },
 }
 
 impl Obj {
@@ -132,6 +143,28 @@ impl Obj {
                 }
             }
             Obj::Native(_) => {}
+            Obj::Map(kv) => {
+                for (k, v) in kv {
+                    if k.is_obj() {
+                        out.push(k.get_obj());
+                    }
+                    if v.is_obj() {
+                        out.push(v.get_obj());
+                    }
+                }
+            }
+            Obj::Set(items) => {
+                for v in items {
+                    if v.is_obj() {
+                        out.push(v.get_obj());
+                    }
+                }
+            }
+            Obj::Promise { value, .. } => {
+                if value.is_obj() {
+                    out.push(value.get_obj());
+                }
+            }
         }
         out.into_iter()
     }

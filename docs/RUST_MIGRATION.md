@@ -262,6 +262,20 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: cargo test 101 件 + clippy 緑（ビット演算・in/delete・throw/catch の e2e）。
 
+### フェーズ 2/3/4 追補 2: 分割代入・spread・class・new・instanceof・Map/Set/Promise
+
+- 分割代入 `var [a, b] =` / `var {a, b} =` / ネスト / rest / elision（Pattern 型 +
+  `gen_destructure`、`ArrRest` 命令）
+- 配列リテラル spread `[...a, b]`（`ArrPush`/`ArrPushAll` 命令）、配列 rest
+- プロトタイプチェーン（`\x00proto` 特殊プロパティ + `prop_get_chain` + `obj_set_proto`）
+- `instanceof` 真実装（`[[Prototype]]` チェーンを辿る）
+- `new` 演算子（`New` 命令 + `Frame.is_new` で非オブジェクト戻り値は this）
+- `class` 宣言（constructor + メソッドを prototype に、`SetFnProto` 命令）
+- `Obj::Map`/`Obj::Set`/`Obj::Promise`（GC 子参照対応）+ Map/Set メソッド
+  （set/get/has/add）と Promise.resolve 近似
+
+検証: cargo test 108 件 + clippy 緑（分割代入・spread・class/new/instanceof・Map/Set の e2e）。
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）

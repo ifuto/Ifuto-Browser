@@ -73,6 +73,8 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     install_object_methods(rt)?;
     // JSON.stringify
     install_json(rt)?;
+    // Map / Set / Promise
+    install_map_set(rt)?;
 
     Ok(())
 }
@@ -692,6 +694,107 @@ fn arr_at(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErro
     }
 }
 
+/// Map / Set / Promise を登録。
+fn install_map_set(rt: &mut Runtime) -> Result<(), VmError> {
+    // Map コンストラクタ
+    rt.register_global_native("Map", map_ctor)?;
+    for (name, f) in [
+        ("set", map_set as crate::bytecode::NativeFn),
+        ("get", map_get),
+        ("has", map_has),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.map_methods.push((nid, v));
+    }
+    // Set コンストラクタ
+    rt.register_global_native("Set", set_ctor)?;
+    for (name, f) in [
+        ("add", set_add as crate::bytecode::NativeFn),
+        ("has", set_has),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.set_methods.push((nid, v));
+    }
+    // Promise.resolve
+    rt.register_global_native("Promise", promise_ctor)?;
+    Ok(())
+}
+
+fn map_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = rt.heap.alloc(Obj::Map(Vec::new())).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+fn set_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = rt.heap.alloc(Obj::Set(Vec::new())).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+fn promise_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    // Promise.resolve(value) 相当（executor は未対応。解決済み Promise を返す近似）
+    let v = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let id = rt
+        .heap
+        .alloc(Obj::Promise { state: 1, value: v })
+        .map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn map_set(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let key = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let val = a.get(1).copied().unwrap_or(AklVal::UNDEF);
+    if let Some(Obj::Map(kv)) = rt.heap.get_mut(id) {
+        if let Some(slot) = kv.iter_mut().find(|(k, _)| *k == key) {
+            slot.1 = val;
+        } else {
+            kv.push((key, val));
+        }
+        Ok(this)
+    } else {
+        Ok(AklVal::UNDEF)
+    }
+}
+fn map_get(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let key = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if let Some(Obj::Map(kv)) = rt.heap.get(id) {
+        Ok(kv.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap_or(AklVal::UNDEF))
+    } else {
+        Ok(AklVal::UNDEF)
+    }
+}
+fn map_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::FALSE) };
+    let key = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if let Some(Obj::Map(kv)) = rt.heap.get(id) {
+        Ok(AklVal::from_bool(kv.iter().any(|(k, _)| *k == key)))
+    } else {
+        Ok(AklVal::FALSE)
+    }
+}
+fn set_add(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let val = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if let Some(Obj::Set(items)) = rt.heap.get_mut(id) {
+        if !items.contains(&val) {
+            items.push(val);
+        }
+        Ok(this)
+    } else {
+        Ok(AklVal::UNDEF)
+    }
+}
+fn set_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::FALSE) };
+    let val = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if let Some(Obj::Set(items)) = rt.heap.get(id) {
+        Ok(AklVal::from_bool(items.contains(&val)))
+    } else {
+        Ok(AklVal::FALSE)
+    }
+}
+
 /// Object 静的メソッド（keys/values/assign）を登録。
 fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
     let obj_id = rt.intern("Object").ok_or(VmError::Oom)?;
@@ -1013,6 +1116,26 @@ mod tests {
         assert_eq!(
             run_src("var o = {a: 1}; Object.assign(o, {b: 2}); o.b;").unwrap().0,
             AklVal::mk_int(2)
+        );
+    }
+
+    #[test]
+    fn map_set() {
+        assert_eq!(
+            run_src("var m = new Map(); m.set(\"a\", 1); m.get(\"a\");").unwrap().0,
+            AklVal::mk_int(1)
+        );
+        assert_eq!(
+            run_src("var m = new Map(); m.set(\"a\", 1); m.has(\"a\");").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("var s = new Set(); s.add(1); s.has(1);").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("var s = new Set(); s.add(1); s.has(2);").unwrap().0,
+            AklVal::FALSE
         );
     }
 

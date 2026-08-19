@@ -300,6 +300,10 @@ pub struct Runtime {
     pub str_methods: Vec<(ObjId, AklVal)>,
     /// 配列メソッド表（name → native）。`PLoad` が配列で解決する。C の `arr_meth_vals` 相当。
     pub arr_methods: Vec<(ObjId, AklVal)>,
+    /// Map メソッド表（name → native）。
+    pub map_methods: Vec<(ObjId, AklVal)>,
+    /// Set メソッド表（name → native）。
+    pub set_methods: Vec<(ObjId, AklVal)>,
     /// `length` プロパティ名の ObjId（install_builtins で設定。文字列/配列の length 用）。
     pub length_id: ObjId,
     /// `\x00proto` プロパティ名の ObjId（プロトタイプチェーン用。C の `proto_name` 相当）。
@@ -827,6 +831,30 @@ impl Runtime {
                         // メソッド（Array.prototype 相当）
                         let v = self
                             .arr_methods
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, v)| *v)
+                            .unwrap_or(AklVal::UNDEF);
+                        stack.push(v);
+                        pc += 1;
+                        continue;
+                    }
+                    // Map のメソッド
+                    if matches!(self.heap.get(id), Some(Obj::Map(_))) {
+                        let v = self
+                            .map_methods
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map(|(_, v)| *v)
+                            .unwrap_or(AklVal::UNDEF);
+                        stack.push(v);
+                        pc += 1;
+                        continue;
+                    }
+                    // Set のメソッド
+                    if matches!(self.heap.get(id), Some(Obj::Set(_))) {
+                        let v = self
+                            .set_methods
                             .iter()
                             .find(|(n, _)| *n == name)
                             .map(|(_, v)| *v)
