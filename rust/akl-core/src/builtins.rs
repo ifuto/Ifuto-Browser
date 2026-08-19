@@ -457,11 +457,18 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
 fn install_string_methods(rt: &mut Runtime) -> Result<(), VmError> {
     let mut prototype = Vec::new();
     for (name, f) in [
-        ("toUpperCase", str_to_upper as crate::bytecode::NativeFn),
+        ("charAt", str_char_at as crate::bytecode::NativeFn),
+        ("charCodeAt", str_char_code_at),
+        ("codePointAt", str_char_code_at),
+        ("toUpperCase", str_to_upper),
         ("toLowerCase", str_to_lower),
         ("trim", str_trim),
         ("indexOf", str_index_of),
+        ("lastIndexOf", str_last_index_of),
         ("slice", str_slice),
+        ("substring", str_substring),
+        ("substr", str_substr),
+        ("concat", str_concat),
         ("includes", str_includes),
         ("startsWith", str_starts_with),
         ("endsWith", str_ends_with),
@@ -472,6 +479,8 @@ fn install_string_methods(rt: &mut Runtime) -> Result<(), VmError> {
         ("split", str_split),
         ("padStart", str_pad_start),
         ("padEnd", str_pad_end),
+        ("toString", str_to_string),
+        ("at", str_at),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -496,6 +505,94 @@ fn this_str(rt: &Runtime, this: AklVal) -> String {
 fn str_to_upper(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
     let s = this_str(rt, this).to_uppercase();
     let id = rt.intern(&s).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn str_char_at(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let chars: Vec<char> = s.chars().collect();
+    let idx = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
+    let c = if idx >= 0 && (idx as usize) < chars.len() {
+        chars[idx as usize].to_string()
+    } else {
+        String::new()
+    };
+    let id = rt.intern(&c).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn str_char_code_at(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let chars: Vec<char> = s.chars().collect();
+    let idx = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
+    let code = if idx >= 0 && (idx as usize) < chars.len() {
+        chars[idx as usize] as i32
+    } else {
+        -1
+    };
+    Ok(AklVal::mk_int(code))
+}
+
+fn str_last_index_of(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let needle = to_js_string(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+    match s.rfind(&needle) {
+        Some(i) => Ok(AklVal::mk_int(s[..i].chars().count() as i32)),
+        None => Ok(AklVal::mk_int(-1)),
+    }
+}
+
+fn str_substring(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let start = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0).clamp(0, n) as usize;
+    let end = a.get(1).map(|v| to_number(rt, *v) as i64).unwrap_or(n).clamp(0, n) as usize;
+    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    let out: String = chars[lo..hi].iter().collect();
+    let id = rt.intern(&out).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn str_substr(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let start = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
+    let start = if start < 0 { (n + start).max(0) } else { start.min(n) } as usize;
+    let len = a.get(1).map(|v| to_number(rt, *v) as i64).unwrap_or(n);
+    let len = if len < 0 { 0 } else { len as usize };
+    let end = (start + len).min(chars.len());
+    let out: String = chars[start..end].iter().collect();
+    let id = rt.intern(&out).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn str_concat(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let mut s = this_str(rt, this);
+    for v in a {
+        s.push_str(&to_js_string(rt, *v));
+    }
+    let id = rt.intern(&s).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn str_to_string(_rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(this)
+}
+
+fn str_at(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let s = this_str(rt, this);
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len() as i64;
+    let idx = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
+    let idx = if idx < 0 { n + idx } else { idx };
+    let c = if idx >= 0 && idx < n {
+        chars[idx as usize].to_string()
+    } else {
+        String::new()
+    };
+    let id = rt.intern(&c).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
 fn str_to_lower(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
@@ -1234,6 +1331,11 @@ fn install_map_set(rt: &mut Runtime) -> Result<(), VmError> {
         ("set", map_set as crate::bytecode::NativeFn),
         ("get", map_get),
         ("has", map_has),
+        ("delete", map_delete),
+        ("clear", map_clear),
+        ("keys", map_keys),
+        ("values", map_values),
+        ("forEach", map_for_each),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -1244,6 +1346,10 @@ fn install_map_set(rt: &mut Runtime) -> Result<(), VmError> {
     for (name, f) in [
         ("add", set_add as crate::bytecode::NativeFn),
         ("has", set_has),
+        ("delete", set_delete),
+        ("clear", set_clear),
+        ("values", set_values),
+        ("forEach", set_for_each),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
@@ -1425,6 +1531,109 @@ fn set_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     } else {
         Ok(AklVal::FALSE)
     }
+}
+
+fn set_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::FALSE) };
+    let val = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if let Some(Obj::Set(items)) = rt.heap.get_mut(id) {
+        let before = items.len();
+        items.retain(|v| *v != val);
+        Ok(AklVal::from_bool(items.len() != before))
+    } else {
+        Ok(AklVal::FALSE)
+    }
+}
+
+fn set_clear(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    if let Some(Obj::Set(items)) = rt.heap.get_mut(id) {
+        items.clear();
+    }
+    Ok(AklVal::UNDEF)
+}
+
+fn set_values(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let items = if let Some(Obj::Set(items)) = rt.heap.get(id) {
+        items.clone()
+    } else {
+        Vec::new()
+    };
+    let aid = rt.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(aid))
+}
+
+fn set_for_each(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let items = if let Some(Obj::Set(items)) = rt.heap.get(id) {
+        items.clone()
+    } else {
+        Vec::new()
+    };
+    for v in &items {
+        let args = vec![*v, *v, this];
+        call_native(rt, cb, AklVal::UNDEF, &args)?;
+    }
+    Ok(AklVal::UNDEF)
+}
+
+fn map_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::FALSE) };
+    let key = a.first().copied().unwrap_or(AklVal::UNDEF);
+    if let Some(Obj::Map(kv)) = rt.heap.get_mut(id) {
+        let before = kv.len();
+        kv.retain(|(k, _)| *k != key);
+        Ok(AklVal::from_bool(kv.len() != before))
+    } else {
+        Ok(AklVal::FALSE)
+    }
+}
+
+fn map_clear(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    if let Some(Obj::Map(kv)) = rt.heap.get_mut(id) {
+        kv.clear();
+    }
+    Ok(AklVal::UNDEF)
+}
+
+fn map_keys(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let keys: Vec<AklVal> = if let Some(Obj::Map(kv)) = rt.heap.get(id) {
+        kv.iter().map(|(k, _)| *k).collect()
+    } else {
+        Vec::new()
+    };
+    let aid = rt.heap.alloc(Obj::Arr(keys)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(aid))
+}
+
+fn map_values(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let vals: Vec<AklVal> = if let Some(Obj::Map(kv)) = rt.heap.get(id) {
+        kv.iter().map(|(_, v)| *v).collect()
+    } else {
+        Vec::new()
+    };
+    let aid = rt.heap.alloc(Obj::Arr(vals)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(aid))
+}
+
+fn map_for_each(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
+    let kv = if let Some(Obj::Map(kv)) = rt.heap.get(id) {
+        kv.clone()
+    } else {
+        Vec::new()
+    };
+    for (k, v) in &kv {
+        let args = vec![*v, *k, this];
+        call_native(rt, cb, AklVal::UNDEF, &args)?;
+    }
+    Ok(AklVal::UNDEF)
 }
 
 /// `Object(v)`（関数として呼ぶ）→ v をオブジェクト化（オブジェクトはそのまま、
@@ -2137,9 +2346,10 @@ fn call_native(rt: &mut Runtime, f: AklVal, this: AklVal, args: &[AklVal]) -> Re
         let nf = *nf;
         return nf(rt, this, args);
     }
-    if let Some(Obj::Func { fidx, .. }) = rt.heap.get(id) {
-        let fidx = *fidx;
-        return rt.run(fidx, args);
+    // バイトコード関数（クロージャ含む）は call_value 経由で env / this を保持して呼ぶ。
+    // `run(fidx)` だとクロージャの捕捉 env と this が失われる（Array.map 等のコールバック）。
+    if matches!(rt.heap.get(id), Some(Obj::Func { .. })) {
+        return rt.call_value(f, this, args);
     }
     Ok(AklVal::UNDEF)
 }

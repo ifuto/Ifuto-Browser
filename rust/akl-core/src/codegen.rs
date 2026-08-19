@@ -1415,28 +1415,22 @@ impl Compiler<'_> {
                     .ok_or_else(|| CompileError("intern failed".into()))?;
                 code.push(Op::GStore(tmp_id));
 
-                // パス 1: 値 case の比較ヘッダ（GLoad; val; Seq; JmpF）を生成。
-                // 値 case の「case 全体における index」を記録して default を正しく扱う。
-                let mut jmpf_patches: Vec<usize> = Vec::new();
-                let mut value_case_idx: Vec<usize> = Vec::new();
-                for (idx, (case_val, _)) in cases.iter().enumerate() {
+                // 各 case を「比較ヘッダ → 本体 → Jmp(end)」の順でインターリーブ生成する。
+                // 値 case の JmpF は「次の case のエントリ」（比較 or default body）へ。
+                // switch 内の `break` も end へ飛ばすため break_patches を積む。
+                let mut case_entries: Vec<usize> = Vec::new();
+                let mut jmpf_patches: Vec<(usize, usize)> = Vec::new(); // (case_index, patch_pos)
+                let mut end_patches: Vec<usize> = Vec::new();
+                self.break_patches.push(Vec::new());
+                for (idx, (case_val, body)) in cases.iter().enumerate() {
+                    case_entries.push(code.len());
                     if let Some(val_expr) = case_val {
                         code.push(Op::GLoad(tmp_id));
                         self.gen_expr(val_expr, code)?;
                         code.push(Op::Seq);
-                        jmpf_patches.push(code.len());
+                        jmpf_patches.push((idx, code.len()));
                         code.push(Op::JmpF(0)); // プレースホルダ
-                        value_case_idx.push(idx);
                     }
-                }
-
-                // パス 2: 各 case 本体（開始位置を記録）+ break 相当の Jmp(end)。
-                // switch 内の `break` もこの end へ飛ばすため break_patches を積む。
-                let mut case_starts = vec![0usize; cases.len()];
-                let mut end_patches: Vec<usize> = Vec::new();
-                self.break_patches.push(Vec::new());
-                for (idx, (_, body)) in cases.iter().enumerate() {
-                    case_starts[idx] = code.len();
                     for s in body {
                         self.gen_stmt(s, code)?;
                     }
@@ -1451,11 +1445,10 @@ impl Compiler<'_> {
                 for b in &breaks {
                     code[*b] = Op::Jmp(end_pos as u32);
                 }
-                // JmpF のターゲット = 「次の case」の開始（無ければ end）
-                for (j, patch) in jmpf_patches.iter().enumerate() {
-                    let case_idx = value_case_idx[j];
-                    let target = case_starts.get(case_idx + 1).copied().unwrap_or(end_pos);
-                    code[*patch] = Op::JmpF(target as u32);
+                // 値 case の JmpF ターゲット = 「次の case」のエントリ（無ければ end）
+                for (case_idx, patch) in jmpf_patches {
+                    let target = case_entries.get(case_idx + 1).copied().unwrap_or(end_pos);
+                    code[patch] = Op::JmpF(target as u32);
                 }
             }
         }

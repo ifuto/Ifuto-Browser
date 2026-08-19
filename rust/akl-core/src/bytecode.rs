@@ -480,6 +480,7 @@ impl Runtime {
 
     /// `TypeError: <msg>` を投げる（try/catch で捕捉可能な例外として）。
     fn type_error(&mut self, msg: &str) -> VmError {
+
         let text = format!("TypeError: {msg}");
         let id = self.intern(&text).unwrap_or(0);
         VmError::Thrown(AklVal::mk_obj(id))
@@ -847,7 +848,7 @@ impl Runtime {
                     .map_err(|_| VmError::Oom)?;
                 return Ok(AklVal::mk_obj(gen_id));
             }
-            return self.run_with_this(fidx, args, _this);
+            return self.run_with_this_env(fidx, args, _this, env, Some(id));
         }
         Err(VmError::NotCallable)
     }
@@ -865,6 +866,20 @@ impl Runtime {
         args: &[AklVal],
         this: AklVal,
     ) -> Result<AklVal, VmError> {
+        self.run_with_this_env(func_idx, args, this, None, None)
+    }
+
+    /// `this`・クロージャ捕捉 env・自己参照オブジェクトを指定して実行する。
+    /// `call_value` が `Obj::Func` の env を保持したまま再入するために必要。
+    /// （`.apply()`/`.call()` でクロージャを呼ぶと env が失われないよう明示的に渡す）
+    fn run_with_this_env(
+        &mut self,
+        func_idx: u32,
+        args: &[AklVal],
+        this: AklVal,
+        env: Option<ObjId>,
+        self_obj: Option<ObjId>,
+    ) -> Result<AklVal, VmError> {
         let stack: Vec<AklVal> = Vec::new();
         let mut frames: Vec<Frame> = Vec::new();
         let pc = 0usize;
@@ -876,7 +891,13 @@ impl Runtime {
             for (i, a) in args.iter().enumerate().take(f.n_params) {
                 locals[i] = *a;
             }
-            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this, args: args.to_vec(), env: None, catch_pc: None, is_new: false });
+            // 名前付き関数式の自己参照（`function name(){}` の `name` = 関数自身）
+            if let (Some(ss), Some(sobj)) = (f.self_slot, self_obj) {
+                if (ss as usize) < locals.len() {
+                    locals[ss as usize] = AklVal::mk_obj(sobj);
+                }
+            }
+            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this, args: args.to_vec(), env, catch_pc: None, is_new: false });
         }
         match self.run_loop(stack, frames, pc, None)? {
             RunEnd::Value(v) => Ok(v),
@@ -1100,6 +1121,7 @@ impl Runtime {
                         return Err(VmError::StackUnderflow);
                     }
                     let callee = stack[stack.len() - argc - 1];
+
                     let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
                     stack.truncate(stack.len() - argc - 1);
                     match self.do_call(&mut frames, &mut pc, callee, AklVal::UNDEF, &args) {
@@ -1694,15 +1716,29 @@ impl Runtime {
                         pc += 1;
                         continue;
                     }
-                    // プレーンオブジェクトの計算済みプロパティ取得 `obj[key]`
-                    if let Some(Obj::Obj(_)) = self.heap.get(id) {
+                    // プレーンオブジェクト/関数の計算済みプロパティ取得 `obj[key]`
+                    if matches!(self.heap.get(id), Some(Obj::Obj(_)) | Some(Obj::Func { .. })) {
                         let key = self.stringify(idx).ok();
                         let v = key
                             .and_then(|k| self.prop_get_chain(id, k))
+                            .or_else(|| key.and_then(|k| self.heap.prop_get(id, k)))
                             .unwrap_or(AklVal::UNDEF);
                         stack.push(v);
                         pc += 1;
                         continue;
+                    }
+                    // 配列/文字列/Map/Set 等のブラケットアクセス: 数値インデックスは要素、
+                    // 文字列キーはメソッド（`length` / `sort` 等）を解決する。
+                    if idx.is_obj() && matches!(self.heap.get(idx.get_obj()), Some(Obj::Str(_))) {
+                        let key = self.stringify(idx).ok();
+                        if let Some(k) = key {
+                            let v = self.prop_load(id, k);
+                            if !v.is_undef() {
+                                stack.push(v);
+                                pc += 1;
+                                continue;
+                            }
+                        }
                     }
                     let i = self.to_number(idx) as i64;
                     let v = if i >= 0 {
@@ -1725,8 +1761,8 @@ impl Runtime {
                         if i >= 0 {
                             self.arr_set(id, i as usize, val)?;
                         }
-                    } else if let Some(Obj::Obj(_)) = self.heap.get(id) {
-                        // 計算済みプロパティ設定 `obj[key] = v`
+                    } else if matches!(self.heap.get(id), Some(Obj::Obj(_)) | Some(Obj::Func { .. })) {
+                        // 計算済みプロパティ設定 `obj[key] = v`（関数オブジェクト含む）
                         let key = self.stringify(idx)?;
                         self.heap
                             .prop_set(id, key, val)

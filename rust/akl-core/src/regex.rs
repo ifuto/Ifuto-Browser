@@ -708,23 +708,33 @@ pub fn replace_all(text: &str, rx: &Regex, replacement: &str) -> String {
     result
 }
 
-/// 置換文字列の `$1` 展開。
+/// 置換文字列の `$&` / `$$` / `$1` 展開。
 fn expand_replacement(replacement: &str, caps: &[String]) -> String {
     let mut out = String::new();
     let mut chars = replacement.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '$' {
-            if let Some(&d) = chars.peek() {
-                if d.is_ascii_digit() {
+            match chars.peek() {
+                Some('&') => {
+                    chars.next();
+                    // `$&` = マッチ全体（caps[0]）
+                    if let Some(full) = caps.first() {
+                        out.push_str(full);
+                    }
+                }
+                Some('$') => {
+                    chars.next();
+                    out.push('$');
+                }
+                Some(&d) if d.is_ascii_digit() => {
                     chars.next();
                     let idx = d.to_digit(10).unwrap() as usize;
                     if idx < caps.len() {
                         out.push_str(&caps[idx]);
                     }
-                    continue;
                 }
+                _ => out.push('$'),
             }
-            out.push('$');
         } else {
             out.push(c);
         }
