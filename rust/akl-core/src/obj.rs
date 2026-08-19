@@ -98,6 +98,14 @@ pub enum Obj {
     /// ネイティブ関数（C の `AKL_OK_NATIVE` 相当）。index はランタイムの
     /// `native_fns` 表を指す（C の fn ポインタ + udata と同型）。
     Native(u32),
+    /// ホスト（FFI 層）提供のネイティブ関数。`idx` は `Runtime::foreign_fns` 表を
+    /// 指し、`data` は FFI 層が C ネイティブを識別する不透明 u64。
+    ForeignNative {
+        /// `Runtime::foreign_fns` 表の index。
+        idx: u32,
+        /// FFI 層が解釈する不透明データ（登録表 index 等）。
+        data: u64,
+    },
     /// Map（キーと値のペア列。C の `AKL_OK_MAP` 相当。簡易版は線形探索）。
     Map(Vec<(AklVal, AklVal)>),
     /// Set（値の集合。C の `AKL_OK_SET` 相当）。
@@ -123,10 +131,13 @@ pub enum Obj {
         ms: f64,
     },
     /// ホストハンドル（C の `AKL_OK_HANDLE` 相当。DOM 要素等の不透明参照）。
-    /// `ptr` はホスト側オブジェクトの不透明アドレス（u64 で保持。unsafe は FFI 層）。
+    /// `ptr` はホスト側オブジェクトの不透明アドレス、`data` は vtable を識別する
+    /// 不透明値（FFI 層の vtable レジストリ index 等）。いずれも u64 で保持。
     Handle {
         /// ディスパッチ vtable。
         vtab: &'static HandleVTab,
+        /// vtable を識別する不透明データ。
+        data: u64,
         /// ホスト側オブジェクトの不透明アドレス。
         ptr: u64,
     },
@@ -185,6 +196,7 @@ impl Obj {
                 }
             }
             Obj::Native(_) => {}
+            Obj::ForeignNative { .. } => {}
             Obj::Map(kv) => {
                 for (k, v) in kv {
                     if k.is_obj() {

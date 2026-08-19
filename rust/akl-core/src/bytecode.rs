@@ -263,22 +263,29 @@ pub enum VmError {
 /// （失敗は実行を停止させる）。
 pub type NativeFn = fn(&mut Runtime, AklVal, &[AklVal]) -> Result<AklVal, VmError>;
 
+/// ホスト（FFI 層）提供のネイティブ関数。
+///
+/// `data` は FFI 層が C ネイティブを識別する不透明 `u64`（例: 登録表 index）。
+/// 本クレートは `data` を解釈せず、そのままコールバックへ渡すだけ（unsafe は
+/// FFI 層に隔離され、`akl-core` は `#![forbid(unsafe_code)]` を維持する）。
+pub type ForeignNativeFn = fn(&mut Runtime, AklVal, &[AklVal], u64) -> Result<AklVal, VmError>;
+
 /// ホストハンドル（DOM 要素等の不透明参照）の vtable。
 ///
-/// コールバックは全て安全 Rust の `fn` ポインタ。`ptr`（ホスト側オブジェクトの
-/// 不透明アドレスを `u64` で保持）の参照解除・生ポインタ生成などの `unsafe` は
-/// FFI 層（`rust/akl-ffi`）が担い、本クレート（`#![forbid(unsafe_code)]`）には
-/// unsafe を持ち込まない。C 実装の `AklHandleVTab` 相当。
+/// コールバックは全て安全 Rust の `fn` ポインタ。`data`（vtable を識別する不透明
+/// u64）と `ptr`（ホスト側オブジェクトの不透明アドレス）の参照解除・生ポインタ
+/// 生成などの `unsafe` は FFI 層（`rust/akl-ffi`）が担い、本クレート
+/// （`#![forbid(unsafe_code)]`）には unsafe を持ち込まない。C の `AklHandleVTab` 相当。
 #[derive(Clone, Copy, Debug)]
 pub struct HandleVTab {
     /// `[object TAG]` 用のタグ名（診断・文字列化）。
     pub tag: &'static str,
     /// プロパティ取得。`None` = 未知プロパティ（undefined / メソッド扱い）。
-    pub get: fn(&mut Runtime, ptr: u64, name: &str) -> Option<AklVal>,
+    pub get: fn(&mut Runtime, data: u64, ptr: u64, name: &str) -> Option<AklVal>,
     /// プロパティ設定。`false` = 拒否（TypeError）。
-    pub set: fn(&mut Runtime, ptr: u64, name: &str, v: AklVal) -> bool,
+    pub set: fn(&mut Runtime, data: u64, ptr: u64, name: &str, v: AklVal) -> bool,
     /// メソッド呼び出し。`None` = 未定義メソッド（TypeError: not a function）。
-    pub call: fn(&mut Runtime, ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal>,
+    pub call: fn(&mut Runtime, data: u64, ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal>,
 }
 
 impl PartialEq for HandleVTab {
@@ -326,6 +333,11 @@ pub struct Runtime {
     pub last_val: AklVal,
     /// ネイティブ関数表（C の native fn ポインタ + udata と同型。`Obj::Native(i)` が参照）。
     pub native_fns: Vec<NativeFn>,
+    /// ホスト（FFI 層）提供のネイティブ関数表（`Obj::ForeignNative` が参照）。
+    pub foreign_fns: Vec<ForeignNativeFn>,
+    /// ホスト側コンテキストへの不透明ポインタ（アドレスを u64 で保持。FFI 層が
+    /// `AklRT` ラッパーのアドレスを設定し、コールバック内で復元して使う）。
+    pub host_ctx: u64,
     /// `console.log` の出力先バッファ（テストで検証可能に。None なら無視）。
     pub console_out: Vec<String>,
     /// 直近のエラー文言（C の `rt->err` 相当。`akl_error` 用）。
@@ -402,6 +414,14 @@ impl Runtime {
         let name_id = self.intern(name).ok_or(VmError::Oom)?;
         self.global_set(name_id, v);
         Ok(())
+    }
+
+    /// ホスト（FFI 層）提供のネイティブ関数を登録して表 index を返す。
+    /// `data` は `Obj::ForeignNative` の不透明フィールドとして保持される。
+    pub fn register_foreign_native(&mut self, f: ForeignNativeFn) -> Result<u32, VmError> {
+        let idx = self.foreign_fns.len() as u32;
+        self.foreign_fns.push(f);
+        Ok(idx)
     }
 
     /// プロパティをプロトタイプチェーン込みで解決（C の `obj_proto_find` 相当）。
@@ -481,6 +501,57 @@ impl Runtime {
             }
         }
         callee
+    }
+
+    /// 任意の callable 値（Func / Native / ForeignNative / BoundMethod）を呼ぶ。
+    /// C の `akl_call` / `akl_call_this` 相当（ホストからの再入呼び出し。
+    /// `Runtime::run` は再入可能なので、バイトコード関数もここで完全に実行できる）。
+    pub fn call_value(
+        &mut self,
+        f: AklVal,
+        _this: AklVal,
+        args: &[AklVal],
+    ) -> Result<AklVal, VmError> {
+        let callee = self.ctor_of(f);
+        if !callee.is_obj() {
+            return Err(VmError::NotCallable);
+        }
+        let id = callee.get_obj();
+        if let Some(Obj::BoundMethod { handle, name }) = self.heap.get(id) {
+            let (handle, name) = (*handle, *name);
+            let (vtab, data, ptr) = match self.heap.get(handle) {
+                Some(Obj::Handle { vtab, data, ptr }) => (*vtab, *data, *ptr),
+                _ => return Err(VmError::NotCallable),
+            };
+            let name_str = match self.heap.get(name) {
+                Some(Obj::Str(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            return match (vtab.call)(self, data, ptr, &name_str, args) {
+                Some(v) => Ok(v),
+                None => {
+                    let msg = self.intern("TypeError: not a function").unwrap_or(0);
+                    Err(VmError::Thrown(AklVal::mk_obj(msg)))
+                }
+            };
+        }
+        if let Some(Obj::ForeignNative { idx, data }) = self.heap.get(id) {
+            let (idx, data) = (*idx, *data);
+            let f = self.foreign_fns.get(idx as usize).ok_or(VmError::NotCallable)?;
+            let f = *f;
+            return f(self, _this, args, data);
+        }
+        if let Some(Obj::Native(nidx)) = self.heap.get(id) {
+            let nidx = *nidx;
+            let f = self.native_fns.get(nidx as usize).ok_or(VmError::NotCallable)?;
+            let f = *f;
+            return f(self, _this, args);
+        }
+        if let Some(Obj::Func { fidx, .. }) = self.heap.get(id) {
+            let fidx = *fidx;
+            return self.run(fidx, args);
+        }
+        Err(VmError::NotCallable)
     }
 
     /// 関数表 index の関数を実行する（C の `vm_exec` 相当）。
@@ -961,13 +1032,13 @@ impl Runtime {
                         continue;
                     }
                     // ホストハンドル（DOM 要素等）のプロパティ解決
-                    if let Some(Obj::Handle { vtab, ptr }) = self.heap.get(id) {
-                        let (vtab, ptr) = (*vtab, *ptr);
+                    if let Some(Obj::Handle { vtab, data, ptr }) = self.heap.get(id) {
+                        let (vtab, data, ptr) = (*vtab, *data, *ptr);
                         let name_str = match self.heap.get(name) {
                             Some(Obj::Str(s)) => s.to_string(),
                             _ => String::new(),
                         };
-                        let v = match (vtab.get)(self, ptr, &name_str) {
+                        let v = match (vtab.get)(self, data, ptr, &name_str) {
                             Some(v) => v,
                             None => {
                                 // 未知プロパティ → メソッド呼び出し用の BoundMethod
@@ -993,13 +1064,13 @@ impl Runtime {
                     }
                     let id = obj.get_obj();
                     // ホストハンドルのプロパティ設定
-                    if let Some(Obj::Handle { vtab, ptr }) = self.heap.get(id) {
-                        let (vtab, ptr) = (*vtab, *ptr);
+                    if let Some(Obj::Handle { vtab, data, ptr }) = self.heap.get(id) {
+                        let (vtab, data, ptr) = (*vtab, *data, *ptr);
                         let name_str = match self.heap.get(name) {
                             Some(Obj::Str(s)) => s.to_string(),
                             _ => String::new(),
                         };
-                        if !(vtab.set)(self, ptr, &name_str, val) {
+                        if !(vtab.set)(self, data, ptr, &name_str, val) {
                             return Err(VmError::NotObject);
                         }
                         stack.push(val);
@@ -1079,8 +1150,8 @@ impl Runtime {
                     }
                     let id = obj.get_obj();
                     // ホストハンドルのブラケットアクセス（キー文字列で get）
-                    if let Some(Obj::Handle { vtab, ptr }) = self.heap.get(id) {
-                        let (vtab, ptr) = (*vtab, *ptr);
+                    if let Some(Obj::Handle { vtab, data, ptr }) = self.heap.get(id) {
+                        let (vtab, data, ptr) = (*vtab, *data, *ptr);
                         let key_str = match self.stringify(idx) {
                             Ok(k) => match self.heap.get(k) {
                                 Some(Obj::Str(s)) => s.to_string(),
@@ -1088,7 +1159,7 @@ impl Runtime {
                             },
                             Err(_) => String::new(),
                         };
-                        let v = (vtab.get)(self, ptr, &key_str).unwrap_or(AklVal::UNDEF);
+                        let v = (vtab.get)(self, data, ptr, &key_str).unwrap_or(AklVal::UNDEF);
                         stack.push(v);
                         pc += 1;
                         continue;
@@ -1240,21 +1311,29 @@ impl Runtime {
         // ハンドル束縛メソッド: vtable の call へディスパッチ
         if let Some(Obj::BoundMethod { handle, name }) = self.heap.get(id) {
             let (handle, name) = (*handle, *name);
-            let (vtab, ptr) = match self.heap.get(handle) {
-                Some(Obj::Handle { vtab, ptr }) => (*vtab, *ptr),
+            let (vtab, data, ptr) = match self.heap.get(handle) {
+                Some(Obj::Handle { vtab, data, ptr }) => (*vtab, *data, *ptr),
                 _ => return Err(VmError::NotCallable),
             };
             let name_str = match self.heap.get(name) {
                 Some(Obj::Str(s)) => s.to_string(),
                 _ => String::new(),
             };
-            let r = match (vtab.call)(self, ptr, &name_str, args) {
+            let r = match (vtab.call)(self, data, ptr, &name_str, args) {
                 Some(v) => v,
                 None => {
                     let msg = self.intern("TypeError: not a function").unwrap_or(0);
                     return Err(VmError::Thrown(AklVal::mk_obj(msg)));
                 }
             };
+            return Ok(Some(r));
+        }
+        // ホスト（FFI 層）提供のネイティブ関数
+        if let Some(Obj::ForeignNative { idx, data }) = self.heap.get(id) {
+            let (idx, data) = (*idx, *data);
+            let f = self.foreign_fns.get(idx as usize).ok_or(VmError::NotCallable)?;
+            let f = *f;
+            let r = f(self, this_v, args, data)?;
             return Ok(Some(r));
         }
         // ネイティブ関数なら直接呼んで結果を返す
@@ -1453,9 +1532,10 @@ impl Runtime {
         } else if v.is_obj() {
             match self.heap.get(v.get_obj()) {
                 Some(Obj::Str(_)) => "string",
-                Some(Obj::Func { .. }) | Some(Obj::Native(_)) | Some(Obj::BoundMethod { .. }) => {
-                    "function"
-                }
+                Some(Obj::Func { .. })
+                | Some(Obj::Native(_))
+                | Some(Obj::ForeignNative { .. })
+                | Some(Obj::BoundMethod { .. }) => "function",
                 _ => "object",
             }
         } else {
@@ -1490,7 +1570,9 @@ impl Runtime {
     }
 
     /// 値 → intern 済み文字列 ObjId（C の `akl_to_string` 相当の簡易版）。
-    fn stringify(&mut self, v: AklVal) -> Result<ObjId, VmError> {
+    /// 値 → intern 済み文字列 ObjId（C の `akl_to_string` 相当。FFI 層の
+    /// `akl_tostring` が使用する）。
+    pub fn stringify(&mut self, v: AklVal) -> Result<ObjId, VmError> {
         let s: String = if v.is_int() {
             v.get_int().to_string()
         } else if let Some(d) = v.as_f64() {

@@ -160,6 +160,14 @@ impl AklVal {
     pub const fn bits(self) -> u64 {
         self.0
     }
+
+    /// 内部ビット列から値を作る（C 連携の `AklVal`(=u64) ↔ Rust 変換用）。
+    ///
+    /// 任意のビット列を「そのまま」包むだけ（全メソッドはタグ検査を行うため、
+    /// 不正なビット列でも UB は無い）。FFI 層が C 側の NaN-box 値を受け取る際に使う。
+    pub const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
 }
 
 impl Default for AklVal {

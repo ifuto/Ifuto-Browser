@@ -354,9 +354,26 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 
 検証: cargo test 127 件 + clippy 緑（Handle の get/set/call・ブラケット・未知メソッド throw の e2e）。
 
-残り: FFI クレート（`rust/akl-ffi`。unsafe 境界を 1 ファイルに集約して `akl.h` 互換の
-C ABI を公開）、C ネイティブ登録のブリッジ（`AklNativeFn` → Rust `NativeFn`）、
-`akl_call` 再入（ホストからの JS 関数呼び出し）、C 側 `script.c` 等の差し替え。
+### 6-b: FFI クレート（rust/akl-ffi）
+
+- `AklVal::from_bits` / `bits`（C の `AklVal`=u64 とビット互換変換。`repr(transparent)`）
+- `Obj::ForeignNative { idx, data }` + `Runtime::foreign_fns` / `host_ctx` / `call_value`
+  （C の `AklNativeFn(rt, self, argc, argv, udata)` と Rust `NativeFn` のシグネチャ差を
+  汎用アダプタで吸収。`host_ctx` = ラッパーアドレス、`data` = C ネイティブ登録表 index）
+- `rust/akl-ffi`（`staticlib` + `cdylib`。`#![deny(unsafe_op_in_unsafe_fn)]`）: `akl.h` 互換の
+  全 37 シンボル（new/free/eval/call/call_this/error/as_*/is_*/mk*/native_register/
+  global_set/prop_get/prop_set/mkobject/mknative/mkhandle/mkarray/arr_len/tostring/as_str/
+  native_throw/tune/budget/cojit/module_loader/eval_module）を公開
+- ハンドル vtable は `data`（vtable レジストリ index）+ `host_ctx`（ラッパー）経由で
+  C の `AklHandleVTab`（get/set/call + tag）へディスパッチ。tag は leak で `'static` 化して
+  `[object TAG]` 文字列化に対応
+
+検証: cargo test 132 件（akl-core 127 + akl-ffi 5）+ clippy 緑。さらに
+`rust/akl-ffi/smoke.c` を本物の `akl.h` と `libakl_ffi.a` にリンクして eval / native 登録 /
+ハンドル / エラー報告が ABI 互換で動くことを C 側から検証（`C smoke test OK`）。
+
+残り: C 側差し替え（`script.c` / `ext.c` / `ifuto_pages.c` を `libakl_ffi.a` にリンクして
+`src/akl/akl.c` を撤去。Makefile 変更 + 全ゲート guismoke/golden/tlssmoke/html5lib/fuzz 緑）。
 
 ### フェーズ 4 追補 2: 制御フロー完全化
 

@@ -1768,7 +1768,7 @@ mod tests {
     use crate::codegen::compile;
 
     // ---- ハンドル（DOM 等）ディスパッチのテスト用 vtable ----
-    fn h_get(rt: &mut Runtime, _ptr: u64, name: &str) -> Option<AklVal> {
+    fn h_get(rt: &mut Runtime, _data: u64, _ptr: u64, name: &str) -> Option<AklVal> {
         if name == "title" {
             let id = rt.intern("Hello")?;
             Some(AklVal::mk_obj(id))
@@ -1776,12 +1776,12 @@ mod tests {
             None
         }
     }
-    fn h_set(rt: &mut Runtime, _ptr: u64, name: &str, v: AklVal) -> bool {
+    fn h_set(rt: &mut Runtime, _data: u64, _ptr: u64, name: &str, v: AklVal) -> bool {
         let s = rt.flatten_str(v);
         rt.console_out.push(format!("set {name} = {s}"));
         true
     }
-    fn h_call(rt: &mut Runtime, _ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal> {
+    fn h_call(rt: &mut Runtime, _data: u64, _ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal> {
         if name == "getElementById" {
             let arg = args.first().map(|v| rt.flatten_str(*v)).unwrap_or_default();
             let id = rt.intern(&format!("found:{arg}"))?;
@@ -1804,7 +1804,7 @@ mod tests {
         // テスト用に document ハンドルを束縛
         let handle = rt
             .heap
-            .alloc(Obj::Handle { vtab: &H_VT, ptr: 0x1234 })
+            .alloc(Obj::Handle { vtab: &H_VT, data: 0, ptr: 0x1234 })
             .map_err(|e| format!("{e:?}"))?;
         let doc_name = rt.intern("document").unwrap();
         rt.global_set(doc_name, AklVal::mk_obj(handle));
