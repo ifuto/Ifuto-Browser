@@ -1329,7 +1329,7 @@ fn set_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     }
 }
 
-/// Object 静的メソッド（keys/values/assign）を登録。
+/// Object 静的メソッド（keys/values/assign）+ Object.prototype を登録。
 fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
     let obj_id = rt.intern("Object").ok_or(VmError::Oom)?;
     let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
@@ -1344,8 +1344,77 @@ fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
         rt.heap.prop_set(obj, nid, v).map_err(|_| VmError::Oom)?;
     }
+    // Object.prototype（toString / hasOwnProperty。lodash の getTag / hasOwnProperty.call 用）
+    let proto = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    for (name, f) in [
+        ("toString", object_proto_to_string as crate::bytecode::NativeFn),
+        ("hasOwnProperty", object_proto_has_own_property),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(proto, nid, v).map_err(|_| VmError::Oom)?;
+    }
+    let proto_name = rt.intern("prototype").ok_or(VmError::Oom)?;
+    rt.heap
+        .prop_set(obj, proto_name, AklVal::mk_obj(proto))
+        .map_err(|_| VmError::Oom)?;
     rt.global_set(obj_id, AklVal::mk_obj(obj));
     Ok(())
+}
+
+/// 値の `Object.prototype.toString` タグ（`[object X]` の X）。
+fn object_tag(rt: &Runtime, v: AklVal) -> &'static str {
+    if v.is_int() || !v.is_tagged() {
+        return "Number";
+    }
+    if v.is_undef() {
+        return "Undefined";
+    }
+    if v.is_null() {
+        return "Null";
+    }
+    if v == AklVal::TRUE || v == AklVal::FALSE {
+        return "Boolean";
+    }
+    if v.is_obj() {
+        return match rt.heap.get(v.get_obj()) {
+            Some(Obj::Str(_)) | Some(Obj::Rope { .. }) => "String",
+            Some(Obj::Arr(_)) => "Array",
+            Some(Obj::Func { .. })
+            | Some(Obj::Native(_))
+            | Some(Obj::ForeignNative { .. })
+            | Some(Obj::BoundMethod { .. }) => "Function",
+            Some(Obj::Map(_)) => "Map",
+            Some(Obj::Set(_)) => "Set",
+            Some(Obj::Promise { .. }) => "Promise",
+            Some(Obj::RegExp { .. }) => "RegExp",
+            Some(Obj::Date { .. }) => "Date",
+            Some(Obj::BigInt(_)) => "BigInt",
+            Some(Obj::Handle { vtab, .. }) => vtab.tag,
+            _ => "Object",
+        };
+    }
+    "Object"
+}
+
+/// `Object.prototype.toString.call(v)` → `[object X]`。
+fn object_proto_to_string(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let tag = object_tag(rt, this);
+    let id = rt.intern(&format!("[object {tag}]")).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Object.prototype.hasOwnProperty.call(obj, key)`。
+fn object_proto_has_own_property(
+    rt: &mut Runtime,
+    this: AklVal,
+    a: &[AklVal],
+) -> Result<AklVal, VmError> {
+    let key = rt.flatten_str(a.first().copied().unwrap_or(AklVal::UNDEF));
+    let key_id = rt.intern(&key).ok_or(VmError::Oom)?;
+    let has = this.is_obj()
+        && matches!(rt.heap.get(this.get_obj()), Some(Obj::Obj(props)) if props.iter().any(|(n, _)| *n == key_id));
+    Ok(AklVal::from_bool(has))
 }
 
 /// プレーンオブジェクトのプロパティ列を取得。
@@ -2671,6 +2740,36 @@ mod tests {
         let src2 = "function* g() { yield 1; }
                     var it = g(); it.next(); it.next().done;";
         assert_eq!(run_src(src2).unwrap().0, AklVal::TRUE);
+    }
+
+    #[test]
+    fn logic_short_circuit() {
+        // && / || は値返し短絡（lodash の環境検出 `typeof x == 'object' && x` が依存）
+        assert_eq!(run_src("1 && 2;").unwrap().0, AklVal::mk_int(2));
+        assert_eq!(run_src("0 && 2;").unwrap().0, AklVal::mk_int(0));
+        assert_eq!(run_src("1 || 2;").unwrap().0, AklVal::mk_int(1));
+        assert_eq!(run_src("0 || 2;").unwrap().0, AklVal::mk_int(2));
+        // 短絡で未宣言グローバルも評価されない（typeof と組み合わせた環境検出）
+        assert_eq!(
+            run_src("(typeof noSuchGlobal == 'object' && noSuchGlobal) ? 1 : 2;").unwrap().0,
+            AklVal::mk_int(2)
+        );
+    }
+
+    #[test]
+    fn object_proto_to_string() {
+        assert_eq!(
+            run_src("Object.prototype.toString.call([]) === '[object Array]';").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("Object.prototype.toString.call({}) === '[object Object]';").unwrap().0,
+            AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("Object.prototype.hasOwnProperty.call({a: 1}, 'a');").unwrap().0,
+            AklVal::TRUE
+        );
     }
 
     #[test]
