@@ -712,8 +712,23 @@ impl Runtime {
 
     /// 関数に既定の `prototype` オブジェクト（`constructor` が自身を指す）を付与する。
     /// JS の `function foo(){}` は暗黙に `foo.prototype = { constructor: foo }` を持つ。
-    fn attach_default_proto(&mut self, fid: ObjId) -> Result<(), VmError> {
+    fn attach_default_proto(&mut self, fid: ObjId, fidx: u32) -> Result<(), VmError> {
         let pname = self.intern("prototype").ok_or(VmError::Oom)?;
+        // 関数自身の `length`（引数数）と `name` を設定（JS の関数は own プロパティ）
+        let (n_params, name) = match self.funcs.get(fidx as usize) {
+            Some(f) => (f.n_params, f.name),
+            None => (0, None),
+        };
+        let len_name = self.intern("length").ok_or(VmError::Oom)?;
+        if self.heap.prop_get(fid, len_name).is_none() {
+            self.heap.prop_set(fid, len_name, AklVal::mk_int(n_params as i32)).map_err(|_| VmError::Oom)?;
+        }
+        if let Some(nm) = name {
+            let name_name = self.intern("name").ok_or(VmError::Oom)?;
+            if self.heap.prop_get(fid, name_name).is_none() {
+                self.heap.prop_set(fid, name_name, AklVal::mk_obj(nm)).map_err(|_| VmError::Oom)?;
+            }
+        }
         // 既に prototype があれば何もしない
         if self.heap.prop_get(fid, pname).is_some() {
             return Ok(());
@@ -1346,7 +1361,7 @@ impl Runtime {
                         .heap
                         .alloc(Obj::Func { fidx, env: None, props: Vec::new() })
                         .map_err(|_| VmError::Oom)?;
-                    self.attach_default_proto(id)?;
+                    self.attach_default_proto(id, fidx)?;
                     stack.push(AklVal::mk_obj(id));
                 }
                 Op::Throw => {
@@ -1382,7 +1397,7 @@ impl Runtime {
                         .heap
                         .alloc(Obj::Func { fidx, env, props: Vec::new() })
                         .map_err(|_| VmError::Oom)?;
-                    self.attach_default_proto(id)?;
+                    self.attach_default_proto(id, fidx)?;
                     stack.push(AklVal::mk_obj(id));
                 }
                 Op::CeLoad(depth, idx) => {
