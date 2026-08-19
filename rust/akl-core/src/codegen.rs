@@ -388,22 +388,22 @@ impl Compiler<'_> {
                 self.gen_store(name, code)?;
             }
             Expr::Call { callee, args } => {
-                // メソッド呼び出し `obj.method(...)` は this=obj で呼ぶ（MCall）
+                // メソッド呼び出し `obj.method(...)` は this=obj で呼ぶ（MCallName）。
+                // ハンドル（DOM 等）は vtable の call へ直接ディスパッチし、プロパティ
+                // 取得（PLoad）と構文的に分離する（C の OP_MCALL と同型）。
                 if let Expr::Member { obj, name } = &**callee {
                     self.gen_expr(obj, code)?; // receiver
-                    code.push(Op::Dup); // receiver を this 用に残す
                     let name_id = self
                         .rt
                         .intern(name)
                         .ok_or_else(|| CompileError("intern failed".into()))?;
-                    code.push(Op::PLoad(name_id)); // method 取得
                     for a in args {
                         self.gen_expr(a, code)?;
                     }
                     if args.len() > u8::MAX as usize {
                         return Err(CompileError("too many arguments".into()));
                     }
-                    code.push(Op::MCall(args.len() as u8));
+                    code.push(Op::MCallName { name: name_id, argc: args.len() as u8 });
                 } else {
                     self.gen_expr(callee, code)?;
                     for a in args {

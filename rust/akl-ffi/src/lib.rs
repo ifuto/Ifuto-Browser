@@ -73,8 +73,6 @@ pub struct AklRT {
     err_len: usize,
     /// C ネイティブが `akl_native_throw` したか。
     native_err: bool,
-    /// `akl_as_str` の返却先スクラッチ（呼び出しごとに上書き。C 側は即コピー規約）。
-    scratch: Vec<u8>,
     /// モジュールローダ（API 互換で保持。Rust 側 import は簡易近似のため未使用）。
     _mod_loader: Option<CAklModuleLoader>,
     _mod_udata: *mut c_void,
@@ -102,6 +100,12 @@ fn set_err(rt: &mut AklRT, msg: &str) {
     rt.err[..n].copy_from_slice(&bytes[..n]);
     rt.err[n] = 0;
     rt.err_len = n;
+}
+
+/// エラー文言をクリア（NUL 終端も戻す。`akl_error` が陳腐な文言を返さないため）。
+fn clear_err(rt: &mut AklRT) {
+    rt.err[0] = 0;
+    rt.err_len = 0;
 }
 
 /// `VmError` → 文言（`akl_error` 用の簡易マップ）。
@@ -265,7 +269,6 @@ pub unsafe extern "C" fn akl_new() -> *mut AklRT {
         err: [0; 256],
         err_len: 0,
         native_err: false,
-        scratch: Vec::new(),
         _mod_loader: None,
         _mod_udata: std::ptr::null_mut(),
         _mod_base: Vec::new(),
@@ -298,19 +301,20 @@ pub unsafe extern "C" fn akl_eval(rt: *mut AklRT, src: *const c_char, out: *mut 
     let rt = unsafe { &mut *rt };
     let src = unsafe { cstr(src) };
     // 前回エラーをクリア
-    rt.err_len = 0;
+    clear_err(rt);
     rt.native_err = false;
     let program = match Parser::new(src).parse_program() {
         Ok(p) => p,
         Err(e) => {
-            set_err(rt, &e.0);
+            // C 実装と同一の「SyntaxError: <why>」書式（test_script のオラクルが依存）
+            set_err(rt, &format!("SyntaxError: {}", e.0));
             return false;
         }
     };
     let fidx = match compile(&mut rt.rt, &program) {
         Ok(f) => f,
         Err(e) => {
-            set_err(rt, &e.0);
+            set_err(rt, &format!("SyntaxError: {}", e.0));
             return false;
         }
     };
@@ -382,7 +386,13 @@ pub unsafe extern "C" fn akl_error(rt: *mut AklRT) -> *const c_char {
         return c"".as_ptr();
     }
     // SAFETY: rt は akl_new 由来。
-    unsafe { (*rt).err.as_ptr() as *const c_char }
+    let rt = unsafe { &*rt };
+    // C 実装の `akl_error` は `err[0]` が NUL なら空文字を返す。err_len で同等に判定し、
+    // 前回 eval の残留文言が後続 eval 成功後に見えることを防ぐ。
+    if rt.err_len == 0 {
+        return c"".as_ptr();
+    }
+    rt.err.as_ptr() as *const c_char
 }
 
 /// `akl_as_num`: 数値（int/double）なら out を満たして true。
@@ -450,7 +460,13 @@ pub unsafe extern "C" fn akl_is_string(rt: *mut AklRT, v: CAklVal) -> bool {
     )
 }
 
-/// `akl_as_str`: 文字列内容のポインタ（スクラッチへコピー。len はバイト長）。
+/// `akl_as_str`: 文字列内容のポインタ（rt 所有。len はバイト長）。
+///
+/// C 実装と同一に「ヒープ文字列の内部ポインタ」を返す（単一スクラッチバッファでは
+/// 呼び出し側が `akl_as_str(argv[0])` と `akl_as_str(argv[1])` を同時に保持できず、
+/// `elem_call` の setAttribute で名前と値が相互に破壊される）。ROPE はここで
+/// 平坦化して同一 ObjId の STR に置換する（Rust 側は実行中に自動 GC しないため、
+/// 返したポインタは `akl_free` まで有効）。
 #[no_mangle]
 pub unsafe extern "C" fn akl_as_str(rt: *mut AklRT, v: CAklVal, len: *mut u32) -> *const c_char {
     if rt.is_null() {
@@ -462,18 +478,22 @@ pub unsafe extern "C" fn akl_as_str(rt: *mut AklRT, v: CAklVal, len: *mut u32) -
     if !val.is_obj() {
         return std::ptr::null();
     }
-    let s = match rt.rt.heap.get(val.get_obj()) {
-        Some(Obj::Str(s)) => s.to_string(),
-        Some(Obj::Rope { .. }) => rt.rt.flatten_str(val),
-        _ => return std::ptr::null(),
-    };
-    rt.scratch.clear();
-    rt.scratch.extend_from_slice(s.as_bytes());
-    if !len.is_null() {
-        // SAFETY: len は呼び出し側の有効ポインタ。
-        unsafe { *len = s.len() as u32 };
+    let id = val.get_obj();
+    if !matches!(rt.rt.heap.get(id), Some(Obj::Str(_)) | Some(Obj::Rope { .. })) {
+        return std::ptr::null();
     }
-    rt.scratch.as_ptr() as *const c_char
+    rt.rt.flatten_rope_in_place(id);
+    match rt.rt.heap.get(id) {
+        Some(Obj::Str(s)) => {
+            if !len.is_null() {
+                // SAFETY: len は呼び出し側の有効ポインタ。
+                unsafe { *len = s.len() as u32 };
+            }
+            // SAFETY: Box<str> のヒープデータは安定（akl_free まで不変）。
+            s.as_ptr() as *const c_char
+        }
+        _ => std::ptr::null(),
+    }
 }
 
 // ---- 値生成 ----

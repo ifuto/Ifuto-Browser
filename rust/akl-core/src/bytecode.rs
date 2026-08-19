@@ -182,6 +182,15 @@ pub enum Op {
     Call(u8),
     /// メソッド呼び出し（`[receiver, callee, ...args]`。callee を this=receiver で呼ぶ）。
     MCall(u8),
+    /// 名前指定のメソッド呼び出し（`[receiver, ...args]`。name を this=receiver で解決して呼ぶ）。
+    /// C の `OP_MCALL`（argc + name）相当。ハンドル（DOM 等）は vtable の `call` へ直接
+    /// ディスパッチする（プロパティ取得とメソッド呼び出しを構文的に分離するため）。
+    MCallName {
+        /// メソッド名（intern 済み文字列 ObjId）。
+        name: ObjId,
+        /// 引数の個数。
+        argc: u8,
+    },
     /// コンストラクタ呼び出し（`new`。argc 個の引数 + callee を pop。this=新オブジェクト）。
     New(u8),
     /// 正規表現オブジェクトを生成して push（pattern 文字列 ObjId を pop、flags は即値）。
@@ -453,6 +462,59 @@ impl Runtime {
             }
         }
         None
+    }
+
+    /// プロパティ解決（ハンドル以外。`PLoad` / `MCallName` の共通部）。
+    /// 文字列・配列の `length` と各プロトタイプメソッド、Map/Set/Date メソッド、
+    /// プレーンオブジェクトの proto チェーンをこの順で解決する。無ければ UNDEF。
+    fn prop_load(&self, id: ObjId, name: ObjId) -> AklVal {
+        if let Some(Obj::Str(s)) = self.heap.get(id) {
+            if name == self.length_id {
+                return AklVal::mk_int(s.chars().count() as i32);
+            }
+            return self
+                .str_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
+        if let Some(Obj::Arr(items)) = self.heap.get(id) {
+            if name == self.length_id {
+                return AklVal::mk_int(items.len() as i32);
+            }
+            return self
+                .arr_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
+        if matches!(self.heap.get(id), Some(Obj::Map(_))) {
+            return self
+                .map_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
+        if matches!(self.heap.get(id), Some(Obj::Set(_))) {
+            return self
+                .set_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
+        if matches!(self.heap.get(id), Some(Obj::Date { .. })) {
+            return self
+                .date_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
+        self.prop_get_chain(id, name).unwrap_or(AklVal::UNDEF)
     }
 
     /// オブジェクトに [[Prototype]] を設定（C の `akl_obj_set_proto` 相当）。
@@ -805,6 +867,61 @@ impl Runtime {
                         Err(e) => return Err(e),
                     }
                 }
+                Op::MCallName { name, argc } => {
+                    let argc = argc as usize;
+                    if stack.len() < argc + 1 {
+                        return Err(VmError::StackUnderflow);
+                    }
+                    let receiver = stack[stack.len() - argc - 1];
+                    let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
+                    stack.truncate(stack.len() - argc - 1);
+                    // ホストハンドルのメソッド: vtable の call へ直接ディスパッチ
+                    let handle = if receiver.is_obj() {
+                        match self.heap.get(receiver.get_obj()) {
+                            Some(Obj::Handle { vtab, data, ptr }) => Some((*vtab, *data, *ptr)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some((vtab, data, ptr)) = handle {
+                        let name_str = match self.heap.get(name) {
+                            Some(Obj::Str(s)) => s.to_string(),
+                            _ => String::new(),
+                        };
+                        match (vtab.call)(self, data, ptr, &name_str, &args) {
+                            Some(v) => {
+                                stack.push(v);
+                                pc += 1;
+                                continue;
+                            }
+                            None => {
+                                let msg = self.intern("TypeError: not a function").unwrap_or(0);
+                                self.unwind(&mut frames, &mut stack, &mut pc, AklVal::mk_obj(msg))?;
+                                continue;
+                            }
+                        }
+                    }
+                    // 通常オブジェクト: プロパティを解決して this=receiver で呼ぶ
+                    let method = if receiver.is_obj() {
+                        self.prop_load(receiver.get_obj(), name)
+                    } else {
+                        AklVal::UNDEF
+                    };
+                    match self.do_call(&mut frames, &mut pc, method, receiver, &args) {
+                        Ok(Some(r)) => {
+                            stack.push(r);
+                            pc += 1;
+                            continue;
+                        }
+                        Ok(None) => continue,
+                        Err(VmError::Thrown(v)) => {
+                            self.unwind(&mut frames, &mut stack, &mut pc, v)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
                 Op::New(argc) => {
                     let argc = argc as usize;
                     if stack.len() < argc + 1 {
@@ -973,102 +1090,19 @@ impl Runtime {
                         return Err(VmError::NotObject);
                     }
                     let id = obj.get_obj();
-                    // 文字列リテラルの length プロパティ（直接返す）
-                    if let Some(Obj::Str(s)) = self.heap.get(id) {
-                        if name == self.length_id {
-                            stack.push(AklVal::mk_int(s.chars().count() as i32));
-                            pc += 1;
-                            continue;
-                        }
-                        // メソッド（String.prototype 相当）
-                        let v = self
-                            .str_methods
-                            .iter()
-                            .find(|(n, _)| *n == name)
-                            .map(|(_, v)| *v)
-                            .unwrap_or(AklVal::UNDEF);
-                        stack.push(v);
-                        pc += 1;
-                        continue;
-                    }
-                    // 配列の length プロパティ（直接返す）
-                    if let Some(Obj::Arr(items)) = self.heap.get(id) {
-                        if name == self.length_id {
-                            stack.push(AklVal::mk_int(items.len() as i32));
-                            pc += 1;
-                            continue;
-                        }
-                        // メソッド（Array.prototype 相当）
-                        let v = self
-                            .arr_methods
-                            .iter()
-                            .find(|(n, _)| *n == name)
-                            .map(|(_, v)| *v)
-                            .unwrap_or(AklVal::UNDEF);
-                        stack.push(v);
-                        pc += 1;
-                        continue;
-                    }
-                    // Map のメソッド
-                    if matches!(self.heap.get(id), Some(Obj::Map(_))) {
-                        let v = self
-                            .map_methods
-                            .iter()
-                            .find(|(n, _)| *n == name)
-                            .map(|(_, v)| *v)
-                            .unwrap_or(AklVal::UNDEF);
-                        stack.push(v);
-                        pc += 1;
-                        continue;
-                    }
-                    // Set のメソッド
-                    if matches!(self.heap.get(id), Some(Obj::Set(_))) {
-                        let v = self
-                            .set_methods
-                            .iter()
-                            .find(|(n, _)| *n == name)
-                            .map(|(_, v)| *v)
-                            .unwrap_or(AklVal::UNDEF);
-                        stack.push(v);
-                        pc += 1;
-                        continue;
-                    }
-                    // Date のメソッド
-                    if matches!(self.heap.get(id), Some(Obj::Date { .. })) {
-                        let v = self
-                            .date_methods
-                            .iter()
-                            .find(|(n, _)| *n == name)
-                            .map(|(_, v)| *v)
-                            .unwrap_or(AklVal::UNDEF);
-                        stack.push(v);
-                        pc += 1;
-                        continue;
-                    }
-                    // ホストハンドル（DOM 要素等）のプロパティ解決
+                    // ホストハンドル（DOM 要素等）のプロパティ解決。未知プロパティは
+                    // undefined（メソッドは MCallName が vtable の call へ直接ディスパッチ）。
                     if let Some(Obj::Handle { vtab, data, ptr }) = self.heap.get(id) {
                         let (vtab, data, ptr) = (*vtab, *data, *ptr);
                         let name_str = match self.heap.get(name) {
                             Some(Obj::Str(s)) => s.to_string(),
                             _ => String::new(),
                         };
-                        let v = match (vtab.get)(self, data, ptr, &name_str) {
-                            Some(v) => v,
-                            None => {
-                                // 未知プロパティ → メソッド呼び出し用の BoundMethod
-                                let bm = self
-                                    .heap
-                                    .alloc(Obj::BoundMethod { handle: id, name })
-                                    .map_err(|_| VmError::Oom)?;
-                                AklVal::mk_obj(bm)
-                            }
-                        };
+                        let v = (vtab.get)(self, data, ptr, &name_str).unwrap_or(AklVal::UNDEF);
                         stack.push(v);
-                        pc += 1;
-                        continue;
+                    } else {
+                        stack.push(self.prop_load(id, name));
                     }
-                    let v = self.prop_get_chain(id, name).unwrap_or(AklVal::UNDEF);
-                    stack.push(v);
                 }
                 Op::PStore(name) => {
                     let val = stack.pop().ok_or(VmError::StackUnderflow)?;
@@ -1654,6 +1688,19 @@ impl Runtime {
         let mut result = String::new();
         self.flatten_str_rec(v.get_obj(), &mut result);
         result
+    }
+
+    /// ROPE を平坦化し、同一 ObjId の `Str` に置き換える（FFI の `akl_as_str` が安定
+    /// ポインタを返すための準備。Rust 側は実行中に自動 GC しないため、置換後の
+    /// `Box<str>` のヒープアドレスは `akl_free` まで不変）。
+    pub fn flatten_rope_in_place(&mut self, id: ObjId) {
+        if !matches!(self.heap.get(id), Some(Obj::Rope { .. })) {
+            return;
+        }
+        let flat = self.flatten_str(AklVal::mk_obj(id));
+        if let Some(slot) = self.heap.get_mut(id) {
+            *slot = Obj::Str(flat.into_boxed_str());
+        }
     }
 
     /// ROPE を再帰的に平坦化（深さ上限で防御）。
