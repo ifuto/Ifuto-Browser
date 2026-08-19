@@ -136,6 +136,20 @@ pub enum Op {
     Or,
     /// 論理否定 `!`。
     Not,
+    /// ビット NOT `~`（ToInt32）。
+    BNot,
+    /// ビット AND `&`。
+    BAnd,
+    /// ビット OR `|`。
+    BOr,
+    /// ビット XOR `^`。
+    BXor,
+    /// 左シフト `<<`。
+    BShl,
+    /// 算術右シフト `>>`。
+    BShr,
+    /// 論理右シフト `>>>`。
+    BUShr,
     /// 単項マイナス `-`。
     Neg,
     /// 単項プラス `+`（数値化）。
@@ -184,6 +198,18 @@ pub enum Op {
     AGet,
     /// 要素書き込み（val, idx, obj を pop、val を push。C の `ASET`）。
     ASet,
+    /// `instanceof`（obj, f を pop、真偽値を push）。
+    Instanceof,
+    /// `in`（obj, key を pop、真偽値を push）。
+    In,
+    /// `delete obj[key]`（idx, obj を pop、真偽値を push）。
+    Delete,
+    /// `throw`（TOS の例外値を投げる。C の `OP_THROW`）。
+    Throw,
+    /// try ブロック入口（catch_pc を現在フレームに記録。C の `OP_TRY_PUSH` 相当）。
+    TryPush(u32),
+    /// try ブロック終了（catch ハンドラを解除。C の `OP_TRY_LEAVE` 相当）。
+    TryPop,
     /// 環境オブジェクトを生成（n 個 pop して Env を push。C の env 生成）。
     MakeEnv(u32),
     /// クロージャを生成（env を pop、Func{fidx, env} を push。C の `MAKEF` env 版）。
@@ -213,6 +239,8 @@ pub enum VmError {
     Oom,
     /// プロパティ/要素アクセスの対象がオブジェクトでない。
     NotObject,
+    /// 未捕捉の例外（`throw` が catch されずに伝搬した）。
+    Thrown(AklVal),
 }
 
 /// ネイティブ関数（C の `AklNativeFn` 相当）。
@@ -234,6 +262,8 @@ struct Frame {
     this: AklVal,
     /// クロージャ捕捉環境（無ければ None）。
     env: Option<ObjId>,
+    /// 現在の try ブロックの catch 位置（無ければ None）。
+    catch_pc: Option<usize>,
 }
 
 /// ランタイム（C の `AklRT` 相当）。ヒープ・文字列インターン・関数表・グローバルを束ねる。
@@ -320,7 +350,7 @@ impl Runtime {
             for (i, a) in args.iter().enumerate().take(f.n_params) {
                 locals[i] = *a;
             }
-            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this: AklVal::UNDEF, env: None });
+            frames.push(Frame { func: func_idx, ret_pc: 0, locals, this: AklVal::UNDEF, env: None, catch_pc: None });
         }
 
         loop {
@@ -398,6 +428,25 @@ impl Runtime {
                 Op::Not => {
                     let v = stack.pop().ok_or(VmError::StackUnderflow)?;
                     stack.push(AklVal::from_bool(!self.truthy(v)));
+                }
+                Op::BNot => {
+                    let v = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let i = self.to_number(v) as i32;
+                    stack.push(AklVal::mk_int(!i));
+                }
+                Op::BAnd | Op::BOr | Op::BXor | Op::BShl | Op::BShr | Op::BUShr => {
+                    let b = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let a = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let (ia, ib) = (self.to_number(a) as i32, self.to_number(b) as i32);
+                    let r = match op {
+                        Op::BAnd => ia & ib,
+                        Op::BOr => ia | ib,
+                        Op::BXor => ia ^ ib,
+                        Op::BShl => ia << (ib & 31),
+                        Op::BShr => ia >> (ib & 31),
+                        _ => ((ia as u32) >> (ib & 31)) as i32,
+                    };
+                    stack.push(AklVal::mk_int(r));
                 }
                 Op::And => {
                     let b = stack.pop().ok_or(VmError::StackUnderflow)?;
@@ -486,14 +535,18 @@ impl Runtime {
                     let callee = stack[stack.len() - argc - 1];
                     let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
                     stack.truncate(stack.len() - argc - 1);
-                    if let Some(r) = self.do_call(&mut frames, &mut pc, callee, AklVal::UNDEF, &args)? {
-                        // native 関数の結果を push。pc は do_call 後も呼び出し元位置のまま
-                        // なので +1 して次の命令へ（ループ末尾の pc += 1 と二重にしない）。
-                        stack.push(r);
-                        pc += 1;
-                        continue;
-                    } else {
-                        continue;
+                    match self.do_call(&mut frames, &mut pc, callee, AklVal::UNDEF, &args) {
+                        Ok(Some(r)) => {
+                            stack.push(r);
+                            pc += 1;
+                            continue;
+                        }
+                        Ok(None) => continue,
+                        Err(VmError::Thrown(v)) => {
+                            self.unwind(&mut frames, &mut stack, &mut pc, v)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 Op::MCall(argc) => {
@@ -505,12 +558,18 @@ impl Runtime {
                     let receiver = stack[stack.len() - argc - 2];
                     let args: Vec<AklVal> = stack[stack.len() - argc..].to_vec();
                     stack.truncate(stack.len() - argc - 2);
-                    if let Some(r) = self.do_call(&mut frames, &mut pc, callee, receiver, &args)? {
-                        stack.push(r);
-                        pc += 1;
-                        continue;
-                    } else {
-                        continue;
+                    match self.do_call(&mut frames, &mut pc, callee, receiver, &args) {
+                        Ok(Some(r)) => {
+                            stack.push(r);
+                            pc += 1;
+                            continue;
+                        }
+                        Ok(None) => continue,
+                        Err(VmError::Thrown(v)) => {
+                            self.unwind(&mut frames, &mut stack, &mut pc, v)?;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 Op::Ret => {
@@ -532,6 +591,19 @@ impl Runtime {
                         .alloc(Obj::Func { fidx, env: None })
                         .map_err(|_| VmError::Oom)?;
                     stack.push(AklVal::mk_obj(id));
+                }
+                Op::Throw => {
+                    let v = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    self.unwind(&mut frames, &mut stack, &mut pc, v)?;
+                    continue;
+                }
+                Op::TryPush(catch_pc) => {
+                    let frame = frames.last_mut().ok_or(VmError::StackUnderflow)?;
+                    frame.catch_pc = Some(catch_pc as usize);
+                }
+                Op::TryPop => {
+                    let frame = frames.last_mut().ok_or(VmError::StackUnderflow)?;
+                    frame.catch_pc = None;
                 }
                 Op::MakeEnv(n) => {
                     // 現在フレームの自前 env（box 化されたローカル n 個を undefined で生成）。
@@ -680,12 +752,78 @@ impl Runtime {
                     }
                     stack.push(val);
                 }
+                Op::Instanceof => {
+                    // obj instanceof f（簡易: 常に false 近似。プロトタイプチェーン未対応）
+                    let _f = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let _obj = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    stack.push(AklVal::FALSE);
+                }
+                Op::In => {
+                    // key in obj
+                    let obj = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let key = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let key_id = self.stringify(key).ok();
+                    let r = match (obj.is_obj(), key_id) {
+                        (true, Some(kid)) => match self.heap.get(obj.get_obj()) {
+                            Some(Obj::Obj(props)) => props.iter().any(|(n, _)| *n == kid),
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    stack.push(AklVal::from_bool(r));
+                }
+                Op::Delete => {
+                    // delete obj[key]
+                    let idx = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let obj = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let mut deleted = false;
+                    if obj.is_obj() {
+                        let id = obj.get_obj();
+                        if let Some(Obj::Arr(_)) = self.heap.get(id) {
+                            let i = self.to_number(idx) as i64;
+                            if i >= 0 {
+                                deleted = self.arr_delete(id, i as usize);
+                            }
+                        } else if let Some(Obj::Obj(_)) = self.heap.get(id) {
+                            let key_id = self.stringify(idx).ok();
+                            if let Some(kid) = key_id {
+                                deleted = self.prop_delete(id, kid);
+                            }
+                        }
+                    }
+                    stack.push(AklVal::from_bool(deleted));
+                }
                 Op::Halt => {
                     return Ok(self.last_val);
                 }
             }
             pc += 1;
         }
+    }
+
+    /// 例外を巻き戻す（frames を遡って catch_pc を探す。C の `akl_vm_unwind` 相当）。
+    /// catch が見つかれば例外値をスタックに積んで pc を catch 位置へ。見つからなければ
+    /// `Thrown` を返す（未捕捉例外）。
+    fn unwind(
+        &mut self,
+        frames: &mut Vec<Frame>,
+        stack: &mut Vec<AklVal>,
+        pc: &mut usize,
+        v: AklVal,
+    ) -> Result<(), VmError> {
+        while let Some(frame) = frames.last() {
+            if let Some(catch_pc) = frame.catch_pc {
+                stack.push(v);
+                *pc = catch_pc;
+                return Ok(());
+            }
+            if frames.len() == 1 {
+                // 最上位フレーム（main）で catch なし
+                return Err(VmError::Thrown(v));
+            }
+            frames.pop();
+        }
+        Err(VmError::Thrown(v))
     }
 
     /// 関数呼び出し（C の `OP_CALL` / `OP_MCALL` ハンドラ相当）。フレームを積み pc を
@@ -727,7 +865,7 @@ impl Runtime {
             locals[i] = *a;
         }
         let ret_pc = *pc + 1;
-        frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env });
+        frames.push(Frame { func: fidx, ret_pc, locals, this: this_v, env, catch_pc: None });
         *pc = 0;
         Ok(None)
     }
@@ -999,6 +1137,32 @@ impl Runtime {
                 Ok(())
             }
             _ => Err(VmError::NotObject),
+        }
+    }
+
+    /// 配列要素を削除（穴化。C の `OP_IDEL` 相当）。
+    fn arr_delete(&mut self, id: ObjId, index: usize) -> bool {
+        match self.heap.get_mut(id) {
+            Some(Obj::Arr(items)) if index < items.len() => {
+                items[index] = AklVal::UNDEF;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// プレーンオブジェクトのプロパティを削除。
+    fn prop_delete(&mut self, id: ObjId, name: ObjId) -> bool {
+        match self.heap.get_mut(id) {
+            Some(Obj::Obj(props)) => {
+                if let Some(pos) = props.iter().position(|(n, _)| *n == name) {
+                    props.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
         }
     }
 }

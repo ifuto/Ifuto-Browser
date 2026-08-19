@@ -326,6 +326,7 @@ impl Compiler<'_> {
                     UnaryOp::Pos => Op::Pos,
                     UnaryOp::Not => Op::Not,
                     UnaryOp::Typeof => Op::Typeof,
+                    UnaryOp::BNot => Op::BNot,
                 });
             }
             Expr::Bin { op, lhs, rhs } => {
@@ -347,6 +348,12 @@ impl Compiler<'_> {
                     BinOp::Ge => Op::Ge,
                     BinOp::And => Op::And,
                     BinOp::Or => Op::Or,
+                    BinOp::BAnd => Op::BAnd,
+                    BinOp::BOr => Op::BOr,
+                    BinOp::BXor => Op::BXor,
+                    BinOp::BShl => Op::BShl,
+                    BinOp::BShr => Op::BShr,
+                    BinOp::BUShr => Op::BUShr,
                 });
             }
             Expr::Assign { name, rhs } => {
@@ -444,6 +451,34 @@ impl Compiler<'_> {
                 self.gen_expr(else_, code)?;
                 let end_pos = code.len();
                 code[jmp_idx] = Op::Jmp(end_pos as u32);
+            }
+            Expr::Instanceof { lhs, rhs } => {
+                self.gen_expr(lhs, code)?;
+                self.gen_expr(rhs, code)?;
+                code.push(Op::Instanceof);
+            }
+            Expr::In { key, obj } => {
+                self.gen_expr(key, code)?;
+                self.gen_expr(obj, code)?;
+                code.push(Op::In);
+            }
+            Expr::Delete { target } => {
+                // delete obj.key → 専用命令は delete obj[key] のみなので、
+                // メンバーはインデックス形に変換して対応（キーを文字列として渡す）
+                match &**target {
+                    Expr::Member { obj, name } => {
+                        self.gen_expr(obj, code)?;
+                        let key_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+                        code.push(Op::ConstStr(key_id));
+                        code.push(Op::Delete);
+                    }
+                    Expr::Index { obj, index } => {
+                        self.gen_expr(obj, code)?;
+                        self.gen_expr(index, code)?;
+                        code.push(Op::Delete);
+                    }
+                    _ => return Err(CompileError("invalid delete target".into())),
+                }
             }
             Expr::CompoundAssign { name, op, rhs } => {
                 // x op= y  →  x = x op y（値は新値）
@@ -667,6 +702,36 @@ impl Compiler<'_> {
                 code.push(Op::MakeClosure(fidx));
                 self.gen_store(name, code)?;
             }
+            Stmt::Throw(e) => {
+                self.gen_expr(e, code)?;
+                code.push(Op::Throw);
+            }
+            Stmt::Try { try_body, catch_param, catch_body } => {
+                // TryPush(catch_pc) を発行 → try 本体 → TryPop → Jmp(end)
+                // catch_pc: 例外値がスタックに積まれている → catch 変数に束縛 → catch 本体
+                // end:
+                let try_push_idx = code.len();
+                code.push(Op::TryPush(0)); // プレースホルダ
+                for s in try_body {
+                    self.gen_stmt(s, code)?;
+                }
+                code.push(Op::TryPop);
+                let jmp_idx = code.len();
+                code.push(Op::Jmp(0)); // → end
+                let catch_pc = code.len();
+                code[try_push_idx] = Op::TryPush(catch_pc as u32);
+                // catch 変数へ束縛（例外値がスタック先頭）
+                if let Some(param) = catch_param {
+                    self.gen_store(param, code)?;
+                } else {
+                    code.push(Op::Pop);
+                }
+                for s in catch_body {
+                    self.gen_stmt(s, code)?;
+                }
+                let end_pos = code.len();
+                code[jmp_idx] = Op::Jmp(end_pos as u32);
+            }
             Stmt::Switch { disc, cases } => {
                 // switch を if/else-if チェーンにコンパイル（=== 比較、break 前提で
                 // フォールスルー無し）。disc はグローバル一時に退避して各 case で比較。
@@ -790,6 +855,16 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
                     collect_vars(body, locals);
                 }
             }
+            Stmt::Try { try_body, catch_param, catch_body } => {
+                collect_vars(try_body, locals);
+                if let Some(p) = catch_param {
+                    if !locals.contains_key(p) {
+                        locals.insert(p.clone(), locals.len() as u32);
+                    }
+                }
+                collect_vars(catch_body, locals);
+            }
+            Stmt::Throw(_) => {}
             _ => {}
         }
     }
@@ -848,6 +923,11 @@ fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
                     }
                     collect_refs(body, out);
                 }
+            }
+            Stmt::Throw(e) => collect_expr_refs(e, out),
+            Stmt::Try { try_body, catch_body, .. } => {
+                collect_refs(try_body, out);
+                collect_refs(catch_body, out);
             }
             Stmt::Block(inner) => collect_refs(inner, out),
             // ネスト関数宣言の中身は、その関数自身の自由変数として別途解析されるため
@@ -919,6 +999,17 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
         }
         Expr::Arrow { body, .. } => {
             collect_expr_refs(body, out);
+        }
+        Expr::Instanceof { lhs, rhs } => {
+            collect_expr_refs(lhs, out);
+            collect_expr_refs(rhs, out);
+        }
+        Expr::In { key, obj } => {
+            collect_expr_refs(key, out);
+            collect_expr_refs(obj, out);
+        }
+        Expr::Delete { target } => {
+            collect_expr_refs(target, out);
         }
         Expr::This
         | Expr::Num(_)
@@ -1363,5 +1454,53 @@ mod tests {
             obj.get();
         ";
         assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(42));
+    }
+
+    #[test]
+    fn bitwise_ops() {
+        assert_eq!(run_src("5 & 3;").unwrap(), crate::AklVal::mk_int(1));
+        assert_eq!(run_src("5 | 3;").unwrap(), crate::AklVal::mk_int(7));
+        assert_eq!(run_src("5 ^ 3;").unwrap(), crate::AklVal::mk_int(6));
+        assert_eq!(run_src("~5;").unwrap(), crate::AklVal::mk_int(-6));
+        assert_eq!(run_src("1 << 3;").unwrap(), crate::AklVal::mk_int(8));
+        assert_eq!(run_src("8 >> 2;").unwrap(), crate::AklVal::mk_int(2));
+        assert_eq!(run_src("8 >>> 2;").unwrap(), crate::AklVal::mk_int(2));
+    }
+
+    #[test]
+    fn in_and_delete() {
+        assert_eq!(run_src("var o = {a: 1}; \"a\" in o;").unwrap(), crate::AklVal::TRUE);
+        assert_eq!(run_src("var o = {a: 1}; \"b\" in o;").unwrap(), crate::AklVal::FALSE);
+        assert_eq!(
+            run_src("var o = {a: 1}; delete o.a; \"a\" in o;").unwrap(),
+            crate::AklVal::FALSE
+        );
+    }
+
+    #[test]
+    fn throw_and_catch() {
+        let src = "
+            function f() {
+                throw 42;
+            }
+            try {
+                f();
+            } catch (e) {
+                e;
+            }
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(42));
+    }
+
+    #[test]
+    fn try_catch_no_throw() {
+        let src = "
+            try {
+                1 + 1;
+            } catch (e) {
+                99;
+            }
+        ";
+        assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(2));
     }
 }

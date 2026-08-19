@@ -34,6 +34,8 @@ pub enum UnaryOp {
     Not,
     /// `typeof`。
     Typeof,
+    /// ビット NOT `~`。
+    BNot,
 }
 
 /// 二項演算子。
@@ -69,6 +71,18 @@ pub enum BinOp {
     And,
     /// `||`
     Or,
+    /// `&`（ビット AND）
+    BAnd,
+    /// `|`（ビット OR）
+    BOr,
+    /// `^`（ビット XOR）
+    BXor,
+    /// `<<`（左シフト）
+    BShl,
+    /// `>>`（算術右シフト）
+    BShr,
+    /// `>>>`（論理右シフト）
+    BUShr,
 }
 
 /// 式。
@@ -179,6 +193,25 @@ pub enum Expr {
         /// 偽のときの値。
         else_: Box<Expr>,
     },
+    /// `instanceof` 演算子 `lhs instanceof rhs`。
+    Instanceof {
+        /// 左辺。
+        lhs: Box<Expr>,
+        /// 右辺。
+        rhs: Box<Expr>,
+    },
+    /// `in` 演算子 `key in obj`。
+    In {
+        /// キー。
+        key: Box<Expr>,
+        /// オブジェクト。
+        obj: Box<Expr>,
+    },
+    /// `delete` 演算子 `delete target`。
+    Delete {
+        /// 削除対象（メンバー/インデックス）。
+        target: Box<Expr>,
+    },
     /// 複合代入 `x += y`（`op` は二項演算子。変数のみサポート）。
     CompoundAssign {
         /// 代入先の変数名。
@@ -284,6 +317,17 @@ pub enum Stmt {
         disc: Expr,
         /// (case 値（None = default）, 本体) の列。
         cases: Vec<(Option<Expr>, Vec<Stmt>)>,
+    },
+    /// `throw expr;`。
+    Throw(Expr),
+    /// `try { ... } catch (e) { ... }`。
+    Try {
+        /// try 本体。
+        try_body: Vec<Stmt>,
+        /// catch パラメータ名（catch なしの finally のみは未対応）。
+        catch_param: Option<String>,
+        /// catch 本体。
+        catch_body: Vec<Stmt>,
     },
 }
 
@@ -465,11 +509,44 @@ impl<'a> Parser<'a> {
 
     /// `&&`。
     fn parse_and(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_equality()?;
+        let mut lhs = self.parse_bitor()?;
         while self.at_punct(Punct::AndAnd)? {
             self.bump()?;
-            let rhs = self.parse_equality()?;
+            let rhs = self.parse_bitor()?;
             lhs = Expr::Bin { op: BinOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    /// `|`（ビット OR）。
+    fn parse_bitor(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bitxor()?;
+        while self.at_punct(Punct::Bor)? {
+            self.bump()?;
+            let rhs = self.parse_bitxor()?;
+            lhs = Expr::Bin { op: BinOp::BOr, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    /// `^`（ビット XOR）。
+    fn parse_bitxor(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bitand()?;
+        while self.at_punct(Punct::Bxor)? {
+            self.bump()?;
+            let rhs = self.parse_bitand()?;
+            lhs = Expr::Bin { op: BinOp::BXor, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    /// `&`（ビット AND）。
+    fn parse_bitand(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_equality()?;
+        while self.at_punct(Punct::Band)? {
+            self.bump()?;
+            let rhs = self.parse_equality()?;
+            lhs = Expr::Bin { op: BinOp::BAnd, lhs: Box::new(lhs), rhs: Box::new(rhs) };
         }
         Ok(lhs)
     }
@@ -497,9 +574,9 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// 比較 `< <= > >=`。
+    /// 比較 `< <= > >=` + `instanceof` + `in`。
     fn parse_relational(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_additive()?;
+        let mut lhs = self.parse_shift()?;
         loop {
             let op = if self.at_punct(Punct::Lt)? {
                 Some(BinOp::Lt)
@@ -509,6 +586,42 @@ impl<'a> Parser<'a> {
                 Some(BinOp::Gt)
             } else if self.at_punct(Punct::Ge)? {
                 Some(BinOp::Ge)
+            } else {
+                None
+            };
+            let Some(op) = op else {
+                // instanceof / in（比較と同レベル）
+                if self.at_kw(Keyword::Instanceof)? {
+                    self.bump()?;
+                    let rhs = self.parse_shift()?;
+                    lhs = Expr::Instanceof { lhs: Box::new(lhs), rhs: Box::new(rhs) };
+                    continue;
+                }
+                if self.at_kw(Keyword::In)? {
+                    self.bump()?;
+                    let rhs = self.parse_shift()?;
+                    lhs = Expr::In { key: Box::new(lhs), obj: Box::new(rhs) };
+                    continue;
+                }
+                break;
+            };
+            self.bump()?;
+            let rhs = self.parse_shift()?;
+            lhs = Expr::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Ok(lhs)
+    }
+
+    /// シフト `<< >> >>>`。
+    fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_additive()?;
+        loop {
+            let op = if self.at_punct(Punct::Shl)? {
+                Some(BinOp::BShl)
+            } else if self.at_punct(Punct::Shr)? {
+                Some(BinOp::BShr)
+            } else if self.at_punct(Punct::UShr)? {
+                Some(BinOp::BUShr)
             } else {
                 None
             };
@@ -568,6 +681,8 @@ impl<'a> Parser<'a> {
             Some(UnaryOp::Neg)
         } else if self.at_punct(Punct::Plus)? {
             Some(UnaryOp::Pos)
+        } else if self.at_punct(Punct::Bnot)? {
+            Some(UnaryOp::BNot)
         } else if self.at_kw(Keyword::Typeof)? {
             Some(UnaryOp::Typeof)
         } else {
@@ -577,6 +692,12 @@ impl<'a> Parser<'a> {
             self.bump()?;
             let operand = self.parse_unary()?;
             return Ok(Expr::Unary { op, operand: Box::new(operand) });
+        }
+        // delete
+        if self.at_kw(Keyword::Delete)? {
+            self.bump()?;
+            let target = self.parse_unary()?;
+            return Ok(Expr::Delete { target: Box::new(target) });
         }
         // 前置 ++ / --
         let incdec = if self.at_punct(Punct::Inc)? {
@@ -852,6 +973,12 @@ impl<'a> Parser<'a> {
         if self.at_kw(Keyword::Switch)? {
             return self.parse_switch();
         }
+        if self.at_kw(Keyword::Throw)? {
+            return self.parse_throw();
+        }
+        if self.at_kw(Keyword::Try)? {
+            return self.parse_try();
+        }
         // 式文
         let e = self.parse_expr()?;
         // セミコロンは任意（`}` / EOF の直前は省略可。C の最小 ASI 相当）
@@ -1019,6 +1146,40 @@ impl<'a> Parser<'a> {
         }
         self.expect_punct(Punct::RBrace, "'}'")?;
         Ok(Stmt::Switch { disc, cases })
+    }
+
+    /// `throw expr;`。
+    fn parse_throw(&mut self) -> Result<Stmt, ParseError> {
+        self.bump()?; // throw
+        let e = self.parse_expr()?;
+        if self.at_punct(Punct::Semi)? {
+            self.bump()?;
+        }
+        Ok(Stmt::Throw(e))
+    }
+
+    /// `try { ... } catch (e) { ... }`。
+    fn parse_try(&mut self) -> Result<Stmt, ParseError> {
+        self.bump()?; // try
+        let try_body = match self.parse_block()? {
+            Stmt::Block(s) => s,
+            _ => unreachable!(),
+        };
+        if !self.at_kw(Keyword::Catch)? {
+            return Err(ParseError("expected 'catch'".into()));
+        }
+        self.bump()?; // catch
+        self.expect_punct(Punct::LParen, "'('")?;
+        let catch_param = match self.bump()? {
+            Token::Ident(n) => Some(n.to_string()),
+            other => return Err(ParseError(format!("expected catch parameter, got {other:?}"))),
+        };
+        self.expect_punct(Punct::RParen, "')'")?;
+        let catch_body = match self.parse_block()? {
+            Stmt::Block(s) => s,
+            _ => unreachable!(),
+        };
+        Ok(Stmt::Try { try_body, catch_param, catch_body })
     }
 
     /// `while (cond) body`。

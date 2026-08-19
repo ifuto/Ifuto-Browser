@@ -249,7 +249,18 @@ C 実装は文字列も `rt->objs[]`（単一 obj テーブル）に載せる。
 検証: cargo test 91 件 + clippy 緑。console.log / Math / parseInt / 文字列・配列
 メソッドの e2e が通る。
 
-残り: 正規表現系メソッド・JSON.stringify/parse・Date・try/catch/throw・ビット演算。
+残り: 正規表現系メソッド・JSON.parse・Date。
+
+### フェーズ 3/4 追補: ビット演算・instanceof/in/delete・try/catch/throw
+
+- ビット演算: `& | ^ ~ << >> >>>`（パーサに優先順位段 `parse_bitor/bitxor/bitand/shift`
+  を追加、VM に `BAnd/BOr/BXor/BShl/BShr/BUShr/BNot`、ToInt32 セマンティクス）
+- `instanceof` / `in` / `delete`（パーサ + VM。`in` はプロパティ存在検査、
+  `delete` は配列穴化 + オブジェクトプロパティ削除）
+- try/catch/throw: `Frame.catch_pc` + `TryPush/TryPop/Throw` 命令 + `unwind`
+  （例外を frames を遡って catch へ巻き戻す。C の `akl_vm_unwind` 相当）
+
+検証: cargo test 101 件 + clippy 緑（ビット演算・in/delete・throw/catch の e2e）。
 
 ### フェーズ 4 追補 2: 制御フロー完全化
 
