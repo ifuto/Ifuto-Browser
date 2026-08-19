@@ -390,13 +390,37 @@ impl Compiler<'_> {
                 }
             }
             Expr::Arr(items) => {
-                for item in items {
-                    self.gen_expr(item, code)?;
+                // spread がある場合は ArrPush/ArrPushAll でビルドアップ
+                if items.iter().any(|i| matches!(i, Expr::Spread(_))) {
+                    code.push(Op::ArrNew(0));
+                    for item in items {
+                        match item {
+                            Expr::Spread(e) => {
+                                self.gen_expr(e, code)?;
+                                code.push(Op::ArrPushAll);
+                            }
+                            Expr::Hole => {
+                                code.push(Op::Undef);
+                                code.push(Op::ArrPush);
+                            }
+                            _ => {
+                                self.gen_expr(item, code)?;
+                                code.push(Op::ArrPush);
+                            }
+                        }
+                    }
+                } else {
+                    for item in items {
+                        match item {
+                            Expr::Hole => code.push(Op::Undef),
+                            _ => self.gen_expr(item, code)?,
+                        }
+                    }
+                    if items.len() > u32::MAX as usize {
+                        return Err(CompileError("array too large".into()));
+                    }
+                    code.push(Op::ArrNew(items.len() as u32));
                 }
-                if items.len() > u32::MAX as usize {
-                    return Err(CompileError("array too large".into()));
-                }
-                code.push(Op::ArrNew(items.len() as u32));
             }
             Expr::ObjLit(entries) => {
                 code.push(Op::ObjNew);
@@ -479,6 +503,9 @@ impl Compiler<'_> {
                     }
                     _ => return Err(CompileError("invalid delete target".into())),
                 }
+            }
+            Expr::Spread(_) | Expr::Rest(_) | Expr::Hole => {
+                return Err(CompileError("spread/rest/hole outside valid context".into()))
             }
             Expr::CompoundAssign { name, op, rhs } => {
                 // x op= y  →  x = x op y（値は新値）
@@ -706,6 +733,11 @@ impl Compiler<'_> {
                 self.gen_expr(e, code)?;
                 code.push(Op::Throw);
             }
+            Stmt::Destructure { pattern, init } => {
+                // 右辺を評価してスタックに積み、パターンに従って各要素を束縛
+                self.gen_expr(init, code)?;
+                self.gen_destructure(pattern, code)?;
+            }
             Stmt::Try { try_body, catch_param, catch_body } => {
                 // TryPush(catch_pc) を発行 → try 本体 → TryPop → Jmp(end)
                 // catch_pc: 例外値がスタックに積まれている → catch 変数に束縛 → catch 本体
@@ -789,6 +821,62 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// 分割代入パターンをコード生成（スタックトップの値を pattern に束縛して消費）。
+    fn gen_destructure(
+        &mut self,
+        pattern: &crate::parser::Pattern,
+        code: &mut Vec<Op>,
+    ) -> Result<(), CompileError> {
+        match pattern {
+            crate::parser::Pattern::Ident(name) => {
+                self.gen_store(name, code)?;
+            }
+            crate::parser::Pattern::Arr(items) => {
+                // スタックトップは配列。各要素を取り出して束縛。
+                for (i, item) in items.iter().enumerate() {
+                    match item {
+                        crate::parser::Pattern::Rest(name) => {
+                            // 残り [i..n) を rest 配列に束縛
+                            code.push(Op::Dup); // [arr, arr]
+                            code.push(Op::ConstI(i as i32)); // [arr, arr, i]
+                            code.push(Op::ArrRest); // [arr, rest]
+                            self.gen_store(name, code)?; // [arr]
+                            break;
+                        }
+                        crate::parser::Pattern::Hole => {
+                            // 空き要素: 束縛しない（インデックスは進む）
+                        }
+                        _ => {
+                            code.push(Op::Dup); // [arr, arr]
+                            code.push(Op::ConstI(i as i32)); // [arr, arr, i]
+                            code.push(Op::AGet); // [arr, elem]
+                            self.gen_destructure(item, code)?; // [arr]
+                        }
+                    }
+                }
+                code.push(Op::Pop); // arr を消費
+            }
+            crate::parser::Pattern::Obj(items) => {
+                // スタックトップはオブジェクト。各キーを取り出して束縛。
+                for (key, item) in items {
+                    code.push(Op::Dup); // [obj, obj]
+                    let key_id = self
+                        .rt
+                        .intern(key)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
+                    code.push(Op::PLoad(key_id)); // [obj, val]
+                    self.gen_destructure(item, code)?; // [obj]
+                }
+                code.push(Op::Pop); // obj を消費
+            }
+            crate::parser::Pattern::Rest(_) => {
+                return Err(CompileError("rest outside array pattern".into()))
+            }
+            crate::parser::Pattern::Hole => {}
+        }
+        Ok(())
+    }
+
     /// 変数を読み出す（捕捉 env → ローカル → グローバルの順で解決）。
     /// 捕捉をローカルより優先するのは、box 化ローカルが locals に残るため。
     fn gen_load(&mut self, name: &str, code: &mut Vec<Op>) -> Result<(), CompileError> {
@@ -865,8 +953,33 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
                 collect_vars(catch_body, locals);
             }
             Stmt::Throw(_) => {}
+            Stmt::Destructure { pattern, .. } => {
+                collect_pattern_vars(pattern, locals);
+            }
             _ => {}
         }
+    }
+}
+
+/// 分割代入パターンから変数名を収集。
+fn collect_pattern_vars(pattern: &crate::parser::Pattern, locals: &mut HashMap<String, u32>) {
+    match pattern {
+        crate::parser::Pattern::Ident(name) | crate::parser::Pattern::Rest(name) => {
+            if !locals.contains_key(name) {
+                locals.insert(name.clone(), locals.len() as u32);
+            }
+        }
+        crate::parser::Pattern::Arr(items) => {
+            for item in items {
+                collect_pattern_vars(item, locals);
+            }
+        }
+        crate::parser::Pattern::Obj(items) => {
+            for (_, item) in items {
+                collect_pattern_vars(item, locals);
+            }
+        }
+        crate::parser::Pattern::Hole => {}
     }
 }
 
@@ -928,6 +1041,9 @@ fn collect_refs(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
             Stmt::Try { try_body, catch_body, .. } => {
                 collect_refs(try_body, out);
                 collect_refs(catch_body, out);
+            }
+            Stmt::Destructure { init, .. } => {
+                collect_expr_refs(init, out);
             }
             Stmt::Block(inner) => collect_refs(inner, out),
             // ネスト関数宣言の中身は、その関数自身の自由変数として別途解析されるため
@@ -1011,6 +1127,8 @@ fn collect_expr_refs(expr: &Expr, out: &mut std::collections::HashSet<String>) {
         Expr::Delete { target } => {
             collect_expr_refs(target, out);
         }
+        Expr::Spread(e) => collect_expr_refs(e, out),
+        Expr::Rest(_) | Expr::Hole => {}
         Expr::This
         | Expr::Num(_)
         | Expr::Str(_)
@@ -1474,6 +1592,47 @@ mod tests {
         assert_eq!(
             run_src("var o = {a: 1}; delete o.a; \"a\" in o;").unwrap(),
             crate::AklVal::FALSE
+        );
+    }
+
+    #[test]
+    fn destructuring_array() {
+        assert_eq!(
+            run_src("var [a, b] = [1, 2]; a + b;").unwrap(),
+            crate::AklVal::mk_int(3)
+        );
+        assert_eq!(
+            run_src("var [a, , b] = [1, 2, 3]; a + b;").unwrap(),
+            crate::AklVal::mk_int(4)
+        );
+        // rest
+        assert_eq!(
+            run_src("var [a, ...rest] = [1, 2, 3]; rest.length;").unwrap(),
+            crate::AklVal::mk_int(2)
+        );
+    }
+
+    #[test]
+    fn destructuring_object() {
+        assert_eq!(
+            run_src("var {a, b} = {a: 1, b: 2}; a + b;").unwrap(),
+            crate::AklVal::mk_int(3)
+        );
+        assert_eq!(
+            run_src("var {a: x} = {a: 10}; x;").unwrap(),
+            crate::AklVal::mk_int(10)
+        );
+    }
+
+    #[test]
+    fn spread_array() {
+        assert_eq!(
+            run_src("var a = [2, 3]; [1, ...a, 4].length;").unwrap(),
+            crate::AklVal::mk_int(4)
+        );
+        assert_eq!(
+            run_src("var a = [2, 3]; [1, ...a, 4][2];").unwrap(),
+            crate::AklVal::mk_int(3)
         );
     }
 

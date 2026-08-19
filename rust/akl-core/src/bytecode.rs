@@ -194,6 +194,12 @@ pub enum Op {
     PStore(ObjId),
     /// 配列リテラル（count 個 pop して配列を push。C の `ANEW`）。
     ArrNew(u32),
+    /// 配列へ要素を追加（val, arr を pop、arr を push。C の `ARRPUSH` 相当）。
+    ArrPush,
+    /// 配列へ別配列の全要素を追加（src, arr を pop、arr を push。C の `ARRPUSHALL` 相当）。
+    ArrPushAll,
+    /// 配列の残り [start..n) を新配列に（start, arr を pop、新配列を push。C の `ARRREST` 相当）。
+    ArrRest,
     /// 要素読み出し（idx, obj を pop、値を push。C の `AGET`）。
     AGet,
     /// 要素書き込み（val, idx, obj を pop、val を push。C の `ASET`）。
@@ -295,7 +301,10 @@ pub struct Runtime {
 impl Runtime {
     /// 空のランタイムを作る。
     pub fn new() -> Self {
-        Self::default()
+        let mut rt = Self::default();
+        // `length` プロパティ名を設定（文字列/配列の length 解決用。install_builtins 前でも有効）。
+        rt.length_id = rt.intern("length").unwrap_or(0);
+        rt
     }
 
     /// 文字列を intern してヒープ上の文字列 ObjId を返す（失敗時 None）。
@@ -723,6 +732,56 @@ impl Runtime {
                     let items = stack[stack.len() - count..].to_vec();
                     stack.truncate(stack.len() - count);
                     let id = self.heap.alloc(Obj::Arr(items)).map_err(|_| VmError::Oom)?;
+                    stack.push(AklVal::mk_obj(id));
+                }
+                Op::ArrPush => {
+                    let val = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let arr = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    if !arr.is_obj() {
+                        return Err(VmError::NotObject);
+                    }
+                    let id = arr.get_obj();
+                    match self.heap.get_mut(id) {
+                        Some(Obj::Arr(items)) => items.push(val),
+                        _ => return Err(VmError::NotObject),
+                    }
+                    stack.push(arr);
+                }
+                Op::ArrPushAll => {
+                    let src = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let arr = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    if !arr.is_obj() || !src.is_obj() {
+                        return Err(VmError::NotObject);
+                    }
+                    let src_items = match self.heap.get(src.get_obj()) {
+                        Some(Obj::Arr(items)) => items.clone(),
+                        _ => return Err(VmError::NotObject),
+                    };
+                    let id = arr.get_obj();
+                    match self.heap.get_mut(id) {
+                        Some(Obj::Arr(items)) => items.extend_from_slice(&src_items),
+                        _ => return Err(VmError::NotObject),
+                    }
+                    stack.push(arr);
+                }
+                Op::ArrRest => {
+                    let start = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    let arr = stack.pop().ok_or(VmError::StackUnderflow)?;
+                    if !arr.is_obj() {
+                        return Err(VmError::NotObject);
+                    }
+                    let items = match self.heap.get(arr.get_obj()) {
+                        Some(Obj::Arr(v)) => v.clone(),
+                        _ => return Err(VmError::NotObject),
+                    };
+                    let s = self.to_number(start) as i64;
+                    let s = if s < 0 { 0 } else { s as usize };
+                    let rest: Vec<AklVal> = if s < items.len() {
+                        items[s..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let id = self.heap.alloc(Obj::Arr(rest)).map_err(|_| VmError::Oom)?;
                     stack.push(AklVal::mk_obj(id));
                 }
                 Op::AGet => {

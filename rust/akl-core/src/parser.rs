@@ -212,6 +212,12 @@ pub enum Expr {
         /// 削除対象（メンバー/インデックス）。
         target: Box<Expr>,
     },
+    /// spread 要素 `...expr`（配列リテラル・関数呼び出し引数）。
+    Spread(Box<Expr>),
+    /// rest 要素（関数パラメータ・分割代入）。
+    Rest(String),
+    /// 配列リテラルの空き要素 `[,,]`（elision = undefined）。
+    Hole,
     /// 複合代入 `x += y`（`op` は二項演算子。変数のみサポート）。
     CompoundAssign {
         /// 代入先の変数名。
@@ -230,6 +236,21 @@ pub enum Expr {
         /// true = 前置（`++x`）、false = 後置（`x++`）。
         prefix: bool,
     },
+}
+
+/// 分割代入パターン。
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pattern {
+    /// 識別子（変数名）。
+    Ident(String),
+    /// 配列パターン `[a, b, ...rest]`。
+    Arr(Vec<Pattern>),
+    /// オブジェクトパターン `{a, b: x}`。
+    Obj(Vec<(String, Pattern)>),
+    /// rest 要素（配列パターンの末尾 `...rest`）。
+    Rest(String),
+    /// 空き要素（elision。束縛しない）。
+    Hole,
 }
 
 /// `for` 文の初期化節。
@@ -328,6 +349,13 @@ pub enum Stmt {
         catch_param: Option<String>,
         /// catch 本体。
         catch_body: Vec<Stmt>,
+    },
+    /// 分割代入宣言 `var [a, b] = expr;` / `var {a} = expr;`。
+    Destructure {
+        /// パターン。
+        pattern: Pattern,
+        /// 右辺。
+        init: Expr,
     },
 }
 
@@ -727,7 +755,12 @@ impl<'a> Parser<'a> {
                 let mut args = Vec::new();
                 if !self.at_punct(Punct::RParen)? {
                     loop {
-                        args.push(self.parse_expr()?);
+                        if self.eat_punct(Punct::Ellipsis)? {
+                            let e = self.parse_expr()?;
+                            args.push(Expr::Spread(Box::new(e)));
+                        } else {
+                            args.push(self.parse_expr()?);
+                        }
                         if !self.eat_punct(Punct::Comma)? {
                             break;
                         }
@@ -827,13 +860,30 @@ impl<'a> Parser<'a> {
                 Ok(Expr::ObjLit(entries))
             }
             Token::Punct(Punct::LBracket) => {
-                // 配列リテラル [ e, ... ]
+                // 配列リテラル [ e, ... ]（spread・elision 対応）
                 let mut items = Vec::new();
                 if !self.at_punct(Punct::RBracket)? {
                     loop {
-                        items.push(self.parse_expr()?);
+                        if self.at_punct(Punct::Comma)? {
+                            // エルジョン: 空き要素
+                            items.push(Expr::Hole);
+                            self.bump()?;
+                            if self.at_punct(Punct::RBracket)? {
+                                break;
+                            }
+                            continue;
+                        }
+                        if self.eat_punct(Punct::Ellipsis)? {
+                            let e = self.parse_expr()?;
+                            items.push(Expr::Spread(Box::new(e)));
+                        } else {
+                            items.push(self.parse_expr()?);
+                        }
                         if !self.eat_punct(Punct::Comma)? {
                             break;
+                        }
+                        if self.at_punct(Punct::RBracket)? {
+                            break; // trailing comma
                         }
                     }
                 }
@@ -999,9 +1049,21 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Block(stmts))
     }
 
-    /// `var` / `let` / `const` 宣言。
+    /// `var` / `let` / `const` 宣言（分割代入含む）。
     fn parse_var_decl(&mut self) -> Result<Stmt, ParseError> {
         self.bump()?; // var/let/const
+        // 分割代入: var [a, b] = expr / var {a} = expr
+        if self.at_punct(Punct::LBracket)? || self.at_punct(Punct::LBrace)? {
+            let pattern = self.parse_pattern()?;
+            if !self.eat_punct(Punct::Assign)? {
+                return Err(ParseError("expected '=' in destructuring".into()));
+            }
+            let init = self.parse_expr()?;
+            if self.at_punct(Punct::Semi)? {
+                self.bump()?;
+            }
+            return Ok(Stmt::Destructure { pattern, init });
+        }
         let name = match self.bump()? {
             Token::Ident(n) => n.to_string(),
             other => return Err(ParseError(format!("expected identifier, got {other:?}"))),
@@ -1015,6 +1077,84 @@ impl<'a> Parser<'a> {
             self.bump()?;
         }
         Ok(Stmt::Var { name, init })
+    }
+
+    /// 分割代入パターン（配列 `[a, b, ...r]` / オブジェクト `{a, b: x}`）。
+    fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
+        if self.at_punct(Punct::LBracket)? {
+            self.bump()?;
+            let mut items = Vec::new();
+            if !self.at_punct(Punct::RBracket)? {
+                loop {
+                    if self.eat_punct(Punct::Ellipsis)? {
+                        let name = match self.bump()? {
+                            Token::Ident(n) => n.to_string(),
+                            other => return Err(ParseError(format!("expected rest name, got {other:?}"))),
+                        };
+                        items.push(Pattern::Rest(name));
+                        break; // rest は末尾
+                    }
+                    // 空き要素（elision）: コンマが連続
+                    if self.at_punct(Punct::Comma)? {
+                        items.push(Pattern::Hole);
+                        self.bump()?;
+                        if self.at_punct(Punct::RBracket)? {
+                            break;
+                        }
+                        continue;
+                    }
+                    // ネスト配列/オブジェクトパターン
+                    if self.at_punct(Punct::LBracket)? || self.at_punct(Punct::LBrace)? {
+                        items.push(self.parse_pattern()?);
+                    } else {
+                        let name = match self.bump()? {
+                            Token::Ident(n) => n.to_string(),
+                            other => return Err(ParseError(format!("expected pattern name, got {other:?}"))),
+                        };
+                        items.push(Pattern::Ident(name));
+                    }
+                    if !self.eat_punct(Punct::Comma)? {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(Punct::RBracket, "']'")?;
+            Ok(Pattern::Arr(items))
+        } else if self.at_punct(Punct::LBrace)? {
+            self.bump()?;
+            let mut items = Vec::new();
+            if !self.at_punct(Punct::RBrace)? {
+                loop {
+                    let key = match self.bump()? {
+                        Token::Ident(n) => n.to_string(),
+                        Token::Str(s) => s,
+                        other => return Err(ParseError(format!("expected pattern key, got {other:?}"))),
+                    };
+                    // {a: x} の形（x はパターン）
+                    let val = if self.eat_punct(Punct::Colon)? {
+                        if self.at_punct(Punct::LBracket)? || self.at_punct(Punct::LBrace)? {
+                            self.parse_pattern()?
+                        } else {
+                            match self.bump()? {
+                                Token::Ident(n) => Pattern::Ident(n.to_string()),
+                                other => return Err(ParseError(format!("expected pattern, got {other:?}"))),
+                            }
+                        }
+                    } else {
+                        // {a} の shorthand
+                        Pattern::Ident(key.clone())
+                    };
+                    items.push((key, val));
+                    if !self.eat_punct(Punct::Comma)? {
+                        break;
+                    }
+                }
+            }
+            self.expect_punct(Punct::RBrace, "'}'")?;
+            Ok(Pattern::Obj(items))
+        } else {
+            Err(ParseError("expected destructuring pattern".into()))
+        }
     }
 
     /// `return [expr];`。
