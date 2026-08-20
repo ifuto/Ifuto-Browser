@@ -624,3 +624,23 @@ Aklus（JS エンジン）の移行（フェーズ 0〜6）が完了したため
 
 残り: `charset`（Shift_JIS/EUC-JP 変換。生成表 1467 行）→ `arena` →
 `html_tok`/`html_tree` → DOM/CSS/レイアウト → 最後に `ifuto-ffi` で C 側と差し替え。
+
+### フェーズ 8-b: 文字コード層（charset）
+
+- `tools/gen_charset.py` を拡張し、C ヘッダ（`src/charset_tables_gen.h`）に加えて
+  Rust 表（`rust/ifuto-core/src/charset_tables.rs`）も同一データから生成。
+  `--verify` は両ファイルを照合（C ヘッダは byte 一致で後方互換を維持）。
+- `charset` モジュール: `label` / `from_http` / `sniff`（`(Enc, bom)` を返す）/
+  `decode`（`Vec<u8>` を返す）。C の arena 出力を所有権ベースの `Vec<u8>` に置換し、
+  手動の容量計算（`3n+3`）とバッファ境界検査を構造的に排除。
+- 判定順（HTTP > BOM > meta prescan 4096B > UTF-8）・malformed の FFFD restore 規則・
+  cp932 波ダッシュ採用を C と同一に維持。
+
+検証:
+- C オラクル `tests/test_charset.c` の `t_label`/`t_sniff`/`t_decode_sjis`/
+  `t_decode_euc`/`t_sweep`/`t_bom_strip_rule` を 1:1 で Rust に再現（`t_e2e` は
+  DOM 未移行のため保留）。
+- **全バイト対（65536 × SJIS/EUCJP）の decode 出力を C と Rust で突合し、byte 一致
+  を確認**（クロスチェック用ダンプを一時生成して diff。コミット対象外）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 14 =
+  162 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。

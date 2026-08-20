@@ -41,3 +41,9 @@ pub mod strutil;
 
 /// UTF-8 デコーダ / エンコーダ / セル幅（C の `utf8.c` 相当）。
 pub mod utf8;
+
+/// 文字コード層（Shift_JIS / EUC-JP → UTF-8。C の `charset.c` 相当）。
+pub mod charset;
+
+/// 文字コード変換表（`tools/gen_charset.py` 生成。C の `charset_tables_gen.h` 相当）。
+pub mod charset_tables;
