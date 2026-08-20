@@ -678,3 +678,20 @@ Aklus（JS エンジン）の移行（フェーズ 0〜6）が完了したため
   Rust テストとして再現（全 2125 エントリの自分自身 find 往復）。
 - `cargo test --offline --workspace`（ifuto-core 39 件 = 合計 187 件）緑、
   `cargo clippy --offline --workspace -- -D warnings` 緑。
+
+### フェーズ 8-e: 永続ストア読み面パーサ（store）
+
+- `store` モジュール: `session.txt`（`ifuto-session 1`）と `bookmarks.tsv`
+  の読み面パーサを移植。fs 操作は C 同様 `IfFsOps` 注入で分離し、Rust 側は
+  「テキスト → 結果」の純関数として移植（所有権により arena 不要）。
+- C の `IfSessionTab*`（arena 内 `char*` を指す）を `SessionTab { url: String, .. }`
+  に置換。`parse_session` は `(Vec<SessionTab>, i32)` を返し、「タブ 0 件でも
+  `active` 行を読めれば active_id が非 -1」という C の細部まで一致。
+
+検証:
+- **差分 fuzz**: session 20,008 件 + bookmarks 10,004 件の入力で C/Rust 出力を突合し
+  **0 不一致**。
+- fuzz_store.c の機械不変条件（n ∈ [0,64]、id ∈ [0,1e6]、scroll ∈ [0,1<<24]、
+  url 非空、決定性）を Rust テストとして再現。
+- `cargo test --offline --workspace`（ifuto-core 51 件 = 合計 199 件）緑、
+  `cargo clippy --offline --workspace -- -D warnings` 緑。

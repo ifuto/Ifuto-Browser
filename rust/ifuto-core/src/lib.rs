@@ -56,3 +56,6 @@ pub mod entities;
 
 /// HTML 名前付き文字参照の生成表（`tools/gen_entities.py` 生成）。
 pub mod entities_tables;
+
+/// 永続ストア層の読み面パーサ（C の `store.c` の session / bookmarks 相当）。
+pub mod store;
