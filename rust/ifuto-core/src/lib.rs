@@ -50,3 +50,9 @@ pub mod charset_tables;
 
 /// 拡張 manifest パーサ（C の `ext_manifest.c` 相当。純粋関数のみ）。
 pub mod ext_manifest;
+
+/// HTML 名前付き文字参照の解決（C の `entities_gen.h` + `html_tok.c` の検索プリミティブ）。
+pub mod entities;
+
+/// HTML 名前付き文字参照の生成表（`tools/gen_entities.py` 生成）。
+pub mod entities_tables;

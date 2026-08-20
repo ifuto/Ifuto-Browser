@@ -662,3 +662,19 @@ Aklus（JS エンジン）の移行（フェーズ 0〜6）が完了したため
   決定性）を Rust テストとして再現。
 - `cargo test --offline --workspace`（ifuto-core 31 件 = 合計 179 件）緑、
   `cargo clippy --offline --workspace -- -D warnings` 緑。
+
+### フェーズ 8-d: HTML 名前付き文字参照（entities）
+
+- `tools/gen_entities.py` を拡張し、C ヘッダ（`src/entities_gen.h`）に加えて Rust 表
+  （`rust/ifuto-core/src/entities_tables.rs`、2722 行）も同一データから生成。
+  `--verify` は両ファイルを照合（C ヘッダは byte 一致で後方互換）。
+- `entities` モジュール: `find`（完全一致二分探索）/ `longest_legacy`（legacy 最長
+  prefix）/ `codepoints`（cp1/cp2/astral の復号）を移植。`name_off` の blob オフセット
+  を `&[u8]` スライスの `get` に置き換え、範囲外アクセスを構造的に排除。
+
+検証:
+- 全 2125 エントリの `find`/`longest_legacy` を C と Rust で突合し **byte 一致**。
+- 生成時 assert（2-cp は両方 BMP・astral は単一 cp・cp 非ゼロ・ソート一貫性）を
+  Rust テストとして再現（全 2125 エントリの自分自身 find 往復）。
+- `cargo test --offline --workspace`（ifuto-core 39 件 = 合計 187 件）緑、
+  `cargo clippy --offline --workspace -- -D warnings` 緑。
