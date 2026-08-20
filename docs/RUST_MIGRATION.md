@@ -513,6 +513,37 @@ lodash は `runInContext` 本体の `createWrap`/`createRecurry` 機構の深部
 残る壁は `WeakMap`/`WeakSet` と well-known Symbol（`setData`/`getData` のメタデータ
 保持に使用）など。
 
+### フェーズ 5 追補 6: lodash smoke 320/320 達成（フェーズ 5 完了）
+
+`build/akl_rust`（Rust エンジン CLI）で lodash 4.17.21 のスモークテスト
+`tests/lodash_smoke.js` 全 **320 checks を通過**（`lodash-smoke ok=320 ng=0`）。
+これによりロードマップのフェーズ 5（組み込み）完了条件を満たした。C エンジンも
+`lodash-smoke ok=320 ng=0` を維持（比較基準）。
+
+残っていた壁を以下の追加実装で突破:
+
+- **switch のフォールスルー**（`case A: case B: body` の空 case マージ。lodash の
+  `equalByTag` が `case dateTag: case numberTag:` 形式で依存）
+- **関数オブジェクトの独自プロパティメソッド呼び出しで `this` = メソッド自身**
+  （C の `OP_MCALL` 互換。`_.noConflict()` が `root._ === this` を満たさず
+  グローバル `_` を消さない根拠。Function メソッド `call`/`apply` は従来通り
+  `this` = レシーバ）
+- **Error / TypeError / RangeError / SyntaxError** コンストラクタ（`\x01tag` による
+  `Object.prototype.toString` タグ + `instanceof` 成立。`_.isError`/`_.attempt`）
+- **WeakMap / WeakSet**（`\x01tag` 付き OBJ。WeakMap は get/set/has/delete を
+  文字列キー近似で実装。`_.isWeakMap`/`_.isWeakSet`/`metaMap`）
+- **TypedArray / ArrayBuffer / DataView**（タグ付き OBJ + `.length`。
+  `_.isTypedArray`/`_.isArrayBuffer`）
+- **setTimeout / setInterval / clearTimeout / clearInterval**（実行は近似で ID のみ。
+  `_.throttle`/`_.debounce`/`_.delay`/`_.defer`）
+- **配列 ToString = join(",")**（`String([1,2])==="1,2"`。`_.toString`/`_.chain` 系）
+- **RegExp ToString = `/source/flags`** + `obj == string` の ToPrimitive
+  （`_.isEqual(/a/g, /a/g)` の `equalByTag`）
+- **`Number('') === 0`**（`js_str_to_number`。lodash の `createRound` の `+pair[1]`）
+- **Map/Set イテラブルコンストラクタ**、**Symbol タグ**、**split limit**、
+  **hasOwnProperty の数値キー**、**parseInt radix**、**文字クラス範囲の
+  エスケープ終端**（`a-\uXXXX`。`_.size("pebbles")` の `reHasUnicode`）
+
 ### フェーズ 4 追補 2: 制御フロー完全化
 
 - `for (init; cond; step) body`（init は var 宣言 or 式、cond/step 省略可）
