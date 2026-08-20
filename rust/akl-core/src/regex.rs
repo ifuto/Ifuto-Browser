@@ -424,71 +424,104 @@ impl Parser {
                 self.pos += 1;
                 return Ok(RegexNode::Class { negated, chars, ranges });
             }
-            // エスケープ（`\uXXXX` / `\xXX` / `\\` / `\-` 等）
-            let c = if c == '\\' {
-                self.pos += 1;
-                let e = self.peek().ok_or("trailing backslash in class")?;
-                match e {
-                    'u' => {
-                        self.pos += 1;
-                        self.parse_unicode_escape()?
-                    }
-                    'x' => {
-                        self.pos += 1;
-                        let hi = self.peek().ok_or("trailing \\x")?;
-                        self.pos += 1;
-                        let lo = self.peek().ok_or("trailing \\x")?;
-                        self.pos += 1;
-                        let h = hi.to_digit(16).ok_or("bad \\x")?;
-                        let l = lo.to_digit(16).ok_or("bad \\x")?;
-                        char::from_u32(h * 16 + l).unwrap_or('?')
-                    }
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    'f' => '\u{0c}',
-                    'd' => {
-                        // `\d` は範囲 [0-9] に展開
-                        self.pos += 1;
-                        ranges.push(('0', '9'));
-                        continue;
-                    }
-                    's' => {
-                        self.pos += 1;
-                        chars.extend([' ', '\t', '\n', '\r', '\u{0b}', '\u{0c}']);
-                        continue;
-                    }
-                    'w' => {
-                        self.pos += 1;
-                        chars.push('_');
-                        ranges.extend([('0', '9'), ('A', 'Z'), ('a', 'z')]);
-                        continue;
-                    }
-                    _ => {
-                        self.pos += 1;
-                        e
-                    }
-                }
-            } else {
-                self.pos += 1;
-                c
+            // 先頭文字（エスケープ処理込み）。None は \d/\s/\w を展開済み。
+            let c = match self.read_class_char(&mut chars, &mut ranges)? {
+                Some(c) => c,
+                None => continue,
             };
-            // 範囲 a-z
+            // 範囲 a-z（エスケープされた終端 a-\uXXXX にも対応）
             if self.peek() == Some('-') {
-                let next = self.chars.get(self.pos + 1).copied();
-                if let Some(next) = next {
-                    if next != ']' {
-                        self.pos += 1; // '-'
-                        let end = self.peek().unwrap();
-                        self.pos += 1;
-                        ranges.push((c, end));
+                let save = self.pos;
+                self.pos += 1; // '-'
+                if self.peek() == Some(']') {
+                    // `[a-]` は '-' をリテラル扱い（範囲にしない）
+                    self.pos = save;
+                    chars.push(c);
+                    continue;
+                }
+                let end = match self.read_class_char(&mut chars, &mut ranges)? {
+                    Some(e) => e,
+                    None => {
+                        // `[a-\d]` のような変則形は '-' をリテラル扱い
+                        chars.push(c);
                         continue;
                     }
-                }
+                };
+                ranges.push((c, end));
+                continue;
             }
             chars.push(c);
         }
         Err("unclosed character class".to_string())
+    }
+
+    /// 文字クラス内の 1 要素（エスケープ処理込み）を読む。
+    /// `\d` / `\s` / `\w` は `chars`/`ranges` へ直接展開して `None` を返す。
+    fn read_class_char(
+        &mut self,
+        chars: &mut Vec<char>,
+        ranges: &mut Vec<(char, char)>,
+    ) -> Result<Option<char>, String> {
+        if self.peek() != Some('\\') {
+            let c = self.peek().unwrap();
+            self.pos += 1;
+            return Ok(Some(c));
+        }
+        self.pos += 1; // '\\'
+        let e = self.peek().ok_or("trailing backslash in class")?;
+        match e {
+            'u' => {
+                self.pos += 1;
+                Ok(Some(self.parse_unicode_escape()?))
+            }
+            'x' => {
+                self.pos += 1;
+                let hi = self.peek().ok_or("trailing \\x")?;
+                self.pos += 1;
+                let lo = self.peek().ok_or("trailing \\x")?;
+                self.pos += 1;
+                let h = hi.to_digit(16).ok_or("bad \\x")?;
+                let l = lo.to_digit(16).ok_or("bad \\x")?;
+                Ok(Some(char::from_u32(h * 16 + l).unwrap_or('?')))
+            }
+            'n' => {
+                self.pos += 1;
+                Ok(Some('\n'))
+            }
+            't' => {
+                self.pos += 1;
+                Ok(Some('\t'))
+            }
+            'r' => {
+                self.pos += 1;
+                Ok(Some('\r'))
+            }
+            'f' => {
+                self.pos += 1;
+                Ok(Some('\u{0c}'))
+            }
+            'd' => {
+                // `\d` は範囲 [0-9] に展開
+                self.pos += 1;
+                ranges.push(('0', '9'));
+                Ok(None)
+            }
+            's' => {
+                self.pos += 1;
+                chars.extend([' ', '\t', '\n', '\r', '\u{0b}', '\u{0c}']);
+                Ok(None)
+            }
+            'w' => {
+                self.pos += 1;
+                chars.push('_');
+                ranges.extend([('0', '9'), ('A', 'Z'), ('a', 'z')]);
+                Ok(None)
+            }
+            _ => {
+                self.pos += 1;
+                Ok(Some(e))
+            }
+        }
     }
 }
 

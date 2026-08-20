@@ -537,14 +537,23 @@ impl Compiler<'_> {
                     .rt
                     .intern("\x01spread_argc")
                     .ok_or_else(|| CompileError("intern failed".into()))?;
-                // メソッド呼び出し `obj.method(...)` は this=obj で呼ぶ（MCallName）。
-                // ハンドル（DOM 等）は vtable の call へ直接ディスパッチし、プロパティ
-                // 取得（PLoad）と構文的に分離する（C の OP_MCALL と同型）。
-                if let Expr::Member { obj, name } = &**callee {
+                // メソッド呼び出し `obj.method(...)` / `obj['method'](...)`（文字列リテラルの
+                // ブラケット記法）は this=obj で呼ぶ（MCallName）。ハンドル（DOM 等）は
+                // vtable の call へ直接ディスパッチし、プロパティ取得（PLoad）と構文的に
+                // 分離する（C の OP_MCALL と同型）。
+                let method = match &**callee {
+                    Expr::Member { obj, name } => Some((obj, name.clone())),
+                    Expr::Index { obj, index } => match &**index {
+                        Expr::Str(name) => Some((obj, name.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((obj, name)) = method {
                     self.gen_expr(obj, code)?; // receiver
                     let name_id = self
                         .rt
-                        .intern(name)
+                        .intern(&name)
                         .ok_or_else(|| CompileError("intern failed".into()))?;
                     if has_spread {
                         // 固定引数数をカウンタに設定 → spread 引数を展開 → MCallDyn
@@ -570,6 +579,20 @@ impl Compiler<'_> {
                         }
                         code.push(Op::MCallName { name: name_id, argc: args.len() as u8 });
                     }
+                } else if let Expr::Index { obj, index } = &**callee {
+                    // 計算済みキーのメソッド呼び出し `obj[expr](...)`（this=obj）。
+                    // `[obj, obj, expr]` → AGet で `[obj, method]` にし、MCall で呼ぶ。
+                    self.gen_expr(obj, code)?;
+                    code.push(Op::Dup);
+                    self.gen_expr(index, code)?;
+                    code.push(Op::AGet);
+                    for a in args {
+                        self.gen_expr(a, code)?;
+                    }
+                    if args.len() > u8::MAX as usize {
+                        return Err(CompileError("too many arguments".into()));
+                    }
+                    code.push(Op::MCall(args.len() as u8));
                 } else {
                     self.gen_expr(callee, code)?;
                     if has_spread {
@@ -1132,7 +1155,6 @@ impl Compiler<'_> {
                         .ok_or_else(|| CompileError("intern failed".into()))?;
                     let obj_id = self.rt.intern("Object").ok_or_else(|| CompileError("intern failed".into()))?;
                     code.push(Op::GLoad(obj_id)); // Object
-                    code.push(Op::Dup);
                     let keys_name = self.rt.intern("keys").ok_or_else(|| CompileError("intern failed".into()))?;
                     code.push(Op::PLoad(keys_name)); // Object.keys
                     code.push(Op::GLoad(tmp_obj)); // obj
@@ -1406,8 +1428,9 @@ impl Compiler<'_> {
                 code.push(Op::GStore(id));
             }
             Stmt::Switch { disc, cases } => {
-                // switch を if/else-if チェーンにコンパイル（=== 比較、break 前提で
-                // フォールスルー無し）。disc はグローバル一時に退避して各 case で比較。
+                // switch を if/else-if チェーンにコンパイル（=== 比較）。disc はグローバル
+                // 一時に退避して各 case で比較する。空本体の case（`case A: case B: body`）
+                // は次の case のラベルとしてマージし、JS のフォールスルーを再現する。
                 self.gen_expr(disc, code)?;
                 let tmp_id = self
                     .rt
@@ -1415,20 +1438,42 @@ impl Compiler<'_> {
                     .ok_or_else(|| CompileError("intern failed".into()))?;
                 code.push(Op::GStore(tmp_id));
 
-                // 各 case を「比較ヘッダ → 本体 → Jmp(end)」の順でインターリーブ生成する。
-                // 値 case の JmpF は「次の case のエントリ」（比較 or default body）へ。
-                // switch 内の `break` も end へ飛ばすため break_patches を積む。
-                let mut case_entries: Vec<usize> = Vec::new();
-                let mut jmpf_patches: Vec<(usize, usize)> = Vec::new(); // (case_index, patch_pos)
+                // 空本体の case を次の case のラベルへマージ（フォールスルー）。
+                let mut groups: Vec<(Vec<Option<Expr>>, Vec<Stmt>)> = Vec::new();
+                {
+                    let mut pending: Vec<Option<Expr>> = Vec::new();
+                    for (val, body) in cases {
+                        pending.push(val.clone());
+                        if !body.is_empty() {
+                            groups.push((std::mem::take(&mut pending), body.clone()));
+                        }
+                    }
+                    if !pending.is_empty() {
+                        groups.push((pending, Vec::new()));
+                    }
+                }
+
+                // 各グループを「比較ヘッダ（ラベル分 OR）→ 本体 → Jmp(end)」で生成する。
+                let mut group_entries: Vec<usize> = Vec::new();
+                let mut jmpf_patches: Vec<(usize, usize)> = Vec::new(); // (group_index, patch_pos)
                 let mut end_patches: Vec<usize> = Vec::new();
                 self.break_patches.push(Vec::new());
-                for (idx, (case_val, body)) in cases.iter().enumerate() {
-                    case_entries.push(code.len());
-                    if let Some(val_expr) = case_val {
+                for (gi, (labels, body)) in groups.iter().enumerate() {
+                    group_entries.push(code.len());
+                    let value_labels: Vec<&Expr> =
+                        labels.iter().filter_map(|l| l.as_ref()).collect();
+                    let has_default = labels.iter().any(|l| l.is_none());
+                    // 比較ヘッダ: disc===label0 || disc===label1 || ...
+                    for (i, val_expr) in value_labels.iter().enumerate() {
                         code.push(Op::GLoad(tmp_id));
                         self.gen_expr(val_expr, code)?;
                         code.push(Op::Seq);
-                        jmpf_patches.push((idx, code.len()));
+                        if i > 0 {
+                            code.push(Op::Or);
+                        }
+                    }
+                    if !value_labels.is_empty() && !has_default {
+                        jmpf_patches.push((gi, code.len()));
                         code.push(Op::JmpF(0)); // プレースホルダ
                     }
                     for s in body {
@@ -1445,9 +1490,9 @@ impl Compiler<'_> {
                 for b in &breaks {
                     code[*b] = Op::Jmp(end_pos as u32);
                 }
-                // 値 case の JmpF ターゲット = 「次の case」のエントリ（無ければ end）
-                for (case_idx, patch) in jmpf_patches {
-                    let target = case_entries.get(case_idx + 1).copied().unwrap_or(end_pos);
+                // 値グループの JmpF ターゲット = 「次のグループ」のエントリ（無ければ end）
+                for (gi, patch) in jmpf_patches {
+                    let target = group_entries.get(gi + 1).copied().unwrap_or(end_pos);
                     code[patch] = Op::JmpF(target as u32);
                 }
             }
@@ -2230,9 +2275,21 @@ fn collect_boxed_expr(expr: &Expr, outer: &HashSet<String>, boxed: &mut HashMap<
         Expr::Member { obj, .. } | Expr::MemberCompoundAssign { obj, .. } => {
             collect_boxed_expr(obj, outer, boxed);
         }
-        Expr::Index { obj, index } | Expr::IndexAssign { obj, index, .. } => {
+        // `obj.prop = function() {...}` の右辺（関数式）も捕捉変数を解析する
+        // （lodash の mixin が `lodash.prototype[m] = function() {...}` で
+        // `isTaker`/`checkIteratee` 等を捕捉するため必須）。
+        Expr::MemberAssign { obj, rhs, .. } => {
+            collect_boxed_expr(obj, outer, boxed);
+            collect_boxed_expr(rhs, outer, boxed);
+        }
+        Expr::Index { obj, index } => {
             collect_boxed_expr(obj, outer, boxed);
             collect_boxed_expr(index, outer, boxed);
+        }
+        Expr::IndexAssign { obj, index, rhs } => {
+            collect_boxed_expr(obj, outer, boxed);
+            collect_boxed_expr(index, outer, boxed);
+            collect_boxed_expr(rhs, outer, boxed);
         }
         Expr::Ternary { cond, then, else_ } => {
             collect_boxed_expr(cond, outer, boxed);

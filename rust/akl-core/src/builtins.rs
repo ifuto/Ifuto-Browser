@@ -20,7 +20,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use crate::bytecode::{Runtime, VmError};
+use crate::bytecode::{NativeFn, Runtime, VmError};
 use crate::obj::{Obj, ObjId};
 use crate::AklVal;
 
@@ -95,6 +95,15 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     install_regex_methods(rt)?;
     // Date（同期近似）
     install_date(rt)?;
+    // Error / TypeError / RangeError / SyntaxError（lodash の isError / attempt 用）
+    install_error_ctors(rt)?;
+    // WeakMap / WeakSet（lodash の isWeakMap / isWeakSet / metaMap 用）
+    install_weak_collections(rt)?;
+    // TypedArray / ArrayBuffer / DataView（lodash の isTypedArray / isArrayBuffer 用）
+    install_typed_arrays(rt)?;
+    // setTimeout / clearTimeout / setInterval / clearInterval（lodash の
+    // throttle / debounce / delay / defer 用。実行は近似として行わず ID のみ返す）
+    install_timers(rt)?;
 
     Ok(())
 }
@@ -104,6 +113,13 @@ fn str_of(rt: &Runtime, v: AklVal) -> String {
     if v.is_obj() {
         if let Some(Obj::Str(s)) = rt.heap.get(v.get_obj()) {
             return s.to_string();
+        }
+        if let Some(Obj::RegExp { pattern, flags }) = rt.heap.get(v.get_obj()) {
+            return format!("/{pattern}/{flags}");
+        }
+        // ROPE（文字列連結の遅延表現）は平坦化して返す。
+        if matches!(rt.heap.get(v.get_obj()), Some(Obj::Rope { .. })) {
+            return rt.flatten_str(v);
         }
     }
     String::new()
@@ -124,6 +140,22 @@ fn to_js_string(rt: &mut Runtime, v: AklVal) -> String {
     } else if v == AklVal::FALSE {
         "false".into()
     } else if v.is_obj() {
+        // 配列は join(",")（Array.prototype.toString 相当。`String([1,2]) === "1,2"`。
+        // undefined/null 要素は空文字）。
+        if let Some(Obj::Arr(items)) = rt.heap.get(v.get_obj()) {
+            let items = items.clone();
+            let parts: Vec<String> = items
+                .iter()
+                .map(|x| {
+                    if x.is_undef() || x.is_null() {
+                        String::new()
+                    } else {
+                        to_js_string(rt, *x)
+                    }
+                })
+                .collect();
+            return parts.join(",");
+        }
         str_of(rt, v)
     } else {
         "undefined".into()
@@ -145,7 +177,7 @@ fn to_number(rt: &Runtime, v: AklVal) -> f64 {
     } else if v == AklVal::FALSE {
         0.0
     } else if v.is_obj() {
-        str_of(rt, v).parse::<f64>().unwrap_or(f64::NAN)
+        crate::bytecode::js_str_to_number(&str_of(rt, v))
     } else {
         f64::NAN
     }
@@ -246,7 +278,7 @@ fn math_random(_rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, V
 
 fn parse_int(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let s = to_js_string(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
-    let s = s.trim();
+    let s = s.trim_start();
     // 先頭の符号
     let (neg, rest) = if let Some(r) = s.strip_prefix('-') {
         (true, r)
@@ -255,12 +287,31 @@ fn parse_int(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     } else {
         (false, s)
     };
-    let _ = neg;
-    let radix = a
+    // radix（0 / undefined / NaN は自動判定: 0x なら 16、それ以外 10）
+    let raw_radix = a
         .get(1)
-        .map(|r| to_number(rt, *r) as u32)
-        .unwrap_or(10);
-    let digits: String = rest.chars().take_while(|c| c.is_digit(radix)).collect();
+        .map(|r| to_number(rt, *r))
+        .unwrap_or(0.0);
+    let raw_radix = if raw_radix.is_nan() { 0.0 } else { raw_radix };
+    let radix = if raw_radix == 0.0 {
+        if rest.starts_with("0x") || rest.starts_with("0X") {
+            16
+        } else {
+            10
+        }
+    } else {
+        raw_radix as u32
+    };
+    if !(2..=36).contains(&radix) {
+        return Ok(AklVal::from_f64(f64::NAN));
+    }
+    // 0x プレフィックス（radix 16 のとき）を除去
+    let digits_src = if radix == 16 && (rest.starts_with("0x") || rest.starts_with("0X")) {
+        &rest[2..]
+    } else {
+        rest
+    };
+    let digits: String = digits_src.chars().take_while(|c| c.is_digit(radix)).collect();
     if digits.is_empty() {
         return Ok(AklVal::from_f64(f64::NAN));
     }
@@ -354,8 +405,18 @@ fn boolean_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
 
 /// `RegExp(pattern[, flags])` コンストラクタ。
 fn regexp_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let pattern = rt.flatten_str(a.first().copied().unwrap_or(AklVal::UNDEF));
-    let flags = rt.flatten_str(a.get(1).copied().unwrap_or(AklVal::UNDEF));
+    let pattern = to_js_string(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+    // flags は `reFlags.exec(regexp)` の結果（配列 ["gi"]）が渡される場合があるため、
+    // 配列なら先頭要素（マッチ文字列）を採用する（JS の `String(["gi"]) === "gi"`）。
+    let flags_val = a.get(1).copied().unwrap_or(AklVal::UNDEF);
+    let flags = if flags_val.is_obj() {
+        match rt.heap.get(flags_val.get_obj()) {
+            Some(Obj::Arr(items)) => to_js_string(rt, items.first().copied().unwrap_or(AklVal::UNDEF)),
+            _ => to_js_string(rt, flags_val),
+        }
+    } else {
+        to_js_string(rt, flags_val)
+    };
     let id = rt
         .heap
         .alloc(Obj::RegExp { pattern: pattern.into_boxed_str(), flags: flags.into_boxed_str() })
@@ -366,8 +427,11 @@ fn regexp_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
 /// `Symbol([desc])` コンストラクタ（一意値を返す簡易近似。well-known symbol は未対応）。
 fn symbol_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
     // 一意な文字列で近似（`typeof` が "symbol" にはならないが、lodash は `typeof Symbol`
-    // を環境判定に使うだけなので関数であれば十分）。
+    // を環境判定に使うだけなので関数であれば十分）。`\x01tag = "Symbol"` を付けて
+    // `_.isSymbol(Symbol("x"))` が `Object.prototype.toString` で true になるようにする。
     let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let tag = rt.intern("Symbol").ok_or(VmError::Oom)?;
+    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(tag)).map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
 
@@ -431,6 +495,7 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
     // Boolean
     rt.register_global_native("Boolean", boolean_ctor)?;
     // RegExp / Symbol / isFinite（lodash の環境判定・正規表現生成用）
+    rt.regexp_ctor = rt.register_native(regexp_ctor)?;
     rt.register_global_native("RegExp", regexp_ctor)?;
     rt.register_global_native("Symbol", symbol_ctor)?;
     rt.register_global_native("isFinite", is_finite)?;
@@ -439,6 +504,7 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
     let arr_id = rt.intern("Array").ok_or(VmError::Oom)?;
     let arr = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
     let ctor = rt.register_native(array_ctor)?;
+    rt.array_ctor = ctor;
     rt.heap
         .prop_set(arr, rt.ctor_name, ctor)
         .map_err(|_| VmError::Oom)?;
@@ -909,7 +975,7 @@ fn str_search(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
 fn str_split(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let s = this_str(rt, this);
     let sep = a.first().copied().unwrap_or(AklVal::UNDEF);
-    let parts: Vec<String> = if let Some((pattern, flags)) = regex_of(rt, sep) {
+    let mut parts: Vec<String> = if let Some((pattern, flags)) = regex_of(rt, sep) {
         let flag_num = flags_to_num(&flags);
         let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
         let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
@@ -924,6 +990,14 @@ fn str_split(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
             s.split(&needle).map(|p| p.to_string()).collect()
         }
     };
+    // limit 引数（`str.split(sep, limit)`。this=str, a=[sep, limit]）で先頭 limit 個に切り詰める。
+    let limit = a
+        .get(1)
+        .map(|v| to_number(rt, *v) as i64)
+        .unwrap_or(i64::MAX);
+    if limit >= 0 && (limit as usize) < parts.len() {
+        parts.truncate(limit as usize);
+    }
     let items: Vec<AklVal> = parts
         .iter()
         .map(|p| rt.intern(p).map(AklVal::mk_obj).unwrap_or(AklVal::UNDEF))
@@ -950,6 +1024,7 @@ fn install_array_methods(rt: &mut Runtime) -> Result<(), VmError> {
         ("shift", arr_shift),
         ("unshift", arr_unshift),
         ("join", arr_join),
+        ("toString", arr_to_string as crate::bytecode::NativeFn),
         ("concat", arr_concat),
         ("indexOf", arr_index_of),
         ("includes", arr_includes),
@@ -1024,9 +1099,38 @@ fn arr_pop(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmEr
 }
 fn arr_join(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let items = this_arr(rt, this);
-    let sep = a.first().map(|v| str_of(rt, *v)).unwrap_or_default();
-    let parts: Vec<String> = items.iter().map(|v| to_js_string(rt, *v)).collect();
+    // 区切り省略時は ","（JS の Array.prototype.join 既定）。
+    let sep = a.first().map(|v| str_of(rt, *v)).unwrap_or_else(|| ",".to_string());
+    // undefined/null 要素は空文字（JS の join 準拠）
+    let parts: Vec<String> = items
+        .iter()
+        .map(|v| {
+            if v.is_undef() || v.is_null() {
+                String::new()
+            } else {
+                to_js_string(rt, *v)
+            }
+        })
+        .collect();
     let s = parts.join(&sep);
+    let id = rt.intern(&s).ok_or(VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// `Array.prototype.toString()` = `join(",")`。
+fn arr_to_string(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let items = this_arr(rt, this);
+    let parts: Vec<String> = items
+        .iter()
+        .map(|v| {
+            if v.is_undef() || v.is_null() {
+                String::new()
+            } else {
+                to_js_string(rt, *v)
+            }
+        })
+        .collect();
+    let s = parts.join(",");
     let id = rt.intern(&s).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
@@ -1382,17 +1486,26 @@ fn install_map_set(rt: &mut Runtime) -> Result<(), VmError> {
     Ok(())
 }
 
-/// `Function.prototype.call` / `apply` を登録（lodash 等が `fn.call(thisArg, ...)` を使う）。
+/// `Function.prototype.call` / `apply` / `valueOf` を登録（lodash 等が
+/// `fn.call(thisArg, ...)` や `_.valueOf` を使う。`valueOf` は `Object.prototype`
+/// 由来だが、関数のプロパティ解決は func_methods までしか辿らない近似のため、
+/// ここにも登録して `typeof _.valueOf === "function"` を成立させる）。
 fn install_func_methods(rt: &mut Runtime) -> Result<(), VmError> {
     for (name, f) in [
         ("call", func_call as crate::bytecode::NativeFn),
         ("apply", func_apply),
+        ("valueOf", func_value_of as crate::bytecode::NativeFn),
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
         rt.func_methods.push((nid, v));
     }
     Ok(())
+}
+
+/// `Object.prototype.valueOf()`：`this` をそのまま返す。
+fn func_value_of(_rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(this)
 }
 
 /// `fn.call(thisArg, ...args)`：`this`（＝呼ばれる関数）を thisArg で呼ぶ。
@@ -1432,12 +1545,42 @@ fn gen_next(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmE
     Ok(AklVal::UNDEF)
 }
 
-fn map_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = rt.heap.alloc(Obj::Map(Vec::new())).map_err(|_| VmError::Oom)?;
+fn map_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let mut kv: Vec<(AklVal, AklVal)> = Vec::new();
+    // `new Map([[k,v], ...])` のイテラブル（配列の配列）を受け付ける。
+    if let Some(iterable) = a.first().copied() {
+        if iterable.is_obj() {
+            if let Some(Obj::Arr(pairs)) = rt.heap.get(iterable.get_obj()) {
+                for pair in pairs.iter() {
+                    if let Some(Obj::Arr(entry)) = pair.is_obj().then(|| rt.heap.get(pair.get_obj())).flatten() {
+                        let k = entry.first().copied().unwrap_or(AklVal::UNDEF);
+                        let v = entry.get(1).copied().unwrap_or(AklVal::UNDEF);
+                        if !kv.iter().any(|(ek, _)| *ek == k) {
+                            kv.push((k, v));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let id = rt.heap.alloc(Obj::Map(kv)).map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
-fn set_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = rt.heap.alloc(Obj::Set(Vec::new())).map_err(|_| VmError::Oom)?;
+fn set_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let mut items: Vec<AklVal> = Vec::new();
+    // `new Set([v, ...])` のイテラブル（配列）を受け付ける。
+    if let Some(iterable) = a.first().copied() {
+        if iterable.is_obj() {
+            if let Some(Obj::Arr(values)) = rt.heap.get(iterable.get_obj()) {
+                for v in values.iter() {
+                    if !items.contains(v) {
+                        items.push(*v);
+                    }
+                }
+            }
+        }
+    }
+    let id = rt.heap.alloc(Obj::Set(items)).map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
 fn promise_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
@@ -1702,38 +1845,49 @@ fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
 }
 
 /// 値の `Object.prototype.toString` タグ（`[object X]` の X）。
-fn object_tag(rt: &Runtime, v: AklVal) -> &'static str {
+fn object_tag(rt: &Runtime, v: AklVal) -> String {
     if v.is_int() || !v.is_tagged() {
-        return "Number";
+        return "Number".into();
     }
     if v.is_undef() {
-        return "Undefined";
+        return "Undefined".into();
     }
     if v.is_null() {
-        return "Null";
+        return "Null".into();
     }
     if v == AklVal::TRUE || v == AklVal::FALSE {
-        return "Boolean";
+        return "Boolean".into();
     }
     if v.is_obj() {
-        return match rt.heap.get(v.get_obj()) {
-            Some(Obj::Str(_)) | Some(Obj::Rope { .. }) => "String",
-            Some(Obj::Arr(_)) => "Array",
+        let tag = match rt.heap.get(v.get_obj()) {
+            Some(Obj::Str(_)) | Some(Obj::Rope { .. }) => "String".to_string(),
+            Some(Obj::Arr(_)) => "Array".to_string(),
             Some(Obj::Func { .. })
             | Some(Obj::Native(_))
             | Some(Obj::ForeignNative { .. })
-            | Some(Obj::BoundMethod { .. }) => "Function",
-            Some(Obj::Map(_)) => "Map",
-            Some(Obj::Set(_)) => "Set",
-            Some(Obj::Promise { .. }) => "Promise",
-            Some(Obj::RegExp { .. }) => "RegExp",
-            Some(Obj::Date { .. }) => "Date",
-            Some(Obj::BigInt(_)) => "BigInt",
-            Some(Obj::Handle { vtab, .. }) => vtab.tag,
-            _ => "Object",
+            | Some(Obj::BoundMethod { .. }) => "Function".to_string(),
+            Some(Obj::Map(_)) => "Map".to_string(),
+            Some(Obj::Set(_)) => "Set".to_string(),
+            Some(Obj::Promise { .. }) => "Promise".to_string(),
+            Some(Obj::RegExp { .. }) => "RegExp".to_string(),
+            Some(Obj::Date { .. }) => "Date".to_string(),
+            Some(Obj::BigInt(_)) => "BigInt".to_string(),
+            Some(Obj::Handle { vtab, .. }) => vtab.tag.to_string(),
+            Some(Obj::Obj(props)) => {
+                // `\x01tag` プロパティでタグ上書き（Error / WeakMap / TypedArray 等）
+                if let Some((_, tv)) = props.iter().find(|(n, _)| *n == rt.tag_name) {
+                    let s = rt.flatten_str(*tv);
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+                "Object".to_string()
+            }
+            _ => "Object".to_string(),
         };
+        return tag;
     }
-    "Object"
+    "Object".into()
 }
 
 /// `Object.prototype.toString.call(v)` → `[object X]`。
@@ -1812,7 +1966,7 @@ fn object_proto_property_is_enumerable(
     this: AklVal,
     a: &[AklVal],
 ) -> Result<AklVal, VmError> {
-    let key = rt.flatten_str(a.first().copied().unwrap_or(AklVal::UNDEF));
+    let key = to_js_string(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
     let key_id = rt.intern(&key).ok_or(VmError::Oom)?;
     let has = this.is_obj()
         && matches!(rt.heap.get(this.get_obj()), Some(Obj::Obj(props)) if props.iter().any(|(n, _)| *n == key_id && *n != rt.proto_name));
@@ -1825,7 +1979,7 @@ fn object_proto_has_own_property(
     this: AklVal,
     a: &[AklVal],
 ) -> Result<AklVal, VmError> {
-    let key = rt.flatten_str(a.first().copied().unwrap_or(AklVal::UNDEF));
+    let key = to_js_string(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
     let key_id = rt.intern(&key).ok_or(VmError::Oom)?;
     let has = this.is_obj()
         && matches!(rt.heap.get(this.get_obj()), Some(Obj::Obj(props)) if props.iter().any(|(n, _)| *n == key_id));
@@ -1835,7 +1989,15 @@ fn object_proto_has_own_property(
 /// プレーンオブジェクトのプロパティ列を取得。
 fn obj_props(rt: &Runtime, v: AklVal) -> Vec<(AklVal, AklVal)> {
     if v.is_obj() {
-        if let Some(Obj::Obj(props)) = rt.heap.get(v.get_obj()) {
+        // プレーンオブジェクトと関数オブジェクトの両方の own プロパティを列挙する
+        // （`Object.keys(lodash)` 等。lodash は関数なので `mixin(lodash, lodash)` が
+        // `keys(lodash)` でメソッド列を取得するのに必須）。
+        let props = match rt.heap.get(v.get_obj()) {
+            Some(Obj::Obj(props)) => Some(props),
+            Some(Obj::Func { props, .. }) => Some(props),
+            _ => None,
+        };
+        if let Some(props) = props {
             return props
                 .iter()
                 .map(|(n, val)| (AklVal::mk_obj(*n), *val))
@@ -2468,6 +2630,7 @@ fn install_date(rt: &mut Runtime) -> Result<(), VmError> {
     let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
     // constructor（new Date() / Date() 用のフォールバック解決対象）
     let ctor = rt.register_native(date_ctor)?;
+    rt.date_ctor = ctor;
     rt.heap
         .prop_set(obj, rt.ctor_name, ctor)
         .map_err(|_| VmError::Oom)?;
@@ -2561,6 +2724,256 @@ fn date_utc(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmErro
     Ok(AklVal::from_f64(
         days as f64 * 86_400_000.0 + ((h * 3600 + mi * 60 + s) as f64) * 1000.0 + msd,
     ))
+}
+
+/// Error / TypeError / RangeError / SyntaxError コンストラクタを登録する。
+/// 各 Error 系グローバルは「`constructor` プロパティにネイティブ ctor を持つ OBJ」で、
+/// `new Error(msg)` は `Op::New` の ctor_of フォールバックで解決される（Date と同型）。
+/// 生成インスタンスは `\x01tag` プロパティで `Object.prototype.toString` が
+/// `[object Error]` 等を返し、`[[Prototype]]` が対応コンストラクタの prototype を指す
+/// ため `instanceof` も成立する（lodash の isError / attempt 用）。
+fn install_error_ctors(rt: &mut Runtime) -> Result<(), VmError> {
+    let ctors: &[(&str, NativeFn)] = &[
+        ("Error", error_ctor_error),
+        ("TypeError", error_ctor_type_error),
+        ("RangeError", error_ctor_range_error),
+        ("SyntaxError", error_ctor_syntax_error),
+    ];
+    let ctor_k = rt.intern("constructor").ok_or(VmError::Oom)?;
+    let name_k = rt.intern("name").ok_or(VmError::Oom)?;
+    for (name, f) in ctors {
+        let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+        let ctor = rt.register_native(*f)?;
+        rt.heap.prop_set(obj, ctor_k, ctor).map_err(|_| VmError::Oom)?;
+        let name_id = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(obj, name_k, AklVal::mk_obj(name_id)).map_err(|_| VmError::Oom)?;
+        rt.global_set(name_id, AklVal::mk_obj(obj));
+    }
+    Ok(())
+}
+
+/// `new Error(msg)` 系の共通実装。`this`（`Op::New` が用意した [[Prototype]] 済み
+/// オブジェクト）に name / message / toString / `\x01tag` を設定して返す。
+fn error_ctor_impl(rt: &mut Runtime, this: AklVal, a: &[AklVal], name: &str) -> Result<AklVal, VmError> {
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?
+    };
+    let name_id = rt.intern(name).ok_or(VmError::Oom)?;
+    let name_k = rt.intern("name").ok_or(VmError::Oom)?;
+    let msg_k = rt.intern("message").ok_or(VmError::Oom)?;
+    rt.heap.prop_set(id, name_k, AklVal::mk_obj(name_id)).map_err(|_| VmError::Oom)?;
+    let msg = a.first().copied().filter(|v| !v.is_undef()).unwrap_or(AklVal::UNDEF);
+    rt.heap.prop_set(id, msg_k, msg).map_err(|_| VmError::Oom)?;
+    // `\x01tag` = name（Object.prototype.toString が [object Error] 等を返す）
+    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(name_id)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+fn error_ctor_error(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    error_ctor_impl(rt, this, a, "Error")
+}
+fn error_ctor_type_error(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    error_ctor_impl(rt, this, a, "TypeError")
+}
+fn error_ctor_range_error(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    error_ctor_impl(rt, this, a, "RangeError")
+}
+fn error_ctor_syntax_error(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    error_ctor_impl(rt, this, a, "SyntaxError")
+}
+
+/// WeakMap / WeakSet の最小実装（lodash の isWeakMap / isWeakSet / metaMap 用）。
+/// 実体は `\x01tag` 付き OBJ。WeakMap は get/set/has/delete を文字列キー近似で持つ。
+fn install_weak_collections(rt: &mut Runtime) -> Result<(), VmError> {
+    // WeakMap（コンストラクタ + get/set/has/delete）
+    let wm_ctor = rt.register_native(weakmap_ctor)?;
+    rt.register_global_native("WeakMap", weakmap_ctor)?;
+    // WeakSet（タグ付き OBJ のみ）
+    let _ = wm_ctor;
+    rt.register_global_native("WeakSet", weakset_ctor)?;
+    Ok(())
+}
+
+/// WeakMap コンストラクタ。タグ付き OBJ を返す（get/set/has/delete は自身に実装）。
+fn weakmap_ctor(rt: &mut Runtime, _this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let tag = rt.intern("WeakMap").ok_or(VmError::Oom)?;
+    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(tag)).map_err(|_| VmError::Oom)?;
+    // get/set/has/delete（lodash の metaMap = new WeakMap 用。文字列キー近似）
+    for (name, f) in [
+        ("get", weakmap_get as NativeFn),
+        ("set", weakmap_set as NativeFn),
+        ("has", weakmap_has as NativeFn),
+        ("delete", weakmap_delete as NativeFn),
+    ] {
+        let v = rt.register_native(f)?;
+        let nid = rt.intern(name).ok_or(VmError::Oom)?;
+        rt.heap.prop_set(id, nid, v).map_err(|_| VmError::Oom)?;
+    }
+    Ok(AklVal::mk_obj(id))
+}
+
+/// WeakMap の内部データ OBJ（`\x01data` プロパティ。文字列キー → 値）。
+fn weakmap_data(rt: &mut Runtime, this: AklVal) -> Option<ObjId> {
+    let self_id = this.get_obj();
+    let dn = rt.intern("\x01data")?;
+    if let Some(v) = rt.heap.prop_get(self_id, dn) {
+        if v.is_obj() {
+            return Some(v.get_obj());
+        }
+    }
+    let o = rt.heap.alloc(Obj::Obj(Vec::new())).ok()?;
+    rt.heap.prop_set(self_id, dn, AklVal::mk_obj(o)).ok()?;
+    Some(o)
+}
+
+/// キーを intern 済み文字列 ObjId に変換。文字列キーのみ対応（関数等のオブジェクト
+/// キーは C エンジン同様に実質 no-op = None）。lodash の `metaMap = new WeakMap` は
+/// 関数キーで get/set するが、C エンジンでも非インターン文字列化により no-op に
+/// なっており（実測確認済み）、`getData`/`setData` が常に undefined を返す挙動に
+/// 一致させる。
+fn weakmap_key(rt: &mut Runtime, key: AklVal) -> Option<ObjId> {
+    if !key.is_obj() {
+        let s = to_js_string(rt, key);
+        return rt.intern(&s);
+    }
+    match rt.heap.get(key.get_obj()) {
+        Some(Obj::Str(_)) | Some(Obj::Rope { .. }) => {
+            let s = to_js_string(rt, key);
+            rt.intern(&s)
+        }
+        _ => None,
+    }
+}
+
+fn weakmap_get(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let Some(d) = weakmap_data(rt, this) else { return Ok(AklVal::UNDEF) };
+    let Some(kid) = weakmap_key(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) else {
+        return Ok(AklVal::UNDEF);
+    };
+    Ok(rt.heap.prop_get(d, kid).unwrap_or(AklVal::UNDEF))
+}
+fn weakmap_set(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let Some(d) = weakmap_data(rt, this) else { return Ok(AklVal::UNDEF) };
+    let Some(kid) = weakmap_key(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) else {
+        return Ok(this);
+    };
+    let val = a.get(1).copied().unwrap_or(AklVal::UNDEF);
+    rt.heap.prop_set(d, kid, val).map_err(|_| VmError::Oom)?;
+    Ok(this)
+}
+fn weakmap_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let Some(d) = weakmap_data(rt, this) else { return Ok(AklVal::FALSE) };
+    let Some(kid) = weakmap_key(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) else {
+        return Ok(AklVal::FALSE);
+    };
+    Ok(AklVal::from_bool(rt.heap.prop_get(d, kid).is_some()))
+}
+fn weakmap_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    let Some(d) = weakmap_data(rt, this) else { return Ok(AklVal::FALSE) };
+    let Some(kid) = weakmap_key(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) else {
+        return Ok(AklVal::FALSE);
+    };
+    let mut deleted = false;
+    if let Some(Obj::Obj(props)) = rt.heap.get_mut(d) {
+        if let Some(pos) = props.iter().position(|(n, _)| *n == kid) {
+            props.remove(pos);
+            deleted = true;
+        }
+    }
+    Ok(AklVal::from_bool(deleted))
+}
+
+/// WeakSet コンストラクタ。タグ付き OBJ を返す（lodash の isWeakSet 用）。
+fn weakset_ctor(rt: &mut Runtime, _this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let tag = rt.intern("WeakSet").ok_or(VmError::Oom)?;
+    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(tag)).map_err(|_| VmError::Oom)?;
+    Ok(AklVal::mk_obj(id))
+}
+
+/// TypedArray / ArrayBuffer / DataView コンストラクタ（lodash の isTypedArray /
+/// isArrayBuffer 用のタグ付き OBJ。実体は空で、要素アクセスは非対応）。
+fn install_typed_arrays(rt: &mut Runtime) -> Result<(), VmError> {
+    let idx = rt.register_foreign_native(typed_array_foreign)?;
+    for (i, tag) in TYPED_ARRAY_TAGS.iter().enumerate() {
+        let fid = rt
+            .heap
+            .alloc(Obj::ForeignNative { idx, data: i as u64 })
+            .map_err(|_| VmError::Oom)?;
+        let gid = rt.intern(tag).ok_or(VmError::Oom)?;
+        rt.global_set(gid, AklVal::mk_obj(fid));
+    }
+    Ok(())
+}
+
+/// TypedArray タグの静的テーブル（`Obj::ForeignNative.data` がこの index を指す）。
+const TYPED_ARRAY_TAGS: &[&str] = &[
+    "Uint8Array",
+    "Uint16Array",
+    "Uint32Array",
+    "Int8Array",
+    "Int16Array",
+    "Int32Array",
+    "Float32Array",
+    "Float64Array",
+    "Uint8ClampedArray",
+    "ArrayBuffer",
+    "DataView",
+];
+
+/// ForeignNative 経由の TypedArray コンストラクタ（data = タグ index）。
+fn typed_array_foreign(
+    rt: &mut Runtime,
+    _this: AklVal,
+    a: &[AklVal],
+    data: u64,
+) -> Result<AklVal, VmError> {
+    let tag = TYPED_ARRAY_TAGS.get(data as usize).copied().unwrap_or("Object");
+    typed_array_ctor(rt, _this, a, tag)
+}
+
+/// TypedArray / ArrayBuffer コンストラクタの共通実装。タグ付き OBJ + `.length`。
+fn typed_array_ctor(rt: &mut Runtime, _this: AklVal, a: &[AklVal], tag: &str) -> Result<AklVal, VmError> {
+    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let tag_id = rt.intern(tag).ok_or(VmError::Oom)?;
+    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(tag_id)).map_err(|_| VmError::Oom)?;
+    if tag != "ArrayBuffer" {
+        let len = to_number(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
+        if len >= 0.0 && len <= 0x7FFF_FFFF as f64 {
+            rt.heap.prop_set(id, rt.length_id, AklVal::mk_int(len as i32)).map_err(|_| VmError::Oom)?;
+        }
+    }
+    Ok(AklVal::mk_obj(id))
+}
+
+/// setTimeout / setInterval / clearTimeout / clearInterval を登録する。
+/// 実行は近似として行わない（eval 完了後のドレインを持たない）が、lodash の
+/// throttle / debounce / delay / defer は「関数呼び出しが数字 ID を返す」ことと
+/// 「leadingEdge の同期実行」に依存するため、ID 発行だけ実装する。
+fn install_timers(rt: &mut Runtime) -> Result<(), VmError> {
+    rt.register_global_native("setTimeout", set_timeout)?;
+    rt.register_global_native("setInterval", set_timeout)?;
+    rt.register_global_native("clearTimeout", clear_timeout)?;
+    rt.register_global_native("clearInterval", clear_timeout)?;
+    Ok(())
+}
+
+/// `setTimeout(fn, ms)` → タイマー ID（数字）。fn は関数でなければ TypeError。
+fn set_timeout(rt: &mut Runtime, _this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+    if a.is_empty() || !a[0].is_obj() || !matches!(rt.heap.get(a[0].get_obj()), Some(Obj::Func { .. }) | Some(Obj::Native(_)) | Some(Obj::ForeignNative { .. })) {
+        let msg = rt.intern("TypeError: not a function").unwrap_or(0);
+        return Err(VmError::Thrown(AklVal::mk_obj(msg)));
+    }
+    rt.timer_id = rt.timer_id.wrapping_add(1);
+    Ok(AklVal::mk_int(rt.timer_id as i32))
+}
+
+/// `clearTimeout(id)` → no-op（実行しない近似）。
+fn clear_timeout(_rt: &mut Runtime, _this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+    Ok(AklVal::UNDEF)
 }
 
 fn date_get_time(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {

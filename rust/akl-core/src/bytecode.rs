@@ -437,10 +437,22 @@ pub struct Runtime {
     pub size_id: ObjId,
     /// `constructor` プロパティ名の ObjId（コンストラクタ解決フォールバック用）。
     pub ctor_name: ObjId,
+    /// `Array` コンストラクタ（`[].constructor` の解決用。install_builtins で設定）。
+    pub array_ctor: AklVal,
+    /// `Date` コンストラクタ（`date.constructor` の解決用）。
+    pub date_ctor: AklVal,
+    /// `RegExp` コンストラクタ（`regexp.constructor` の解決用）。
+    pub regexp_ctor: AklVal,
     /// `\x00proto` プロパティ名の ObjId（プロトタイプチェーン用。C の `proto_name` 相当）。
     pub proto_name: ObjId,
+    /// `\x01tag` プロパティ名の ObjId（Object.prototype.toString のタグ上書き用。
+    /// Error / WeakMap / WeakSet / TypedArray 等のタグ付け）。
+    pub tag_name: ObjId,
     /// 関数 → prototype オブジェクト（C の `fn_protos` 相当。new/instanceof 用）。
     pub fn_protos: Vec<(ObjId, ObjId)>,
+    /// `setTimeout` のタイマー ID カウンタ（lodash の throttle/debounce 用。実行は
+    /// 近似として行わないが、呼び出しは数字 ID を返す）。
+    pub timer_id: u32,
 }
 
 impl Runtime {
@@ -453,6 +465,8 @@ impl Runtime {
         rt.size_id = rt.intern("size").unwrap_or(0);
         // `\x00proto` プロパティ名（プロトタイプチェーン）。
         rt.proto_name = rt.intern("\x00proto").unwrap_or(0);
+        // `\x01tag` プロパティ名（Object.prototype.toString のタグ上書き用）
+        rt.tag_name = rt.intern("\x01tag").unwrap_or(0);
         // `constructor` プロパティ名（コンストラクタ解決フォールバック用）。
         rt.ctor_name = rt.intern("constructor").unwrap_or(0);
         // 命令バジェット既定（C の insn_budget_def = 10M と同値）。
@@ -558,7 +572,7 @@ impl Runtime {
     /// プロパティ解決（ハンドル以外。`PLoad` / `MCallName` の共通部）。
     /// 文字列・配列の `length` と各プロトタイプメソッド、Map/Set/Date メソッド、
     /// プレーンオブジェクトの proto チェーンをこの順で解決する。無ければ UNDEF。
-    fn prop_load(&self, id: ObjId, name: ObjId) -> AklVal {
+    fn prop_load(&mut self, id: ObjId, name: ObjId) -> AklVal {
         if let Some(Obj::Str(s)) = self.heap.get(id) {
             if name == self.length_id {
                 return AklVal::mk_int(s.chars().count() as i32);
@@ -570,9 +584,24 @@ impl Runtime {
                 .map(|(_, v)| *v)
                 .unwrap_or(AklVal::UNDEF);
         }
+        // ROPE（文字列連結の遅延表現）も文字列として扱う（`"a"+"b"` の .split 等）。
+        if let Some(Obj::Rope { .. }) = self.heap.get(id) {
+            if name == self.length_id {
+                return AklVal::mk_int(self.flatten_str(AklVal::mk_obj(id)).chars().count() as i32);
+            }
+            return self
+                .str_methods
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF);
+        }
         if let Some(Obj::Arr(items)) = self.heap.get(id) {
             if name == self.length_id {
                 return AklVal::mk_int(items.len() as i32);
+            }
+            if name == self.ctor_name && !self.array_ctor.is_undef() {
+                return self.array_ctor;
             }
             return self
                 .arr_methods
@@ -604,6 +633,9 @@ impl Runtime {
                 .unwrap_or(AklVal::UNDEF);
         }
         if let Some(Obj::Date { .. }) = self.heap.get(id) {
+            if name == self.ctor_name && !self.date_ctor.is_undef() {
+                return self.date_ctor;
+            }
             return self
                 .date_methods
                 .iter()
@@ -611,7 +643,20 @@ impl Runtime {
                 .map(|(_, v)| *v)
                 .unwrap_or(AklVal::UNDEF);
         }
-        if let Some(Obj::RegExp { .. }) = self.heap.get(id) {
+        if let Some(Obj::RegExp { pattern, flags }) = self.heap.get(id) {
+            if name == self.ctor_name && !self.regexp_ctor.is_undef() {
+                return self.regexp_ctor;
+            }
+            let nm = self.flatten_str(AklVal::mk_obj(name));
+            if nm == "source" {
+                return self.intern(&pattern.clone()).map(AklVal::mk_obj).unwrap_or(AklVal::UNDEF);
+            }
+            if nm == "flags" {
+                return self.intern(&flags.clone()).map(AklVal::mk_obj).unwrap_or(AklVal::UNDEF);
+            }
+            if nm == "lastIndex" {
+                return AklVal::mk_int(0);
+            }
             return self
                 .regex_methods
                 .iter()
@@ -763,6 +808,24 @@ impl Runtime {
         let proto = self.heap.alloc(Obj::Obj(Vec::new())).ok()?;
         self.fn_protos.push((fid, proto));
         Some(proto)
+    }
+
+    /// メソッド呼び出しの `this` を決定する（C の `OP_MCALL` の `mcall_common` 相当）。
+    ///
+    /// C エンジンは「関数オブジェクトの独自プロパティをメソッドとして呼ぶ」場合、
+    /// レシーバスロットをメソッド自身に置き換える（`stk[..] = uf; ov = uf`）ため、
+    /// `this` がメソッド自身になる。lodash の `_.noConflict()` がこれに依存する
+    /// （`root._ === this` を満たさず、グローバル `_` を消さない）。
+    /// Function メソッド（`call`/`apply`/`valueOf`）は独自プロパティではないため、
+    /// 従来どおり `this` = レシーバのまま。
+    fn mcall_this(&self, receiver: AklVal, method: AklVal, name: ObjId) -> AklVal {
+        if receiver.is_obj()
+            && matches!(self.heap.get(receiver.get_obj()), Some(Obj::Func { .. }))
+            && self.heap.prop_get(receiver.get_obj(), name).is_some()
+        {
+            return method;
+        }
+        receiver
     }
 
     /// コンストラクタ解決: callee が `Obj::Obj` で `constructor` プロパティ
@@ -1196,13 +1259,15 @@ impl Runtime {
                             }
                         }
                     }
-                    // 通常オブジェクト: プロパティを解決して this=receiver で呼ぶ
+                    // 通常オブジェクト: プロパティを解決して呼ぶ（関数の独自プロパティ
+                    // メソッドは this=メソッド自身。C の OP_MCALL 相当）。
                     let method = if receiver.is_obj() {
                         self.prop_load(receiver.get_obj(), name)
                     } else {
                         AklVal::UNDEF
                     };
-                    match self.do_call(&mut frames, &mut pc, method, receiver, &args) {
+                    let this_v = self.mcall_this(receiver, method, name);
+                    match self.do_call(&mut frames, &mut pc, method, this_v, &args) {
                         Ok(Some(r)) => {
                             stack.push(r);
                             pc += 1;
@@ -1261,7 +1326,8 @@ impl Runtime {
                     } else {
                         AklVal::UNDEF
                     };
-                    match self.do_call(&mut frames, &mut pc, method, receiver, &args) {
+                    let this_v = self.mcall_this(receiver, method, name);
+                    match self.do_call(&mut frames, &mut pc, method, this_v, &args) {
                         Ok(Some(r)) => {
                             stack.push(r);
                             pc += 1;
@@ -1542,6 +1608,10 @@ impl Runtime {
                     // プレーンオブジェクトは setter アクセサ対応
                     if matches!(self.heap.get(id), Some(Obj::Obj(_))) {
                         self.obj_prop_store(id, name, val)?;
+                    } else if matches!(self.heap.get(id), Some(Obj::RegExp { .. }) | Some(Obj::Date { .. })) {
+                        // RegExp / Date の追加プロパティ（`lastIndex` 等）は簡易近似として
+                        // 保持しない（読み書きしてもエラーにしない）。lodash の cloneRegExp
+                        // 等が `result.lastIndex = ...` を実行するため。
                     } else {
                         self.heap
                             .prop_set(id, name, val)
@@ -1777,7 +1847,9 @@ impl Runtime {
                     let mut r = false;
                     if f.is_obj() && obj.is_obj() {
                         // f の prototype を取得（f が Obj なら "prototype" プロパティ、
-                        // f が Func/Native なら fn_protos テーブル）
+                        // f が Func/Native なら fn_protos テーブル）。OBJ コンストラクタ
+                        // （Error / TypeError 等）は ctor_of で constructor ネイティブへ解決。
+                        let f = self.ctor_of(f);
                         let f_proto = self.func_proto(f);
                         if let Some(fp) = f_proto {
                             // obj の [[Prototype]] チェーンを辿って fp と比較
@@ -2191,6 +2263,16 @@ impl Runtime {
         if self.is_number(a) && self.is_string(b) {
             return self.to_number(a) == self.str_to_num(b);
         }
+        // オブジェクト vs 文字列: オブジェクトを ToString して比較（V8 準拠。
+        // lodash の equalByTag が `/a/g == (other + '')` で RegExp を比較する）。
+        if self.is_string(b) && a.is_obj() && !self.is_string(a) {
+            let sa = self.stringify(a).map(|id| self.flatten_str(AklVal::mk_obj(id))).unwrap_or_default();
+            return sa == self.str_slice(b);
+        }
+        if self.is_string(a) && b.is_obj() && !self.is_string(b) {
+            let sb = self.stringify(b).map(|id| self.flatten_str(AklVal::mk_obj(id))).unwrap_or_default();
+            return self.str_slice(a) == sb;
+        }
         // 真偽値同士
         if self.is_bool(a) && self.is_bool(b) {
             return a == b;
@@ -2287,7 +2369,9 @@ impl Runtime {
             0.0
         } else if v.is_obj() {
             match self.heap.get(v.get_obj()) {
-                Some(Obj::Str(s)) => s.parse::<f64>().unwrap_or(f64::NAN),
+                Some(Obj::Str(s)) => js_str_to_number(s),
+                // ROPE（文字列連結の遅延表現）も平坦化して数値化
+                Some(Obj::Rope { .. }) => js_str_to_number(&self.flatten_str(v)),
                 // Date は valueOf（エポック ms）に数値化
                 Some(Obj::Date { ms }) => *ms,
                 // BigInt は数値化（`==` 比較・単項 `+` 等）
@@ -2322,9 +2406,26 @@ impl Runtime {
                     let flat = self.flatten_str(v);
                     return self.intern(&flat).ok_or(VmError::Oom);
                 }
-                Some(Obj::Arr(_)) => "[object Array]".into(),
+                // 配列は join(",")（Array.prototype.toString 相当。`String([1,2])==="1,2"`、
+                // `[1,2,undefined]` は `"1,2,"`。undefined/null 要素は空文字）。
+                Some(Obj::Arr(items)) => {
+                    let items = items.clone();
+                    let mut parts = Vec::with_capacity(items.len());
+                    for it in &items {
+                        if it.is_undef() || it.is_null() {
+                            parts.push(String::new());
+                        } else {
+                            let kid = self.stringify(*it)?;
+                            parts.push(self.flatten_str(AklVal::mk_obj(kid)));
+                        }
+                    }
+                    parts.join(",")
+                }
                 Some(Obj::Date { ms }) => date_to_string(*ms),
                 Some(Obj::BigInt(x)) => x.to_string(),
+                // RegExp の ToString = "/source/flags"（V8 準拠。lodash の
+                // equalByTag が `/a/g == (other + '')` で RegExp を比較する）。
+                Some(Obj::RegExp { pattern, flags }) => format!("/{pattern}/{flags}"),
                 Some(Obj::Handle { vtab, .. }) => format!("[object {}]", vtab.tag),
                 Some(Obj::BoundMethod { .. }) => "[object Function]".into(),
                 _ => "[object Object]".into(),
@@ -2419,7 +2520,7 @@ impl Runtime {
 
     /// 文字列値を数値化（パース失敗は NaN）。
     fn str_to_num(&self, v: AklVal) -> f64 {
-        self.str_slice(v).parse::<f64>().unwrap_or(f64::NAN)
+        js_str_to_number(&self.str_slice(v))
     }
 
     /// 配列へ要素を設定（範囲拡張を伴う。C の `OP_ASET` 相当）。
@@ -2507,6 +2608,22 @@ enum Arith {
 /// f64 の JS 風文字列化（整数は小数点なし、NaN/Infinity は JS 表記）。公開版。
 pub fn fmt_num_pub(d: f64) -> String {
     fmt_num(d)
+}
+
+/// JS の `Number(str)` 相当（C の `akl_str_to_number` 相当）。
+/// 前後空白を除き、空なら 0.0。パース失敗は NaN。`+"" === 0` を実現する。
+pub fn js_str_to_number(s: &str) -> f64 {
+    let t = s.trim();
+    if t.is_empty() {
+        return 0.0;
+    }
+    if t == "Infinity" || t == "+Infinity" {
+        return f64::INFINITY;
+    }
+    if t == "-Infinity" {
+        return f64::NEG_INFINITY;
+    }
+    t.parse::<f64>().unwrap_or(f64::NAN)
 }
 
 /// f64 の JS 風文字列化（整数は小数点なし、NaN/Infinity は JS 表記）。
