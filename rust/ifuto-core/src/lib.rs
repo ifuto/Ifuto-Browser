@@ -47,3 +47,6 @@ pub mod charset;
 
 /// 文字コード変換表（`tools/gen_charset.py` 生成。C の `charset_tables_gen.h` 相当）。
 pub mod charset_tables;
+
+/// 拡張 manifest パーサ（C の `ext_manifest.c` 相当。純粋関数のみ）。
+pub mod ext_manifest;

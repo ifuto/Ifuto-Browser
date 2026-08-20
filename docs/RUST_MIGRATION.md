@@ -644,3 +644,21 @@ Aklus（JS エンジン）の移行（フェーズ 0〜6）が完了したため
   を確認**（クロスチェック用ダンプを一時生成して diff。コミット対象外）。
 - `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 14 =
   162 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+### フェーズ 8-c: 拡張 manifest パーサ（ext_manifest）
+
+- `ext_manifest` モジュール: 行ベース `key: value` の純粋パーサを移植。文法（E1 凍結）:
+  空行/コメントスキップ・前後トリム・CRLF 救済・key 完全一致・重複失敗・name/version/
+  entry の charset 検証・permissions 単一効果・64KB 上限・必須キー検証。
+- C の `char name[64]` 固定配列 + `char *err` 書き込み先を、`Manifest { name: String, ... }`
+  + `Result<_, String>` に置換。バッファ長の手動管理・NUL 終端・err 境界検査が構造的に消える。
+- エラー文言（`manifest: line N: ...`）は ext_smoke.py の golden 行と一致するよう C と
+  完全同一に維持。
+
+検証:
+- **差分 fuzz**: 典型 27 件 + ランダム 20,000 件の manifest 入力に対し、C と Rust の
+  出力（成功/失敗 + フィールド + エラー文言）を突合し **0 不一致**。
+- fuzz_ext.c の機械不変条件（成功 ⇒ フィールド非空・cap 内、失敗 ⇒ 理由非空、
+  決定性）を Rust テストとして再現。
+- `cargo test --offline --workspace`（ifuto-core 31 件 = 合計 179 件）緑、
+  `cargo clippy --offline --workspace -- -D warnings` 緑。
