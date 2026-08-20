@@ -1,0 +1,13 @@
+[package]
+name = "ifuto-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Ifuto Browser 本体（HTML/DOM/CSS/レイアウト等）の Rust 移行コア。C 実装 src/*.c（src/akl を除く）からの段階移行"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]

@@ -591,3 +591,36 @@ inc/dec の e2e が通る。
 - **FFI の unsafe**: 最小限にし、境界（翻訳単位）を 1 ファイルに集約して監査
 - **完全移行の期間**: 数ヶ月規模。各フェーズを独立コミットで進め、途中で C が
   動き続ける状態を維持（段階的移行）
+
+## フェーズ 8（進行中）: ブラウザ本体の Rust 移行
+
+Aklus（JS エンジン）の移行（フェーズ 0〜6）が完了したため、次はブラウザ本体
+（`src/*.c` のうち `src/akl/` を除く約 15k 行）を Rust へ移行する。クレートは
+`rust/ifuto-core`（`#![forbid(unsafe_code)]` を維持）。方針は Aklus 移行と同一:
+
+- **1 モジュール = 1 検証ゲート**。C 実装を回帰オラクルに並走させ、入出力を
+  突合してから差し替える。各 Rust モジュールは C の単体テスト（`tests/test_*.c`）
+  と同一の期待値を Rust テストとして再現し、加えて全数走査で表外セルの安全性を
+  機械的に証明する。
+- **葉モジュールから順に**: 依存が少ない純粋関数（文字コード層・arena）から
+  始め、DOM / HTML パーサ / レイアウトへと進む。
+
+### フェーズ 8-a: 基盤 + 文字コード層（utf8 / strutil / common）
+
+- `rust/ifuto-core` クレートを新設し、ワークスペースに追加。
+- `common`（ハードリミット + `fatal` = fail-fast パニック）、`strutil`
+  （`IfStr` = `&[u8]` スライス。`str_eq`/`str_eq_ci`/`trim`/`contains` 等）、
+  `utf8`（`decode`/`encode`/`glyph_width`/`band_w2`）を移植。
+- C 実装で手動管理していた「ポインタ + 長さ」と境界検査を `&[u8]` スライスに
+  置き換え、OOB 読み・dangling・NUL 終端の誤仮定を構造的に排除。
+
+検証:
+- `cargo test --offline --workspace`: ifuto-core 8 件（akl-core 142 + akl-ffi 6 と
+  併せて 156 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+- C オラクル `tests/test_utf8.c`（29 checks）を 1:1 で Rust に再現
+  （`utf8::tests::oracle_mirrors_c`）。
+- 全数走査: `encode` の全コードポイント往復（0..=0x10FFFF）、`band_w2` の
+  3 バイト全域（E0..EF × 256 × 256）で「真 ⟹ decode 成功 ∧ 幅 2」を機械証明。
+
+残り: `charset`（Shift_JIS/EUC-JP 変換。生成表 1467 行）→ `arena` →
+`html_tok`/`html_tree` → DOM/CSS/レイアウト → 最後に `ifuto-ffi` で C 側と差し替え。
