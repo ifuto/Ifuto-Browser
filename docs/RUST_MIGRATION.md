@@ -1251,6 +1251,50 @@ C のモジュール静的グローバル（`g_arena` / `g_dom` / `g_log`）と�
 統合は chrome（`chrome.c` 603、タブ状態機械）・net ソケット（`net.c`）・TLS ソケット
 （`tls.c`、BearSSL 置換）のみ。
 
+### フェーズ 8-x: TLS CA ロード（ca_load_pem + ta_add）— X.509 トラストアンカー抽出
+
+`tls.c` の **CA ロード層**（`ca_load_pem` / `ta_add`）を移植した。PEM バンドルから証明書を
+抽出し、DER 証明書から subject DN + SPKI 公開鍵（トラストアンカー）を BearSSL の
+`br_x509_decoder` と同一の規則で抜き出す。
+
+- **`b64_decode`**（既存）+ **`ca_load_pem(pem) -> Vec<Vec<u8>>`**: `-----BEGIN
+  CERTIFICATE-----` / `-----END CERTIFICATE-----` の組を走査し、間の base64 を復号。
+  破損証明書は無視（C と同じく 1 枚でも成功すれば前進）。
+- **`ta_add(der) -> Option<TrustAnchor>`**: 最小 DER/ASN.1 リーダで X.509 構造を解析。
+  `Certificate → tbsCertificate → [version] / serialNumber / signature / issuer /
+  validity / subject / SPKI / [1][2][3] extensions / signatureAlgorithm /
+  signatureValue` の全構文を検証し、subject Name の DER 全体（DN）と公開鍵
+  （RSA `n`/`e`、EC `curve`/`q`）を抽出。
+- **`TrustAnchor` / `Pkey`**: 自己完結の正規化表現（DN + SPKI）。rustls の
+  `TrustAnchor` も DN + SPKI を要求するため、TLS バックエンド非依存。
+
+**BearSSL の `br_x509_decoder` の全検証を忠実再現**（差分 fuzz が byte 一致で担保）:
+
+- version 0..2 のみ（`read-small-int-value`。先頭バイト < 0x80）。
+- validity の日付検証（`read-date`: UTCTime/GeneralizedTime の書式・月/日/時/分/秒
+  範囲・うるう年・小数秒・`Z` 終端）。
+- extensions の構造検証 + **basicConstraints**（`SEQUENCE { BOOLEAN OPTIONAL }`）の
+  内容検証。
+- 入れ子長さの親構造はみ出し（`open-elt` の `lim < length`）・末尾余分バイト・不定長
+  （0x80）・拡張タグ（31）・application/private クラスの拒否。
+- RSA は `RSAPublicKey`（先頭 0 剥ぎ）、EC は `id-ecPublicKey` + 曲線 OID（P-256/384/521）。
+
+検証:
+
+- **差分 fuzz**: システム CA バンドル（`/etc/ssl/certs/ca-certificates.crt`）の実
+  143 枚 + 切断 20,000 + 変異 20,000 + ランダムゴミ 20,000 = **60,143 件**で C
+  （BearSSL `br_x509_decoder`）と Rust `ta_add` の出力（成功/失敗 + DN + 鍵）を突合し
+  **0 不一致**（byte 一致）。切断/変異 fuzz が validity 日付検証・basicConstraints・
+  入れ子長さ検査の各経路を炙り出し、順に修正した。
+- 単体テスト 7 件（b64 基本/空白/NUL/拒否、ca_load_pem 抽出、ta_add ゴミ/日付必須）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 171 +
+  ifuto-ffi 6 = 325 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+残る最終統合は chrome（`chrome.c` 603、タブ状態機械）・net ソケット（`net.c` の
+`connect_one`/`send_all`/`fetch_once`/`if_http_get(_ex)`）・TLS ソケット（`tls.c` の
+`if_tls_client` 等、BearSSL 置換）。**TLS ソケットは TLS ライブラリ選定（rustls 等）が
+必要で、オフライン環境では外部クレートを取得できないため、設計判断待ち**。
+
 ### フェーズ 8-s: `<script>` 実行配線の純粋関数（script）
 
 `script.c` の **style 属性操作**（`<element>.style` HANDLE の背後の純粋関数）を移植した。
