@@ -16,3 +16,11 @@ dependencies = [
 [[package]]
 name = "ifuto-core"
 version = "0.1.0"
+
+[[package]]
+name = "ifuto-ffi"
+version = "0.1.0"
+dependencies = [
+ "akl-core",
+ "ifuto-core",
+]

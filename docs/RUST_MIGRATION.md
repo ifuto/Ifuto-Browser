@@ -1206,6 +1206,51 @@ C の `IfStr` 借用返却を所有 `Vec<u8>` / `Option<...>` に置換。**移�
 - `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 168 =
   316 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
 
+### フェーズ 8-w: `<script>` 実行配線の FFI 層（ifuto-ffi クレート）
+
+`script.c` の **FFI 層**（`if_script_run` + AklHandleVTab の get/set/call）を移植した。
+新クレート `rust/ifuto-ffi`（`#![forbid(unsafe_code)]`）が `akl-core`（JS エンジン）と
+`ifuto-core`（DOM）をクロスクレート配線する。
+
+- **`script_run(dom: &mut Dom, log: &mut Vec<u8>) -> ScriptReport`**: 文書順 DFS で
+  HTML ns `<script>` を収集（上限 128）→ 同一 `Runtime` で順次 eval。外部 src・
+  未知 type・空 script は skip、サイズ >4MB / NUL は明白に失敗。`IF_SCRIPT=0` kill
+  switch・`has_script` 走査スイッチを維持。
+- **`DOC_VT` / `ELEM_VT` / `STYLE_VT`**（`HandleVTab`）: `document`（title /
+  body / documentElement / getElementById / querySelector / getElementsByTagName）、
+  element（textContent / id / tagName / style / getAttribute / setAttribute）、
+  `CSSStyleDeclaration`（style 属性の prop get/set）。`ptr` には C の `IfNode*` の代わりに
+  `NodeId`（`Vec<Node>` index）を詰める。
+- **`script_console_log`**: `[script:console]` 出力の `console.log` native（空白区切り
+  連結・960 バイト cap・`\n \r` 空白化）。
+- **エラー文言**: akl-ffi の `akl_eval` と同一の構築（`SyntaxError: ...` / thrown 値の
+  flatten / `%.128s` 打ち切り + 改行畳み）。eval 失敗は当該 script のみ打切り・後続継続。
+
+C のモジュール静的グローバル（`g_arena` / `g_dom` / `g_log`）と「eval は同時 1 実行」の
+前提を、safe Rust の `thread_local!` + `RefCell` コンテキスト（eval 期間中のみ `Dom` を
+所有）に置換。`#![forbid(unsafe_code)]` を維持するため raw ポインタは一切使わない。
+
+**C の `call` コールバックの quirk（忠実再現）**: `akl_native_throw` は Rust エンジン
+（akl-ffi の `handle_call_adapter`）では握り潰され、`out` 未書込の `Some(0)`（= double
+0.0）が返る。引数数不一致・非文字列引数・名前過長の各 throw 経路を `Some(from_bits(0))`
+で再現（差分 fuzz が byte 一致で検証）。
+
+検証:
+
+- **差分 fuzz**: ランダム 12,000 件（HTML + `<script>`。textContent / title / set・
+  getAttribute / style / tagName / console.log / getElementsByTagName / querySelector /
+  構文エラー / TypeError / throw / budget 枯渇 / skip 規則）で C の `if_script_run`
+  （libakl_ffi.a リンク）と Rust `script_run` の出力（wpt + log + report）を突合し
+  **0 不一致**（byte 一致）。
+- 単体テスト 6 件（textContent 変異 / title + console / failure 隔離 / skip 規則 /
+  style + tagName + attr / kill switch）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 168 +
+  ifuto-ffi 6 = 322 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+これで **script.c の FFI 層（JS 実行 + DOM バインディング）が Rust で完動**。残る最終
+統合は chrome（`chrome.c` 603、タブ状態機械）・net ソケット（`net.c`）・TLS ソケット
+（`tls.c`、BearSSL 置換）のみ。
+
 ### フェーズ 8-s: `<script>` 実行配線の純粋関数（script）
 
 `script.c` の **style 属性操作**（`<element>.style` HANDLE の背後の純粋関数）を移植した。
