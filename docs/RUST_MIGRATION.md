@@ -825,3 +825,52 @@ Rust パーサ単体で html5lib tree-construction 1922/1922 を再現した。�
 Rust で完動し、html5lib 適合 1922/1922 を byte 一致で実証**した。次は CSS
 （`css.c` 1554 行。selector/declaration パーサ + cascade）→ レイアウト
 （`layout.c` 1574 行）へ進む。
+
+### フェーズ 8-k: CSS サブセット（css）— パース + カスケード
+
+`css.c`（1555 行）を Rust へ移植した。色・値レクサ・宣言パーサ・セレクタパーサ・
+スタイルシートパーサ・マッチャ・カスケード・computed style dump の全 eager 経路を
+カバーする。
+
+- **色**（`css_color`）: `#hex`（3/4/6/8 桁）/ `rgb()` / `rgba()` / 色名 55 種 /
+  `transparent` → RGBA8。`hexv`・`rgba8` を C と同一に。
+- **値レクサ**（`lex_value`）: NUM / DIM / PCT / IDENT / COLOR / STR / AUTO の 8 種。
+  `parse_number` は C ロケール非依存の f32 手動変換を忠実再現（f32 累積で C と
+  byte 一致する数値）。
+- **宣言パーサ**（`parse_decls`）: `!important` 検出・shorthand 展開（margin/padding/
+  border/border-width/background）・font/flex/grid 等の未対応 shorthand 丸ごと棄却・
+  プロパティ表（25 種）。
+- **セレクタパーサ**: type/class/id/universal の複合 + 子孫・子結合子。specificity は
+  `(ids<<16)|(classes<<8)|types`。pseudo/属性/兄弟結合子はセレクタごと棄却。
+- **スタイルシートパーサ**（`parse_stylesheet`）: @規則は丸ごと棄却、プリリュード/
+  ブロックの括弧・文字列・コメント考慮の走査、decl 単位の単調 order。
+- **マッチャ**（`match_selector`）: 右→左の子孫バックトラッキング、未知タグの CI 照合。
+- **カスケード**（`apply_styles`）: (important, origin, specificity, order) の辞書順。
+  UA シート + `<style>` 要素（author）+ inline style の 3 元。継承・font-size 先行解決・
+  `resolve_len`（em/rem/pt/px）・`kw_font_size`（xx-small..xx-large/smaller/larger）。
+- **computed style dump**（`dump_styles`）: C の `%.6g` を `fmt_g6` で忠実再現
+  （f32→f64 昇格・末尾ゼロ除去・`1e+06` 形式の指数表記切替を `{:.5e}` から指数を
+  取り出して再構成）。
+
+計算済みスタイルは `Node` に埋め込まず `Vec<Option<Style>>`（`NodeId` 並行）で返し、
+`dom` → `css` の依存を断つ（循環参照を構造的に排除）。
+
+**未移植（性能最適化・観測不変、将来の最適化として保留）**: RuleSet 風セレクタ
+インデックス（`css_build_ruleset`）、computed style interning（`st_intern`）、決定
+メモ化（`IfStCache`）、lazy computed style（`if_style_lazy_*`、md fast-DOM 専用）、
+Blink ファサード（`css_blink.h`）。いずれも `--dump-styles` の出力に影響しない
+（naive 全走査と indexed 経路は同一バイト列になることは C 側の `test_css_ruleset_oracle`
+が機械監査済み）。
+
+検証:
+
+- **差分 fuzz**: ランダム 20,000 件の HTML + CSS（セレクタ・shorthand・`!important`・
+  inline style・@規則・色・未知タグ CI・継承・float 書式）で C の `--dump-styles` と
+  Rust 出力を突合し **0 不一致**（byte 一致）。
+- C の `tests/test_css.c` の主要ケース（色 11 件 / UA 既定 / specificity / !important /
+  shorthand 展開 + 継承 / マッチャ / dump 固定文字列オラクル）を Rust テストとして再現。
+- `fmt_g6` を C `printf("%.6g")` と対照（0.1 / 13.3333 / 0.3 / 1e-05 / 1e+06 等）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 102 =
+  250 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+次はレイアウト（`layout.c` 1574 行。box 木 + 行レイアウト）→ 描画系へ進む。

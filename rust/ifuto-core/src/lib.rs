@@ -74,3 +74,6 @@ pub mod dom;
 
 /// HTML ツリービルダ（C の `html_tree.c` 相当。WHATWG insertion modes）。
 pub mod html_tree;
+
+/// CSS サブセット（パース + カスケード。C の `css.c` 相当）。
+pub mod css;
