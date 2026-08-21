@@ -1292,8 +1292,62 @@ C のモジュール静的グローバル（`g_arena` / `g_dom` / `g_log`）と�
 
 残る最終統合は chrome（`chrome.c` 603、タブ状態機械）・net ソケット（`net.c` の
 `connect_one`/`send_all`/`fetch_once`/`if_http_get(_ex)`）・TLS ソケット（`tls.c` の
-`if_tls_client` 等、BearSSL 置換）。**TLS ソケットは TLS ライブラリ選定（rustls 等）が
-必要で、オフライン環境では外部クレートを取得できないため、設計判断待ち**。
+`if_tls_client` 等、BearSSL 置換）。
+
+### フェーズ 8-y: net ソケット + TLS ソケット（net_sock / bearssl）— https 取得の完動
+
+`net.c` のソケット層（`connect_one` / `send_all` / `fetch_once` / `if_http_get(_ex)`）と
+`tls.c` のソケット層（`if_tls_client` / `if_tls_send_all` / `if_tls_recv` /
+`if_tls_close`）を `std::net` + BearSSL で移植した。http（平文）と https（TLS 1.2）の
+両経路をカバーする（**スタブなし・完全実装**）。
+
+- **`net_sock`（`net.c` ソケット層）**: `connect_one`（`ToSocketAddrs` IPv4 のみ・
+  `connect_timeout` 8s・`set_read/write_timeout` 10s = SO_*TIMEO 相当）、`send_all`、
+  `fetch_once`（リクエスト構築 → EOF まで受信 → ヘッダ解析 → chunked/Content-Length/
+  close ボディ決定）、`http_get_ex`（リダイレクト 5 回・private 拒否・https→http 降格
+  拒否）。err 分類（"bad url"/"dns"/"connect"/"send"/"recv"/"too large"/"bad response"/
+  "truncated"/"redirect loop"/"private redirect blocked"/"https downgrade blocked"）を
+  C と同一に。URL 分解・解決・ヘッダ解析・chunked・private 判定は `ifuto_core::net` の
+  純粋関数（差分 fuzz 検証済み）を再利用。
+- **`bearssl`（`tls.c` ソケット層）**: BearSSL の unsafe FFI 境界（`br_ssl_client_*` /
+  `br_ssl_engine_*`）。`br_ssl_client_context` / `br_x509_minimal_context` は巨大内部構造
+  のため **レイアウトを再現せず**、`build.rs` が `sizeof` から生成するサイズ
+  （`bearssl_sizes.rs`）で確保した 8 バイトアライン済みバッファを不透明ポインタで渡す。
+  `br_x509_trust_anchor`（64B）は `repr(C)` で再現し、コンパイル時 `assert!` でサイズを
+  検証。`static inline` の `br_ssl_engine_set_versions` / `br_ssl_engine_last_error` は
+  `bearssl_shim.c`（非インライン薄ラッパ）で提供。
+- **`TlsClient`**: BearSSL エンジン駆動（`sendrec_buf`/`recvrec_buf` が生レコードを渡し、
+  `TcpStream` が実 I/O を担う）。C の `tls.c` が `int fd` へ raw `send`/`recv` するのに対し、
+  `std::net` に移行。ハンドシェイク（`tls_run_until` 相当）・`send_all`（flush 込み）・
+  `recv`・`close`（close_notify ベストエフォート）を C と同一セマンティクスで再現。
+  エラー分類（"tls"/"cert"(33..63)/"ca"/"send"/"recv"）も同一。
+- **CA ロード**: `ca_load`（`IFUTO_CA_BUNDLE` → 既定 4 パス）は `ifuto_core::tls` の
+  `ca_load_pem_anchors`（`ca_load_pem` + `ta_add`、差分 fuzz 検証済み）を再利用。
+  プロセス 1 回ロードは `OnceLock` で保持（C のプロセス静的 `g_ta` と同型）。
+
+**ビルド**: `ifuto-ffi/build.rs` が BearSSL（`vendor/bearssl`、MIT、166 .c）をシステム
+`cc` + `ar` で静的ライブラリ化してリンク（`cc` クレート非依存 = オフライン可）。製品法則
+「ldd = vdso/libm/libc/ld」は静的リンクで維持。unsafe は `bearssl.rs` にのみ存在し、
+`// SAFETY:` コメント付きで集約（akl-ffi と同じ「境界を 1 ファイルに集約」方針。
+`#![deny(unsafe_op_in_unsafe_fn)]`。それ以外のモジュールは safe Rust）。
+
+検証:
+
+- **差分 fuzz（ローカル HTTP + HTTPS サーバ）**: openssl で自己署名 CA + server 証明書
+  （SAN: DNS:localhost, IP:127.0.0.1）を生成し、Python 生ソケットサーバ（HTTP 18080 /
+  HTTPS 18443）で http 11 種（200/404/chunked/empty/204/no-length/utf-8/redirect/
+  redirect404/redirect-loop/欠落）+ https 13 種（CA 信頼あり / システム CA のみ / 降格
+  拒否 / localhost SNI）の計 **24 URL × 3 反復** で C の `if_http_get_ex`（net.c+tls.c+
+  BearSSL）と Rust `http_get_ex` の出力（status + Content-Type + ボディ / err 分類）を突合し
+  **0 不一致**（byte 一致）。https（CA 信頼）は 200 + ボディが正しく取得でき、**Rust 単体で
+  TLS 1.2 ハンドシェイク + 証明書検証 + SNI 照合が完動**することを実証。
+- 単体テスト 3 件（private 判定 9 パタン / URL 過長 / 不正 URL）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 171 +
+  ifuto-ffi 9 = 328 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+これで **net/tls のソケット層（http + https 取得）が Rust で完動**。残る最終統合は
+chrome（`chrome.c` 603、タブ状態機械 = `net_sock` / `script_run` / store を束ねる
+オーケストレータ）と `main.c` の Rust 置換のみ。
 
 ### フェーズ 8-s: `<script>` 実行配線の純粋関数（script）
 

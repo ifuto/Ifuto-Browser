@@ -25,9 +25,12 @@
 //! 取り戻す（`Dom: Default` なので `std::mem::take` で空文書と交換）。
 //!
 //! C の「akl eval は本プロセスで同時 1 実行のみ」という前提を `thread_local!` が
-//! そのまま維持する（`#![forbid(unsafe_code)]` を保つため、`RefCell` で借用を検査）。
+//! そのまま維持する（`RefCell` で借用を検査）。
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+// unsafe は [`bearssl`]（BearSSL の C FFI 境界）にのみ存在し、`// SAFETY:` コメント
+// 付きで集約する（akl-ffi と同じ「境界を 1 ファイルに集約」方針）。それ以外のモジュール
+// （script 実行配線・net ソケット）は safe Rust のみ。
 
 use akl_core::bytecode::{HandleVTab, Runtime, VmError};
 use akl_core::builtins::install_builtins;
@@ -40,6 +43,13 @@ use ifuto_core::script::{style_get_prop, style_set_prop};
 use ifuto_core::strutil::str_eq_ci;
 use ifuto_core::tags_tables::{TAG_BODY, TAG_HTML, TAG_SCRIPT};
 use std::cell::RefCell;
+
+/// BearSSL（TLS 1.2 クライアント）の unsafe FFI 境界。C の `src/tls.c` のソケット側を
+/// `std::net::TcpStream` 駆動で再実装する。
+pub mod bearssl;
+
+/// net.c のソケット層（http / https の取得）。`std::net` + [`bearssl`]。
+pub mod net_sock;
 
 /// 1 文書で実行する `<script>` の上限（C の `IF_SCRIPT_MAX_RUN`）。
 const MAX_RUN: usize = 128;
