@@ -22,6 +22,9 @@
 use crate::tags::{self, Tag};
 use crate::strutil::str_eq_ci;
 
+/// 属性（トークナイザの `Attr` をそのまま共有。名前は ASCII lowercase 正規化済み）。
+pub use crate::html_tok::Attr;
+
 /// DOM ノードの index（C の `IfNode*` 相当。所有 `Vec<Node>` への index）。
 pub type NodeId = u32;
 
@@ -51,15 +54,6 @@ pub enum Ns {
     Mathml,
 }
 
-/// 属性（名前は ASCII lowercase 正規化済み）。
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Attr {
-    /// 属性名。
-    pub name: Vec<u8>,
-    /// 属性値（文字参照デコード済み）。
-    pub value: Vec<u8>,
-}
-
 /// DOM ノード（C の `IfNode` 相当）。
 #[derive(Clone, Debug)]
 pub struct Node {
@@ -83,6 +77,8 @@ pub struct Node {
     pub last_child: Option<NodeId>,
     /// 次の兄弟。
     pub next_sibling: Option<NodeId>,
+    /// template 要素の content フラグメント（rare-data。C の `if_dom_tpl_content` 相当）。
+    pub tpl_content: Option<NodeId>,
 }
 
 impl Node {
@@ -99,6 +95,7 @@ impl Node {
             first_child: None,
             last_child: None,
             next_sibling: None,
+            tpl_content: None,
         }
     }
 }
@@ -107,13 +104,21 @@ impl Node {
 #[derive(Clone, Debug)]
 pub struct Dom {
     /// 全ノード（`NodeId` はここへの index）。
-    nodes: Vec<Node>,
+    pub nodes: Vec<Node>,
     /// ルート（DOCUMENT ノード）。
     pub root: NodeId,
     /// クイークスモード（DOCTYPE 完全表で判定。limited-quirks は false）。
     pub quirks: bool,
     /// `<title>` のテキスト（見つからなければ空）。
     pub title: Vec<u8>,
+    /// 回復したパースエラー数（統計用）。
+    pub n_errors: u32,
+    /// `<script>` 要素を観測（script 実行の走査スイッチ）。
+    pub has_script: bool,
+    /// `<style>` 要素を観測。
+    pub has_style: bool,
+    /// `<selectedcontent>` を観測（customizable select の走査スイッチ）。
+    pub has_selectedcontent: bool,
 }
 
 impl Dom {
@@ -127,6 +132,10 @@ impl Dom {
             root,
             quirks: false,
             title: Vec::new(),
+            n_errors: 0,
+            has_script: false,
+            has_style: false,
+            has_selectedcontent: false,
         }
     }
 
@@ -156,6 +165,26 @@ impl Dom {
             self.nodes[parent as usize].first_child = Some(child);
         }
         self.nodes[parent as usize].last_child = Some(child);
+        self.nodes[child as usize].parent = Some(parent);
+    }
+
+    /// `parent` の `before` の直前に `child` を挿入（C の `insert_child_before` 相当）。
+    pub fn insert_child_before(&mut self, parent: NodeId, child: NodeId, before: NodeId) {
+        // 前兄弟を探す
+        let mut prev: Option<NodeId> = None;
+        let mut cur = self.nodes[parent as usize].first_child;
+        while let Some(c) = cur {
+            if c == before {
+                break;
+            }
+            prev = Some(c);
+            cur = self.nodes[c as usize].next_sibling;
+        }
+        self.nodes[child as usize].next_sibling = Some(before);
+        match prev {
+            Some(pv) => self.nodes[pv as usize].next_sibling = Some(child),
+            None => self.nodes[parent as usize].first_child = Some(child),
+        }
         self.nodes[child as usize].parent = Some(parent);
     }
 

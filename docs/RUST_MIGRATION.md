@@ -752,3 +752,27 @@ DOM ノードは JS エンジンで実証済みの「`NodeId` = `Vec<Node>` へ�
 
 次はツリー構築（`html_tree.c` 3147 行）の挿入モード状態機械を移植し、
 `parse_html` でトークナイザ + DOM を接続。html5lib 適合（1922/1922）の Rust 再現へ。
+
+### フェーズ 8-i: HTML ツリービルダ（html_tree）
+
+- `html_tree` モジュール: WHATWG insertion modes の完全移植。`TreeBuilder` が `Dom` +
+  `Tokenizer` を束ね、`stack: Vec<NodeId>`（C の `IfNode**`）で open-elements を保持。
+- 全 18 挿入モード（initial/before-html/head/in-body/table 系/frameset/template/
+  after-body/after-after-body）、foster parenting、active formatting elements +
+  adoption agency（outer≤8/inner≤3）、quirks モード完全表、foreign content（SVG/MathML
+  のタグ・属性 case 調整 + integration points + breakout）、customizable select の
+  selectedcontent clone、fragment 解析（WHATWG 13.4）。
+- `tools/gen_tags.py` を拡張し、タグ ID 定数（`TAG_HTML` 等 137 個）も生成。
+  C の arena/raw ポインタ連結を `NodeId`（`Vec<Node>` index）+ `Option<NodeId>` に置換。
+
+検証:
+- **差分 fuzz**: 手作り 35 件（adoption/foster/SVG/table/template/frameset/select 等）
+  + ランダム 50,000 件の HTML 入力で C/Rust の DOM ツリーを突合し **0 不一致**。
+- 単体テスト 8 件（基本構造/暗黙 html-head-body/p 閉じ/table/adoption/title trim/
+  SVG/script 観測）。
+- `cargo test --offline --workspace`（ifuto-core 86 件 = 合計 234 件）緑、
+  `cargo clippy --offline --workspace -- -D warnings` 緑。
+
+これで HTML パーサ（トークナイザ + ツリービルダ + DOM）が Rust で完動。残るは
+`serialize_wpt`（html5lib 採点ハーネス）を Rust 側で走らせて 1922/1922 を実証し、
+続いて CSS（`css.c` 1554 行）→ レイアウト（`layout.c` 1574 行）へ進む。

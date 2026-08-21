@@ -71,3 +71,6 @@ pub mod html_tok;
 
 /// DOM ノードモデル（C の `dom.c` / `dom.h` 相当のデータ構造と純粋ヘルパ）。
 pub mod dom;
+
+/// HTML ツリービルダ（C の `html_tree.c` 相当。WHATWG insertion modes）。
+pub mod html_tree;
