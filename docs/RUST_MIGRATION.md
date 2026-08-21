@@ -1170,6 +1170,42 @@ C の `IfStr` 借用返却を所有 `Vec<u8>` / `Option<...>` に置換。**移�
 - `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 163 =
   311 件）緑、`cargo clippy --offline --workspace --examples -- -D warnings` 緑。
 
+### フェーズ 8-v: DOM 変異面 + 最小セレクタ（script バインディングの基盤）
+
+`<script>` 実行の FFI 層（`script.c` の `doc_*` / `elem_*` / `style_*` vtab コールバック）
+が依存する **DOM の変異面 + セレクタ照合** を移植した。いずれも `Dom` の純粋メソッド。
+
+- **`Dom::set_text(n, t)`**: ELEMENT の子群を単一 TEXT 子に置換（`t` 空なら全子除去）。
+  C の `if_dom_set_text` 相当。旧子孫は木から切り離す（C と同様、切断サブツリーは
+  `parent` を残したまま孤立）。
+- **`Dom::title_set(t)`**: `<title>` を設定（無ければ head 先頭に生成）。`self.title`
+  も trim 済み text_content で更新。C の `if_dom_title_set` 相当。
+- **`Dom::query_selector(sel)`**: 文書順 DFS で最初にマッチする要素。対応は単純セレクタ
+  （tag / `#id` / `.class` の複合）+ 空白区切り子孫結合子列（上限 4）。C の
+  `if_dom_query_selector` 相当。
+- **`Dom::elements_by_tag(root, tag, cap)`**: 文書順でタグ名一致の全要素を収集
+  （戻り値は `(総数, 先頭 cap 個)`。`""` / `"*"` は全要素）。C の `if_dom_elements_by_tag`
+  相当。
+
+**移植で発見した C の潜在バグ（修正済み）**: `sel_part_matches` と `ebt_rec` の未知タグ
+経路が `if_tag_name(IF_TAG_UNKNOWN)`（= NULL）を `strlen` する。`<my-widget>` 等の
+カスタム要素を含む文書で `querySelector(\"div\")` や `getElementsByTagName(\"my-widget\")`
+を呼ぶと **セグメンテーション違反** する（`strlen(NULL)`）。意図（コメントの
+「未知タグ: 名前文字列と CI 比較」）どおり、要素の実名（`Node.name` = C の
+`u.tag_name`）と CI 比較する形に修正した。既知タグは `name` が canonical 名
+（=`if_tag_name(tag)`）と同値なので、両経路を 1 つの `str_eq_ci(&name, tag)` に統合。
+
+検証:
+
+- **差分 fuzz**: ランダム 50,000 件（HTML + T/Q/E/S 操作列。title_set / query_selector /
+  elements_by_tag / set_text 後の wpt シリアライズ）で C と Rust 出力を突合し **0 不一致**
+  （byte 一致）。未知タグ照合は C が segfault するため既知タグ域に限定し、未知タグの
+  正しさは単体テストで担保。
+- 単体テスト 5 件追加（set_text / query_selector 基本 / 未知タグ CI / elements_by_tag
+  cap / title_set 生成・更新）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 168 =
+  316 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
 ### フェーズ 8-s: `<script>` 実行配線の純粋関数（script）
 
 `script.c` の **style 属性操作**（`<element>.style` HANDLE の背後の純粋関数）を移植した。

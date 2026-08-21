@@ -342,6 +342,126 @@ impl Dom {
         });
     }
 
+    /// ELEMENT の子群を単一 TEXT 子に置換（`t` が空なら全子除去）。C の
+    /// `if_dom_set_text` 相当。旧子孫は木から切り離す（C と同様、切断された
+    /// サブツリーは `parent` を残したまま孤立する — 所有 `Vec` 上では到達不能に
+    /// なるだけで構造は一致）。
+    pub fn set_text(&mut self, n: NodeId, t: &[u8]) {
+        if self.nodes[n as usize].kind != NodeKind::Element {
+            return;
+        }
+        self.nodes[n as usize].first_child = None;
+        self.nodes[n as usize].last_child = None;
+        if t.is_empty() {
+            return;
+        }
+        let tn = self.alloc_node(NodeKind::Text);
+        self.nodes[tn as usize].name = t.to_vec();
+        self.nodes[tn as usize].parent = Some(n);
+        self.nodes[n as usize].first_child = Some(tn);
+        self.nodes[n as usize].last_child = Some(tn);
+    }
+
+    /// `<title>` を設定（無ければ head 先頭に生成）。`self.title` も更新。
+    /// C の `if_dom_title_set` 相当。head が無い（パーサ保証外）なら `None`。
+    pub fn title_set(&mut self, t: &[u8]) -> Option<NodeId> {
+        let title_tag = tags::tag_id(b"title");
+        let ttl = match self.find_tag_dfs(title_tag) {
+            Some(t) => t,
+            None => {
+                let head = self.find_tag_dfs(tags::tag_id(b"head"))?;
+                let ttl = self.alloc_node(NodeKind::Element);
+                {
+                    let node = self.node_mut(ttl);
+                    node.tag = title_tag;
+                    node.ns = Ns::Html;
+                    node.name = b"title".to_vec();
+                }
+                // head の先頭へ挿入（C: parent=head / next_sibling=旧 first_child）
+                let head_first = self.nodes[head as usize].first_child;
+                self.nodes[ttl as usize].parent = Some(head);
+                self.nodes[ttl as usize].next_sibling = head_first;
+                if self.nodes[head as usize].last_child.is_none() {
+                    self.nodes[head as usize].last_child = Some(ttl);
+                }
+                self.nodes[head as usize].first_child = Some(ttl);
+                ttl
+            }
+        };
+        self.set_text(ttl, t);
+        let fresh = self.find_tag_dfs(title_tag);
+        self.title = match fresh {
+            Some(f) => crate::strutil::trim(&self.text_content(f)).to_vec(),
+            None => Vec::new(),
+        };
+        Some(ttl)
+    }
+
+    /// 最初にマッチする要素を文書順 DFS で返す（最小セレクタ）。C の
+    /// `if_dom_query_selector` 相当。対応は単純セレクタ（tag / #id / .class）の
+    /// 空白区切り子孫結合子列（上限 4）。
+    pub fn query_selector(&self, sel: &[u8]) -> Option<NodeId> {
+        let parts = sel_split(sel)?;
+        self.qs_rec(self.root, &parts)
+    }
+
+    fn qs_rec(&self, cur: NodeId, parts: &[SelPart<'_>]) -> Option<NodeId> {
+        if node_matches_full(self, cur, parts) {
+            return Some(cur);
+        }
+        let mut c = self.node(cur).first_child;
+        while let Some(cid) = c {
+            if let Some(r) = self.qs_rec(cid, parts) {
+                return Some(r);
+            }
+            c = self.node(cid).next_sibling;
+        }
+        None
+    }
+
+    /// `root` 配下の要素をタグ名で収集（文書順）。戻り値は `(総数, 先頭 cap 個)`。
+    /// `tag` が空 or `"*"` なら全要素。C の `if_dom_elements_by_tag` 相当。
+    pub fn elements_by_tag(&self, root: NodeId, tag: &[u8], cap: usize) -> (usize, Vec<NodeId>) {
+        let any = tag.is_empty() || (tag.len() == 1 && tag[0] == b'*');
+        let mut ctx = EbtCtx {
+            tag_id: if any { tags::TAG_UNKNOWN } else { tags::tag_id(tag) },
+            any,
+            tag,
+            cap,
+            out: Vec::new(),
+        };
+        let total = self.ebt_rec(root, &mut ctx, 0);
+        (total, ctx.out)
+    }
+
+    fn ebt_rec(&self, cur: NodeId, ctx: &mut EbtCtx<'_>, cnt: usize) -> usize {
+        let node = self.node(cur);
+        let mut cnt = cnt;
+        if node.kind == NodeKind::Element {
+            let matched = if ctx.any {
+                true
+            } else if ctx.tag_id != tags::TAG_UNKNOWN {
+                node.tag == ctx.tag_id
+            } else {
+                // 未知タグ名照合（C の ebt_rec は if_tag_name(未知) を読む潜在クラッシュ。
+                // 意図どおり要素の実名 `name` と CI 比較する）
+                str_eq_ci(&node.name, ctx.tag)
+            };
+            if matched {
+                if cnt < ctx.cap {
+                    ctx.out.push(cur);
+                }
+                cnt += 1;
+            }
+        }
+        let mut c = node.first_child;
+        while let Some(cid) = c {
+            cnt = self.ebt_rec(cid, ctx, cnt);
+            c = self.node(cid).next_sibling;
+        }
+        cnt
+    }
+
     /// html5lib tree-construction 形式（`| indented`）へシリアライズ。
     /// C の `if_dom_serialize_wpt` 相当。出力は `Vec<u8>`（バイト一致を保証）。
     pub fn serialize_wpt(&self) -> Vec<u8> {
@@ -577,6 +697,181 @@ impl Dom {
     }
 }
 
+// ---- 最小セレクタ（C の dom.c `SelPart` / `sel_part_parse` / `sel_split` /
+//      `sel_part_matches` / `qs_rec` 相当） ----
+
+/// `elements_by_tag` の走査文脈（DFS 再帰の引数を束ねる）。
+struct EbtCtx<'a> {
+    tag_id: Tag,
+    any: bool,
+    tag: &'a [u8],
+    cap: usize,
+    out: Vec<NodeId>,
+}
+
+/// 単純セレクタ 1 個（`div#main.nav`）。C の `SelPart` 相当。
+#[derive(Clone, Copy)]
+struct SelPart<'a> {
+    tag: Option<&'a [u8]>,
+    id: Option<&'a [u8]>,
+    cls: Option<&'a [u8]>,
+}
+
+/// 複合セレクタ 1 つをパース（例: `div#main.nav`）。失敗で `None`。
+fn sel_part_parse(s: &[u8]) -> Option<SelPart<'_>> {
+    let n = s.len();
+    let mut out = SelPart {
+        tag: None,
+        id: None,
+        cls: None,
+    };
+    let mut i = 0usize;
+    if i < n && (s[i] == b'#' || s[i] == b'.') {
+        // タグなし（#id / .class から開始）
+    } else {
+        let st = i;
+        while i < n && s[i] != b'#' && s[i] != b'.' {
+            i += 1;
+        }
+        if i == st {
+            return None;
+        }
+        out.tag = Some(&s[st..i]);
+    }
+    while i < n {
+        let c = s[i];
+        if c == b'#' {
+            i += 1;
+            let st = i;
+            while i < n && s[i] != b'.' && s[i] != b'#' {
+                i += 1;
+            }
+            if i == st || out.id.is_some() {
+                return None; // 空 or 複数 id は非対応
+            }
+            out.id = Some(&s[st..i]);
+        } else if c == b'.' {
+            i += 1;
+            let st = i;
+            while i < n && s[i] != b'.' && s[i] != b'#' {
+                i += 1;
+            }
+            if i == st || out.cls.is_some() {
+                return None; // 空 or 複数 class は非対応
+            }
+            out.cls = Some(&s[st..i]);
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// セレクタを空白区切りの複合列に分割（子孫結合子）。上限 4。失敗・空で `None`。
+fn sel_split(sel: &[u8]) -> Option<Vec<SelPart<'_>>> {
+    let mut parts = Vec::new();
+    let mut i = 0usize;
+    while i < sel.len() {
+        while i < sel.len() && (sel[i] == b' ' || sel[i] == b'\t' || sel[i] == b'\n' || sel[i] == b'\r') {
+            i += 1;
+        }
+        if i >= sel.len() {
+            break;
+        }
+        let st = i;
+        while i < sel.len() && !(sel[i] == b' ' || sel[i] == b'\t' || sel[i] == b'\n' || sel[i] == b'\r') {
+            i += 1;
+        }
+        if parts.len() >= 4 {
+            return None; // 過剰分割 = 非対応
+        }
+        parts.push(sel_part_parse(&sel[st..i])?);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts)
+}
+
+/// class 属性にトークンとして含まれるか（case-sensitive）。C の `sel_part_matches`
+/// の class 分岐と同一の空白集合（space/tab/nl/cr/ff）。
+fn has_class_token(class_attr: &[u8], cls: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < class_attr.len() {
+        while i < class_attr.len()
+            && (class_attr[i] == b' '
+                || class_attr[i] == b'\t'
+                || class_attr[i] == b'\n'
+                || class_attr[i] == b'\r'
+                || class_attr[i] == b'\x0c')
+        {
+            i += 1;
+        }
+        let st = i;
+        while i < class_attr.len()
+            && !(class_attr[i] == b' '
+                || class_attr[i] == b'\t'
+                || class_attr[i] == b'\n'
+                || class_attr[i] == b'\r'
+                || class_attr[i] == b'\x0c')
+        {
+            i += 1;
+        }
+        if &class_attr[st..i] == cls {
+            return true;
+        }
+    }
+    false
+}
+
+/// 複合セレクタ 1 個がノードにマッチするか。C の `sel_part_matches` 相当。
+fn sel_part_matches(dom: &Dom, n: NodeId, p: &SelPart<'_>) -> bool {
+    let node = dom.node(n);
+    if node.kind != NodeKind::Element {
+        return false;
+    }
+    if let Some(tag) = p.tag {
+        // C は既知タグを `if_tag_name(n->tag)`、未知タグを `u.tag_name` で CI 比較する
+        // 「意図」だが、未知タグ経路は `if_tag_name(UNKNOWN)=NULL` を strlen する潜在
+        // クラッシュ。どちらも `Node.name`（実名）と同値なので統合して CI 照合する。
+        if !str_eq_ci(&node.name, tag) {
+            return false;
+        }
+    }
+    if let Some(id) = p.id {
+        match dom.attr(n, b"id") {
+            Some(v) if v == id => {}
+            _ => return false,
+        }
+    }
+    if let Some(cls) = p.cls {
+        match dom.attr(n, b"class") {
+            Some(v) if has_class_token(v, cls) => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// 複合セレクタ列全体（右端が n 自身、左群は祖先に右から順にマッチ）の照合。
+/// C の `qs_rec` のマッチ部 / `if_dom_selector_matches` 相当。
+fn node_matches_full(dom: &Dom, n: NodeId, parts: &[SelPart<'_>]) -> bool {
+    if !sel_part_matches(dom, n, &parts[parts.len() - 1]) {
+        return false;
+    }
+    let mut pi = parts.len() - 1;
+    let mut a = dom.node(n).parent;
+    while pi > 0 {
+        let Some(aid) = a else { break };
+        let anode = dom.node(aid);
+        if anode.kind == NodeKind::Element && sel_part_matches(dom, aid, &parts[pi - 1]) {
+            pi -= 1;
+        }
+        a = anode.parent;
+    }
+    pi == 0
+}
+
 impl Default for Dom {
     fn default() -> Self {
         Self::new()
@@ -687,6 +982,119 @@ mod tests {
         assert_eq!(d.node(html).last_child, Some(c));
         assert_eq!(d.node(b).parent, None);
         assert_eq!(d.node(b).next_sibling, None);
+    }
+
+    #[test]
+    fn set_text_replaces_children() {
+        let mut d = Dom::new();
+        let root = d.root;
+        let body = make_elem(&mut d, root, tags::tag_id(b"body"));
+        make_text(&mut d, body, b"old");
+        let nested = make_elem(&mut d, body, tags::tag_id(b"p"));
+        make_text(&mut d, nested, b"x");
+
+        d.set_text(body, b"new");
+        assert_eq!(d.text_content(body), b"new");
+        assert_eq!(d.node(body).first_child, Some(d.node(body).last_child.unwrap()));
+        assert_eq!(d.node(body).first_child.map(|c| d.node(c).kind), Some(NodeKind::Text));
+
+        // 空 text は全子除去
+        d.set_text(body, b"");
+        assert_eq!(d.node(body).first_child, None);
+        assert_eq!(d.node(body).last_child, None);
+    }
+
+    #[test]
+    fn query_selector_basic() {
+        let mut d = Dom::new();
+        let root = d.root;
+        let html = make_elem(&mut d, root, tags::tag_id(b"html"));
+        let body = make_elem(&mut d, html, tags::tag_id(b"body"));
+        let div = make_elem(&mut d, body, tags::tag_id(b"div"));
+        d.attr_set(div, b"id", b"main");
+        d.attr_set(div, b"class", b"nav box");
+        let p = make_elem(&mut d, div, tags::tag_id(b"p"));
+        d.attr_set(p, b"class", b"para");
+
+        assert_eq!(d.query_selector(b"div"), Some(div));
+        assert_eq!(d.query_selector(b"#main"), Some(div));
+        assert_eq!(d.query_selector(b".nav"), Some(div));
+        assert_eq!(d.query_selector(b"div#main.nav"), Some(div));
+        // 子孫結合子
+        assert_eq!(d.query_selector(b"div p"), Some(p));
+        assert_eq!(d.query_selector(b"#main .para"), Some(p));
+        // 無い
+        assert_eq!(d.query_selector(b".missing"), None);
+        assert_eq!(d.query_selector(b"span"), None);
+        // 空 / 不正
+        assert_eq!(d.query_selector(b""), None);
+        assert_eq!(d.query_selector(b"div##main"), None);
+    }
+
+    #[test]
+    fn query_selector_unknown_tag_and_case() {
+        let mut d = Dom::new();
+        let root = d.root;
+        let html = make_elem(&mut d, root, tags::tag_id(b"html"));
+        let custom = make_elem(&mut d, html, tags::TAG_UNKNOWN);
+        d.node_mut(custom).name = b"my-widget".to_vec();
+        let body = make_elem(&mut d, html, tags::tag_id(b"body"));
+        let div = make_elem(&mut d, body, tags::tag_id(b"div"));
+
+        // 未知タグ名は CI 照合
+        assert_eq!(d.query_selector(b"my-widget"), Some(custom));
+        assert_eq!(d.query_selector(b"MY-WIDGET"), Some(custom));
+        // 既知タグも CI
+        assert_eq!(d.query_selector(b"DIV"), Some(div));
+    }
+
+    #[test]
+    fn elements_by_tag_collects() {
+        let mut d = Dom::new();
+        let root = d.root;
+        let html = make_elem(&mut d, root, tags::tag_id(b"html"));
+        let body = make_elem(&mut d, html, tags::tag_id(b"body"));
+        let a = make_elem(&mut d, body, tags::tag_id(b"p"));
+        let b2 = make_elem(&mut d, body, tags::tag_id(b"div"));
+        let c = make_elem(&mut d, b2, tags::tag_id(b"p"));
+
+        let (total, got) = d.elements_by_tag(root, b"p", 1024);
+        assert_eq!(total, 2);
+        assert_eq!(got, vec![a, c]);
+        // cap で打ち切り
+        let (total, got) = d.elements_by_tag(root, b"p", 1);
+        assert_eq!(total, 2);
+        assert_eq!(got, vec![a]);
+        // wildcard（html, body, p, div, p の 5 要素）
+        let (total, got) = d.elements_by_tag(root, b"*", 1024);
+        assert_eq!(total, 5);
+        assert_eq!(got.len(), 5);
+        // 未知タグ名 CI
+        let custom = make_elem(&mut d, body, tags::TAG_UNKNOWN);
+        d.node_mut(custom).name = b"x-foo".to_vec();
+        let (total, got) = d.elements_by_tag(root, b"x-foo", 1024);
+        assert_eq!(total, 1);
+        assert_eq!(got, vec![custom]);
+    }
+
+    #[test]
+    fn title_set_updates() {
+        let mut d = Dom::new();
+        let root = d.root;
+        let html = make_elem(&mut d, root, tags::tag_id(b"html"));
+        let head = make_elem(&mut d, html, tags::tag_id(b"head"));
+        let _body = make_elem(&mut d, html, tags::tag_id(b"body"));
+
+        // 既存 title なし → head 先頭に生成
+        let t = d.title_set(b"  Hello  ").unwrap();
+        assert_eq!(d.node(t).tag, tags::tag_id(b"title"));
+        assert_eq!(d.node(head).first_child, Some(t));
+        assert_eq!(d.title, b"Hello"); // trim 済み
+
+        // 既存 title を更新
+        d.title_set(b"World");
+        assert_eq!(d.title, b"World");
+        assert_eq!(d.node(head).first_child, Some(t)); // 再生成しない
     }
 
     /// C の `if_dom_dump` のデバッグ形式（`--dump-dom`）を固定。
