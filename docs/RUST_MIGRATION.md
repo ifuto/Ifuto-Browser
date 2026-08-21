@@ -776,3 +776,52 @@ DOM ノードは JS エンジンで実証済みの「`NodeId` = `Vec<Node>` へ�
 これで HTML パーサ（トークナイザ + ツリービルダ + DOM）が Rust で完動。残るは
 `serialize_wpt`（html5lib 採点ハーネス）を Rust 側で走らせて 1922/1922 を実証し、
 続いて CSS（`css.c` 1554 行）→ レイアウト（`layout.c` 1574 行）へ進む。
+
+### フェーズ 8-j: wpt シリアライザ + html5lib 適合の Rust 実証（1922/1922）
+
+`dom.c` の `if_dom_serialize_wpt` / `if_dom_serialize_wpt_frag` を Rust へ移植し、
+Rust パーサ単体で html5lib tree-construction 1922/1922 を再現した。併せて、
+移植時に見つかったツリービルダの 2 件のバグを修正した。
+
+- **`Dom::serialize_wpt` / `serialize_wpt_frag`**: `| indented` 形式（TEXT `"…"`・
+  COMMENT/PI・DOCTYPE（pub/sys 引用規則）・ELEMENT（svg/math 接頭辞・属性辞書順
+  ソート）・template の content 擬似ノード）を byte 一致で移植。
+- **DOCTYPE 情報の保持**: `Node.doctype: Option<Doctype>`（name/has_name/pub_id/sys_id）
+  を追加（C の `IfDoctype` 相当）。従来は `name` のみで pub/sys が欠落していた。
+- **PI ターゲットの保持**: `Node.pi_target: Vec<u8>` を追加（C は attrs[0].name に
+  保持）。`<?xml…?>` は XML 宣言様式のため bogus comment（仕様）、非 xml ターゲット
+  のみ PI として扱う。
+- **customizable select の clone**（`sc_clone` / `sc_selected_option` / `sc_fill` /
+  `sc_select_walk`）: `<selectedcontent>` へ選択中 option の子孫を複写する処理を移植
+  （webkit02#44-#47）。従来は `has_selectedcontent` フラグを立てるだけで clone 自体が
+  未実装だった。
+
+**移植で発見したツリービルダのバグ 2 件（修正済み）**:
+
+1. **AAA の inner>3 打ち切り欠落**: WHATWG adoption agency の内側ループには
+   「counter > 3 なら active formatting elements から node を除去する」規則があるが、
+   Rust 版に欠落していた。これにより `<b><em><foo><foo><foo><aside></b>` 等の
+   深い書式ネスト + special 要素介入で余分な clone 要素が挿入されていた
+   （adoption01 #14/#17、tests22 #0/#4、webkit02 #11/#14-#17 の 9 件）。
+2. **annotation-xml の encoding 属性が case-sensitive 比較**: `in_foreign` /
+   `in_foreign_text` の encoding 判定（text/html / application/xhtml+xml）が
+   `==` の大文字小文字区別比較になっていた（C は `if_str_eq_ci`）。`Text/htmL` /
+   `aPPlication/xhtmL+xMl` で `<div>` が annotation-xml の外へ foster されていた
+   （tests20 #55/#57 の 2 件）。
+
+検証:
+
+- **html5lib tree-construction: 1922/1922 passed（100.0%, skip 12）** を Rust パーサ
+  単体（一時 CLI example で `tests/run_html5lib.py` を流す）で再現。C 本体と完全一致。
+- **差分 fuzz**: ランダム 30,000 件（fragment / DOCTYPE / PI / 実体参照 /
+  selectedcontent / annotation-xml / foreign content を含む）で C の `--dump-wptdom`
+  と Rust 出力を突合し **0 不一致**。
+- 単体テスト 8 件追加（wpt 基本 / DOCTYPE pub+sys / DOCTYPE 裸 / PI / template content /
+  selectedcontent clone / annotation-xml CI / AAA counter clamp）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 94 =
+  242 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+これで **HTML パーサ全体（トークナイザ + ツリービルダ + DOM + wpt シリアライザ）が
+Rust で完動し、html5lib 適合 1922/1922 を byte 一致で実証**した。次は CSS
+（`css.c` 1554 行。selector/declaration パーサ + cascade）→ レイアウト
+（`layout.c` 1574 行）へ進む。

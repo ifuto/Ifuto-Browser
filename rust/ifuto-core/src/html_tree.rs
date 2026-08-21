@@ -20,7 +20,7 @@
 //! 木の連結は `Option<NodeId>`。ポインタ寿命・エイリアシング問題を構造的に排除。
 //! テキスト・属性値はトークナイザが所有 `Vec<u8>` で返すため arena が不要。
 
-use crate::dom::{Attr, Dom, NodeId, NodeKind, Ns};
+use crate::dom::{Attr, Dom, Doctype, NodeId, NodeKind, Ns};
 use crate::html_tok::{Tok, TokKind, Tokenizer};
 use crate::tags::{self, Tag};
 use crate::strutil::str_eq_ci;
@@ -1249,35 +1249,44 @@ impl<'a> TreeBuilder<'a> {
             } else {
                 self.dom.root
             };
-            let mut bookmark = fi + 1;
-            let mut last_node = furthest;
-            let mut ni = fb;
-            loop {
-                if ni == 0 {
-                    break;
-                }
-                ni -= 1;
-                let mut node = self.stack[ni];
-                if node == fe {
-                    break;
-                }
-                let a2 = self.afe_find_node(node);
-                if a2.is_none() {
-                    self.stack_remove_at(ni);
-                    continue;
-                }
-                let a2 = a2.unwrap();
-                let clone = self.clone_element(node);
-                self.afe[a2].node = clone;
-                self.stack[ni] = clone;
-                node = clone;
-                if last_node == furthest {
-                    bookmark = a2 + 1;
-                }
-                self.dom.detach(last_node);
-                self.dom.append_child(node, last_node);
-                last_node = node;
+        let mut bookmark = fi + 1;
+        let mut last_node = furthest;
+        let mut ni = fb;
+        let mut inner = 0u32;
+        loop {
+            inner += 1; // 12.1
+            if ni == 0 {
+                break;
             }
+            ni -= 1;
+            let mut node = self.stack[ni];
+            if node == fe {
+                break;
+            }
+            // 12.4: inner > 3 なら AFE から node を除去（WHATWG 打ち切り規則）
+            if inner > 3 {
+                if let Some(rm) = self.afe_find_node(node) {
+                    self.afe_remove_at(rm);
+                }
+            }
+            // 12.5: AFE に無い node は stack から除去して次へ
+            let a2 = self.afe_find_node(node);
+            if a2.is_none() {
+                self.stack_remove_at(ni);
+                continue;
+            }
+            let a2 = a2.unwrap();
+            let clone = self.clone_element(node);
+            self.afe[a2].node = clone;
+            self.stack[ni] = clone;
+            node = clone;
+            if last_node == furthest {
+                bookmark = a2 + 1;
+            }
+            self.dom.detach(last_node);
+            self.dom.append_child(node, last_node);
+            last_node = node;
+        }
             self.dom.detach(last_node);
             let (parent, before) = self.place_for(ancestor);
             match before {
@@ -1491,7 +1500,12 @@ impl<'a> TreeBuilder<'a> {
                 self.dom.quirks = Self::doctype_is_quirks(&tok);
                 self.mode = Mode::BeforeHtml;
                 let d = self.dom.alloc_node(NodeKind::Doctype);
-                self.dom.node_mut(d).name = tok.text.clone();
+                self.dom.node_mut(d).doctype = Some(Doctype {
+                    name: tok.text.clone(),
+                    has_name: tok.dt_has_name,
+                    pub_id: tok.dt_pub.clone(),
+                    sys_id: tok.dt_sys.clone(),
+                });
                 self.dom.append_child(self.dom.root, d);
             }
             TokKind::Comment => {
@@ -1522,6 +1536,9 @@ impl<'a> TreeBuilder<'a> {
     fn make_comment(&mut self, tok: &Tok) -> NodeId {
         let n = self.dom.alloc_node(NodeKind::Comment);
         self.dom.node_mut(n).name = tok.text.clone();
+        if tok.is_pi && !tok.pi_target.is_empty() {
+            self.dom.node_mut(n).pi_target = tok.pi_target.clone();
+        }
         n
     }
 
@@ -3061,7 +3078,9 @@ impl<'a> TreeBuilder<'a> {
                 }
                 if let Some(nid) = node {
                     let enc = self.dom.attr(nid, b"encoding");
-                    if enc == Some(&b"text/html"[..]) || enc == Some(&b"application/xhtml+xml"[..]) {
+                    if enc.is_some_and(|e| {
+                        str_eq_ci(e, b"text/html") || str_eq_ci(e, b"application/xhtml+xml")
+                    }) {
                         return false;
                     }
                 }
@@ -3097,7 +3116,9 @@ impl<'a> TreeBuilder<'a> {
         if ns == Ns::Mathml && tag == TAG_ANNOTATION_XML {
             if let Some(nid) = self.acn() {
                 let enc = self.dom.attr(nid, b"encoding");
-                if enc == Some(&b"text/html"[..]) || enc == Some(&b"application/xhtml+xml"[..]) {
+                if enc.is_some_and(|e| {
+                    str_eq_ci(e, b"text/html") || str_eq_ci(e, b"application/xhtml+xml")
+                }) {
                     return false;
                 }
             }
@@ -3664,6 +3685,12 @@ impl<'a> TreeBuilder<'a> {
                 c = node.next_sibling;
             }
         }
+        // customizable select: <selectedcontent> への選択中 option の clone
+        // （C の sc_select_walk。観測時のみ走査）
+        if self.dom.has_selectedcontent {
+            let root = self.dom.root;
+            sc_select_walk(&mut self.dom, root);
+        }
         self.dom
     }
 
@@ -3694,6 +3721,161 @@ pub fn parse_html_fragment(input: &[u8], ctx: &str) -> Dom {
     let tok = Tokenizer::new(input);
     let tb = TreeBuilder::new(dom, tok);
     tb.parse(Some(ctx))
+}
+
+// ---- customizable select: <selectedcontent> への選択中 option の clone ----
+// C の sc_clone / sc_selected_option / sc_fill / sc_select_walk 相当。
+// <select> 内の各 <selectedcontent> に、選択中 option（selected 属性を持つ最後の
+// option、無ければ先頭 option）の子孫全体の複写を挿入する（webkit02#44-#47）。
+
+/// ノードを子孫ごと複写する（C の `sc_clone` 相当。`tpl_content` は複写しない）。
+fn sc_clone(dom: &mut Dom, s: NodeId) -> NodeId {
+    let n = dom.alloc_node(dom.node(s).kind);
+    let (tag, ns, flags, name, attrs, doctype, pi_target) = {
+        let sn = dom.node(s);
+        (
+            sn.tag,
+            sn.ns,
+            sn.flags,
+            sn.name.clone(),
+            sn.attrs.clone(),
+            sn.doctype.clone(),
+            sn.pi_target.clone(),
+        )
+    };
+    {
+        let node = dom.node_mut(n);
+        node.tag = tag;
+        node.ns = ns;
+        node.flags = flags;
+        node.name = name;
+        node.attrs = attrs;
+        node.doctype = doctype;
+        node.pi_target = pi_target;
+    }
+    let children: Vec<NodeId> = {
+        let mut v = Vec::new();
+        let mut c = dom.node(s).first_child;
+        while let Some(cid) = c {
+            v.push(cid);
+            c = dom.node(cid).next_sibling;
+        }
+        v
+    };
+    let mut tail: Option<NodeId> = None;
+    for cid in children {
+        let cc = sc_clone(dom, cid);
+        dom.node_mut(cc).parent = Some(n);
+        match tail {
+            Some(t) => {
+                dom.node_mut(t).next_sibling = Some(cc);
+                tail = Some(cc);
+            }
+            None => {
+                dom.node_mut(n).first_child = Some(cc);
+                tail = Some(cc);
+            }
+        }
+    }
+    dom.node_mut(n).last_child = tail;
+    n
+}
+
+/// 選択中 option（最後の selected 属性持ち、無ければ先頭 option。C の `sc_selected_option`）。
+fn sc_selected_option(dom: &Dom, sel: NodeId) -> Option<NodeId> {
+    let mut first = None;
+    let mut chosen = None;
+    let mut c = dom.node(sel).first_child;
+    while let Some(cid) = c {
+        let node = dom.node(cid);
+        if node.kind == NodeKind::Element && node.tag == TAG_OPTION && node.ns == Ns::Html {
+            if first.is_none() {
+                first = Some(cid);
+            }
+            if node.attrs.iter().any(|a| str_eq_ci(&a.name, b"selected")) {
+                chosen = Some(cid);
+            }
+        }
+        c = node.next_sibling;
+    }
+    chosen.or(first)
+}
+
+/// `<selectedcontent>` を option の子孫 clone で満たす（C の `sc_fill` 相当）。
+fn sc_fill(dom: &mut Dom, n: NodeId, opt: NodeId) {
+    let is_sc = {
+        let node = dom.node(n);
+        node.kind == NodeKind::Element
+            && node.ns == Ns::Html
+            && node.tag == tags::TAG_UNKNOWN
+            && str_eq_ci(&node.name, b"selectedcontent")
+    };
+    if is_sc {
+        dom.node_mut(n).first_child = None;
+        dom.node_mut(n).last_child = None;
+        let children: Vec<NodeId> = {
+            let mut v = Vec::new();
+            let mut c = dom.node(opt).first_child;
+            while let Some(cid) = c {
+                v.push(cid);
+                c = dom.node(cid).next_sibling;
+            }
+            v
+        };
+        let mut tail: Option<NodeId> = None;
+        for cid in children {
+            let cc = sc_clone(dom, cid);
+            dom.node_mut(cc).parent = Some(n);
+            match tail {
+                Some(t) => {
+                    dom.node_mut(t).next_sibling = Some(cc);
+                    tail = Some(cc);
+                }
+                None => {
+                    dom.node_mut(n).first_child = Some(cc);
+                    tail = Some(cc);
+                }
+            }
+        }
+        dom.node_mut(n).last_child = tail;
+        return;
+    }
+    let children: Vec<NodeId> = {
+        let mut v = Vec::new();
+        let mut c = dom.node(n).first_child;
+        while let Some(cid) = c {
+            v.push(cid);
+            c = dom.node(cid).next_sibling;
+        }
+        v
+    };
+    for cid in children {
+        sc_fill(dom, cid, opt);
+    }
+}
+
+/// 文書内の `<select>` を走査して selectedcontent を満たす（C の `sc_select_walk`）。
+fn sc_select_walk(dom: &mut Dom, n: NodeId) {
+    {
+        let node = dom.node(n);
+        if node.kind == NodeKind::Element && node.tag == TAG_SELECT && node.ns == Ns::Html {
+            if let Some(opt) = sc_selected_option(dom, n) {
+                sc_fill(dom, n, opt);
+            }
+        }
+    }
+    let children: Vec<NodeId> = {
+        let mut v = Vec::new();
+        let mut c = dom.node(n).first_child;
+        while let Some(cid) = c {
+            v.push(cid);
+            c = dom.node(cid).next_sibling;
+        }
+        v
+    };
+    for cid in children {
+        sc_select_walk(dom, cid);
+    }
 }
 
 #[cfg(test)]
@@ -3777,5 +3959,69 @@ mod tests {
     fn has_script_observed() {
         let dom = parse_html(b"<script>var x = 1;</script>");
         assert!(dom.has_script);
+    }
+
+    /// wpt 形式シリアライズの出力を文字列として得る補助。
+    fn wpt(input: &[u8]) -> String {
+        String::from_utf8(parse_html(input).serialize_wpt()).unwrap()
+    }
+
+    #[test]
+    fn wpt_basic() {
+        let s = wpt(b"<p>hello</p>");
+        assert_eq!(
+            s,
+            "| <html>\n|   <head>\n|   <body>\n|     <p>\n|       \"hello\"\n"
+        );
+    }
+
+    #[test]
+    fn wpt_doctype_public_system() {
+        let s = wpt(b"<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \"http://x\">");
+        assert!(s.starts_with(
+            "| <!DOCTYPE html \"-//W3C//DTD XHTML 1.0//EN\" \"http://x\">\n"
+        ));
+    }
+
+    #[test]
+    fn wpt_doctype_bare() {
+        let s = wpt(b"<!DOCTYPE>");
+        assert!(s.starts_with("| <!DOCTYPE >\n"));
+    }
+
+    #[test]
+    fn wpt_pi() {
+        // <?xml...?> は XML 宣言様式のため bogus comment 扱い（HTML 仕様）。
+        // PI として扱われるのは非 xml ターゲットのみ。
+        let s = wpt(b"<?target data?>");
+        assert!(s.contains("| <?target data?>\n"));
+    }
+
+    #[test]
+    fn wpt_template_content() {
+        let s = wpt(b"<template><div>x</div></template>");
+        assert!(s.contains("|     <template>\n|       content\n|         <div>\n"));
+    }
+
+    #[test]
+    fn wpt_selectedcontent_clone() {
+        let s = wpt(b"<select><button><selectedcontent></button><option>X<option selected>Y");
+        // 選択中 option（selected 持ちの最後）の子 "Y" が selectedcontent へ clone される
+        assert!(s.contains("|         <selectedcontent>\n|           \"Y\"\n"));
+    }
+
+    #[test]
+    fn wpt_annotation_xml_encoding_ci() {
+        // encoding は case-insensitive 一致（tests20 #55/#57）
+        let s = wpt(b"<math><annotation-xml encoding=\"Text/htmL\"><div>");
+        assert!(s.contains("|         <div>\n"));
+    }
+
+    #[test]
+    fn wpt_adoption_counter_clamp() {
+        // AAA の inner>3 打ち切り（adoption01 #14 / webkit02 #14 系の余分な clone 防止）
+        let s = wpt(b"<b><em><foo><foo><foo><aside></b>");
+        assert!(!s.contains("|     <em>\n|       <aside>"));
+        assert!(s.contains("|     <aside>\n|       <b>\n"));
     }
 }

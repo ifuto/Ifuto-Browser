@@ -54,6 +54,19 @@ pub enum Ns {
     Mathml,
 }
 
+/// DOCTYPE 情報（C の `IfDoctype` 相当。`NodeKind::Doctype` のみ有意）。
+#[derive(Clone, Debug, Default)]
+pub struct Doctype {
+    /// DOCTYPE 名（lowercase 済み）。
+    pub name: Vec<u8>,
+    /// 名前あり。
+    pub has_name: bool,
+    /// public identifier。
+    pub pub_id: Vec<u8>,
+    /// system identifier。
+    pub sys_id: Vec<u8>,
+}
+
 /// DOM ノード（C の `IfNode` 相当）。
 #[derive(Clone, Debug)]
 pub struct Node {
@@ -65,10 +78,14 @@ pub struct Node {
     pub ns: Ns,
     /// フラグ（`IF_NF_*`。当面未使用）。
     pub flags: u8,
-    /// タグ名（ELEMENT）/ テキスト（TEXT, COMMENT）/ DOCTYPE name。
+    /// タグ名（ELEMENT）/ テキスト（TEXT, COMMENT）。
     pub name: Vec<u8>,
     /// 属性列（ELEMENT）。
     pub attrs: Vec<Attr>,
+    /// DOCTYPE 情報（`NodeKind::Doctype` のみ有意）。
+    pub doctype: Option<Doctype>,
+    /// PI ターゲット（COMMENT が処理命令のときのみ非空。C は attrs[0].name に保持）。
+    pub pi_target: Vec<u8>,
     /// 親。
     pub parent: Option<NodeId>,
     /// 先頭の子。
@@ -91,6 +108,8 @@ impl Node {
             flags: 0,
             name: Vec::new(),
             attrs: Vec::new(),
+            doctype: None,
+            pi_target: Vec::new(),
             parent: None,
             first_child: None,
             last_child: None,
@@ -321,6 +340,134 @@ impl Dom {
             name: name.to_vec(),
             value: value.to_vec(),
         });
+    }
+
+    /// html5lib tree-construction 形式（`| indented`）へシリアライズ。
+    /// C の `if_dom_serialize_wpt` 相当。出力は `Vec<u8>`（バイト一致を保証）。
+    pub fn serialize_wpt(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.ser_children(self.root, 0, &mut out);
+        out
+    }
+
+    /// fragment 版の wpt シリアライズ（仮想 html root の子群を出力）。
+    /// C の `if_dom_serialize_wpt_frag` 相当。
+    pub fn serialize_wpt_frag(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut c = self.node(self.root).first_child;
+        while let Some(cid) = c {
+            if self.node(cid).kind == NodeKind::Element {
+                self.ser_children(cid, 0, &mut out);
+                return out;
+            }
+            c = self.node(cid).next_sibling;
+        }
+        out
+    }
+
+    /// 子ノードを文書順に出力（C の `ser_children` 相当）。
+    fn ser_children(&self, n: NodeId, depth: usize, out: &mut Vec<u8>) {
+        let mut c = self.node(n).first_child;
+        while let Some(cid) = c {
+            self.ser_node(cid, depth, out);
+            c = self.node(cid).next_sibling;
+        }
+    }
+
+    /// インデント（深さごとに 2 スペース。C の `ser_indent` 相当）。
+    fn ser_indent(out: &mut Vec<u8>, depth: usize) {
+        for _ in 0..depth {
+            out.extend_from_slice(b"  ");
+        }
+    }
+
+    /// ノード 1 個を出力（C の `ser_node` 相当）。
+    fn ser_node(&self, n: NodeId, depth: usize, out: &mut Vec<u8>) {
+        let node = self.node(n);
+        match node.kind {
+            NodeKind::Text => {
+                out.extend_from_slice(b"| ");
+                Self::ser_indent(out, depth);
+                out.push(b'"');
+                out.extend_from_slice(&node.name);
+                out.extend_from_slice(b"\"\n");
+            }
+            NodeKind::Comment => {
+                out.extend_from_slice(b"| ");
+                Self::ser_indent(out, depth);
+                if !node.pi_target.is_empty() {
+                    out.extend_from_slice(b"<?");
+                    out.extend_from_slice(&node.pi_target);
+                    out.push(b' ');
+                    out.extend_from_slice(&node.name);
+                    out.extend_from_slice(b"?>\n");
+                } else {
+                    out.extend_from_slice(b"<!-- ");
+                    out.extend_from_slice(&node.name);
+                    out.extend_from_slice(b" -->\n");
+                }
+            }
+            NodeKind::Doctype => {
+                out.extend_from_slice(b"| ");
+                Self::ser_indent(out, depth);
+                match node.doctype.as_ref() {
+                    None | Some(Doctype { has_name: false, .. }) => {
+                        out.extend_from_slice(b"<!DOCTYPE >\n");
+                    }
+                    Some(d) => {
+                        out.extend_from_slice(b"<!DOCTYPE ");
+                        out.extend_from_slice(&d.name);
+                        if d.pub_id.is_empty() && d.sys_id.is_empty() {
+                            out.extend_from_slice(b">\n");
+                        } else {
+                            out.extend_from_slice(b" \"");
+                            out.extend_from_slice(&d.pub_id);
+                            out.extend_from_slice(b"\" \"");
+                            out.extend_from_slice(&d.sys_id);
+                            out.extend_from_slice(b"\">\n");
+                        }
+                    }
+                }
+            }
+            NodeKind::Element => {
+                out.extend_from_slice(b"| ");
+                Self::ser_indent(out, depth);
+                out.push(b'<');
+                match node.ns {
+                    Ns::Svg => out.extend_from_slice(b"svg "),
+                    Ns::Mathml => out.extend_from_slice(b"math "),
+                    Ns::Html => {}
+                }
+                out.extend_from_slice(&node.name);
+                out.extend_from_slice(b">\n");
+                if !node.attrs.is_empty() {
+                    // 属性は名前の辞書順（バイト比較）で出力（C の attr_name_cmp + qsort）
+                    let mut sorted: Vec<&Attr> = node.attrs.iter().collect();
+                    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+                    for a in sorted {
+                        out.extend_from_slice(b"| ");
+                        Self::ser_indent(out, depth + 1);
+                        out.extend_from_slice(&a.name);
+                        out.extend_from_slice(b"=\"");
+                        out.extend_from_slice(&a.value);
+                        out.extend_from_slice(b"\"\n");
+                    }
+                }
+                // HTML ns の <template> のみ content 擬似ノード配下に子を出す
+                if node.ns == Ns::Html && node.name == b"template" {
+                    out.extend_from_slice(b"| ");
+                    Self::ser_indent(out, depth + 1);
+                    out.extend_from_slice(b"content\n");
+                    let tc = node.tpl_content.unwrap_or(n);
+                    self.ser_children(tc, depth + 2, out);
+                } else {
+                    self.ser_children(n, depth + 1, out);
+                }
+            }
+            NodeKind::Document => {
+                self.ser_children(n, depth, out);
+            }
+        }
     }
 }
 
