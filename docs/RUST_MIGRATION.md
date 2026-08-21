@@ -1065,3 +1065,50 @@ C は `IfChrome *`（タブ・store・raster 判定結果）と fs を直接読�
 
 次は net/tls（`net.c` 573 / `tls.c` 406）→ script（`script.c` 424）→ chrome
 （`chrome.c` 603、オーケストレータ = 最終統合で移植）へ進む。
+
+### フェーズ 8-q: raster fill + HTTP 純粋関数（raster / net）
+
+残る純粋関数の葉を移植した。
+
+**raster（`raster.c` 155 行）**:
+
+- `fill32(dst: &mut [u32], v)`: 32bpp fill のスカラ参照実装。C は 4 候補カーネル
+  （scalar/u64x2/u64x8/smart）をマイクロベンチで自動選択するが、**全候補は bit-exact に
+  同一**（`tests/test_raster.c` が相互証明）なので、スカラ一本に縮約（観測不変・選択は
+  速度のみ）。
+- `KERNEL_NAMES`: 診断・表示用の候補名。
+- 未移植（観測不変）: 候補カーネル・`if_raster_autodetect`（`clock_gettime` + `/dev/dri`
+  に依存する機種依存計測。選択は速度にのみ効く）。
+
+**net（`net.c` 573 行の非ソケット部分）**:
+
+- `parse_url`: http/https 分解（fragment 除去・`:port` 検査・userinfo/IPv6 拒否・
+  host/path 長溢れ）。
+- `resolve_url`: RFC3986 最小解決（absolute / scheme-relative / 絶対パス / 相対 /
+  クエリ置換。scheme 変更 http<->https は拒否）。
+- `head_parse`: 応答ヘッダ解析（状態行 + Content-Length 先勝ち / Transfer-Encoding /
+  Location / Content-Type。`\r\n\r\n`・`\n\n` 宽容）。
+- `dechunk`: chunked 復号（chunk-ext・trailer 消費・hex 大文字・LF-only 宽容）。
+- `addr_is_private`: private/loopback/link-local/CGNAT 判定（SSRF 対策）。
+
+C の `IfStr` 借用返却を所有 `Vec<u8>` / `Option<...>` に置換。**移植で 1 箇所バグを修正**
+（`/abs` 解決で先頭 `/` を誤って剥がしていた。C は `loc` 全体を連結）。
+
+未移植（ソケット I/O・最終統合）: `connect_one` / `send_all` / `fetch_once` /
+`if_http_get(_ex)`（ソケット + BearSSL TLS。非決定的で純粋関数化不能。chrome 移植時に
+`std::net` + TLS で再実装）、`tls.c`（BearSSL ラッパ）。
+
+検証:
+
+- **差分 fuzz**: ランダム 105,000 件（parse_url 20,000 / resolve_url 30,000 /
+  head_parse 30,000 / dechunk 20,000 / private addr 5,000）で C と Rust 出力を突合し
+  **0 不一致**。
+- `tests/test_http.c` の主要ケース（parse/resolve/head/dechunk/private）を Rust テスト
+  として再現（6 テスト関数）。
+- `fill32` を C の test_raster.c の任意オフセット・任意長・任意色で再現。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 147 =
+  295 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+残るのは **script（`script.c` 424、JS エンジン DOM 結合 = akl-ffi と ifuto-core の
+クロスクレート配線）** と **chrome（`chrome.c` 603、オーケストレータ）**。両者は相互
+依存が深い最終統合層で、ソケット/TLS I/O を含む。

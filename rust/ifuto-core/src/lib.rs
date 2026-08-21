@@ -92,3 +92,9 @@ pub mod image;
 
 /// 内部ページ生成（C の `ifuto_pages.c` 相当）。
 pub mod ifuto_pages;
+
+/// raster fill カーネル（C の `raster.c` 相当）。
+pub mod raster;
+
+/// HTTP/1.1 取得の純粋関数（C の `net.c` の非ソケット部分相当）。
+pub mod net;
