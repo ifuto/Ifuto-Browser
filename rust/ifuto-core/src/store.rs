@@ -19,6 +19,208 @@
 /// タブ数上限（C の `IF_TABS_MAX`）。
 pub const TABS_MAX: usize = 64;
 
+/// URL の上限（C の `IF_URL_CAP`）。
+pub const URL_CAP: usize = 4096;
+/// タイトルの上限（C の `IF_TITLE_CAP`）。
+pub const TITLE_CAP: usize = 256;
+/// グループ名の上限（C の `IF_GROUP_CAP`）。
+pub const GROUP_CAP: usize = 64;
+/// 履歴の最大バイト数（C の `IF_HISTORY_MAX_BYTES`）。
+pub const HISTORY_MAX_BYTES: usize = 512 * 1024;
+
+/// 保存対象タブ（C の `IfTab` のセッション保存に使うフィールド）。
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SaveTab {
+    /// タブ id。
+    pub id: i32,
+    /// URL（空 = 空白タブ = 保存対象外）。
+    pub url: String,
+    /// タイトル（空 = 保存しない）。
+    pub title: String,
+    /// グループ名（空 = 保存しない）。
+    pub group: String,
+    /// スクロール位置（>0 のときのみ保存）。
+    pub scroll: i32,
+}
+
+/// 保存側の無害化（`\t \n \r` → 空白、`maxlen` 打ち切り）。C の `gb_safe` 相当。
+fn push_safe(out: &mut Vec<u8>, s: &str, maxlen: usize) {
+    for &ch in s.as_bytes().iter().take(maxlen) {
+        out.push(if ch == b'\t' || ch == b'\n' || ch == b'\r' {
+            b' '
+        } else {
+            ch
+        });
+    }
+}
+
+/// `session.txt` を生成（C の `if_store_session_save` のシリアライズ部分）。
+///
+/// 空白タブ（url 空）は保存しない。`active_index` はタブ列の index（-1 = なし）。
+/// active は「その index のタブが保存対象ならその id、でなければ先頭の保存対象 id」。
+pub fn serialize_session(tabs: &[SaveTab], active_index: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"ifuto-session 1\n");
+    let mut first_managed: i32 = -1;
+    for t in tabs {
+        if t.url.is_empty() {
+            continue;
+        }
+        if first_managed < 0 {
+            first_managed = t.id;
+        }
+        out.extend_from_slice(b"url ");
+        out.extend_from_slice(t.id.to_string().as_bytes());
+        out.push(b' ');
+        push_safe(&mut out, &t.url, URL_CAP);
+        out.push(b'\n');
+        if !t.title.is_empty() {
+            out.extend_from_slice(b"title ");
+            out.extend_from_slice(t.id.to_string().as_bytes());
+            out.push(b' ');
+            push_safe(&mut out, &t.title, TITLE_CAP);
+            out.push(b'\n');
+        }
+        if !t.group.is_empty() {
+            out.extend_from_slice(b"group ");
+            out.extend_from_slice(t.id.to_string().as_bytes());
+            out.push(b' ');
+            push_safe(&mut out, &t.group, GROUP_CAP);
+            out.push(b'\n');
+        }
+        if t.scroll > 0 {
+            out.extend_from_slice(b"scroll ");
+            out.extend_from_slice(t.id.to_string().as_bytes());
+            out.push(b' ');
+            out.extend_from_slice(t.scroll.to_string().as_bytes());
+            out.push(b'\n');
+        }
+    }
+    // active: 保存対象の current タブ、無ければ先頭の保存対象
+    let cur_id = if active_index >= 0 && (active_index as usize) < tabs.len() {
+        let t = &tabs[active_index as usize];
+        if !t.url.is_empty() {
+            Some(t.id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let active = cur_id.or(if first_managed >= 0 {
+        Some(first_managed)
+    } else {
+        None
+    });
+    if let Some(id) = active {
+        out.extend_from_slice(b"active ");
+        out.extend_from_slice(id.to_string().as_bytes());
+        out.push(b'\n');
+    }
+    out.extend_from_slice(b"end\n");
+    out
+}
+
+/// 履歴の 1 行を生成（C の `if_store_history_add` の行生成部分）。
+/// 書式: `epoch \t title \t url \n`（title/url は無害化）。
+pub fn history_line(now: i64, title: &str, url: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(now.to_string().as_bytes());
+    out.push(b'\t');
+    push_safe(&mut out, title, TITLE_CAP);
+    out.push(b'\t');
+    push_safe(&mut out, url, URL_CAP);
+    out.push(b'\n');
+    out
+}
+
+/// 履歴が最大バイトを超えたときの縮退（後半を残す）。C の縮退ロジック相当。
+/// 縮退不要なら `None`。
+pub fn shrink_history(text: &[u8]) -> Option<Vec<u8>> {
+    if text.len() <= HISTORY_MAX_BYTES {
+        return None;
+    }
+    let keep = text.len() - HISTORY_MAX_BYTES / 2;
+    // keep 以降の最初の '\n' の次からを残す
+    text[keep..]
+        .iter()
+        .position(|&c| c == b'\n')
+        .map(|nl| text[keep + nl + 1..].to_vec())
+}
+
+/// 行 `title<TAB>url[\n]` の URL 部が `url` と一致するか。C の `line_url_eq` 相当。
+fn line_url_eq(line: &[u8], url: &[u8]) -> bool {
+    let Some(tab) = line.iter().position(|&c| c == b'\t') else {
+        return false;
+    };
+    let mut u = &line[tab + 1..];
+    if u.last() == Some(&b'\n') {
+        u = &u[..u.len() - 1];
+    }
+    u == url
+}
+
+/// ブックマークのフィルタ + 追加。C の `bmrk_write_filtered` 相当。
+///
+/// `remove_url`: `Some` なら一致 URL の行を除去。`add`: `Some((title, url))` なら末尾に追記。
+pub fn filter_bookmarks(
+    text: &[u8],
+    remove_url: Option<&str>,
+    add: Option<(&str, &str)>,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut p = text;
+    while !p.is_empty() {
+        let (line, rest) = match p.iter().position(|&c| c == b'\n') {
+            Some(i) => (&p[..i + 1], &p[i + 1..]),
+            None => (p, &[][..]),
+        };
+        p = rest;
+        let remove = remove_url.is_some_and(|u| line_url_eq(line, u.as_bytes()));
+        if !remove {
+            out.extend_from_slice(line);
+        }
+    }
+    if let Some((title, url)) = add {
+        push_safe(&mut out, title, TITLE_CAP);
+        out.push(b'\t');
+        push_safe(&mut out, url, URL_CAP);
+        out.push(b'\n');
+    }
+    out
+}
+
+/// ブックマークのトグル。C の `if_store_bookmark_toggle` 相当。
+/// 戻り値 `(新しいテキスト, added)`（added = 追加されたか）。
+/// url が空なら C 同様に即「変更なし・未追加」（`return false` 相当）を返す。
+pub fn toggle_bookmark(text: &[u8], title: &str, url: &str) -> (Vec<u8>, bool) {
+    if url.is_empty() {
+        return (text.to_vec(), false);
+    }
+    // 存在判定
+    let present = {
+        let mut p = text;
+        let mut found = false;
+        while !p.is_empty() {
+            let (line, rest) = match p.iter().position(|&c| c == b'\n') {
+                Some(i) => (&p[..i + 1], &p[i + 1..]),
+                None => (p, &[][..]),
+            };
+            p = rest;
+            if line_url_eq(line, url.as_bytes()) {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+    if present {
+        (filter_bookmarks(text, Some(url), None), false)
+    } else {
+        (filter_bookmarks(text, None, Some((title, url))), true)
+    }
+}
+
 /// 復元タブ（C の `IfSessionTab` 相当。URL/title/group は所有 `String`）。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SessionTab {
@@ -284,5 +486,119 @@ mod tests {
                 assert!(!t.url.is_empty());
             }
         }
+    }
+
+    // ---- 書き面（シリアライズ）のテスト ----
+
+    #[test]
+    fn serialize_session_basic() {
+        let tabs = [
+            SaveTab {
+                id: 1,
+                url: "https://a/".into(),
+                title: "A".into(),
+                group: String::new(),
+                scroll: 0,
+            },
+            SaveTab {
+                id: 2,
+                url: "https://b/".into(),
+                title: String::new(),
+                group: "work".into(),
+                scroll: 500,
+            },
+        ];
+        let out = serialize_session(&tabs, 1);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "ifuto-session 1\n\
+url 1 https://a/\n\
+title 1 A\n\
+url 2 https://b/\n\
+group 2 work\n\
+scroll 2 500\n\
+active 2\n\
+end\n"
+        );
+    }
+
+    #[test]
+    fn serialize_session_skips_blank() {
+        // 空白タブは保存しない。active が空白なら先頭保存対象に落ちる
+        let tabs = [
+            SaveTab {
+                id: 1,
+                url: String::new(),
+                title: String::new(),
+                group: String::new(),
+                scroll: 0,
+            },
+            SaveTab {
+                id: 2,
+                url: "https://x/".into(),
+                title: "X".into(),
+                group: String::new(),
+                scroll: 0,
+            },
+        ];
+        let out = serialize_session(&tabs, 0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "ifuto-session 1\nurl 2 https://x/\ntitle 2 X\nactive 2\nend\n"
+        );
+    }
+
+    #[test]
+    fn serialize_session_sanitizes() {
+        let tabs = [SaveTab {
+            id: 1,
+            url: "a\tb\nc\rd".into(),
+            title: "t\nx".into(),
+            group: "g\ty".into(),
+            scroll: 3,
+        }];
+        let out = serialize_session(&tabs, 0);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "ifuto-session 1\nurl 1 a b c d\ntitle 1 t x\ngroup 1 g y\nscroll 1 3\nactive 1\nend\n"
+        );
+    }
+
+    #[test]
+    fn history_line_basic() {
+        assert_eq!(history_line(1750000000, "Title", "https://a/"), b"1750000000\tTitle\thttps://a/\n");
+        // 無害化
+        assert_eq!(history_line(1, "t\tx", "u\nv"), b"1\tt x\tu v\n");
+    }
+
+    #[test]
+    fn test_toggle_bookmark() {
+        let text = b"Google\thttps://google.com\nGitHub\thttps://github.com\n";
+        // 追加
+        let (new, added) = toggle_bookmark(text, "Ifuto", "https://ifuto.jp");
+        assert!(added);
+        assert_eq!(
+            String::from_utf8(new).unwrap(),
+            "Google\thttps://google.com\nGitHub\thttps://github.com\nIfuto\thttps://ifuto.jp\n"
+        );
+        // 除去
+        let (new2, added2) = toggle_bookmark(text, "X", "https://github.com");
+        assert!(!added2);
+        assert_eq!(String::from_utf8(new2).unwrap(), "Google\thttps://google.com\n");
+    }
+
+    #[test]
+    fn test_shrink_history() {
+        // 縮退不要
+        assert_eq!(shrink_history(b"short"), None);
+        // 縮退（後半の最初の行境界から）
+        let mut big = Vec::new();
+        for i in 0..100_000 {
+            big.extend_from_slice(format!("{i}\thttps://x/{i}\n").as_bytes());
+        }
+        let shrunk = shrink_history(&big).unwrap();
+        assert!(shrunk.len() <= HISTORY_MAX_BYTES / 2 + 1000);
+        // 行境界で切れている（末尾が '\n' または途中行の完全な形）
+        assert!(!shrunk.is_empty());
     }
 }

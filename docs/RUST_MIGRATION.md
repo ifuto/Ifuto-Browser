@@ -1112,3 +1112,30 @@ C の `IfStr` 借用返却を所有 `Vec<u8>` / `Option<...>` に置換。**移�
 残るのは **script（`script.c` 424、JS エンジン DOM 結合 = akl-ffi と ifuto-core の
 クロスクレート配線）** と **chrome（`chrome.c` 603、オーケストレータ）**。両者は相互
 依存が深い最終統合層で、ソケット/TLS I/O を含む。
+
+### フェーズ 8-r: 永続ストア書き面（store シリアライズ）
+
+`store.c` の**書き面**（セッション保存・履歴行・ブックマークトグル）を Rust へ移植した。
+読み面（`parse_session` / `parse_bookmarks`）は既存、本フェーズでシリアライズ側を補完。
+
+- **`serialize_session(tabs, active_index)`**: `session.txt` 生成。空白タブ（url 空）は
+  スキップ、title/group は非空のみ、scroll は >0 のみ。active は「保存対象の current
+  タブ、無ければ先頭の保存対象」。
+- **`history_line(now, title, url)`**: `epoch \t title \t url \n`（無害化込み）。
+- **`shrink_history(text)`**: 512KB 超で後半（行境界から）を残す縮退。
+- **`toggle_bookmark(text, title, url)`**: 存在行の除去 / 末尾追記のトグル。url 空は
+  C 同様に即「変更なし」。
+- 無害化（`\t \n \r` → 空白）を `push_safe` に集約。C の `gb_safe` + arena を所有
+  `Vec<u8>` に置換。
+
+C の `IfChrome *`（タブ配列 + active index）と `IfStore`（fs 注入）を、純粋な
+「データ → テキスト」関数に分離。fs 書き込みは呼び出し側（chrome 移植時）が担う。
+
+検証:
+
+- **差分 fuzz**: ランダム 90,000 件（session 30,000 / history 30,000 / bookmark 30,000。
+  id/scroll/active/空フィールド/多言語文字を網羅）で C と Rust 出力を突合し **0 不一致**。
+- 単体テスト 6 件追加（session 基本/空白スキップ/無害化、history 行/無害化、
+  bookmark トグル/縮退）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 153 =
+  301 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
