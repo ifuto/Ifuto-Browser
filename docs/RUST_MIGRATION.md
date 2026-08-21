@@ -695,3 +695,25 @@ Aklus（JS エンジン）の移行（フェーズ 0〜6）が完了したため
   url 非空、決定性）を Rust テストとして再現。
 - `cargo test --offline --workspace`（ifuto-core 51 件 = 合計 199 件）緑、
   `cargo clippy --offline --workspace -- -D warnings` 緑。
+
+### フェーズ 8-f: HTML タグ表（tags）— HTML パーサの基盤
+
+- `tools/gen_tags.py` を新設。`src/dom.c` の `IF_TAGS` テーブル（137 タグ）を
+  抽出して `rust/ifuto-core/src/tags_tables.rs` を生成。`--verify` は再抽出と照合。
+  C の手書き長さ `n` フィールドと `if_dom_tag_table_sane` 検査を、`str.len()` の
+  自動導出に置き換えて構造的に排除。
+- `tags` モジュール: `tag_name` / `tag_id`（CI）/ `is_void` / `is_rawtext` /
+  `is_rcdata` を移植。void 18 / rawtext 6 / rcdata 2 の flags を忠実再現。
+
+検証:
+- 全 137 タグの `tag_name`/`is_void`/`is_rawtext`/`is_rcdata` を C/Rust で突合し
+  **byte 一致**。
+- 全タグの round-trip（`tag_id`→`tag_name`）と flags 相互排他・小文字 canonical を
+  Rust テストで機械証明。
+- `cargo test --offline --workspace`（ifuto-core 57 件 = 合計 205 件）緑、
+  `cargo clippy --offline --workspace -- -D warnings` 緑。
+
+次は HTML トークナイザ（`html_tok.c` 817 行）→ ツリー構築（`html_tree.c` 3147 行）。
+DOM ノードは JS エンジンで実証済みの「`NodeId` = `Vec<Node>` への index」パターンを
+踏襲し、`arena` は所有権ベースの `Vec` に置換する（safe Rust では arena の raw
+ポインタ返却が本質的で、`forbid(unsafe_code)` を維持できないため「移植しない」判断）。

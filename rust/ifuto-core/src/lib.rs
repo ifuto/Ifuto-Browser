@@ -59,3 +59,9 @@ pub mod entities_tables;
 
 /// 永続ストア層の読み面パーサ（C の `store.c` の session / bookmarks 相当）。
 pub mod store;
+
+/// HTML タグ表（C の `dom.c` の `IF_TAGS` + 検索プリミティブ相当）。
+pub mod tags;
+
+/// HTML タグ表の生成データ（`tools/gen_tags.py` 生成。正本は `src/dom.c`）。
+pub mod tags_tables;
