@@ -65,3 +65,6 @@ pub mod tags;
 
 /// HTML タグ表の生成データ（`tools/gen_tags.py` 生成。正本は `src/dom.c`）。
 pub mod tags_tables;
+
+/// HTML トークナイザ（C の `html_tok.c` 相当）。
+pub mod html_tok;

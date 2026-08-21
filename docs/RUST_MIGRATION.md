@@ -717,3 +717,21 @@ Aklus（JS エンジン）の移行（フェーズ 0〜6）が完了したため
 DOM ノードは JS エンジンで実証済みの「`NodeId` = `Vec<Node>` への index」パターンを
 踏襲し、`arena` は所有権ベースの `Vec` に置換する（safe Rust では arena の raw
 ポインタ返却が本質的で、`forbid(unsafe_code)` を維持できないため「移植しない」判断）。
+
+### フェーズ 8-g: HTML トークナイザ（html_tok）
+
+- `html_tok` モジュール: WHATWG tokenizer の実用形を移植。`TokKind`（Text/Start/End/
+  Comment/Doctype/Eof）+ `Tok`（所有 `Vec<u8>`）+ `Tokenizer`（`&[u8]` + pos）。
+- 状態: rawtext/RCDATA（`set_raw`）、fragment 直接 raw、strip_lf、foreign content
+  の CDATA/U+0000 規則、plaintext、属性値の ambiguous-amp。
+- 文字参照（数値/名前/C1 補正/2-cp）は `entities` モジュールと `utf8` を再利用。
+- C の「ゼロコピー切片 + arena 切片の混在」（`if_resolved` の 2 パス）を、所有
+  `Vec<u8>` の 1 パスに統合。手動容量計算とバッファ境界検査を構造的に排除。
+
+検証:
+- **差分 fuzz**: 既定モード 30,034 件 + foreign content モード（NUL 含む）10,005 件で
+  C/Rust のトークン列を突合し **0 不一致**（byte 一致）。
+- 単体テスト 16 件（テキスト/タグ/属性/文字参照/rawtext/rcdata/コメント/PI/
+  DOCTYPE/void/自己終了/NUL 規則）。
+- `cargo test --offline --workspace`（ifuto-core 73 件 = 合計 221 件）緑、
+  `cargo clippy --offline --workspace -- -D warnings` 緑。

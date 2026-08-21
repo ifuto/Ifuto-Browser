@@ -134,6 +134,22 @@ pub fn resolve(s: &[u8]) -> Option<Vec<u32>> {
     None
 }
 
+/// エントリ index の flags（bit0 = formal ';' あり、bit1 = legacy 裸）。
+/// 範囲外は 0。
+pub fn entry_flags(i: usize) -> u8 {
+    NAMED.get(i).map(|e| e.2).unwrap_or(0)
+}
+
+/// エントリ index の名前長。範囲外は 0。
+pub fn entry_name_len(i: usize) -> u8 {
+    NAMED.get(i).map(|e| e.1).unwrap_or(0)
+}
+
+/// エントリ index のコードポイント列。範囲外は空。
+pub fn entry_codepoints(i: usize) -> Vec<u32> {
+    NAMED.get(i).map(codepoints).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
