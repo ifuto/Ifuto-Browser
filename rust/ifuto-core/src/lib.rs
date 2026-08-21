@@ -80,3 +80,6 @@ pub mod css;
 
 /// レイアウト（整数セル座標系。C の `layout.c` 相当）。
 pub mod layout;
+
+/// セルグリッドレンダラ（C の `render_ansi.c` 相当）。
+pub mod render;

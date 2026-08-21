@@ -912,3 +912,52 @@ link span 収集・deco 装飾 op（dump に現れず、描画層移行時に移
 
 次は描画系（`raster.c` 155 / `render_ansi.c` 1209 / `md.c` 1698 / `chrome.c` 603 /
 `image.c` 540）へ進む。
+
+### フェーズ 8-m: セルグリッドレンダラ（render）— grid + paint + emit
+
+`render_ansi.c`（1209 行）の機能コアを Rust へ移植した。ボックスツリー → セルグリッド
+→ 発行バイト列の全 eager 経路をカバーする。
+
+- **色**（`rgba_to_ansi`）: RGBA8 → ANSI 256 色 index（グレー特別経路 + 立方体）。
+- **セルグリッド**（`render_grid` / `Grid` / `Cell`）: `lay.width` 幅に固定し、はみ出す
+  seg（右寄せ + ハード分割の `line_w` 残存値に起因）は右端でクリップ。
+- **paint**（`paint_box` / `paint_shell`）: 背景塗り・罫線（Unicode 罫線素片 ┌─┐│└┘）・
+  `<hr>`・li マーカー（ul "• " / ol "N."）・テキスト（全角継続セル cp=0）。deco 挿入順
+  （marker → 自 BG → 自 BORDER）を再現。
+- **emit**（`render_emit`）: ansi=256 色 SGR（reset→bold→italic→uline→strike→fg→bg）/
+  plain（行末空白 trim）。行末リセットは無条件（C の 2026-08-01 契約統一）。
+- **extent**（`render_extent`）: `grid_max_walk` で文書行列の最大範囲。
+
+golden テスト（`tests/golden/doc` の `--no-ansi --width 40` 出力）が Rust 単体で
+**byte 一致**することを確認した。
+
+**移植で発見した C の sweep 経路固有規則（byte 一致に必須）**:
+
+1. 幅は `lay->width` でクリップ（`if_render_grid` は `grid_max_walk` で拡張するが、CLI
+   が使う行スイープは打ち切る）。
+2. `h=0` の空ボックスの BG/罫線は `max(h,1)` の 1 行として描く（deco 有効高）。
+3. li マーカーは `<li>` かつ `display:list-item` のみ（任意の `display:list-item` 要素には
+   描かない。sweep の `c->tag == IF_TAG_LI` 条件）。
+
+**既知の偏差（1 ケース、C の FAST/SLOW 経路不整合に起因）**: `<li><dl style="background">`
+の clamped マーカー（li.x=1）が子孫 BG と重なる場合、C の FAST 経路（罫線なし行）は
+マーカーを上層ランとして扱い自 st の bg（既定）を保つが、SLOW 経路（deco 順）は子孫 BG が
+マーカーの bg を上書きする。本実装は SLOW（参照セル経路）に一致させる。差分 fuzz 40,000
+件中この 1 ケースのみ乖離（0.0025%）。
+
+**未移植（性能最適化・観測不変）**: 窓グリッド経路（`if_render_grid_rows_into(_cur)`）、
+行スイープ直接発行（byte-direct/fast 経路）、2-way 並列 sweep、`raster.c` の fill カーネル
+自動選択（全候補 bit-exact 同値）、rdtsc プロファイリング。
+
+検証:
+
+- **差分 fuzz**: ランダム 40,000 件（HTML + CSS + li マーカー + 罫線 + 背景 + 全角 +
+  複数 viewport 幅 8..100 + ansi/plain）で C の `--no-ansi`/ANSI 出力と突合し、
+  **既知の 1 ケース（C FAST/SLOW 不整合）を除き 0 不一致**。
+- golden テスト（`tests/golden/doc`）が Rust 単体で byte 一致。
+- 単体テスト 5 件（rgba_to_ansi / golden doc / 単純テキスト / ansi SGR / hr + extent）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 116 =
+  264 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+次は Markdown（`md.c` 1698 行）→ chrome（`chrome.c` 603）→ image（`image.c` 540）→
+net/tls（`net.c` 573 / `tls.c` 406）へ進む。
