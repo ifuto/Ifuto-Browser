@@ -89,3 +89,6 @@ pub mod md;
 
 /// 軽量画像デコード（BMP / PNG。C の `image.c` 相当）。
 pub mod image;
+
+/// 内部ページ生成（C の `ifuto_pages.c` 相当）。
+pub mod ifuto_pages;

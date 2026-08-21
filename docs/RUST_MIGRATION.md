@@ -1030,6 +1030,38 @@ C の `malloc`/`realloc`/`free` の手動管理と `u8 *px` 返却を、所有 `
   280 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
 
 次は chrome（`chrome.c` 603、オーケストレータ = 最終統合で移植）→ net/tls（`net.c` 573 /
-`tls.c` 406）→ script（`script.c` 424）→ ifuto_pages（`ifuto_pages.c` 247）へ進む。
-`raster.c`（155 行）は fill カーネル自動選択で全候補 bit-exact 同値のため、スカラ fill
-で十分（描画層統合時に組み込み）。
+`tls.c` 406）→ script（`script.c` 424）へ進む。`raster.c`（155 行）は fill カーネル自動
+選択で全候補 bit-exact 同値のため、スカラ fill で十分（描画層統合時に組み込み）。
+
+### フェーズ 8-p: 内部ページ生成（ifuto_pages）
+
+`ifuto_pages.c`（248 行）を Rust へ移植した。静的な HTML テンプレート + ローカル値の
+差し込みによる 4 内部ページ（settings/history/memory/about）+ unknown ページ。
+
+- **settings / about / unknown**: 静的文字列。about の「WPT 適合率 97.3% (1679/1726)」等
+  の凍結値まで byte 一致。
+- **history**: `history.tsv`（epoch \t title \t url、末尾最新）を末尾から最大 100 件
+  新しい順に表示。外部入力の title/url は `& < >` を escape。
+- **memory**: タブごとの arena 会計（`N KB (M MB)`）+ raster backend 決定欄
+  （`%10.0f MB/s` の右揃え書式を `format!("{:10.0}")` で再現。C と round-half-to-even・
+  `-0` 表示まで一致）。
+
+C は `IfChrome *`（タブ・store・raster 判定結果）と fs を直接読むが、Rust では純関数化
+のため履歴テキスト・タブ一覧・raster 判定結果を引数として注入する（`&[u8] → Option<Vec<u8>>`）。
+
+**既知の C の quirk（忠実再現）**: 履歴の url は属性値としても `& < >` のみ escape
+（ヘッダコメントは「&<>\" を退避」と書くが実コードは `"` を退避しない）。
+
+検証:
+
+- **差分 fuzz**: ランダム 30,000 件の history.tsv（正常行/壊れ行/末尾改行/空行/エスケープ
+  対象文字）で C の `if_ifuto_page` と Rust 出力を突合し **0 不一致**。settings/about/
+  unknown/non-ifuto は 1 発で byte 一致。
+- `%10.0f` を C `printf` と対照（12735 / 0.5 / 2.5 / -0.5 / 1000000 等の round-half-to-even
+  + `-0` 表示）。
+- 単体テスト 7 件（settings/about/unknown/non-ifuto/history escape/history empty/memory 表）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 139 =
+  287 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+次は net/tls（`net.c` 573 / `tls.c` 406）→ script（`script.c` 424）→ chrome
+（`chrome.c` 603、オーケストレータ = 最終統合で移植）へ進む。
