@@ -101,3 +101,9 @@ pub mod net;
 
 /// `<script>` 実行配線の純粋関数（C の `script.c` の style 属性操作相当）。
 pub mod script;
+
+/// TLS クライアントの純粋関数（C の `tls.c` の base64 デコード相当）。
+pub mod tls;
+
+/// クロームモデルの純粋関数（C の `chrome.c` の検索・照合相当）。
+pub mod chrome;

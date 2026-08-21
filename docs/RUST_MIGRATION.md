@@ -1113,6 +1113,36 @@ C の `IfStr` 借用返却を所有 `Vec<u8>` / `Option<...>` に置換。**移�
 クロスクレート配線）** と **chrome（`chrome.c` 603、オーケストレータ）**。両者は相互
 依存が深い最終統合層で、ソケット/TLS I/O を含む。
 
+### フェーズ 8-t: TLS base64 + クローム検索（tls / chrome）
+
+残る純粋関数の葉を移植した。
+
+**tls（`tls.c` の base64 デコード）**:
+
+- `b64_decode`: PEM 標準表の base64 デコード（空白類無視・`=` padding・`\0` 打ち切り）。
+  CA バンドル（PEM）の証明書抽出が使う。
+- 未移植（BearSSL + socket I/O）: `ta_add` / `ca_load_pem` / `ca_load` /
+  `if_tls_client` / `if_tls_send_all` / `if_tls_recv` / `if_tls_close`。最終統合で
+  Rust TLS に再実装。
+
+**chrome（`chrome.c` の検索・照合）**:
+
+- `ci_contains`: 大小無視 ASCII の部分一致（ASCII `A-Z` のみ小文字化。UTF-8 は
+  バイト比較 = C と同一）。
+- `find_tabs`: title/url/group のいずれかに query を含むタブ index を返す
+  （文書順・最大 `max` 件）。
+- 未移植（状態機械）: `tab_load` / `if_chrome_open` / `if_chrome_close` 等の
+  タブ管理オーケストレータ（net/tls/script/ext を束ねる）。
+
+検証:
+
+- **差分 fuzz**: ランダム 60,000 件（b64_decode 30,000 / ci_contains 30,000。有効
+  base64・padding・空白・`\0` 打ち切り・壊れ・多言語文字）で C と Rust 出力を突合し
+  **0 不一致**。
+- 単体テスト 6 件（b64 基本/空白/`\0`/拒否、ci_contains、find_tabs）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 162 =
+  310 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
 ### フェーズ 8-s: `<script>` 実行配線の純粋関数（script）
 
 `script.c` の **style 属性操作**（`<element>.style` HANDLE の背後の純粋関数）を移植した。
