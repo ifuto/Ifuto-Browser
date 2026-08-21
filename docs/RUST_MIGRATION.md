@@ -1143,6 +1143,33 @@ C の `IfStr` 借用返却を所有 `Vec<u8>` / `Option<...>` に置換。**移�
 - `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 162 =
   310 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
 
+### フェーズ 8-u: 統合 CLI（純粋関数の配線 + 回帰ハーネス）
+
+純粋関数を全配線する統合 CLI（`rust/ifuto-core/examples/ifuto.rs`）を新設し、C の
+`ifuto` の観測モード（`--dump-wptdom` / `--dump-dom` / `--dump-layout` / `--dump-styles` /
+`--dump-tokens` / `--no-ansi` render）を Rust 単体で再現した。併せて、未移植だった
+**`if_dom_dump`（デバッグ形式の DOM ダンプ、`--dump-dom`）** を `Dom::dump()` として移植。
+
+- **`Dom::dump()`**: `#document` + インデント付きノード列 + `; nodes=N errors=M
+  title="..."`。テキスト 48 バイト打ち切り（`\n`→`\\n`、`"`→`\\\"`）、属性値 64 バイト
+  打ち切り。
+- **統合 CLI**: `html_tok`（token dump）→ `html_tree`（parse / fragment）→ `css`
+  （style）→ `layout`（box 木）→ `render`（grid + emit）を配線。md は `md_to_html` +
+  `parse_html`（C の `IFUTO_MD_SLOW=1` 経路と同値）。
+
+**移植で 1 箇所バグを修正**: `--dump-tokens` の tag_raw は C の `%-12.*s`（precision =
+全長）により**切り詰めなし**（幅 12 は最小幅の右パディングのみ）。初版は 12 バイトへ
+切り詰めていた（`<annotation-xml>` が `annotation-x` になる）ため、差分 fuzz が炙り出した。
+
+検証:
+
+- **差分 fuzz（フルパイプライン）**: ランダム 35,000 件（HTML 20,000 + md 15,000 ×
+  全 7 観測モード）で C の `ifuto` と Rust 出力を突合し **0 不一致**。
+- **golden 1/1** + **html5lib 1922/1922** を統合 Rust CLI 単体で実証。
+- `Dom::dump()` の単体テスト追加。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 163 =
+  311 件）緑、`cargo clippy --offline --workspace --examples -- -D warnings` 緑。
+
 ### フェーズ 8-s: `<script>` 実行配線の純粋関数（script）
 
 `script.c` の **style 属性操作**（`<element>.style` HANDLE の背後の純粋関数）を移植した。

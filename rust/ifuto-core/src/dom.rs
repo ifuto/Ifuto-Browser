@@ -469,6 +469,112 @@ impl Dom {
             }
         }
     }
+
+    /// デバッグ用の DOM ダンプ（C の `if_dom_dump` 相当。`--dump-dom` の出力）。
+    ///
+    /// `#document` + インデント付きノード列 + `; nodes=N errors=M title="..."`。
+    /// テキストは 48 バイト打ち切り（`\n`→`\\n`、`"`→`\\\"`）、属性値は 64 バイト打ち切り。
+    pub fn dump(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.nodes.is_empty() {
+            out.extend_from_slice(b"(empty dom)\n");
+            return out;
+        }
+        out.extend_from_slice(b"#document\n");
+        let mut c = self.node(self.root).first_child;
+        while let Some(cid) = c {
+            self.dump_node(cid, 0, &mut out);
+            c = self.node(cid).next_sibling;
+        }
+        out.extend_from_slice(
+            format!(
+                "; nodes={} errors={} title=\"",
+                self.nodes.len(),
+                self.n_errors
+            )
+            .as_bytes(),
+        );
+        out.extend_from_slice(&self.title);
+        out.extend_from_slice(b"\"\n");
+        out
+    }
+
+    /// ノード 1 個をデバッグ形式で出力（C の `dump_node` 相当）。
+    fn dump_node(&self, n: NodeId, depth: usize, out: &mut Vec<u8>) {
+        for _ in 0..depth {
+            out.extend_from_slice(b"  ");
+        }
+        let node = self.node(n);
+        match node.kind {
+            NodeKind::Text => {
+                let shown = node.name.len().min(48);
+                out.extend_from_slice(b"#text \"");
+                for &c in &node.name[..shown] {
+                    if c == b'\n' {
+                        out.extend_from_slice(b"\\n");
+                    } else if c == b'"' {
+                        out.extend_from_slice(b"\\\"");
+                    } else {
+                        out.push(c);
+                    }
+                }
+                if node.name.len() > 48 {
+                    out.extend_from_slice("…".as_bytes());
+                }
+                out.extend_from_slice(b"\"\n");
+            }
+            NodeKind::Doctype => match &node.doctype {
+                Some(d) if d.has_name => {
+                    out.extend_from_slice(b"<!DOCTYPE ");
+                    out.extend_from_slice(&d.name);
+                    out.extend_from_slice(b">\n");
+                }
+                _ => out.extend_from_slice(b"<!DOCTYPE >\n"),
+            },
+            NodeKind::Comment => {
+                if !node.pi_target.is_empty() {
+                    out.extend_from_slice(b"<?");
+                    out.extend_from_slice(&node.pi_target);
+                    out.push(b' ');
+                    out.extend_from_slice(&node.name);
+                    out.extend_from_slice(b"?>\n");
+                } else {
+                    out.extend_from_slice(b"<!-- ");
+                    out.extend_from_slice(&node.name);
+                    out.extend_from_slice(b" -->\n");
+                }
+            }
+            NodeKind::Element => {
+                out.push(b'<');
+                if node.name.is_empty() {
+                    out.push(b'?');
+                } else {
+                    out.extend_from_slice(&node.name);
+                }
+                for a in &node.attrs {
+                    out.push(b' ');
+                    out.extend_from_slice(&a.name);
+                    out.extend_from_slice(b"=\"");
+                    let shown = a.value.len().min(64);
+                    out.extend_from_slice(&a.value[..shown]);
+                    out.push(b'"');
+                }
+                out.extend_from_slice(b">\n");
+                let mut c = node.first_child;
+                while let Some(cid) = c {
+                    self.dump_node(cid, depth + 1, out);
+                    c = self.node(cid).next_sibling;
+                }
+            }
+            NodeKind::Document => {
+                let mut c = node.first_child;
+                while let Some(cid) = c {
+                    self.dump_node(cid, depth, out);
+                    c = self.node(cid).next_sibling;
+                }
+            }
+        }
+    }
 }
 
 impl Default for Dom {
@@ -581,5 +687,25 @@ mod tests {
         assert_eq!(d.node(html).last_child, Some(c));
         assert_eq!(d.node(b).parent, None);
         assert_eq!(d.node(b).next_sibling, None);
+    }
+
+    /// C の `if_dom_dump` のデバッグ形式（`--dump-dom`）を固定。
+    #[test]
+    fn dump_debug_format() {
+        let mut d = Dom::new();
+        let root = d.root;
+        let html = make_elem(&mut d, root, tags::tag_id(b"html"));
+        let body = make_elem(&mut d, html, tags::tag_id(b"body"));
+        make_text(&mut d, body, b"hello\nworld");
+        d.title = b"T".to_vec();
+        d.n_errors = 3;
+
+        let out = d.dump();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with("#document\n"), "got: {s:?}");
+        assert!(s.contains("<html>\n"), "got: {s:?}");
+        assert!(s.contains("  <body>\n"), "got: {s:?}");
+        assert!(s.contains("#text \"hello\\nworld\""), "got: {s:?}");
+        assert!(s.ends_with("; nodes=4 errors=3 title=\"T\"\n"), "got: {s:?}");
     }
 }
