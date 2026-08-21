@@ -961,3 +961,39 @@ golden テスト（`tests/golden/doc` の `--no-ansi --width 40` 出力）が Ru
 
 次は Markdown（`md.c` 1698 行）→ chrome（`chrome.c` 603）→ image（`image.c` 540）→
 net/tls（`net.c` 573 / `tls.c` 406）へ進む。
+
+### フェーズ 8-n: Markdown 変換層（md）— 文字列 backend
+
+`md.c`（1699 行）の **文字列 backend**（`if_md_to_html`）を Rust へ移植した。
+Markdown → HTML の変換器本体を純粋関数（`&[u8] → Vec<u8>`）として実装する。
+
+- **ブロック層**（`blocks_win` / `blocks_str`）: ATX 見出し（閉じ `#` trim）・hr・
+  フェンスコード（言語 class）・引用（ネスト / depth≥8 の flatten 飽和）・ul/ol
+  （インデント入れ子）・GFM パイプ表・段落（ハードブレーク）。行分割は `&[u8]` スライス。
+- **inline 層**（`inline_span`）: バックスラッシュ escape・インラインコード・
+  strong/em・del・リンク/画像・自動リンク `<http://…>`。特殊文字走査はスカラ版。
+- **脚注**（`try_link` / `run_blocks`）: `[^id]` 参照（参照順 numbering・多重参照は
+  `fr-id-2`）と `[^id]:` 定義 → `<section class="footnotes">` セクション。
+- **escape**: テキストは `&` `<` `>`、属性値は `&` `<` `"`（生 HTML 非透過・XSS 安全）。
+- **CRLF 正規化**: `\r` / `\r\n` → `\n`（`\r` 無しはゼロコピー）。
+
+C の `realloc` ベースのステージングバッファ + `b_finish` の 2 段構えを、`Vec<u8>` への
+直接追記に置換。手動の容量計算・解放規約を排除する。
+
+**未移植（性能最適化・観測不変）**: DOM 直構築 backend（`if_md_parse_fast*`。`md→HTML→
+parse_html` と観測同値の高速経路。ws-only TEXT 剥がしの `md_ws_stripped` 最適化を含む）、
+2-way 並列 fast parse（`md_par_scan` / pthread）、SIMD 特殊文字走査、rdtsc プロファイリング。
+
+検証:
+
+- **差分 fuzz**: ランダム 30,000 件（見出し/段落/強調/コード/リンク/画像/引用/リスト/
+  表/脚注/CRLF/escape/敵対深度）で C の `if_md_to_html` と Rust 出力を突合し **0 不一致**
+  （byte 一致）。
+- 引用 100 段の飽和（`<blockquote>` 9 個 = 8 段 + flatten）が C と一致。
+- C の `tests/test_md.c` の主要ケース（33 件の文字列完全一致）を Rust テストとして再現
+  （12 テスト関数に集約）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 128 =
+  276 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+次は chrome（`chrome.c` 603）→ image（`image.c` 540）→ net/tls（`net.c` 573 /
+`tls.c` 406）→ script（`script.c` 424）→ ifuto_pages（`ifuto_pages.c` 247）へ進む。

@@ -83,3 +83,6 @@ pub mod layout;
 
 /// セルグリッドレンダラ（C の `render_ansi.c` 相当）。
 pub mod render;
+
+/// Markdown 変換層（C の `md.c` の文字列 backend 相当）。
+pub mod md;
