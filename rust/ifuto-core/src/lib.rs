@@ -77,3 +77,6 @@ pub mod html_tree;
 
 /// CSS サブセット（パース + カスケード。C の `css.c` 相当）。
 pub mod css;
+
+/// レイアウト（整数セル座標系。C の `layout.c` 相当）。
+pub mod layout;

@@ -874,3 +874,41 @@ Blink ファサード（`css_blink.h`）。いずれも `--dump-styles` の出�
   250 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
 
 次はレイアウト（`layout.c` 1574 行。box 木 + 行レイアウト）→ 描画系へ進む。
+
+### フェーズ 8-l: レイアウト（layout）— box 木 + 行レイアウト
+
+`layout.c`（1575 行）のコアを Rust へ移植した。ブロック/インラインの box 木構築と
+行レイアウトの全 eager 経路をカバーする。
+
+- **幾何**（`geom`）: margin/padding/border（幅 1 の有無）/width/height の解決、
+  `len_h`/`len_v`（% は包含ブロック基準、px/em/rem/pt は `resolve_len`）、
+  margin:auto センタリング、`px2col`/`px2row` の C と同一の丸め。
+- **ブロックレイアウト**（`layout_element` / `layout_children`）: トップダウン DFS、
+  兄弟縦マージン相殺（max）、`<hr>` 特殊形状、display:none の除去、list-item の
+  ブロック化。
+- **インライン整形コンテキスト**（`layout_ifc` / `flatten_into` / `wrap_text`）:
+  flatten（TEXT/BR/IMG alt）→ アトム化（ASCII 可視ラン / 全角 1 グリフ / 結合文字）→
+  貪欲折り返し。空白折り畳み・`white-space:pre`・行幅超過グリフのハード分割。
+- **segment 合体**（`push_merge`）: C の `pm_st`/`pm_end`（ソース連続性）追跡を
+  `Option<Style>` + ソースオフセットで忠実再現（seg 境界が dump の `segs=N` と
+  60 バイト打ち切りに現れるため、正確な再現が必須）。
+
+box は `BoxNode`（子を所有 `Vec`）、seg は `Vec<Seg>`（所有 `Vec<u8>`）で表現し、
+C の arena bump + rewind / raw ポインタ連結を構造的に排除。
+
+**未移植（性能最適化・観測不変）**: AVX2/SSE2 の ASCII ラン走査、幾何キャッシュ、
+fused fit 経路、2-way 並列 layout（pthread）、線形モード box 再利用、lazy style、
+link span 収集・deco 装飾 op（dump に現れず、描画層移行時に移植）、rdtsc プロファイリング。
+
+検証:
+
+- **差分 fuzz**: ランダム 50,000 件（HTML 構造 + CSS + 全角/結合文字/長単語の
+  ハード分割 + 複数 viewport 幅 4..250）で C の `--dump-layout` と Rust 出力を突合し
+  **0 不一致**（byte 一致）。
+- 単体テスト 8 件（空レイアウト / 単純ブロック / h1 フォントサイズ / hr /
+  全角グリフ幅 / 折り返し / br / list-item / マージン相殺）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 111 =
+  259 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+次は描画系（`raster.c` 155 / `render_ansi.c` 1209 / `md.c` 1698 / `chrome.c` 603 /
+`image.c` 540）へ進む。
