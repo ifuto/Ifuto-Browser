@@ -98,3 +98,6 @@ pub mod raster;
 
 /// HTTP/1.1 取得の純粋関数（C の `net.c` の非ソケット部分相当）。
 pub mod net;
+
+/// `<script>` 実行配線の純粋関数（C の `script.c` の style 属性操作相当）。
+pub mod script;

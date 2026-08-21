@@ -1113,6 +1113,38 @@ C の `IfStr` 借用返却を所有 `Vec<u8>` / `Option<...>` に置換。**移�
 クロスクレート配線）** と **chrome（`chrome.c` 603、オーケストレータ）**。両者は相互
 依存が深い最終統合層で、ソケット/TLS I/O を含む。
 
+### フェーズ 8-s: `<script>` 実行配線の純粋関数（script）
+
+`script.c` の **style 属性操作**（`<element>.style` HANDLE の背後の純粋関数）を移植した。
+
+- **`style_get_prop(style_attr, prop)`**: `;` 区切り・CI 名前照合でプロパティ値を抽出
+  （前後空白 trim）。C の quirk を忠実再現: 名前部の**後ろ**（`:` 直前）の空白は trim
+  しない（`"color : green"` は `color` に不一致）。
+- **`style_set_prop(style_attr, prop, value)`**: 既存 prop を除去して `prop:value` を
+  追記。C のバッファ操作（`bl + seg_len + 1 <= cur.n` の保持条件・`i <= cur.n && bl <
+  cur.n` の `;` 付与・末尾 `;;` の折り畳み）を忠実に再現。置換時は末尾 `;` を付けない
+  （`"color:red;"` → `"color:blue"`）。
+
+C の `AklHandleVTab`（`CSSStyleDeclaration`）get/set コールバックの内側にある純粋操作を、
+「文字列 → 文字列」関数として抽出した。
+
+**移植で 2 箇所の quirk を特定（忠実再現）**: ① `style_get_prop` は名前部後ろの空白を
+trim しない。② `style_set_prop` は置換時に末尾 `;` を付けない（差分 fuzz が C との
+不一致を炙り出して特定）。
+
+未移植（FFI・最終統合）: `script_console_log` / `doc_*` / `elem_*` / `style_*`（VTab の
+get/set/call。akl-ffi と DOM のクロスクレート配線）、`collect_scripts_rec` /
+`if_script_run`（JS eval ループ）。
+
+検証:
+
+- **差分 fuzz**: ランダム 60,000 件（get 30,000 / set 30,000。style 属性文字列 +
+  prop + value を網羅）で C の `style_get_prop` / `style_set_prop` と Rust 出力を突合し
+  **0 不一致**。
+- 単体テスト 3 件（get / set / C の quirk）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 156 =
+  304 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
 ### フェーズ 8-r: 永続ストア書き面（store シリアライズ）
 
 `store.c` の**書き面**（セッション保存・履歴行・ブックマークトグル）を Rust へ移植した。
