@@ -86,3 +86,6 @@ pub mod render;
 
 /// Markdown 変換層（C の `md.c` の文字列 backend 相当）。
 pub mod md;
+
+/// 軽量画像デコード（BMP / PNG。C の `image.c` 相当）。
+pub mod image;

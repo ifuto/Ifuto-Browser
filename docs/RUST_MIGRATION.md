@@ -997,3 +997,39 @@ parse_html` と観測同値の高速経路。ws-only TEXT 剥がしの `md_ws_st
 
 次は chrome（`chrome.c` 603）→ image（`image.c` 540）→ net/tls（`net.c` 573 /
 `tls.c` 406）→ script（`script.c` 424）→ ifuto_pages（`ifuto_pages.c` 247）へ進む。
+
+### フェーズ 8-o: 軽量画像デコード（image）— PNG / BMP
+
+`image.c`（541 行）を Rust へ移植した。純粋関数（`&[u8] → Result<Image, String>`）として
+実装する。
+
+- **PNG**: チャンク走査（CRC 検証）→ IDAT 連結 → zlib inflate（RFC1950/1951。ストアド/
+  固定/動的ハフマン。正準ハフマンをビット長テーブルで構成）→ フィルタ解除
+  （None/Sub/Up/Average/Paeth。C と同じく `raw` をその場で書き換え、`prev` は解除済み
+  前行を参照）→ 色変換（グレー/RGB/グレー+α/RGBA）。8bit 深度のみ、パレット・
+  インターレースは拒否。
+- **BMP**: 無圧縮 24/32bpp（BITMAPINFOHEADER のみ。ボトムアップ対応。BGR→RGB）。
+  RLE・16bpp・パレットは拒否。
+- メモリ上限: 1 画像 64MB、次元 16384 まで。破損データは明白に失敗（エラー文言まで一致）。
+
+C の `malloc`/`realloc`/`free` の手動管理と `u8 *px` 返却を、所有 `Vec<u8>` + `Result` に
+置換。二重 free・free 漏れ・境界検査漏れを構造的に排除する。
+
+**移植で発見したバグ（修正済み）**: PNG フィルタ解除は C が `raw` を**その場で**書き換え
+（`prev` は「解除済みの前行」を指す）るのに対し、初版は `row` を別 `Vec` にコピーして
+`prev` を未解除の `raw` から読んでいた。Up/Average/Paeth（フィルタ 2/3/4）で 2 行目以降が
+全画素ずれる実害を差分 fuzz が炙り出した。in-place に直して C と byte 一致。
+
+検証:
+
+- **差分 fuzz**: ランダム 35,000 件（有効 PNG 全カラータイプ × 全 5 フィルタ + 高圧縮
+  LZ77 参照 / 有効 BMP 24/32bpp / 破損 PNG / ランダムゴミ）で C の `if_img_decode` と
+  Rust 出力（成功 + ピクセル列 + エラー文言）を突合し **0 不一致**。
+- 単体テスト 4 件（PNG RGBA / PNG グレー / BMP24 / 拒否系）。
+- `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 132 =
+  280 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+次は chrome（`chrome.c` 603、オーケストレータ = 最終統合で移植）→ net/tls（`net.c` 573 /
+`tls.c` 406）→ script（`script.c` 424）→ ifuto_pages（`ifuto_pages.c` 247）へ進む。
+`raster.c`（155 行）は fill カーネル自動選択で全候補 bit-exact 同値のため、スカラ fill
+で十分（描画層統合時に組み込み）。
