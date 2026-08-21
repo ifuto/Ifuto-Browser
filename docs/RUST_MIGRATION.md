@@ -735,3 +735,20 @@ DOM ノードは JS エンジンで実証済みの「`NodeId` = `Vec<Node>` へ�
   DOCTYPE/void/自己終了/NUL 規則）。
 - `cargo test --offline --workspace`（ifuto-core 73 件 = 合計 221 件）緑、
   `cargo clippy --offline --workspace -- -D warnings` 緑。
+
+### フェーズ 8-h: DOM ノードモデル（dom）— ツリービルダの基盤
+
+- `dom` モジュール: `NodeKind` / `Ns` / `Node`（`NodeId` = `Vec<Node>` index）/
+  `Dom`（`Vec<Node>` 所有）を移植。JS エンジンで実証済みの index パターンを踏襲し、
+  C の raw ポインタ連結（parent/first_child/last_child/next_sibling）を
+  `Option<NodeId>` に置換。ポインタの寿命・エイリアシング問題を構造的に排除。
+- 純粋ヘルパ: `append_child` / `detach` / `attr`（CI）/ `has_class` / `text_content`
+  （DFS）/ `find_tag_dfs` / `find_by_id` / `attr_set` を移植。
+
+検証:
+- 単体テスト 5 件（木構造・text_content DFS・attr/has_class・find・detach）。
+- `cargo test --offline --workspace`（ifuto-core 78 件 = 合計 226 件）緑、
+  `cargo clippy --offline --workspace -- -D warnings` 緑。
+
+次はツリー構築（`html_tree.c` 3147 行）の挿入モード状態機械を移植し、
+`parse_html` でトークナイザ + DOM を接続。html5lib 適合（1922/1922）の Rust 再現へ。

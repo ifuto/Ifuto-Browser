@@ -68,3 +68,6 @@ pub mod tags_tables;
 
 /// HTML トークナイザ（C の `html_tok.c` 相当）。
 pub mod html_tok;
+
+/// DOM ノードモデル（C の `dom.c` / `dom.h` 相当のデータ構造と純粋ヘルパ）。
+pub mod dom;
