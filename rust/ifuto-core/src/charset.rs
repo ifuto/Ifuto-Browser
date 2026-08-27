@@ -454,7 +454,10 @@ mod tests {
     #[test]
     fn oracle_sniff() {
         // HTTP 優先
-        let (e, _) = sniff(Some(b"text/html; charset=euc-jp"), b"<meta charset=shift_jis><p>x");
+        let (e, _) = sniff(
+            Some(b"text/html; charset=euc-jp"),
+            b"<meta charset=shift_jis><p>x",
+        );
         assert_eq!(e, Enc::EucJp);
         // meta 引用符・ci・空白
         let (e, _) = sniff(None, b"<META  CHARSET = \"Shift_JIS\">");
@@ -500,8 +503,8 @@ mod tests {
         // こんにちは日本語
         {
             let b = [
-                0x82u8, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd, 0x93, 0xfa, 0x96, 0x7b,
-                0x8c, 0xea,
+                0x82u8, 0xb1, 0x82, 0xf1, 0x82, 0xc9, 0x82, 0xbf, 0x82, 0xcd, 0x93, 0xfa, 0x96,
+                0x7b, 0x8c, 0xea,
             ];
             assert!(eq(&dec(&b, Enc::Sjis), "こんにちは日本語"));
         }
@@ -515,13 +518,22 @@ mod tests {
         // malformed: lead+EOF → FFFD(1)
         assert!(eq(&dec(&[0x93], Enc::Sjis), "\u{FFFD}"));
         // lead + 範囲外 trail(0x20) → FFFD(lead のみ)。trail restore
-        assert!(eq(&dec(&[0x93, 0x20, b'A', b'B'], Enc::Sjis), "\u{FFFD} AB"));
+        assert!(eq(
+            &dec(&[0x93, 0x20, b'A', b'B'], Enc::Sjis),
+            "\u{FFFD} AB"
+        ));
         // 有効 lead + 有効 trail: 0x93 0x41 = 鄭
         assert!(eq(&dec(&[0x93, 0x41], Enc::Sjis), "鄭"));
         // 孤立 0x80 / 0xA0 / 0xFD
-        assert!(eq(&dec(&[0x80, 0xA0, 0xFD], Enc::Sjis), "\u{FFFD}\u{FFFD}\u{FFFD}"));
+        assert!(eq(
+            &dec(&[0x80, 0xA0, 0xFD], Enc::Sjis),
+            "\u{FFFD}\u{FFFD}\u{FFFD}"
+        ));
         // lead + trail 範囲外の継続: 0x82 0x20 → FFFD + ' '
-        assert!(eq(&dec(&[0x82, 0x20, 0x82, 0xa0], Enc::Sjis), "\u{FFFD} あ"));
+        assert!(eq(
+            &dec(&[0x82, 0x20, 0x82, 0xa0], Enc::Sjis),
+            "\u{FFFD} あ"
+        ));
         // 有効 lead+範囲内 trail だが無字セル → FFFD（2 消費）
         assert!(eq(&dec(&[0x85, 0x40], Enc::Sjis), "\u{FFFD}"));
     }
@@ -550,7 +562,10 @@ mod tests {
         // 0x8E + 非範囲 → FFFD(1)+restore
         assert!(eq(&dec(&[0x8e, 0x41], Enc::EucJp), "\u{FFFD}A"));
         // 孤立 0x81/0x90/0xFF → 各 FFFD(1)
-        assert!(eq(&dec(&[0x81, 0x90, 0xff], Enc::EucJp), "\u{FFFD}\u{FFFD}\u{FFFD}"));
+        assert!(eq(
+            &dec(&[0x81, 0x90, 0xff], Enc::EucJp),
+            "\u{FFFD}\u{FFFD}\u{FFFD}"
+        ));
     }
 
     /// 全バイト対（65536 × 2）の総当たり健全性: クラッシュせず・出力長 ≤ 6・決定的。

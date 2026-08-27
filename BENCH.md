@@ -84,20 +84,48 @@ peak RSS 35,596 KB、nodes=206,290。
 
 min **1.40ms** / median **1.66ms** / p90 1.96ms。
 
+### C vs Rust 比較（2026-08-24、移行フェーズ 8-z。`bench/bench_c_vs_rust.py` 実測）
+
+paired interleaved A/B（対ごとに実行順を交互化）で C=`build/ifuto` 1,406,216B /
+Rust=`rust/target/release/ifuto` 1,686,232B（strip 後 1,511,600B）を比較。
+**全計測ペアで stdout byte 一致 + stderr(scrub 後) 一致（177/177）を同時検証済**。
+ldd: C = vdso/libm/libc/ld、Rust = 同 + libgcc_s（C は -static-libgcc 適用済）。
+
+| 指標 | C | Rust | 倍率 (Rust÷C) |
+|---|---|---|---|
+| 16MB total（7 対 median） | 130.14ms | 2,404.21ms | 18.47× |
+| 16MB 段別 parse/style/layout/render ms | 53.13 / 0.01 / 54.05 / 22.70 | 244.06 / 499.07 / 752.83 / 867.41 | — |
+| 16MB peak RSS | 212,960KB | 2,523,504KB | 11.85× |
+| 2MB total（13 対 median） | 18.61ms | 310.94ms | 16.71× |
+| 2MB peak RSS | 34,136KB | 324,468KB | 9.51× |
+| ANSI 2MB total（7 対 median） | 45.22ms | 381.00ms | 8.43× |
+| 起動 wall（150 対 median） | 1.67ms | **1.55ms** | 0.93×（符号 17:133 で Rust 優位） |
+| md fast-DOM 有無 total（slow÷fast、16MB） | 681.7÷146.3ms = 4.66× | 2,995.5÷2,329.6ms = 1.29× | —（fast≡slow の stdout 一致を両者で検証） |
+
+読み方（嘘をつかない注記）: Rust 版は byte-exact 凍結優先の正確性移植で、C の性能
+機構（lazy style・row_emit fast 群・fitdom CJK SIMD・並列 layout）は未移植であり
+上表は現行の事実。行監査帳簿（RowInfo 全行保持）が既知の速度・RSS オーバーヘッド源
+（次フェーズで kill switch 化 or 検証専用ビルド分離の設計候補。未実施）。
+多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/report-2026-08-24.html`
+（生成物。再生成手順はレポート §3）。
+
 ### 適合性・検証の現行値
 
 | ゲート | 現行値 |
 |---|---|
-| WPT tree-construction（`tests/wpt-tree-construction`、WPT master `5b6a1e6`） | **1922/1922 (100.0%)**、skip 12 = `#script-on` のみ（fragment 196 件は `--fragment CTX` で実行済） |
+| WPT tree-construction（`tests/wpt-tree-construction`、WPT master `5b6a1e6`） | **1922/1922 (100.0%)** × 両バイナリ（C / Rust）、skip 12 = `#script-on` のみ（fragment 196 件は `--fragment CTX` で実行済） |
 | TLS smoke（`make tlssmoke`、自己署名 CA + openssl s_server E2E） | 3 checks（https 取得 / CA 不一致 cert 拒否 / IP SAN 非対応の明示） |
-| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **623,986 checks / 0 failures** ×2（script 実行配線 + HANDLE GC 機械証明 + 入力 compaction + 文字コード層 60 checks オラクル込み） |
-| 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **21/21**（+4 = Shift_JIS/EUC-JP E2E、+1 = 変換表再生成一致） |
-| golden（`tests/run_golden.sh`） | 1/1 |
-| GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | 51 checks PASS（X 不在環境の proxi、GUI 実機は未検証と明記） |
-| 拡張 smoke（`tests/ext_smoke.py`） | **12 checks**（console.log 凍結 v1 含む） |
-| akl CLI smoke（`tests/akl_cli_smoke.py`） | 14 checks |
+| 単体テスト（run_tests + run_tests_switch 双子、ASAN+UBSan） | **625,125 checks / 0 failures** ×2（script 実行配線 + HANDLE GC 機械証明 + 入力 compaction + 文字コード層 60 checks オラクル込み。2026-08-24 再計測） |
+| Rust ワークスペース（`cargo test --offline`） | **333 passed / 0 failed**（akl-core 142 + akl-ffi 6 + ifuto-core 176 + ifuto-cli 9。2026-08-26） |
+| 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **21/21 × 両バイナリ**（+4 = Shift_JIS/EUC-JP E2E、+1 = 変換表再生成一致。idm コーパスは gen_idm.py 再生成で復元） |
+| golden（`tests/run_golden.sh`） | 1/1 × 両バイナリ |
+| C↔Rust 差分 fuzz（`tools/diff_fuzz_cli.py`） | **累計 98,133 cases / 0 mismatch**（seed 20260824/1/777/424242/999。stdout/stderr/rc byte 突合、--stats は計測値 scrub・決定値比較。2026-08-24） |
+| chrome 純粋部 C↔Rust 差分 fuzz（`tools/zz_chrome_diff.py`） | **累計 240,000 cases / 0 mismatch**（seed 1/7/42/999/777/424242/20260826。1 入力行=1 出行 byte 突合、両 driver の rc≠0 も不一致扱い。ASan+UBSan 30,000 ×2 で rc=0/stderr 空。2026-08-26） |
+| GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | PASS（C のみ。X 不在環境の proxi、GUI 実機は未検証と明記。Rust 側 --shot は未移植拒否形状のみ fuzz 検証） |
+| 拡張 smoke（`tests/ext_smoke.py`） | **12 checks**（C のみ。console.log 凍結 v1 含む） |
+| akl CLI smoke（`tests/akl_cli_smoke.py`） | 14 checks（C のみ。Rust 側は akl-core 単体テスト + oracle script E2E で担保） |
 | fuzz（`make fuzz`、500 回×5 標的: html/akl/net/store/ext） | 0 crash |
-| 警告 | 全ターゲット（REL/ASAN/tests）で**ゼロ** |
+| 警告 | 全ターゲット（REL/ASAN/tests）で**ゼロ**。Rust も `cargo clippy --workspace --all-targets -- -D warnings` + `cargo fmt --all --check` 緑（生成テーブルは生成器焼き込みの `#[rustfmt::skip]` で対象外化。2026-08-26） |
 
 ### 依存・形状
 
@@ -150,7 +178,8 @@ arena 16MB、-O3、POPULATE_WRITE 一括化、-march=native、style 2-way 並列
 6. `python3 tests/ext_smoke.py ./build/ifuto`
 7. `make build/ifuto-asan`（警告ゼロ）→ 主要経路の ASAN+LSan 走査
 8. `make fuzz`（500 iters × 5 標的）
-9. commit → push → `ifuto-backup.bundle` 更新（リモート整合確認後のみ）
+9. Rust 側変更時: `cargo test --offline && cargo clippy --offline --workspace --all-targets -- -D warnings && cargo fmt --all --check`。`chrome.c`/`chrome.rs` 変更時は `python3 tools/zz_chrome_diff.py 20000`（0 mismatch）も必須
+10. commit → push → `ifuto-backup.bundle` 更新（リモート整合確認後のみ）
 
 ## akl エンジン差分（2026-08-08: native 登録層 + オブジェクトモデルの導入）
 

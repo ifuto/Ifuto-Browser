@@ -1407,3 +1407,157 @@ C の `IfChrome *`（タブ配列 + active index）と `IfStore`（fs 注入）�
   bookmark トグル/縮退）。
 - `cargo test --offline --workspace`（akl-core 142 + akl-ffi 6 + ifuto-core 153 =
   301 件）緑、`cargo clippy --offline --workspace -- -D warnings` 緑。
+
+### フェーズ 8-z: 最終統合 — C↔Rust CLI byte-exact 達成 + 差分 fuzz 98,133 cases / 0 mismatch
+
+CLI 全観測モード（render / `--dump-*` / `--fragment` / `--links` / `--stats` / `--md` /
+`--slim-dom` / `--show-paths` / `--imgdecode` / http(s) 取得 / `<script>` 実行）を Rust
+単体で完動させ、**C バイナリを回帰オラクルとした差分 fuzz（stdout/stderr/rc の byte
+突合）で累計 98,133 cases / 0 mismatch** を達成した。GUI（`--gui` / `--shot` / `--ui`）
+のみ未移植で、明示メッセージ + rc=2 の明白拒否（拒否形状自体も byte 検証済）。
+
+検出・修正した偏差 8 群（全て再現 case に縮約 → 根因特定 → 機械再検証）:
+
+1. **byte-direct quirk（render 発行側）**。C の sweep は direct 旗付き行をセルモデル
+   経由せず生バイト発行する（`row_emit_direct` / `row_emit_fast` / `row_emit_ansi_fast`）。
+   wrap の検査 quirk（折り返し次行に紛れた 0 幅/不正グリフは direct を殺さない）で
+   生バイト ≠ セル再エンコードとなる行が存在。Rust に行監査帳簿（`RowInfo`: 全 paint
+   イベント畳み込み）+ C 受理条件の機械的写し（`fast_plan` / `emit_fast_row`）を実装。
+2. **C layout.c:574 の kill 漏れ**。pre 内の `\t` / `\r` / `\f`（`b0 != ' '`）で C は
+   `direct_all = 0` にするが Rust 版に欠落 → 追加（C 動作が正本）。
+3. **C src/dom.c の NULL strlen SEGV（ゼロデイ 2 件）**。`sel_part_matches`
+   （querySelector）と `ebt_rec`（getElementsByTagName 未知タグ経路）が
+   `if_tag_name(IF_TAG_UNKNOWN) = NULL` を `strlen` して SEGV。実タグ名 `u.tag_name`
+   との CI 比較に統一して C 側を修正（既知タグは `u.tag_name ≡ canonical` で同値）。
+   未知タグ要素を含む文書での `document.querySelector('div')` 等が crash していた
+   （fuzz が 7 件の crash case を検出。ASan 診断: `src/dom.c:276:26`）。
+4. **`; nodes=N` の計数規約**。C の `dom->n_nodes` は解析時専用カウンタで script の
+   事後生成を含まない一方、Rust は物理ノード数を出していた。`Dom::n_nodes`（解析凍結
+   カウンタ）を追加し dump/stats/css-dump で統一。
+5. **`--stats` の `links=N`**。C はレイアウトが常時リンク収集する（`--links` 旗と無関係）
+   → Rust も常時収集に変更（表示側のみ旗でゲート）。
+6. **`--stats` の `grid=WxH`**。C の CLI render は linear build（`no_boxlink`）のため
+   `if_render_extent` は root までしか歩かない → Rust の stats extent を
+   `max(lay.width, root.x+root.w)` / `max(lay.height, root.y+root.h)` に修正。
+7. **seg merge の arena 隣接 quirk**。C `wrap_push_merge` の `pm_end == p` はポインタ
+   比較で、連続 `<img>` 占位文字列が arena の 8B アライン bump 確保で物理隣接すると
+   2 つの `[img: …]` が 1 seg に合体する（`--dump-layout` の `segs=N` にのみ観測）。
+   由来位置クラス `Prov{Src(id), Syn, Never}` + 合成 arena bump モデル +
+   pieces/links/prec の grow イベント追跡で C の受理条件を厳密に再現。
+8. **MARKER+背景重畳の fast 経路依存 bytes**。マージン相殺で `<h4>` の背景が直前
+   `<li>` マーカー行を覆う際、C slow（deco 層順 paint）と C fast（run = 最上位層 pen）
+   で bytes が異なり、C は fast を取る。render.rs を universal fast エミュレーションに
+   拡張（LINE 全件ペイロード + markers を `RowInfo` に保持、`fast_plan` が行 0/1
+   LINE・BORDER 無・ansi 条件・MARKER グリフ検査・runs≤64・非重複・clip 整合を写す）。
+
+検証（2026-08-24 実走、全て緑）:
+
+- **差分 fuzz 累計 98,133 cases / 0 mismatch**: seed 20260824 (30,019) / 1 (20,019) /
+  777 (20,019) / 424242 (20,019) / 999 (3,019 ×2 回) / 777 再検証 (2,019)。
+  ツールは `tools/diff_fuzz_cli.py`（決定 RNG で完全再現。`--stats` は
+  タイミング/RSS/C 固有 arena 会計のみ scrub、決定値 nodes/links/grid は比較に残す）。
+- oracle 両バイナリ 21/21（idm コーパスは `tools/gen_idm.py` で決定再生成して復元。
+  環境消失で 7 NG 化していたのを解消）。
+- WPT tree-construction 両バイナリ 1922/1922 (100.0%)、skip 12（`#script-on` のみ）。
+- golden 両バイナリ PASS。`cargo test`: 328 件（akl-core 142 + akl-ffi 6 +
+  ifuto-core 171 + ifuto-cli 9）緑。`cargo clippy --offline --workspace -- -D warnings`
+  緑（C 側も gcc -Wall -Wextra 警告ゼロ）。
+- ベンチ計測そのものが適合性ゲートを兼ねる設計: 177 計測ペア全てで stdout byte 一致 +
+  stderr scrub 後一致を機械検証しながら速度を測った。
+
+**既知の差異（嘘をつかない台帳）**: 速度・メモリは現状 C が全面優位（16MB md total
+C 130.14ms vs Rust 2,404.21ms = 18.47×、peak RSS 212,960KB vs 2,523,504KB = 11.85×。
+2MB では 16.71× / 9.51×）。Rust 版は byte-exact 凍結を優先した正確性移植であり、
+C の性能機構（lazy style・row_emit fast 群・fitdom CJK SIMD・並列 layout）は未移植。
+行監査帳簿の常時有効化が既知のオーバーヘッド源。起動時間のみ Rust が僅かに速い
+（median 1.55ms vs 1.67ms、150 対で符号 17:133）。ldd は Rust が `libgcc_s` 一本
+多い（C は `-static-libgcc` 適用済）。多角ベンチの全量は
+`bench/report-2026-08-24.html`（生成物。再生成: `python3 bench/bench_c_vs_rust.py`
+→ `sh bench/run_gates.sh` → `python3 bench/gen_report.py bench/data-2026-08-24.json`）。
+
+### フェーズ 9-a: chrome モデル純粋部の Rust 移植 + C↔Rust 差分 fuzz ハーネス恒久化 + akl-ffi leak 全廃
+
+`src/chrome.c`（タブモデル/スクロール/URL 解決/検索）の**純粋関数 8 単位**を
+`rust/ifuto-core/src/chrome.rs` へ機械的写し（全体状態機械 —`cur_doc_bytes`/タブ配列の
+生命周期/描画/イベント loop— は未移植と明記）。C との byte-exact を差分 fuzz で
+凍結し、併せて C 側の UB を根絶し、akl-ffi の既知 leak を所有権設計で全廃した。
+
+移植（全て C 正本の機械的写し、quirk 付き）:
+
+1. `dup_cap`（C: `dup_cap` static）— cap>=1 契約。C の cap==0 は u32 underflow →
+   4GiB alloc 即死領域のため信頼域外（Rust は assert で明白拒否）。
+2. `ci_contains` — ASCII 大小不変の部分文字列。
+3. `scroll_apply`（`if_chrome_scroll`）— **2 段逐次 clamp が必須**。wrap 域で maxs が
+   負になると `<0 → 0` の後に `0 > maxs` で maxs へ引き戻される C quirk があり、
+   早期 return 形はこの引き戻しを落とす = 差分 fuzz が検出した実バグ（修正済）。
+4. `scroll_to_apply`（`if_chrome_scroll_to` lay 存在経路）— scroll と**非対称**:
+   C の scroll_to は単一三項で `pos<0 → 0` のみ、maxs 再評価は無い。
+5. `quit_decide`（確認 2 度押し判定）— 時計逆行 quirk を wrapping_sub で写す。
+6. `link_move`（`if_chrome_link_move`）— `wrapping_rem` 使用。C では
+   `INT_MIN % -1` が x86 SIGFPE crash UB だったため **C 側に `n == -1` ガードを挿入**
+   して同値化（旧観測が変わるのは従来 crash していた入力のみ = ゼロデイ級修正）。
+7. `resolve`（`if_chrome_resolve`）— skip_ws は `' '`/`'\t'` のみ、`"://"` 検出位置
+   2..=8 quirk、絶対パスは cap 検査を exists より先・`rc=2` でも out は memcpy 済み
+   quirk、cwd 相対は snprintf 4095 截断、の非対称群を忠実移植。
+8. `find_tabs` + `TabSearch` — 検索クエリ/タイトル/URL を **Vec<u8> 保持**
+   （String 化しない。非 UTF-8 タイトルも unsafe 無しで流通可能）。
+
+ハーネス恒久化（全てコミット対象の再現可能資産）:
+
+- `tools/zz_chrome_dump.c` — C オラクル driver。1 入力行=1 出行（CI/DUP/SCR/SCT/
+  QUI/LNK/RES/FT）。決定論 fs 予言者 `exists(s) = fnv1a64(s) % 4 == 0`（offset
+  basis 14695981039346656037ULL）、0x01 センチネルで「out 未書き」を検出、
+  BAD 行は raw 退避コピーから出力。
+- `rust/ifuto-core/examples/zz_chrome_dump.rs` — Rust 対応 driver（同一形式）。
+- `tools/zz_chrome_diff.py` — 生成器+突合（python random で seed 完全再現、
+  **両 driver の rc≠0 も mismatch 扱い**。空文字は `-` エンコード）。
+- C 側検証フック: `if_chrome_test_dup_cap` / `if_chrome_test_ci_contains`
+  （src/chrome.c/h。static 関数を driver から触るための shim と明記、本番非使用）。
+
+発見・修正した C 側 UB（ASan+UBSan 30k が確定、修正は観測不変）:
+
+- `if_chrome_scroll` / `if_chrome_scroll_to` / `if_chrome_link_move` の i32 符号溢れ
+  → `(i32)((u32)a - (u32)b)` の**明示 wrap** 化（実効 C ビルドと同値、UB のみ消去）。
+- `if_chrome_link_move` の `INT_MIN % -1` SIGFPE → 上記 `n == -1` ガード。
+
+**akl-ffi `handle_vtab_for` の意図的 leak 全廃**（`rust/akl-ffi/src/lib.rs`）:
+従来は C vtable ごとに `Box::leak` を 2 回実行（tag boxed str + `HandleVTab` box。
+LSan 報告: 80B direct + 23B indirect）。**所有権を AklRT へ移設**:
+`owned_vtabs: Vec<Box<HandleVTab>>` / `owned_tags: Vec<Box<str>>` フィールドに
+所有させ、cache の `&'static` 参照はその Box ヒープ領域（Vec 伸長で不動）を指す
+ライフタイム延長として SAFETY コメントで監査下に置いた。drop はフィールド宣言順
+（Runtime → cache → owned 群）で行われ、akl-core にカスタム Drop は無い（
+`impl Drop` grep 0 件確認）ため Runtime 解体中に参照先は読まれず、最後に owned 群が
+自動解放される。`#[allow(clippy::vec_box)]` には「Box はアドレス安定化が目的の
+ため誤検出」と正当化コメントを併記。効果: **`chk_oracle ./build/ifuto-asan` が
+21/21 に復帰**（script.out は LSan が `_Exit` で stdout flush 前に死ぬ副作用で
+空 got の FAIL 化を起こしていた。leak 0 で解消）。
+
+**生成コードと rustfmt の恒久和解**: `cargo fmt --all` が生成テーブル
+（`charset_tables.rs` 5.5k 行 / `entities_tables.rs`）を整形して
+`gen_*.py --verify`（byte-exact 再生成照合）を破壊する構造的衝突を、生成器 2 本
+（`tools/gen_charset.py` / `tools/gen_entities.py`）が各大表に `#[rustfmt::skip]` を
+焼く形で解消。以後 `cargo fmt --all` を workspace 全体に打っても照合を侵さない
+（`--verify` 再確認済）。
+
+検証（2026-08-26 実走、全て緑）:
+
+- **zz_chrome 差分 fuzz 累計 240,000 cases / 0 mismatch**: 開発時 140,000
+  （seed 1/7/42/999/777/424242/20260826 × 20,000）+ 本コミット直前の復帰検証
+  100,000（seed 1/7/42/999/777 × 20,000。リポジトリ再 clone 後に全 driver 再
+  ビルドして実走）。
+- **ASan+UBSan 30,000 cases × 2 回で rc=0 / stderr 空**（`/tmp/zz_chrome_c_asan`
+  自前ビルド、`-ffunction-sections --gc-sections` 併用）。
+- `cargo test --offline` **333 緑**（akl-core 142 + akl-ffi 6 + ifuto-core 176 +
+  ifuto-cli 9。chrome.rs に7 テスト追加）。
+- `cargo clippy --offline --workspace --all-targets -- -D warnings` 緑、
+  `cargo fmt --all --check` 緑（生成テーブルは skip 属性で rustfmt 対象外）。
+- `make test` 625,125 checks ×2 / 0 failures、`chk_oracle` 21/21 × 両バイナリ
+  （ASan 側 script.out 復帰を含む）、golden 1/1、gui_smoke PASS、ext_smoke 12/12。
+
+**既知の未移植・近似（嘘をつかない台帳の継続）**: chrome の全体状態機械
+（`cur_doc_bytes` / タブ配列の生命周期 / 描画 / イベント loop）は未移植。
+GUI（`--gui` / `--shot` / `--ui`）と `--ext` の chrome init も依然未移植で、
+明示拒否形状のみ差分検証済み（8-z 台帳どおり）。zz_chrome fuzz の信頼域は
+`zz_chrome_diff.py` ヘッダのとおり（文字列に NUL/0x01/改行を含まない、
+DUP cap>=1、RES cap の out 観測は 511B まで）。

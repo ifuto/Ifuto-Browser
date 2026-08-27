@@ -32,8 +32,8 @@
 // 付きで集約する（akl-ffi と同じ「境界を 1 ファイルに集約」方針）。それ以外のモジュール
 // （script 実行配線・net ソケット）は safe Rust のみ。
 
-use akl_core::bytecode::{HandleVTab, Runtime, VmError};
 use akl_core::builtins::install_builtins;
+use akl_core::bytecode::{HandleVTab, Runtime, VmError};
 use akl_core::codegen::compile;
 use akl_core::obj::Obj;
 use akl_core::parser::Parser;
@@ -88,7 +88,13 @@ fn with_dom_mut<T>(f: impl FnOnce(&mut Dom) -> T) -> T {
 }
 
 fn log_bytes(bytes: &[u8]) {
-    CTX.with(|c| c.borrow_mut().as_mut().unwrap().log.extend_from_slice(bytes));
+    CTX.with(|c| {
+        c.borrow_mut()
+            .as_mut()
+            .unwrap()
+            .log
+            .extend_from_slice(bytes)
+    });
 }
 
 /// バイト列から JS 文字列値を作る（非 UTF-8 は C の `akl_mkstring` と同じく空文字列）。
@@ -133,11 +139,7 @@ fn c_throw() -> AklVal {
 }
 
 /// `[script:console]` を出力する `console.log` native（C の `script_console_log`）。
-fn script_console_log(
-    rt: &mut Runtime,
-    _this: AklVal,
-    args: &[AklVal],
-) -> Result<AklVal, VmError> {
+fn script_console_log(rt: &mut Runtime, _this: AklVal, args: &[AklVal]) -> Result<AklVal, VmError> {
     let mut buf: Vec<u8> = Vec::new();
     for (i, arg) in args.iter().enumerate() {
         let s = match to_string(rt, *arg) {
@@ -387,11 +389,7 @@ fn style_get(rt: &mut Runtime, _data: u64, ptr: u64, name: &str) -> Option<AklVa
         return None;
     }
     let n = ptr as NodeId;
-    let cur = with_dom(|d| {
-        d.attr(n, b"style")
-            .map(|v| v.to_vec())
-            .unwrap_or_default()
-    });
+    let cur = with_dom(|d| d.attr(n, b"style").map(|v| v.to_vec()).unwrap_or_default());
     let v = style_get_prop(&cur, name.as_bytes()).unwrap_or(b"");
     Some(mk_string(rt, v))
 }
@@ -492,7 +490,10 @@ pub fn script_run(dom: &mut Dom, log: &mut Vec<u8>) -> ScriptReport {
         return report;
     }
     // kill switch（IF_SCRIPT=0 で完全 no-op）
-    if std::env::var("IF_SCRIPT").map(|s| s == "0").unwrap_or(false) {
+    if std::env::var("IF_SCRIPT")
+        .map(|s| s == "0")
+        .unwrap_or(false)
+    {
         return report;
     }
 
@@ -503,10 +504,17 @@ pub fn script_run(dom: &mut Dom, log: &mut Vec<u8>) -> ScriptReport {
 
     let dom_taken = std::mem::take(dom);
     let log_taken = std::mem::take(log);
-    CTX.with(|c| *c.borrow_mut() = Some(Ctx { dom: dom_taken, log: log_taken }));
+    CTX.with(|c| {
+        *c.borrow_mut() = Some(Ctx {
+            dom: dom_taken,
+            log: log_taken,
+        })
+    });
 
     if total > MAX_RUN {
-        log_bytes(format!("[script] script count truncated at {MAX_RUN} (found {total})\n").as_bytes());
+        log_bytes(
+            format!("[script] script count truncated at {MAX_RUN} (found {total})\n").as_bytes(),
+        );
     }
 
     let mut rt = Runtime::new();
@@ -632,21 +640,24 @@ mod tests {
 
     #[test]
     fn textcontent_mutation() {
-        let (wpt, log, rep) = run(
-            "<html><body><div id='a'>old</div>\
-             <script>document.getElementById('a').textContent = 'new';</script></body></html>",
-        );
+        let (wpt, log, rep) = run("<html><body><div id='a'>old</div>\
+             <script>document.getElementById('a').textContent = 'new';</script></body></html>");
         assert!(wpt.contains("\"new\""), "wpt = {wpt}");
-        assert_eq!(rep, ScriptReport { n_run: 1, n_errors: 0, n_skipped: 0 });
+        assert_eq!(
+            rep,
+            ScriptReport {
+                n_run: 1,
+                n_errors: 0,
+                n_skipped: 0
+            }
+        );
         assert!(log.is_empty(), "log = {log:?}");
     }
 
     #[test]
     fn title_set_and_console() {
-        let (wpt, log, rep) = run(
-            "<html><head><title>old</title></head><body>\
-             <script>document.title='T'; console.log('hello', 42);</script></body></html>",
-        );
+        let (wpt, log, rep) = run("<html><head><title>old</title></head><body>\
+             <script>document.title='T'; console.log('hello', 42);</script></body></html>");
         // title_set で <title> の本文が "T" に置換される（wpt 形式は title を木で出す）
         assert!(wpt.contains("<title>"), "wpt = {wpt}");
         assert!(wpt.contains("\"T\""), "wpt = {wpt}");
@@ -657,24 +668,23 @@ mod tests {
     #[test]
     fn failure_isolation() {
         // 壊れた script は失敗するが後続は継続し、描画は進む
-        let (_wpt, log, rep) = run(
-            "<html><body><script>this is { not valid</script>\
-             <script>document.body.setAttribute('x','y')</script></body></html>",
+        let (_wpt, log, rep) = run("<html><body><script>this is { not valid</script>\
+             <script>document.body.setAttribute('x','y')</script></body></html>");
+        assert!(
+            log.contains("[script] FAILED: SyntaxError:"),
+            "log = {log:?}"
         );
-        assert!(log.contains("[script] FAILED: SyntaxError:"), "log = {log:?}");
         assert_eq!(rep.n_errors, 1);
         assert_eq!(rep.n_run, 2);
     }
 
     #[test]
     fn skip_external_and_type() {
-        let (_wpt, _log, rep) = run(
-            "<html><body>\
+        let (_wpt, _log, rep) = run("<html><body>\
              <script src='http://x/y.js'></script>\
              <script type='application/json'>{}</script>\
              <script></script>\
-             <script type='module'>var a=1;</script></body></html>",
-        );
+             <script type='module'>var a=1;</script></body></html>");
         assert_eq!(rep.n_skipped, 3); // src / unknown type / 空
         assert_eq!(rep.n_run, 1); // module のみ実行
     }

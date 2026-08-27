@@ -15,8 +15,7 @@
 
 use crate::bearssl::{ca_load, TlsClient};
 use ifuto_core::net::{
-    addr_is_private, dechunk, head_parse, parse_url, resolve_url, HttpHead, HttpUrl,
-    HTTP_MAX_BYTES,
+    addr_is_private, dechunk, head_parse, parse_url, resolve_url, HttpHead, HttpUrl, HTTP_MAX_BYTES,
 };
 use ifuto_core::tls::TrustAnchor;
 use std::io::{ErrorKind, Read, Write};

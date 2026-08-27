@@ -28,7 +28,12 @@ fn collect_sources(dir: &Path, out: &mut Vec<PathBuf>) {
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     // rust/ifuto-ffi -> リポジトリルート
-    let repo_root = manifest_dir.parent().unwrap().parent().unwrap().to_path_buf();
+    let repo_root = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let bearssl = repo_root.join("vendor/bearssl");
     let src_dir = bearssl.join("src");
     let inc_dir = bearssl.join("inc");

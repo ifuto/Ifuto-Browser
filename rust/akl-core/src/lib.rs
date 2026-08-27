@@ -365,8 +365,10 @@ mod verification {
             }
             IntAdd::I64(v) => {
                 assert_eq!(v, r, "I64 結果は i64 計算と一致すべき");
-                assert!(r < i32::MIN as i64 || r > i32::MAX as i64,
-                        "I64 に落ちるのは i32 域外のときだけ");
+                assert!(
+                    r < i32::MIN as i64 || r > i32::MAX as i64,
+                    "I64 に落ちるのは i32 域外のときだけ"
+                );
             }
         }
     }

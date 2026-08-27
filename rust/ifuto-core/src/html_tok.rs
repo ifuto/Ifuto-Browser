@@ -113,9 +113,9 @@ const MAX_ATTRS: usize = 256;
 
 /// windows-1252 マッピング（WHATWG 数値文字参照の C1 補正表）。
 const C1_MAP: [u32; 32] = [
-    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160,
-    0x2039, 0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022,
-    0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039,
+    0x0152, 0x008D, 0x017D, 0x008F, 0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
 ];
 
 /// ホワイトスペース（HTML 空白: space/tab/nl/ff/cr）。
@@ -262,7 +262,9 @@ impl<'a> Tokenizer<'a> {
 
         // 1) 正式形: 長い n から下ろして "name;" 完全一致（flags bit0）
         for n in (2..=run).rev() {
-            let Some(ei) = entities::find(&buf[..n]) else { continue };
+            let Some(ei) = entities::find(&buf[..n]) else {
+                continue;
+            };
             if entities::entry_flags(ei) & 1 == 0 {
                 continue;
             }
@@ -280,8 +282,7 @@ impl<'a> Tokenizer<'a> {
             } else {
                 0
             };
-            let blocked = self.in_attr_ctx
-                && (next.is_ascii_alphanumeric() || next == b'=');
+            let blocked = self.in_attr_ctx && (next.is_ascii_alphanumeric() || next == b'=');
             if !blocked {
                 let cps = entities::entry_codepoints(ei);
                 return Some((cps, i + name_len));
@@ -469,7 +470,9 @@ impl<'a> Tokenizer<'a> {
     /// raw_tag の終了タグ `</name` の位置。見つからなければ len。
     /// C の `if_find_raw_end` 相当。
     fn find_raw_end(&self) -> usize {
-        let name = tags::tag_name(self.raw_tag).map(|s| s.as_bytes()).unwrap_or(b"");
+        let name = tags::tag_name(self.raw_tag)
+            .map(|s| s.as_bytes())
+            .unwrap_or(b"");
         if name.is_empty() {
             return self.src.len();
         }
@@ -486,7 +489,9 @@ impl<'a> Tokenizer<'a> {
                 if m {
                     let after = i + 2 + name.len();
                     if after < self.src.len()
-                        && (is_hws(self.src[after]) || self.src[after] == b'/' || self.src[after] == b'>')
+                        && (is_hws(self.src[after])
+                            || self.src[after] == b'/'
+                            || self.src[after] == b'>')
                     {
                         return i;
                     }
@@ -670,7 +675,10 @@ impl<'a> Tokenizer<'a> {
             p += 1;
         }
         if p > ns {
-            let lc: Vec<u8> = rest[ns..p].iter().map(|&c| c.to_ascii_lowercase()).collect();
+            let lc: Vec<u8> = rest[ns..p]
+                .iter()
+                .map(|&c| c.to_ascii_lowercase())
+                .collect();
             tok.text = lc;
             tok.dt_has_name = true;
         }
@@ -741,7 +749,9 @@ impl<'a> Tokenizer<'a> {
     fn markup_decl(&mut self) -> Tok {
         let mut tok = Tok::default();
 
-        if self.pos + 1 < self.src.len() && self.src[self.pos] == b'-' && self.src[self.pos + 1] == b'-'
+        if self.pos + 1 < self.src.len()
+            && self.src[self.pos] == b'-'
+            && self.src[self.pos + 1] == b'-'
         {
             self.pos += 2;
             // "<!-->" / "<!--->" の短絡形
@@ -773,9 +783,7 @@ impl<'a> Tokenizer<'a> {
                         self.pos = j + 3;
                         return tok;
                     }
-                    if self.src[j + 2] == b'!'
-                        && j + 3 < self.src.len()
-                        && self.src[j + 3] == b'>'
+                    if self.src[j + 2] == b'!' && j + 3 < self.src.len() && self.src[j + 3] == b'>'
                     {
                         self.errors += 1; // comment end bang state
                         tok.kind = TokKind::Comment;
@@ -1196,7 +1204,12 @@ mod tests {
     fn nul_in_attr_fffd() {
         // 属性値は NUL → U+FFFD
         let toks = collect(b"<div a=\"x\x00y\">");
-        let expect: Vec<u8> = b"x".iter().chain(b"\xEF\xBF\xBD").chain(b"y").copied().collect();
+        let expect: Vec<u8> = b"x"
+            .iter()
+            .chain(b"\xEF\xBF\xBD")
+            .chain(b"y")
+            .copied()
+            .collect();
         assert_eq!(toks[0].attrs[0].value, expect);
     }
 }

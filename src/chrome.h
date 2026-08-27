@@ -113,6 +113,11 @@ i32 if_chrome_link_move(IfChrome *c, i32 delta);
 /* メモリ計装（C1: 現タブの文書 arena 正確予約量。KB 表示用にバイトで返す） */
 u64 if_chrome_cur_doc_bytes(IfChrome *c);
 
+/* 検証フック（本番経路からは呼ばない。tools/zz_chrome_dump.c の C オラクル
+ * 観測点として static 純粋関数に到達するための shim） */
+char *if_chrome_test_dup_cap(const char *s, u32 cap);
+bool  if_chrome_test_ci_contains(const char *h, const char *n);
+
 /* 実 fs 実装（本番: 読み側は read_only だが書き系も含む完全実装） */
 bool  if_fs_exists_real(const char *path, void *ctx);
 IfStr if_fs_read_real(IfArena *a, const char *path, void *ctx);

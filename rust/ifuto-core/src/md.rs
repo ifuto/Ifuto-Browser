@@ -28,7 +28,15 @@
 //! - SIMD 特殊文字走査（`scan_special_avx2`。スカラ版と同値）。
 //! - rdtsc プロファイリング。
 
+use crate::dom::{Attr, Dom, NodeId, NodeKind};
 use crate::strutil::str_eq_ci;
+use crate::tags::Tag;
+use crate::tags_tables::{
+    TAG_A, TAG_BLOCKQUOTE, TAG_BODY, TAG_BR, TAG_CODE, TAG_EM, TAG_H1, TAG_H2, TAG_H3, TAG_H4,
+    TAG_H5, TAG_H6, TAG_HEAD, TAG_HR, TAG_HTML, TAG_IMG, TAG_LI, TAG_OL, TAG_P, TAG_PRE,
+    TAG_SECTION, TAG_STRONG, TAG_STYLE, TAG_SUP, TAG_TABLE, TAG_TBODY, TAG_TD, TAG_TH, TAG_THEAD,
+    TAG_TR, TAG_UL,
+};
 
 /// 拡張子判定（`.md` / `.markdown`、case-insensitive）。C の `if_path_is_md` 相当。
 pub fn path_is_md(path: &str) -> bool {
@@ -43,74 +51,417 @@ pub fn path_is_md(path: &str) -> bool {
 
 // ================= emitter =================
 
-/// 出力バッファ（C の `B` 相当。`Vec<u8>` に直接追記）。
-struct Out {
+/// 変換エンジンの出力先（C `md.c` の `Mo` 両 backend 共通動詞の相当品）。
+///
+/// string backend（[`StrOut`]）は従来どおりのバイト列を吐き、DOM 直構築 backend
+/// （[`DomOut`]）は `Mo` の dom モードと同一の遷移で [`Dom`] を構築する。
+/// taint 規約（T1..T5。C `md.c` 冒頭の契約コメント相当）は [`DomOut`] に集約する。
+///
+/// 呼び出し側（inline/block 層）はこの動詞集合だけを使うため、両 backend の
+/// 定義により string 出力と DOM 出力の観測同値性が保たれる（C と同じ設計）。
+trait Emit {
+    /// `mo_open_push` 相当: 属性なし要素の open+push。
+    fn open_push(&mut self, tag: Tag, name: &'static str);
+    /// `mo_open_void` 相当: void 要素（hr/br/img 属性なし）。push しない。
+    fn open_void(&mut self, tag: Tag, name: &'static str);
+    /// `mo_open` 相当: pend（属性つき要素）開始。`attr` → `open_end`/`open_end_void`。
+    fn open_pend(&mut self, tag: Tag, name: &'static str);
+    /// `mo_attr` 相当: pend に属性を追加（dom は ≤4 個で切り詰め。C と同じ）。
+    fn attr(&mut self, name: &'static str, value: &[u8]);
+    /// `mo_open_end` 相当: pend を確定してスタックへ push。
+    fn open_end(&mut self);
+    /// `mo_open_end_void` 相当: void 要素として確定（push しない）。
+    fn open_end_void(&mut self);
+    /// `mo_close` 相当。
+    fn close(&mut self, name: &str);
+    /// `mo_text` 相当: 本文スライス（string は `&<>` escape、dom は ws-sink 判定つき
+    /// run へ追加）。
+    fn text(&mut self, s: &[u8]);
+    /// `mo_text_ch` 相当: ブロック間の 1 文字（dom は ws-sink 判定つき run へ追加）。
+    fn text_ch(&mut self, c: u8);
+    /// `mo_raw_ch` 相当: escape リテラル等の「生 1 文字」（string も escape しない。
+    /// dom は `'<'`/`'&'` で T1 taint：string 側に出すと文法外になる Input があるため）。
+    fn raw_ch(&mut self, c: u8);
+}
+
+// ---- string backend（C の `Mo.is_dom=false`）----
+
+/// 出力バッファ（C の string backend `Mo.str` 相当。`Vec<u8>` に直接追記）。
+struct StrOut {
     buf: Vec<u8>,
 }
 
-impl Out {
+impl StrOut {
     fn new() -> Self {
-        Out { buf: Vec::new() }
-    }
-    fn put_str(&mut self, s: &str) {
-        self.buf.extend_from_slice(s.as_bytes());
-    }
-    fn putc(&mut self, c: u8) {
-        self.buf.push(c);
+        StrOut { buf: Vec::new() }
     }
 }
 
-/// テキストを escape して出力（`&` `<` `>`）。C の `mo_text`（string backend）相当。
-fn text_escaped(out: &mut Out, s: &[u8]) {
-    for &c in s {
-        match c {
-            b'&' => out.put_str("&amp;"),
-            b'<' => out.put_str("&lt;"),
-            b'>' => out.put_str("&gt;"),
-            _ => out.putc(c),
+impl Emit for StrOut {
+    fn open_push(&mut self, _tag: Tag, name: &'static str) {
+        self.buf.push(b'<');
+        self.buf.extend_from_slice(name.as_bytes());
+        self.buf.push(b'>');
+    }
+    fn open_void(&mut self, _tag: Tag, name: &'static str) {
+        self.open_push(_tag, name);
+    }
+    fn open_pend(&mut self, _tag: Tag, name: &'static str) {
+        self.buf.push(b'<');
+        self.buf.extend_from_slice(name.as_bytes());
+    }
+    fn attr(&mut self, name: &'static str, value: &[u8]) {
+        // ` name="v"`（v は `&<"` escape。C `mo_attr` string 相当）
+        self.buf.push(b' ');
+        self.buf.extend_from_slice(name.as_bytes());
+        self.buf.extend_from_slice(b"=\"");
+        for &c in value {
+            match c {
+                b'&' => self.buf.extend_from_slice(b"&amp;"),
+                b'<' => self.buf.extend_from_slice(b"&lt;"),
+                b'"' => self.buf.extend_from_slice(b"&quot;"),
+                _ => self.buf.push(c),
+            }
+        }
+        self.buf.push(b'"');
+    }
+    fn open_end(&mut self) {
+        self.buf.push(b'>');
+    }
+    fn open_end_void(&mut self) {
+        self.buf.push(b'>');
+    }
+    fn close(&mut self, name: &str) {
+        self.buf.extend_from_slice(b"</");
+        self.buf.extend_from_slice(name.as_bytes());
+        self.buf.push(b'>');
+    }
+    fn text(&mut self, s: &[u8]) {
+        for &c in s {
+            match c {
+                b'&' => self.buf.extend_from_slice(b"&amp;"),
+                b'<' => self.buf.extend_from_slice(b"&lt;"),
+                b'>' => self.buf.extend_from_slice(b"&gt;"),
+                _ => self.buf.push(c),
+            }
+        }
+    }
+    fn text_ch(&mut self, c: u8) {
+        self.buf.push(c); // string backend は生（C `mo_text_ch` 相当）
+    }
+    fn raw_ch(&mut self, c: u8) {
+        self.buf.push(c); // string backend は生（C `mo_raw_ch` 相当）
+    }
+}
+
+// ---- DOM 直構築 backend（C の `Mo.is_dom=true`。fast-DOM）----
+
+/// ノード数上限（C の `IF_MAX_DOM_NODES`。T5）。
+const MAX_DOM_NODES: usize = 4 * 1000 * 1000;
+/// 開いている要素スタックの上限（C の `Mo.stk[128]`。T3）。
+const STK_CAP: usize = 128;
+
+/// Markdown → DOM 直構築器。C `md.c` の `Mo`（dom モード）相当。
+///
+/// taint 規約（観測したら全体を `None` に倒し、呼び出し側が string backend →
+/// HTML パーサの 2 段経路へフォールバックする。正しさは常に本パーサ側に集約）:
+/// - T1. string 側が文法外になる生文字（escape リテラルの `'<'`/`'&'`）
+/// - T2. 開いている `<a>` の内側で `<a>` を開く（adoption agency 発火で木が変わる）
+/// - T3. ネスト上限 128 / close 不一致
+/// - T4. 入力 NUL（トークナイザと意味が分かれる）→ エントリで早期 `None`
+/// - T5. ノード数上限 `MAX_DOM_NODES`
+///
+/// # C との違い（所有権による構造的な改善）
+///
+/// C は text run を「借用モード（persistent 範囲の連続切片）/複製モード」で自動
+/// 切替し、属性値も persistent 範囲外なら arena に定着させる。Rust では run を
+/// 所有 `Vec<u8>` に常時複製し、TEXT/属性とも所有 `Vec<u8>` で確定する。借用可否の
+/// 範囲管理（`mo_range`/`mo_persistent` 台帳）を構造的に排除する。
+struct DomOut {
+    dom: Dom,
+    /// 現在の open 要素（`Mo.cur`）。
+    cur: NodeId,
+    /// 開いている要素スタック（先頭 2 要素は html/body。`Mo.stk`）。
+    stk: Vec<NodeId>,
+    /// text run アキュムレータ（C の借用/複製 run を単一の所有バッファに簡約）。
+    run: Vec<u8>,
+    tainted: bool,
+    /// `IF_MD_F_SLIM_ATTRS`: 保持属性を A[href]/IMG[alt] に限定。
+    slim_attrs: bool,
+    /// pend（`g_pend` 相当。attr 呼出で最大 4 件まで蓄積）。
+    pend_tag: Tag,
+    pend_name: &'static str,
+    pend_attrs: Vec<(&'static str, Vec<u8>)>,
+}
+
+impl DomOut {
+    /// skeleton（document root + quirks=true + n_errors=1 + html/head/body。
+    /// doctype なし。C `if_md_parse_fast_serial_f` の初期条件と同一）。
+    fn new(slim_attrs: bool) -> Self {
+        let mut dom = Dom::new(); // document root 1 ノード
+        dom.quirks = true;
+        dom.n_errors = 1;
+        let html = dom.alloc_node(NodeKind::Element);
+        {
+            let n = dom.node_mut(html);
+            n.tag = TAG_HTML;
+            n.name = b"html".to_vec();
+        }
+        let root = dom.root;
+        let head = dom.alloc_node(NodeKind::Element);
+        {
+            let n = dom.node_mut(head);
+            n.tag = TAG_HEAD;
+            n.name = b"head".to_vec();
+        }
+        let body = dom.alloc_node(NodeKind::Element);
+        {
+            let n = dom.node_mut(body);
+            n.tag = TAG_BODY;
+            n.name = b"body".to_vec();
+        }
+        let mut o = DomOut {
+            dom,
+            cur: body,
+            stk: vec![html, body],
+            run: Vec::new(),
+            tainted: false,
+            slim_attrs,
+            pend_tag: 0,
+            pend_name: "",
+            pend_attrs: Vec::new(),
+        };
+        o.attach(root, html);
+        o.attach(html, head);
+        o.attach(html, body);
+        o
+    }
+
+    /// C `mattach` 相当（子を末尾に接続。parent の浅い値は既に正しい）。
+    fn attach(&mut self, parent: NodeId, child: NodeId) {
+        self.dom.node_mut(child).parent = Some(parent);
+        match self.dom.node(parent).last_child {
+            Some(last) => self.dom.node_mut(last).next_sibling = Some(child),
+            None => self.dom.node_mut(parent).first_child = Some(child),
+        }
+        self.dom.node_mut(parent).last_child = Some(child);
+    }
+
+    /// C `mnew` 相当（T5: 上限到達で taint して `None`）。
+    fn mnew(&mut self, kind: NodeKind) -> Option<NodeId> {
+        if self.dom.nodes.len() >= MAX_DOM_NODES {
+            self.tainted = true;
+            return None;
+        }
+        Some(self.dom.alloc_node(kind))
+    }
+
+    /// C `run_flush` 相当（run を TEXT ノードとして cur 直下に確定）。
+    /// tainted 後の中間状態は呼び出し側が必ず `None` に倒すので、run は捨てる。
+    fn run_flush(&mut self) {
+        if self.run.is_empty() {
+            return;
+        }
+        if self.tainted {
+            self.run.clear();
+            return;
+        }
+        let text = std::mem::take(&mut self.run);
+        let Some(nid) = self.mnew(NodeKind::Text) else {
+            return;
+        };
+        self.dom.node_mut(nid).name = text;
+        let cur = self.cur;
+        self.attach(cur, nid);
+    }
+
+    /// C `mo_ws_sink` 相当: cur が「純ブロック容器」（直下の ws-only TEXT は描画に
+    /// 寄与しない）なら true。集合は `layout::ws_sink_parent` と完全一致が規約。
+    fn ws_sink(&self) -> bool {
+        matches!(
+            self.dom.node(self.cur).tag,
+            TAG_BODY
+                | TAG_BLOCKQUOTE
+                | TAG_TABLE
+                | TAG_THEAD
+                | TAG_TBODY
+                | TAG_TR
+                | TAG_UL
+                | TAG_OL
+                | TAG_SECTION
+        )
+    }
+
+    /// C `mo_ws_sink` 判定用の ws 集合（` \n\t\r\f`）。
+    fn is_ws(c: u8) -> bool {
+        matches!(c, b' ' | b'\n' | b'\t' | b'\r' | 0x0C)
+    }
+
+    /// C `mo_elem_store` 相当（pend の確定。push=false なら void 要素）。
+    fn elem_store(&mut self, push: bool) {
+        self.run_flush(); // flush は mode≠0 のときだけ（C と同じ順序）
+        if self.tainted {
+            return;
+        }
+        let Some(nid) = self.mnew(NodeKind::Element) else {
+            return;
+        };
+        let tag = self.pend_tag;
+        {
+            let slim = self.slim_attrs;
+            let pend_attrs = std::mem::take(&mut self.pend_attrs);
+            let n = self.dom.node_mut(nid);
+            n.tag = tag;
+            n.name = self.pend_name.as_bytes().to_vec();
+            if !pend_attrs.is_empty() {
+                n.attrs = pend_attrs
+                    .iter()
+                    .filter(|(an, _)| {
+                        // slim: レンダリング経路で読まれる属性のみ保持（C と同一規約）
+                        !slim || (tag == TAG_A && *an == "href") || (tag == TAG_IMG && *an == "alt")
+                    })
+                    .map(|(an, av)| Attr {
+                        name: an.as_bytes().to_vec(),
+                        value: av.clone(),
+                    })
+                    .collect();
+            }
+        }
+        if tag == TAG_STYLE {
+            self.dom.has_style = true; // md emitter は生成しないが規約として監視
+        }
+        let cur = self.cur;
+        self.attach(cur, nid);
+        if push {
+            if self.stk.len() >= STK_CAP {
+                self.tainted = true; // T3
+                return;
+            }
+            self.stk.push(nid);
+            self.cur = nid;
         }
     }
 }
 
-/// 属性値を escape して出力（`&` `<` `"`）。C の `mo_attr`（string backend）相当。
-fn attr_escaped(out: &mut Out, s: &[u8]) {
-    for &c in s {
-        match c {
-            b'&' => out.put_str("&amp;"),
-            b'<' => out.put_str("&lt;"),
-            b'"' => out.put_str("&quot;"),
-            _ => out.putc(c),
+impl Emit for DomOut {
+    fn open_push(&mut self, tag: Tag, name: &'static str) {
+        if self.tainted {
+            return;
+        }
+        // T2 対象外タグ専用（C の `mo_open_push` は T2 検査を持たない）。
+        debug_assert!(tag != TAG_A);
+        self.run_flush();
+        let Some(nid) = self.mnew(NodeKind::Element) else {
+            return;
+        };
+        {
+            let n = self.dom.node_mut(nid);
+            n.tag = tag;
+            n.name = name.as_bytes().to_vec();
+        }
+        let cur = self.cur;
+        self.attach(cur, nid);
+        if self.stk.len() >= STK_CAP {
+            self.tainted = true; // T3
+            return;
+        }
+        self.stk.push(nid);
+        self.cur = nid;
+    }
+
+    fn open_void(&mut self, tag: Tag, name: &'static str) {
+        if self.tainted {
+            return;
+        }
+        self.run_flush();
+        let Some(nid) = self.mnew(NodeKind::Element) else {
+            return;
+        };
+        {
+            let n = self.dom.node_mut(nid);
+            n.tag = tag;
+            n.name = name.as_bytes().to_vec();
+        }
+        let cur = self.cur;
+        self.attach(cur, nid);
+    }
+
+    fn open_pend(&mut self, tag: Tag, name: &'static str) {
+        if tag == TAG_A && !self.tainted {
+            // T2: 開いている <a> の内側で <a> を開くと fallback。
+            if self.stk.iter().any(|&k| self.dom.node(k).tag == TAG_A) {
+                self.tainted = true;
+            }
+        }
+        self.pend_tag = tag;
+        self.pend_name = name;
+        self.pend_attrs.clear();
+    }
+
+    fn attr(&mut self, name: &'static str, value: &[u8]) {
+        if self.pend_attrs.len() < 4 {
+            // C `MoPend.an/av[4]` の切り詰め（超過分は黙って捨てる）
+            self.pend_attrs.push((name, value.to_vec()));
         }
     }
-}
 
-/// `<name>` を出力（開始タグ、属性なし）。C の `mo_open_push`（string）相当。
-fn open(out: &mut Out, name: &str) {
-    out.putc(b'<');
-    out.put_str(name);
-    out.putc(b'>');
-}
+    fn open_end(&mut self) {
+        self.elem_store(true);
+    }
 
-/// `<name` を出力（属性付き開始タグの前半）。C の `mo_open`（string）相当。
-fn open_head(out: &mut Out, name: &str) {
-    out.putc(b'<');
-    out.put_str(name);
-}
+    fn open_end_void(&mut self) {
+        self.elem_store(false);
+    }
 
-/// 属性 ` name="value"` を出力。C の `mo_attr`（string）相当。
-fn attr(out: &mut Out, name: &str, value: &[u8]) {
-    out.putc(b' ');
-    out.put_str(name);
-    out.put_str("=\"");
-    attr_escaped(out, value);
-    out.putc(b'"');
-}
+    fn close(&mut self, name: &str) {
+        self.run_flush();
+        if self.tainted {
+            return;
+        }
+        let Some(&top) = self.stk.last() else {
+            self.tainted = true; // 到達不能のはず（emitter は常に対応させる。C と同じ）
+            return;
+        };
+        if self.dom.node(top).name.as_slice() != name.as_bytes() {
+            self.tainted = true;
+            return;
+        }
+        self.stk.pop();
+        self.cur = *self.stk.last().unwrap_or(&self.dom.root);
+    }
 
-/// `</name>` を出力。C の `mo_close`（string）相当。
-fn close(out: &mut Out, name: &str) {
-    out.put_str("</");
-    out.put_str(name);
-    out.putc(b'>');
+    fn text(&mut self, s: &[u8]) {
+        if self.tainted || s.is_empty() {
+            return;
+        }
+        if self.ws_sink() && s.iter().all(|&c| Self::is_ws(c)) {
+            // 純ブロック容器直下の ws-only chunk は chunk 単位で棄却（描画不寄与。INV）
+            return;
+        }
+        self.run.extend_from_slice(s);
+    }
+
+    fn text_ch(&mut self, c: u8) {
+        if self.tainted {
+            return;
+        }
+        if self.ws_sink() && Self::is_ws(c) {
+            // 純ブロック容器直下の ws-only 断片は DOM 化しない（C と同じ）
+            return;
+        }
+        self.run.push(c);
+    }
+
+    fn raw_ch(&mut self, c: u8) {
+        if self.tainted {
+            return;
+        }
+        if c == b'<' || c == b'&' {
+            self.tainted = true; // T1: 文字列側が文法外になる
+            return;
+        }
+        self.run.push(c);
+    }
 }
 
 // ================= 脚注 =================
@@ -335,7 +686,8 @@ fn trim(s: &[u8]) -> &[u8] {
     while a < b && (s[a] == b' ' || s[a] == b'\t' || s[a] == b'\n' || s[a] == b'\r') {
         a += 1;
     }
-    while b > a && (s[b - 1] == b' ' || s[b - 1] == b'\t' || s[b - 1] == b'\n' || s[b - 1] == b'\r') {
+    while b > a && (s[b - 1] == b' ' || s[b - 1] == b'\t' || s[b - 1] == b'\n' || s[b - 1] == b'\r')
+    {
         b -= 1;
     }
     &s[a..b]
@@ -381,7 +733,10 @@ fn ln_indent(l: Ln) -> usize {
 
 /// 特殊文字か。C の `scan_special` のスカラ版と同値。
 fn is_special(c: u8) -> bool {
-    matches!(c, b'\\' | b'`' | b'*' | b'_' | b'~' | b'!' | b'[' | b'<' | b'&' | b'>')
+    matches!(
+        c,
+        b'\\' | b'`' | b'*' | b'_' | b'~' | b'!' | b'[' | b'<' | b'&' | b'>'
+    )
 }
 
 /// 次の特殊文字位置（無ければ `s.len()`）。C の `scan_special` 相当。
@@ -411,7 +766,7 @@ fn find_close(s: &[u8], from: usize, delim: &[u8]) -> Option<usize> {
 
 /// `[text](dest)` / `![alt](dest)` / `[^id]` / `<http://>` の判定。C の `try_link`。
 /// 成功時は出力して `adv`（消費バイト数）を返す。
-fn try_link(out: &mut Out, fn_: &mut Fn, s: &[u8], i: usize) -> Option<usize> {
+fn try_link<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], i: usize) -> Option<usize> {
     // footnote ref: [^id]
     if i + 1 < s.len() && s[i + 1] == b'^' {
         let mut j = i + 2;
@@ -433,14 +788,14 @@ fn try_link(out: &mut Out, fn_: &mut Fn, s: &[u8], i: usize) -> Option<usize> {
             format!("fr-{}", String::from_utf8_lossy(id))
         };
         let hrv = format!("#fn-{}", String::from_utf8_lossy(id));
-        open(out, "sup");
-        open_head(out, "a");
-        attr(out, "href", hrv.as_bytes());
-        attr(out, "id", idv.as_bytes());
-        out.putc(b'>');
-        out.put_str(&num.to_string());
-        close(out, "a");
-        close(out, "sup");
+        out.open_push(TAG_SUP, "sup");
+        out.open_pend(TAG_A, "a");
+        out.attr("href", hrv.as_bytes());
+        out.attr("id", idv.as_bytes());
+        out.open_end();
+        out.text(num.to_string().as_bytes()); // C: dom では mo_text(nb)、string は b_puts
+        out.close("a");
+        out.close("sup");
         return Some(j + 1);
     }
     // 通常リンク: 対応 ] を探す（入れ子 [ ] は深さ勘定）
@@ -472,20 +827,20 @@ fn try_link(out: &mut Out, fn_: &mut Fn, s: &[u8], i: usize) -> Option<usize> {
         return None;
     }
     let dest = &s[ds..k];
-    open_head(out, "a");
-    attr(out, "href", dest);
-    out.putc(b'>');
+    out.open_pend(TAG_A, "a");
+    out.attr("href", dest);
+    out.open_end();
     inline_span(out, fn_, text);
-    close(out, "a");
+    out.close("a");
     Some(k + 1)
 }
 
-fn inline_span(out: &mut Out, fn_: &mut Fn, s: &[u8]) {
+fn inline_span<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8]) {
     let mut i = 0;
     while i < s.len() {
         let sp0 = scan_special(s, i);
         if sp0 > i {
-            text_escaped(out, &s[i..sp0]);
+            out.text(&s[i..sp0]);
             i = sp0;
         }
         if i >= s.len() {
@@ -498,15 +853,32 @@ fn inline_span(out: &mut Out, fn_: &mut Fn, s: &[u8]) {
                     let n2 = s[i + 1];
                     if matches!(
                         n2,
-                        b'\\' | b'`' | b'*' | b'_' | b'{' | b'}' | b'[' | b']' | b'(' | b')'
-                            | b'#' | b'+' | b'-' | b'.' | b'!' | b'~' | b'|' | b'<' | b'>'
+                        b'\\'
+                            | b'`'
+                            | b'*'
+                            | b'_'
+                            | b'{'
+                            | b'}'
+                            | b'['
+                            | b']'
+                            | b'('
+                            | b')'
+                            | b'#'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'!'
+                            | b'~'
+                            | b'|'
+                            | b'<'
+                            | b'>'
                     ) {
-                        out.putc(n2);
+                        out.raw_ch(n2);
                         i += 2;
                         continue;
                     }
                 }
-                text_escaped(out, &s[i..i + 1]);
+                out.text(&s[i..i + 1]);
                 i += 1;
             }
             b'`' => {
@@ -519,61 +891,73 @@ fn inline_span(out: &mut Out, fn_: &mut Fn, s: &[u8]) {
                     let delim = vec![b'`'; run];
                     find_close(s, i + run, &delim)
                 } else {
-                    s[i + run..].iter().position(|&c| c == b'`').map(|p| p + i + run)
+                    s[i + run..]
+                        .iter()
+                        .position(|&c| c == b'`')
+                        .map(|p| p + i + run)
                 };
                 match close_pos {
                     None => {
-                        text_escaped(out, &s[i..i + 1]);
+                        out.text(&s[i..i + 1]);
                         i += 1;
                     }
                     Some(cl) => {
-                        open_head(out, "code");
-                        out.putc(b'>');
-                        text_escaped(out, &s[i + run..cl]);
-                        close(out, "code");
+                        out.open_pend(TAG_CODE, "code");
+                        out.open_end();
+                        out.text(&s[i + run..cl]);
+                        out.close("code");
                         i = cl + run;
                     }
                 }
             }
             b'*' | b'_' => {
                 if i + 1 < s.len() && s[i + 1] == c {
-                    let delim = if c == b'*' { b"**".as_slice() } else { b"__".as_slice() };
+                    let delim = if c == b'*' {
+                        b"**".as_slice()
+                    } else {
+                        b"__".as_slice()
+                    };
                     if let Some(cl) = find_close(s, i + 2, delim) {
                         if cl > i + 2 {
-                            open(out, "strong");
+                            out.open_push(TAG_STRONG, "strong");
                             inline_span(out, fn_, &s[i + 2..cl]);
-                            close(out, "strong");
+                            out.close("strong");
                             i = cl + 2;
                             continue;
                         }
                     }
                 }
-                let delim = if c == b'*' { b"*".as_slice() } else { b"_".as_slice() };
+                let delim = if c == b'*' {
+                    b"*".as_slice()
+                } else {
+                    b"_".as_slice()
+                };
                 if let Some(cl) = find_close(s, i + 1, delim) {
                     if cl > i + 1 {
-                        open(out, "em");
+                        out.open_push(TAG_EM, "em");
                         inline_span(out, fn_, &s[i + 1..cl]);
-                        close(out, "em");
+                        out.close("em");
                         i = cl + 1;
                         continue;
                     }
                 }
-                text_escaped(out, &s[i..i + 1]);
+                out.text(&s[i..i + 1]);
                 i += 1;
             }
             b'~' => {
                 if i + 1 < s.len() && s[i + 1] == b'~' {
                     if let Some(cl) = find_close(s, i + 2, b"~~") {
                         if cl > i + 2 {
-                            open(out, "del");
+                            // C は del を IF_TAG_UNKNOWN で出す（タグ表に del は無い）
+                            out.open_push(crate::tags::TAG_UNKNOWN, "del");
                             inline_span(out, fn_, &s[i + 2..cl]);
-                            close(out, "del");
+                            out.close("del");
                             i = cl + 2;
                             continue;
                         }
                     }
                 }
-                text_escaped(out, &s[i..i + 1]);
+                out.text(&s[i..i + 1]);
                 i += 1;
             }
             b'!' => {
@@ -598,10 +982,10 @@ fn inline_span(out: &mut Out, fn_: &mut Fn, s: &[u8]) {
                             ke += 1;
                         }
                         if ke < rest.len() {
-                            open_head(out, "img");
-                            attr(out, "src", &rest[ds..ke]);
-                            attr(out, "alt", &rest[1..k]);
-                            out.putc(b'>');
+                            out.open_pend(TAG_IMG, "img");
+                            out.attr("src", &rest[ds..ke]);
+                            out.attr("alt", &rest[1..k]);
+                            out.open_end_void();
                             adv0 = ke + 1;
                         }
                     }
@@ -610,14 +994,14 @@ fn inline_span(out: &mut Out, fn_: &mut Fn, s: &[u8]) {
                         continue;
                     }
                 }
-                text_escaped(out, &s[i..i + 1]);
+                out.text(&s[i..i + 1]);
                 i += 1;
             }
             b'[' => {
                 if let Some(adv) = try_link(out, fn_, &s[i..], 0) {
                     i += adv;
                 } else {
-                    text_escaped(out, &s[i..i + 1]);
+                    out.text(&s[i..i + 1]);
                     i += 1;
                 }
             }
@@ -631,20 +1015,20 @@ fn inline_span(out: &mut Out, fn_: &mut Fn, s: &[u8]) {
                     if (url.len() > 7 && &url[..7] == b"http://")
                         || (url.len() > 8 && &url[..8] == b"https://")
                     {
-                        open_head(out, "a");
-                        attr(out, "href", url);
-                        out.putc(b'>');
-                        text_escaped(out, url);
-                        close(out, "a");
+                        out.open_pend(TAG_A, "a");
+                        out.attr("href", url);
+                        out.open_end();
+                        out.text(url);
+                        out.close("a");
                         i = j + 1;
                         continue;
                     }
                 }
-                text_escaped(out, &s[i..i + 1]);
+                out.text(&s[i..i + 1]);
                 i += 1;
             }
             _ => {
-                text_escaped(out, &s[i..i + 1]);
+                out.text(&s[i..i + 1]);
                 i += 1;
             }
         }
@@ -654,8 +1038,8 @@ fn inline_span(out: &mut Out, fn_: &mut Fn, s: &[u8]) {
 // ================= ブロック層 =================
 
 /// 段落行を連結（ハードブレーク対応）。C の `emit_para_lines` 相当。
-fn emit_para_lines(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize) {
-    open(out, "p");
+fn emit_para_lines<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize) {
+    out.open_push(TAG_P, "p");
     let mut prev_hard = false;
     for (idx, &line) in ls[lo..hi].iter().enumerate() {
         let mut x = line;
@@ -669,19 +1053,19 @@ fn emit_para_lines(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize)
         }
         if idx > 0 {
             if prev_hard {
-                open(out, "br");
+                out.open_void(TAG_BR, "br");
             } else {
-                out.putc(b' ');
+                out.text_ch(b' ');
             }
         }
         inline_span(out, fn_, x);
         prev_hard = hard;
     }
-    close(out, "p");
-    out.putc(b'\n');
+    out.close("p");
+    out.text_ch(b'\n');
 }
 
-fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, depth: usize) {
+fn blocks_win<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, depth: usize) {
     let mut i = lo;
     while i < hi {
         let l = ls[i];
@@ -709,8 +1093,9 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
             let hh = ln_heading(l);
             if hh > 0 {
                 const HNM: [&str; 6] = ["h1", "h2", "h3", "h4", "h5", "h6"];
+                const HTAG: [Tag; 6] = [TAG_H1, TAG_H2, TAG_H3, TAG_H4, TAG_H5, TAG_H6];
                 let nm = HNM[hh - 1];
-                open(out, nm);
+                out.open_push(HTAG[hh - 1], nm);
                 let mut k = hh;
                 while k < l.len() && (l[k] == b' ' || l[k] == b'\t') {
                     k += 1;
@@ -731,16 +1116,16 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
                     t = &t[..(e + 1) as usize];
                 }
                 inline_span(out, fn_, t);
-                close(out, nm);
-                out.putc(b'\n');
+                out.close(nm);
+                out.text_ch(b'\n');
                 i += 1;
                 continue;
             }
         }
         // hr
         if (cs == b'-' || cs == b'*' || cs == b'_' || cs == b'\t') && ln_is_hr(l) {
-            open(out, "hr");
-            out.putc(b'\n');
+            out.open_void(TAG_HR, "hr");
+            out.text_ch(b'\n');
             i += 1;
             continue;
         }
@@ -755,13 +1140,13 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
                 k += 1;
             }
             let lang = &l[k..];
-            open(out, "pre");
-            open_head(out, "code");
+            out.open_push(TAG_PRE, "pre");
+            out.open_pend(TAG_CODE, "code");
             if !lang.is_empty() {
                 let cv = format!("lang-{}", String::from_utf8_lossy(lang));
-                attr(out, "class", cv.as_bytes());
+                out.attr("class", cv.as_bytes());
             }
-            out.putc(b'>');
+            out.open_end();
             i += 1;
             while i < hi {
                 let cl = ls[i];
@@ -771,13 +1156,13 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
                         break;
                     }
                 }
-                text_escaped(out, cl);
-                out.putc(b'\n');
+                out.text(cl);
+                out.text_ch(b'\n');
                 i += 1;
             }
-            close(out, "code");
-            close(out, "pre");
-            out.putc(b'\n');
+            out.close("code");
+            out.close("pre");
+            out.text_ch(b'\n');
             continue;
         }
         // quote
@@ -790,15 +1175,17 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
             if depth < 8 {
                 let cnt = j - i;
                 // 各行の引用符を除いた副窓
-                let wq: Vec<Ln> = (i..j).map(|k| {
-                    let w = ln_quote(ls[k]);
-                    &ls[k][w..]
-                }).collect();
-                open(out, "blockquote");
-                out.putc(b'\n');
+                let wq: Vec<Ln> = (i..j)
+                    .map(|k| {
+                        let w = ln_quote(ls[k]);
+                        &ls[k][w..]
+                    })
+                    .collect();
+                out.open_push(TAG_BLOCKQUOTE, "blockquote");
+                out.text_ch(b'\n');
                 blocks_win(out, fn_, &wq, 0, cnt, depth + 1);
-                close(out, "blockquote");
-                out.putc(b'\n');
+                out.close("blockquote");
+                out.text_ch(b'\n');
             } else {
                 // 深度飽和: flatten
                 let mut flat = Vec::new();
@@ -807,29 +1194,34 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
                     flat.extend_from_slice(&line[w..]);
                     flat.push(b'\n');
                 }
-                open(out, "blockquote");
-                out.putc(b'\n');
-                open(out, "p");
+                out.open_push(TAG_BLOCKQUOTE, "blockquote");
+                out.text_ch(b'\n');
+                out.open_push(TAG_P, "p");
                 inline_span(out, fn_, &flat);
-                close(out, "p");
-                out.putc(b'\n');
-                close(out, "blockquote");
-                out.putc(b'\n');
+                out.close("p");
+                out.text_ch(b'\n');
+                out.close("blockquote");
+                out.text_ch(b'\n');
             }
             i = j;
             continue;
         }
         // list
-        if (cs == b'-' || cs == b'*' || cs == b'+' || cs.is_ascii_digit()) && ln_list_item(l).is_some() {
+        if (cs == b'-' || cs == b'*' || cs == b'+' || cs.is_ascii_digit())
+            && ln_list_item(l).is_some()
+        {
             let mk = ln_list_item(l).unwrap();
             let ordered = mk.ordered;
             let base = mk.indent;
-            open(out, if ordered { "ol" } else { "ul" });
-            out.putc(b'\n');
+            out.open_push(
+                if ordered { TAG_OL } else { TAG_UL },
+                if ordered { "ol" } else { "ul" },
+            );
+            out.text_ch(b'\n');
             while i < hi {
                 match ln_list_item(ls[i]) {
                     Some(m2) if m2.ordered == ordered && m2.indent == base => {
-                        open(out, "li");
+                        out.open_push(TAG_LI, "li");
                         inline_span(out, fn_, &ls[i][m2.mwidth..]);
                         i += 1;
                         let mut j = i;
@@ -840,14 +1232,14 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
                             blocks_win(out, fn_, ls, i, j, depth);
                             i = j;
                         }
-                        close(out, "li");
-                        out.putc(b'\n');
+                        out.close("li");
+                        out.text_ch(b'\n');
                     }
                     _ => break,
                 }
             }
-            close(out, if ordered { "ol" } else { "ul" });
-            out.putc(b'\n');
+            out.close(if ordered { "ol" } else { "ul" });
+            out.text_ch(b'\n');
             continue;
         }
         // GFM 表
@@ -871,20 +1263,20 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
         if is_table {
             let mut heads = Vec::new();
             let nh = split_cells(l, &mut heads).min(32);
-            open(out, "table");
-            out.putc(b'\n');
-            open(out, "thead");
-            open(out, "tr");
+            out.open_push(TAG_TABLE, "table");
+            out.text_ch(b'\n');
+            out.open_push(TAG_THEAD, "thead");
+            out.open_push(TAG_TR, "tr");
             for head in &heads[..nh] {
-                open(out, "th");
+                out.open_push(TAG_TH, "th");
                 inline_span(out, fn_, head);
-                close(out, "th");
+                out.close("th");
             }
-            close(out, "tr");
-            close(out, "thead");
-            out.putc(b'\n');
-            open(out, "tbody");
-            out.putc(b'\n');
+            out.close("tr");
+            out.close("thead");
+            out.text_ch(b'\n');
+            out.open_push(TAG_TBODY, "tbody");
+            out.text_ch(b'\n');
             i += 2;
             while i < hi && !ln_blank(ls[i]) {
                 if !ls[i].contains(&b'|') {
@@ -892,20 +1284,20 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
                 }
                 let mut cells = Vec::new();
                 let nc = split_cells(ls[i], &mut cells).min(32);
-                open(out, "tr");
+                out.open_push(TAG_TR, "tr");
                 for cell in &cells[..nc] {
-                    open(out, "td");
+                    out.open_push(TAG_TD, "td");
                     inline_span(out, fn_, cell);
-                    close(out, "td");
+                    out.close("td");
                 }
-                close(out, "tr");
-                out.putc(b'\n');
+                out.close("tr");
+                out.text_ch(b'\n');
                 i += 1;
             }
-            close(out, "tbody");
-            out.putc(b'\n');
-            close(out, "table");
-            out.putc(b'\n');
+            out.close("tbody");
+            out.text_ch(b'\n');
+            out.close("table");
+            out.text_ch(b'\n');
             continue;
         }
         // 段落
@@ -922,8 +1314,7 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
                 }
                 let xcs = if xsp < x.len() { x[xsp] } else { 0 };
                 let is_block_start = (xsp == 0 && xcs == b'#' && ln_heading(x) > 0)
-                    || ((xcs == b'-' || xcs == b'*' || xcs == b'_' || xcs == b'\t')
-                        && ln_is_hr(x))
+                    || ((xcs == b'-' || xcs == b'*' || xcs == b'_' || xcs == b'\t') && ln_is_hr(x))
                     || (xcs == b'>' && ln_quote(x) > 0)
                     || (xsp == 0 && xcs == b'[' && ln_fndef(x).is_some())
                     || ((xcs == b'`' || xcs == b'~' || xcs == b'\t') && ln_fence(x).is_some())
@@ -942,7 +1333,7 @@ fn blocks_win(out: &mut Out, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, dept
     }
 }
 
-fn blocks_str(out: &mut Out, fn_: &mut Fn, s: &[u8], depth: usize) {
+fn blocks_str<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], depth: usize) {
     // 行配列へ分割（ゼロコピー切片）
     let mut ls: Vec<Ln> = Vec::new();
     let mut st = 0usize;
@@ -965,13 +1356,46 @@ fn blocks_str(out: &mut Out, fn_: &mut Fn, s: &[u8], depth: usize) {
 
 /// Markdown → HTML 変換。C の `if_md_to_html`（string backend）相当。
 pub fn md_to_html(input: &[u8]) -> Vec<u8> {
-    let mut out = Out::new();
+    let mut out = StrOut::new();
     let mut fn_ = Fn::new();
     run_blocks(&mut out, &mut fn_, input);
     out.buf
 }
 
-fn run_blocks(out: &mut Out, fn_: &mut Fn, input: &[u8]) {
+/// 高速経路: Markdown → DOM 直構築。C の `if_md_parse_fast_f` 相当。
+///
+/// taint（T1..T5）を観測したら `None` を返して中間物を捨てる（呼び出し側が
+/// `md_to_html` + `parse_html` の従来 2 段経路で処理する。正しさは常に本パーサ側に
+/// 集約）。成功時の `Dom` は `md_ws_stripped=true`（純ブロック容器直下の ws-only
+/// TEXT を意図的に剥がした DOM。layout が同値補正を行う）。
+///
+/// `slim_attrs=true`（C の `IF_MD_F_SLIM_ATTRS`）で保持属性を A[href]/IMG[alt] に
+/// 限定する（レンダリング経路専用の最適化。観測点経路は false を渡す）。
+pub fn md_to_dom_opts(input: &[u8], slim_attrs: bool) -> Option<Dom> {
+    // T4: input NUL はトークナイザと意味が分かれるので fallback
+    if input.contains(&0) {
+        return None;
+    }
+    let mut out = DomOut::new(slim_attrs);
+    let mut fn_ = Fn::new();
+    run_blocks(&mut out, &mut fn_, input);
+    out.run_flush();
+    if out.tainted {
+        return None;
+    }
+    out.dom.md_ws_stripped = true;
+    // 解析時カウンタの凍結（C `dom->n_nodes` = mo_node 計数と同集合。ws-sink で
+    // 生成自体を剥がした TEXT は両実装とも不算入）
+    out.dom.n_nodes = out.dom.nodes.len() as u32;
+    Some(out.dom)
+}
+
+/// `md_to_dom_opts(input, false)` の短絡形（観測点経路。slim なし）。
+pub fn md_to_dom(input: &[u8]) -> Option<Dom> {
+    md_to_dom_opts(input, false)
+}
+
+fn run_blocks<E: Emit>(out: &mut E, fn_: &mut Fn, input: &[u8]) {
     // CR/CRLF → LF 正規化（'\r' が無ければゼロコピー）
     let normalized: Vec<u8>;
     let s: &[u8] = if input.contains(&b'\r') {
@@ -1000,37 +1424,37 @@ fn run_blocks(out: &mut Out, fn_: &mut Fn, input: &[u8]) {
 
     // 脚注セクション（参照されたものだけ、参照順）
     if !fn_.refs.is_empty() {
-        open_head(out, "section");
-        attr(out, "class", b"footnotes");
-        out.putc(b'>');
-        out.putc(b'\n');
-        open(out, "hr");
-        out.putc(b'\n');
-        open(out, "ol");
-        out.putc(b'\n');
+        out.open_pend(TAG_SECTION, "section");
+        out.attr("class", b"footnotes");
+        out.open_end();
+        out.text_ch(b'\n');
+        out.open_void(TAG_HR, "hr");
+        out.text_ch(b'\n');
+        out.open_push(TAG_OL, "ol");
+        out.text_ch(b'\n');
         let refs = fn_.refs.clone();
         for id in refs {
             let di = fn_.find_def(&id);
             let idv = format!("fn-{}", String::from_utf8_lossy(&id));
             let hrv = format!("#fr-{}", String::from_utf8_lossy(&id));
-            open_head(out, "li");
-            attr(out, "id", idv.as_bytes());
-            out.putc(b'>');
+            out.open_pend(TAG_LI, "li");
+            out.attr("id", idv.as_bytes());
+            out.open_end();
             let txt = di.map_or(Vec::new(), |d| fn_.defs[d].1.clone());
             inline_span(out, fn_, &txt);
-            out.putc(b' ');
-            open_head(out, "a");
-            attr(out, "href", hrv.as_bytes());
-            out.putc(b'>');
-            out.put_str("\u{21A9}"); // ↩
-            close(out, "a");
-            close(out, "li");
-            out.putc(b'\n');
+            out.text_ch(b' ');
+            out.open_pend(TAG_A, "a");
+            out.attr("href", hrv.as_bytes());
+            out.open_end();
+            out.text("\u{21A9}".as_bytes()); // ↩
+            out.close("a");
+            out.close("li");
+            out.text_ch(b'\n');
         }
-        close(out, "ol");
-        out.putc(b'\n');
-        close(out, "section");
-        out.putc(b'\n');
+        out.close("ol");
+        out.text_ch(b'\n');
+        out.close("section");
+        out.text_ch(b'\n');
     }
 }
 

@@ -128,7 +128,9 @@ pub fn parse_url(url: &str) -> Option<HttpUrl> {
 
 /// base の scheme+authority 長。C の `base_origin_len` 相当。
 fn base_origin_len(base: &str) -> usize {
-    base[7..].find(['/', '?', '#']).map_or(base.len(), |i| i + 7)
+    base[7..]
+        .find(['/', '?', '#'])
+        .map_or(base.len(), |i| i + 7)
 }
 
 /// redirect 用の最小 RFC3986 解決。C の `if_http_resolve_url` 相当。
@@ -269,7 +271,10 @@ pub fn head_parse(buf: &[u8]) -> Option<HttpHead> {
     out.status = st;
 
     // 状態行の残りを捨てる
-    let cur = buf[i..].iter().position(|&c| c == b'\n').map(|p| i + p + 1)?;
+    let cur = buf[i..]
+        .iter()
+        .position(|&c| c == b'\n')
+        .map(|p| i + p + 1)?;
     let mut cur = cur;
     while cur < buf.len() {
         let lf = match buf[cur..].iter().position(|&c| c == b'\n') {
@@ -279,7 +284,11 @@ pub fn head_parse(buf: &[u8]) -> Option<HttpHead> {
         let le = lf;
         // 空行 = ヘッダ終端
         if le == cur || (le == cur + 1 && buf[cur] == b'\r') {
-            out.body_off = if lf < buf.len() { (lf + 1) as u64 } else { buf.len() as u64 };
+            out.body_off = if lf < buf.len() {
+                (lf + 1) as u64
+            } else {
+                buf.len() as u64
+            };
             return Some(out);
         }
         if le == buf.len() {
@@ -294,7 +303,9 @@ pub fn head_parse(buf: &[u8]) -> Option<HttpHead> {
                     v += 1;
                 }
                 let mut ve = le;
-                while ve > v && (buf[ve - 1] == b'\r' || buf[ve - 1] == b' ' || buf[ve - 1] == b'\t') {
+                while ve > v
+                    && (buf[ve - 1] == b'\r' || buf[ve - 1] == b' ' || buf[ve - 1] == b'\t')
+                {
                     ve -= 1;
                 }
                 let name = &buf[cur..colon];
@@ -543,11 +554,13 @@ mod tests {
         assert_eq!(h.status, 404);
         assert_eq!(h.content_length, Some(3));
 
-        let h = head_parse(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n0\r\n\r\n").unwrap();
+        let h = head_parse(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, Chunked\r\n\r\n0\r\n\r\n")
+            .unwrap();
         assert!(h.chunked);
         assert_eq!(h.content_length, None);
 
-        let h = head_parse(b"HTTP/1.1 301 Moved\r\nLocation: /new\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let h = head_parse(b"HTTP/1.1 301 Moved\r\nLocation: /new\r\nContent-Length: 0\r\n\r\n")
+            .unwrap();
         assert_eq!(h.status, 301);
         assert_eq!(h.location.as_deref(), Some(&b"/new"[..]));
 
@@ -558,7 +571,8 @@ mod tests {
         assert_eq!(h.content_length, None);
 
         // 複数 CL は先勝ち
-        let h = head_parse(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 9\r\n\r\nab").unwrap();
+        let h = head_parse(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 9\r\n\r\nab")
+            .unwrap();
         assert_eq!(h.content_length, Some(2));
 
         assert!(head_parse(b"garbage\r\n\r\n").is_none());
@@ -593,9 +607,20 @@ mod tests {
     #[test]
     fn test_private_addr() {
         for a in [
-            0x7F000001u32, 0x7F0000FF, 0x0A000001, 0x0AFFFFFF, 0xAC100001, 0xAC1F0001,
-            0xC0A80001, 0xC0A8FFFE, 0xA9FE0001, 0x64400001, 0x647FFFFE, 0x00000000,
-            0x0A0A0A0A, 0xAC100000,
+            0x7F000001u32,
+            0x7F0000FF,
+            0x0A000001,
+            0x0AFFFFFF,
+            0xAC100001,
+            0xAC1F0001,
+            0xC0A80001,
+            0xC0A8FFFE,
+            0xA9FE0001,
+            0x64400001,
+            0x647FFFFE,
+            0x00000000,
+            0x0A0A0A0A,
+            0xAC100000,
         ] {
             assert!(addr_is_private(a), "{a:#x}");
         }

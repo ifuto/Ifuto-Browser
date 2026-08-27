@@ -405,7 +405,12 @@ pub struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     /// ソースからレキサを作る。
     pub fn new(src: &'a str) -> Self {
-        Self { src, bytes: src.as_bytes(), pos: 0, line: 1 }
+        Self {
+            src,
+            bytes: src.as_bytes(),
+            pos: 0,
+            line: 1,
+        }
     }
 
     /// 現在の行番号（1 始まり。エラー報告用）。
@@ -586,8 +591,10 @@ impl<'a> Lexer<'a> {
                 b'"' => out.push('"'),
                 b'/' => out.push('/'),
                 b'x' => {
-                    let h1 = hex_digit(self.cur()).ok_or_else(|| LexError("bad \\x escape".into()))?;
-                    let h2 = hex_digit(self.peek(1)).ok_or_else(|| LexError("bad \\x escape".into()))?;
+                    let h1 =
+                        hex_digit(self.cur()).ok_or_else(|| LexError("bad \\x escape".into()))?;
+                    let h2 =
+                        hex_digit(self.peek(1)).ok_or_else(|| LexError("bad \\x escape".into()))?;
                     self.advance();
                     self.advance();
                     out.push((h1 * 16 + h2) as char);
@@ -595,7 +602,8 @@ impl<'a> Lexer<'a> {
                 b'u' => {
                     let mut cp = 0u32;
                     for _ in 0..4 {
-                        let h = hex_digit(self.cur()).ok_or_else(|| LexError("bad \\u escape".into()))?;
+                        let h = hex_digit(self.cur())
+                            .ok_or_else(|| LexError("bad \\u escape".into()))?;
                         cp = cp * 16 + h as u32;
                         self.advance();
                     }
@@ -905,56 +913,119 @@ mod tests {
     #[test]
     fn numbers_decimal() {
         assert_eq!(lex_all("0"), vec![Token::Num(NumLit::Int(0)), Token::Eof]);
-        assert_eq!(lex_all("123"), vec![Token::Num(NumLit::Int(123)), Token::Eof]);
-        assert_eq!(lex_all("-1"), vec![
-            Token::Punct(Punct::Minus),
-            Token::Num(NumLit::Int(1)),
-            Token::Eof,
-        ]);
-        assert_eq!(lex_all("3.5"), vec![Token::Num(NumLit::Float(3.5)), Token::Eof]);
-        assert_eq!(lex_all("1e3"), vec![Token::Num(NumLit::Float(1000.0)), Token::Eof]);
-        assert_eq!(lex_all("1.5e-2"), vec![Token::Num(NumLit::Float(0.015)), Token::Eof]);
+        assert_eq!(
+            lex_all("123"),
+            vec![Token::Num(NumLit::Int(123)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("-1"),
+            vec![
+                Token::Punct(Punct::Minus),
+                Token::Num(NumLit::Int(1)),
+                Token::Eof,
+            ]
+        );
+        assert_eq!(
+            lex_all("3.5"),
+            vec![Token::Num(NumLit::Float(3.5)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("1e3"),
+            vec![Token::Num(NumLit::Float(1000.0)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("1.5e-2"),
+            vec![Token::Num(NumLit::Float(0.015)), Token::Eof]
+        );
         // i32 超は Float
-        assert_eq!(lex_all("2147483648"), vec![Token::Num(NumLit::Float(2147483648.0)), Token::Eof]);
+        assert_eq!(
+            lex_all("2147483648"),
+            vec![Token::Num(NumLit::Float(2147483648.0)), Token::Eof]
+        );
     }
 
     #[test]
     fn numbers_radix() {
-        assert_eq!(lex_all("0xff"), vec![Token::Num(NumLit::Int(255)), Token::Eof]);
-        assert_eq!(lex_all("0b101"), vec![Token::Num(NumLit::Int(5)), Token::Eof]);
-        assert_eq!(lex_all("0o77"), vec![Token::Num(NumLit::Int(63)), Token::Eof]);
+        assert_eq!(
+            lex_all("0xff"),
+            vec![Token::Num(NumLit::Int(255)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("0b101"),
+            vec![Token::Num(NumLit::Int(5)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("0o77"),
+            vec![Token::Num(NumLit::Int(63)), Token::Eof]
+        );
     }
 
     #[test]
     fn numbers_bigint_and_separators() {
-        assert_eq!(lex_all("10n"), vec![Token::Num(NumLit::BigInt(10)), Token::Eof]);
-        assert_eq!(lex_all("0xFFn"), vec![Token::Num(NumLit::BigInt(255)), Token::Eof]);
-        assert_eq!(lex_all("1_000"), vec![Token::Num(NumLit::Int(1000)), Token::Eof]);
-        assert_eq!(lex_all("0xAB_CD"), vec![Token::Num(NumLit::Int(0xABCD)), Token::Eof]);
+        assert_eq!(
+            lex_all("10n"),
+            vec![Token::Num(NumLit::BigInt(10)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("0xFFn"),
+            vec![Token::Num(NumLit::BigInt(255)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("1_000"),
+            vec![Token::Num(NumLit::Int(1000)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("0xAB_CD"),
+            vec![Token::Num(NumLit::Int(0xABCD)), Token::Eof]
+        );
     }
 
     #[test]
     fn strings_and_escapes() {
-        assert_eq!(lex_all("\"hello\""), vec![Token::Str("hello".into()), Token::Eof]);
-        assert_eq!(lex_all("\"a\\nb\""), vec![Token::Str("a\nb".into()), Token::Eof]);
-        assert_eq!(lex_all("\"\\x41\\u0042\""), vec![Token::Str("AB".into()), Token::Eof]);
+        assert_eq!(
+            lex_all("\"hello\""),
+            vec![Token::Str("hello".into()), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("\"a\\nb\""),
+            vec![Token::Str("a\nb".into()), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("\"\\x41\\u0042\""),
+            vec![Token::Str("AB".into()), Token::Eof]
+        );
         assert_eq!(lex_all("'q'"), vec![Token::Str("q".into()), Token::Eof]);
         // CJK は二重エンコードされない（原列複製）
-        assert_eq!(lex_all("\"日本語\""), vec![Token::Str("日本語".into()), Token::Eof]);
+        assert_eq!(
+            lex_all("\"日本語\""),
+            vec![Token::Str("日本語".into()), Token::Eof]
+        );
     }
 
     #[test]
     fn template_literals() {
         assert_eq!(
             lex_all("`abc`"),
-            vec![Token::Tpl { text: "abc".into(), mid: false }, Token::Eof]
+            vec![
+                Token::Tpl {
+                    text: "abc".into(),
+                    mid: false
+                },
+                Token::Eof
+            ]
         );
         // `${` で mid=true（閉じ backtick はパーサが lex_template を再呼び出しして
         // 消費するため、レキサ単体では `${` までが 1 トークン）
         let toks = lex_all("`a${");
         assert_eq!(
             toks,
-            vec![Token::Tpl { text: "a".into(), mid: true }, Token::Eof]
+            vec![
+                Token::Tpl {
+                    text: "a".into(),
+                    mid: true
+                },
+                Token::Eof
+            ]
         );
     }
 
@@ -962,15 +1033,27 @@ mod tests {
     fn punctuators_longest_match() {
         assert_eq!(lex_all("==="), vec![Token::Punct(Punct::SeqEq), Token::Eof]);
         assert_eq!(lex_all(">>>"), vec![Token::Punct(Punct::UShr), Token::Eof]);
-        assert_eq!(lex_all(">>="), vec![Token::Punct(Punct::ShrAss), Token::Eof]);
+        assert_eq!(
+            lex_all(">>="),
+            vec![Token::Punct(Punct::ShrAss), Token::Eof]
+        );
         assert_eq!(lex_all("=>"), vec![Token::Punct(Punct::Arrow), Token::Eof]);
-        assert_eq!(lex_all("??="), vec![Token::Punct(Punct::NullishAss), Token::Eof]);
+        assert_eq!(
+            lex_all("??="),
+            vec![Token::Punct(Punct::NullishAss), Token::Eof]
+        );
     }
 
     #[test]
     fn comments_skipped() {
-        assert_eq!(lex_all("// comment\n1"), vec![Token::Num(NumLit::Int(1)), Token::Eof]);
-        assert_eq!(lex_all("/* a\nb */ 2"), vec![Token::Num(NumLit::Int(2)), Token::Eof]);
+        assert_eq!(
+            lex_all("// comment\n1"),
+            vec![Token::Num(NumLit::Int(1)), Token::Eof]
+        );
+        assert_eq!(
+            lex_all("/* a\nb */ 2"),
+            vec![Token::Num(NumLit::Int(2)), Token::Eof]
+        );
     }
 
     #[test]

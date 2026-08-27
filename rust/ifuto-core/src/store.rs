@@ -358,15 +358,54 @@ pub fn parse_bookmarks(text: &[u8], max: usize) -> Vec<(String, String)> {
     out
 }
 
+/// C の `IF_STORE_DIR_CAP`。
+pub const STORE_DIR_CAP: usize = 1024;
+
+/// C の `if_store_init(create=false)` 相当のストアディレクトリ解決（副作用ゼロ）。
+///
+/// 解決順は `$IFUTO_HOME` > `$XDG_DATA_HOME/ifuto` > `$HOME/.local/share/ifuto`。
+/// `IFUTO_NO_STORE` が（値に関わらず）設定されていれば None。各 base の長さ検査
+/// （C の `IF_STORE_DIR_CAP` 超過はストア無効）を同一に再現する。
+pub fn resolve_store_dir() -> Option<String> {
+    if std::env::var_os("IFUTO_NO_STORE").is_some() {
+        return None;
+    }
+    let non_empty = |k: &str| match std::env::var(k) {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => None,
+    };
+    if let Some(base) = non_empty("IFUTO_HOME") {
+        // C: `if (strlen(base) >= sizeof d) return false;`（d[1024] + NUL）
+        if base.len() >= STORE_DIR_CAP {
+            return None;
+        }
+        return Some(base);
+    }
+    if let Some(base) = non_empty("XDG_DATA_HOME") {
+        let d = format!("{base}/ifuto");
+        if d.len() >= STORE_DIR_CAP {
+            return None;
+        }
+        return Some(d);
+    }
+    if let Some(base) = non_empty("HOME") {
+        let d = format!("{base}/.local/share/ifuto");
+        if d.len() >= STORE_DIR_CAP {
+            return None;
+        }
+        return Some(d);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn session_basic() {
-        let (tabs, active) = parse_session(
-            b"ifuto-session 1\nurl 1 https://a/\ntitle 1 A\nactive 1\nend\n",
-        );
+        let (tabs, active) =
+            parse_session(b"ifuto-session 1\nurl 1 https://a/\ntitle 1 A\nactive 1\nend\n");
         assert_eq!(active, 1);
         assert_eq!(tabs.len(), 1);
         assert_eq!(tabs[0].id, 1);
@@ -378,9 +417,8 @@ mod tests {
 
     #[test]
     fn session_group_and_scroll() {
-        let (tabs, _) = parse_session(
-            b"ifuto-session 1\nurl 2 https://b/\ngroup 2 work\nscroll 2 500\nend\n",
-        );
+        let (tabs, _) =
+            parse_session(b"ifuto-session 1\nurl 2 https://b/\ngroup 2 work\nscroll 2 500\nend\n");
         assert_eq!(tabs[0].group.as_deref(), Some("work"));
         assert_eq!(tabs[0].scroll, 500);
     }
@@ -400,9 +438,8 @@ mod tests {
 
     #[test]
     fn session_unknown_lines_ignored() {
-        let (tabs, _) = parse_session(
-            b"ifuto-session 1\nfutureline foo bar\nurl 1 https://a/\nend\n",
-        );
+        let (tabs, _) =
+            parse_session(b"ifuto-session 1\nfutureline foo bar\nurl 1 https://a/\nend\n");
         assert_eq!(tabs.len(), 1);
     }
 
@@ -441,10 +478,19 @@ mod tests {
 
     #[test]
     fn bookmarks_basic() {
-        let b = parse_bookmarks(b"Google\thttps://google.com\nGitHub\thttps://github.com\n", 64);
+        let b = parse_bookmarks(
+            b"Google\thttps://google.com\nGitHub\thttps://github.com\n",
+            64,
+        );
         assert_eq!(b.len(), 2);
-        assert_eq!(b[0], ("Google".to_string(), "https://google.com".to_string()));
-        assert_eq!(b[1], ("GitHub".to_string(), "https://github.com".to_string()));
+        assert_eq!(
+            b[0],
+            ("Google".to_string(), "https://google.com".to_string())
+        );
+        assert_eq!(
+            b[1],
+            ("GitHub".to_string(), "https://github.com".to_string())
+        );
     }
 
     #[test]
@@ -566,7 +612,10 @@ end\n"
 
     #[test]
     fn history_line_basic() {
-        assert_eq!(history_line(1750000000, "Title", "https://a/"), b"1750000000\tTitle\thttps://a/\n");
+        assert_eq!(
+            history_line(1750000000, "Title", "https://a/"),
+            b"1750000000\tTitle\thttps://a/\n"
+        );
         // 無害化
         assert_eq!(history_line(1, "t\tx", "u\nv"), b"1\tt x\tu v\n");
     }
@@ -584,7 +633,10 @@ end\n"
         // 除去
         let (new2, added2) = toggle_bookmark(text, "X", "https://github.com");
         assert!(!added2);
-        assert_eq!(String::from_utf8(new2).unwrap(), "Google\thttps://google.com\n");
+        assert_eq!(
+            String::from_utf8(new2).unwrap(),
+            "Google\thttps://google.com\n"
+        );
     }
 
     #[test]

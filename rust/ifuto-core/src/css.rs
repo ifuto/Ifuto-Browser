@@ -56,20 +56,61 @@ fn hexv(c: u8) -> i32 {
 
 /// 色名表（C の `IF_COLORS`。重複は同一 RGB のため無害）。
 const COLORS: &[(&str, u32)] = &[
-    ("black", 0x000000), ("silver", 0xC0C0C0), ("gray", 0x808080), ("grey", 0x808080),
-    ("white", 0xFFFFFF), ("maroon", 0x800000), ("red", 0xFF0000), ("purple", 0x800080),
-    ("fuchsia", 0xFF00FF), ("magenta", 0xFF00FF), ("green", 0x008000), ("lime", 0x00FF00),
-    ("olive", 0x808000), ("yellow", 0xFFFF00), ("navy", 0x000080), ("blue", 0x0000FF),
-    ("teal", 0x008080), ("aqua", 0x00FFFF), ("cyan", 0x00FFFF), ("orange", 0xFFA500),
-    ("aliceblue", 0xF0F8FF), ("brown", 0xA52A2A), ("coral", 0xFF7F50), ("crimson", 0xDC143C),
-    ("darkblue", 0x00008B), ("darkgray", 0xA9A9A9), ("darkgreen", 0x006400), ("darkred", 0x8B0000),
-    ("gold", 0xFFD700), ("goldenrod", 0xDAA520), ("hotpink", 0xFF69B4), ("indigo", 0x4B0082),
-    ("ivory", 0xFFFFF0), ("khaki", 0xF0E68C), ("lavender", 0xE6E6FA), ("lightgray", 0xD3D3D3),
-    ("lightgreen", 0x90EE90), ("lightyellow", 0xFFFFE0), ("limegreen", 0x32CD32),
-    ("magenta", 0xFF00FF), ("midnightblue", 0x191970), ("orchid", 0xDA70D6), ("pink", 0xFFC0CB),
-    ("plum", 0xDDA0DD), ("rebeccapurple", 0x663399), ("salmon", 0xFA8072), ("skyblue", 0x87CEEB),
-    ("slategray", 0x708090), ("snow", 0xFFFAFA), ("tan", 0xD2B48C), ("tomato", 0xFF6347),
-    ("turquoise", 0x40E0D0), ("violet", 0xEE82EE), ("wheat", 0xF5DEB3), ("whitesmoke", 0xF5F5F5),
+    ("black", 0x000000),
+    ("silver", 0xC0C0C0),
+    ("gray", 0x808080),
+    ("grey", 0x808080),
+    ("white", 0xFFFFFF),
+    ("maroon", 0x800000),
+    ("red", 0xFF0000),
+    ("purple", 0x800080),
+    ("fuchsia", 0xFF00FF),
+    ("magenta", 0xFF00FF),
+    ("green", 0x008000),
+    ("lime", 0x00FF00),
+    ("olive", 0x808000),
+    ("yellow", 0xFFFF00),
+    ("navy", 0x000080),
+    ("blue", 0x0000FF),
+    ("teal", 0x008080),
+    ("aqua", 0x00FFFF),
+    ("cyan", 0x00FFFF),
+    ("orange", 0xFFA500),
+    ("aliceblue", 0xF0F8FF),
+    ("brown", 0xA52A2A),
+    ("coral", 0xFF7F50),
+    ("crimson", 0xDC143C),
+    ("darkblue", 0x00008B),
+    ("darkgray", 0xA9A9A9),
+    ("darkgreen", 0x006400),
+    ("darkred", 0x8B0000),
+    ("gold", 0xFFD700),
+    ("goldenrod", 0xDAA520),
+    ("hotpink", 0xFF69B4),
+    ("indigo", 0x4B0082),
+    ("ivory", 0xFFFFF0),
+    ("khaki", 0xF0E68C),
+    ("lavender", 0xE6E6FA),
+    ("lightgray", 0xD3D3D3),
+    ("lightgreen", 0x90EE90),
+    ("lightyellow", 0xFFFFE0),
+    ("limegreen", 0x32CD32),
+    ("magenta", 0xFF00FF),
+    ("midnightblue", 0x191970),
+    ("orchid", 0xDA70D6),
+    ("pink", 0xFFC0CB),
+    ("plum", 0xDDA0DD),
+    ("rebeccapurple", 0x663399),
+    ("salmon", 0xFA8072),
+    ("skyblue", 0x87CEEB),
+    ("slategray", 0x708090),
+    ("snow", 0xFFFAFA),
+    ("tan", 0xD2B48C),
+    ("tomato", 0xFF6347),
+    ("turquoise", 0x40E0D0),
+    ("violet", 0xEE82EE),
+    ("wheat", 0xF5DEB3),
+    ("whitesmoke", 0xF5F5F5),
 ];
 
 /// 色文字列を RGBA8（0xRRGGBBAA）へ。C の `if_css_color` 相当。失敗は `None`。
@@ -95,7 +136,12 @@ pub fn css_color(s: &[u8]) -> Option<u32> {
                 return Some(rgba8(d[0] * 17, d[1] * 17, d[2] * 17, d[3] * 17));
             }
             if s.len() == 7 {
-                return Some(rgba8(d[0] * 16 + d[1], d[2] * 16 + d[3], d[4] * 16 + d[5], 255));
+                return Some(rgba8(
+                    d[0] * 16 + d[1],
+                    d[2] * 16 + d[3],
+                    d[4] * 16 + d[5],
+                    255,
+                ));
             }
             return Some(rgba8(
                 d[0] * 16 + d[1],
@@ -114,7 +160,10 @@ pub fn css_color(s: &[u8]) -> Option<u32> {
         if s.len() <= off || s[s.len() - 1] != b')' {
             return None;
         }
-        let mut c = Cur { p: &s[off..s.len() - 1], i: 0 };
+        let mut c = Cur {
+            p: &s[off..s.len() - 1],
+            i: 0,
+        };
         let mut ch = [0u32, 0, 0, 255];
         let mut got = 0usize;
         for _ in 0..4 {
@@ -455,7 +504,10 @@ pub struct Len {
     pub unit: u8,
 }
 
-const LEN_AUTO: Len = Len { v: 0.0, unit: U_AUTO };
+const LEN_AUTO: Len = Len {
+    v: 0.0,
+    unit: U_AUTO,
+};
 
 // ================= プロパティ表 =================
 
@@ -584,7 +636,16 @@ struct DeclSink {
 
 impl DeclSink {
     #[allow(clippy::too_many_arguments)]
-    fn push(&mut self, prop: u16, important: bool, vkind: u8, num: f32, unit: u8, color: u32, text: Vec<u8>) {
+    fn push(
+        &mut self,
+        prop: u16,
+        important: bool,
+        vkind: u8,
+        num: f32,
+        unit: u8,
+        color: u32,
+        text: Vec<u8>,
+    ) {
         self.decls.push(Decl {
             prop,
             important,
@@ -611,16 +672,31 @@ fn item_to_len(it: &ValItem) -> Option<Len> {
                 None
             }
         }
-        ValKind::Pct => Some(Len { v: it.num, unit: U_PCT }),
+        ValKind::Pct => Some(Len {
+            v: it.num,
+            unit: U_PCT,
+        }),
         ValKind::Dim => {
             if str_eq_ci(&it.unit, b"px") {
-                Some(Len { v: it.num, unit: U_PX })
+                Some(Len {
+                    v: it.num,
+                    unit: U_PX,
+                })
             } else if str_eq_ci(&it.unit, b"em") {
-                Some(Len { v: it.num, unit: U_EM })
+                Some(Len {
+                    v: it.num,
+                    unit: U_EM,
+                })
             } else if str_eq_ci(&it.unit, b"rem") {
-                Some(Len { v: it.num, unit: U_REM })
+                Some(Len {
+                    v: it.num,
+                    unit: U_REM,
+                })
             } else if str_eq_ci(&it.unit, b"pt") {
-                Some(Len { v: it.num, unit: U_PT })
+                Some(Len {
+                    v: it.num,
+                    unit: U_PT,
+                })
             } else {
                 None
             }
@@ -814,8 +890,10 @@ fn decl_one(s: &mut DeclSink, name: &[u8], value: &[u8], important: bool) {
             | P_BORDER_LEFT_WIDTH
     ) {
         match lex_value(value) {
-            Some(items) if items.len() == 1 && items[0].kind == ValKind::Ident
-                && (P_BORDER_TOP_WIDTH..=P_BORDER_LEFT_WIDTH).contains(&p) =>
+            Some(items)
+                if items.len() == 1
+                    && items[0].kind == ValKind::Ident
+                    && (P_BORDER_TOP_WIDTH..=P_BORDER_LEFT_WIDTH).contains(&p) =>
             {
                 let w = if str_eq_ci(&items[0].text, b"thin") {
                     1.0
@@ -1118,7 +1196,10 @@ fn parse_selector_list(raw: &[u8]) -> Vec<Selector> {
                 need_compound = true;
                 continue;
             }
-            if p.peek() == b'+' || p.peek() == b'~' || p.peek() == b':' || p.peek() == b'['
+            if p.peek() == b'+'
+                || p.peek() == b'~'
+                || p.peek() == b':'
+                || p.peek() == b'['
                 || p.peek() == b','
             {
                 valid = false;
@@ -1510,7 +1591,13 @@ fn winner_beats(w: &Winner, cur: &Option<Winner>) -> bool {
     }
 }
 
-fn collect_from_sheet(dom: &Dom, n: NodeId, sh: &StyleSheet, origin: u8, win: &mut [Option<Winner>]) {
+fn collect_from_sheet(
+    dom: &Dom,
+    n: NodeId,
+    sh: &StyleSheet,
+    origin: u8,
+    win: &mut [Option<Winner>],
+) {
     for rule in &sh.rules {
         let mut best_spec = 0u32;
         let mut matched = false;
@@ -1683,7 +1770,10 @@ fn compute_node(
             P_FONT_SIZE => {
                 let mut v = -1.0f32;
                 if d.vkind == V_LEN {
-                    let l = Len { v: d.num, unit: d.unit };
+                    let l = Len {
+                        v: d.num,
+                        unit: d.unit,
+                    };
                     v = if l.unit == U_PCT {
                         parent_fs * l.v / 100.0
                     } else {
@@ -1698,7 +1788,10 @@ fn compute_node(
             }
             P_LINE_HEIGHT => {
                 if d.vkind == V_LEN {
-                    let l = Len { v: d.num, unit: d.unit };
+                    let l = Len {
+                        v: d.num,
+                        unit: d.unit,
+                    };
                     let v = if l.unit == U_PCT {
                         st.font_size * l.v / 100.0
                     } else {
@@ -1855,20 +1948,35 @@ fn compute_node(
             P_MARGIN_TOP | P_MARGIN_RIGHT | P_MARGIN_BOTTOM | P_MARGIN_LEFT => {
                 let idx = (p - P_MARGIN_TOP) as usize;
                 if d.vkind == V_LEN {
-                    st.margin[idx] = Len { v: d.num, unit: d.unit };
+                    st.margin[idx] = Len {
+                        v: d.num,
+                        unit: d.unit,
+                    };
                 }
             }
             P_PADDING_TOP | P_PADDING_RIGHT | P_PADDING_BOTTOM | P_PADDING_LEFT => {
                 let idx = (p - P_PADDING_TOP) as usize;
                 if d.vkind == V_LEN {
-                    st.padding[idx] = Len { v: d.num, unit: d.unit };
+                    st.padding[idx] = Len {
+                        v: d.num,
+                        unit: d.unit,
+                    };
                 }
             }
-            P_BORDER_TOP_WIDTH | P_BORDER_RIGHT_WIDTH | P_BORDER_BOTTOM_WIDTH
+            P_BORDER_TOP_WIDTH
+            | P_BORDER_RIGHT_WIDTH
+            | P_BORDER_BOTTOM_WIDTH
             | P_BORDER_LEFT_WIDTH => {
                 let idx = (p - P_BORDER_TOP_WIDTH) as usize;
                 if d.vkind == V_LEN {
-                    let v = resolve_len(Len { v: d.num, unit: d.unit }, st.font_size, root_fs);
+                    let v = resolve_len(
+                        Len {
+                            v: d.num,
+                            unit: d.unit,
+                        },
+                        st.font_size,
+                        root_fs,
+                    );
                     if (0.0..10000.0).contains(&v) {
                         st.border_w[idx] = v;
                     }
@@ -1880,10 +1988,16 @@ fn compute_node(
                 }
             }
             P_WIDTH if d.vkind == V_LEN => {
-                st.width = Len { v: d.num, unit: d.unit };
+                st.width = Len {
+                    v: d.num,
+                    unit: d.unit,
+                };
             }
             P_HEIGHT if d.vkind == V_LEN => {
-                st.height = Len { v: d.num, unit: d.unit };
+                st.height = Len {
+                    v: d.num,
+                    unit: d.unit,
+                };
             }
             _ => {}
         }
@@ -1984,7 +2098,11 @@ fn fmt_g6(v: f64) -> String {
         return "nan".to_string();
     }
     if v.is_infinite() {
-        return if v > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if v > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     let neg = v < 0.0;
     let a = v.abs();
@@ -2040,7 +2158,14 @@ fn sd_len4(out: &mut String, v: &[Len; 4]) {
     }
 }
 
-fn sd_node(dom: &Dom, n: NodeId, styles: &[Option<Style>], out: &mut String, depth: usize, n_styled: &mut u32) {
+fn sd_node(
+    dom: &Dom,
+    n: NodeId,
+    styles: &[Option<Style>],
+    out: &mut String,
+    depth: usize,
+    n_styled: &mut u32,
+) {
     if dom.node(n).kind != NodeKind::Element {
         return;
     }
@@ -2068,7 +2193,11 @@ fn sd_node(dom: &Dom, n: NodeId, styles: &[Option<Style>], out: &mut String, dep
                 _ => "left",
             });
             out.push_str(" white-space=");
-            out.push_str(if st.white_space == WS_PRE { "pre" } else { "normal" });
+            out.push_str(if st.white_space == WS_PRE {
+                "pre"
+            } else {
+                "normal"
+            });
             out.push_str(" font-size=");
             out.push_str(&fmt_g6(st.font_size as f64));
             out.push_str("px line-height=");
@@ -2122,7 +2251,8 @@ pub fn dump_styles(dom: &Dom, styles: &[Option<Style>]) -> String {
         sd_node(dom, cid, styles, &mut out, 0, &mut n_styled);
         c = dom.node(cid).next_sibling;
     }
-    out.push_str(&format!("; nodes={} styled={}\n", dom.nodes.len(), n_styled));
+    // `nodes=` は解析時カウンタ（script 実行による事後増分を含まない。C と同規約）
+    out.push_str(&format!("; nodes={} styled={}\n", dom.n_nodes, n_styled));
     out
 }
 
@@ -2189,7 +2319,7 @@ mod tests {
              <div><p style=\"color: #333333\">a</p><span><p>b</p></span></div>",
         );
         let div = dom.find_tag_dfs(tags::tag_id(b"div")).unwrap();
-        let mut c = dom.node(div).first_child;
+        let c = dom.node(div).first_child;
         let p1 = c.unwrap(); // 直接子 p
         let span = dom.node(p1).next_sibling.unwrap();
         let p2 = dom.node(span).first_child.unwrap();
@@ -2255,7 +2385,7 @@ mod tests {
         assert_eq!(fmt_g6(0.000083), "8.3e-05");
         assert_eq!(fmt_g6(0.1f32 as f64), "0.1");
         assert_eq!(fmt_g6(13.333333f32 as f64), "13.3333");
-        assert_eq!(fmt_g6(0.30000001f32 as f64), "0.3");
+        assert_eq!(fmt_g6(0.3f32 as f64), "0.3"); // 元値 0.30000001f32 は 0.3f32 と bit 同値（half-ULP 未満）のため lint 指摘どおり素直な形に
         assert_eq!(fmt_g6((-5.0f32) as f64), "-5");
         assert_eq!(fmt_g6(0.00001f32 as f64), "1e-05");
         assert_eq!(fmt_g6(99999.0), "99999");

@@ -20,10 +20,10 @@
 //! 木の連結は `Option<NodeId>`。ポインタ寿命・エイリアシング問題を構造的に排除。
 //! テキスト・属性値はトークナイザが所有 `Vec<u8>` で返すため arena が不要。
 
-use crate::dom::{Attr, Dom, Doctype, NodeId, NodeKind, Ns};
+use crate::dom::{Attr, Doctype, Dom, NodeId, NodeKind, Ns};
 use crate::html_tok::{Tok, TokKind, Tokenizer};
-use crate::tags::{self, Tag};
 use crate::strutil::str_eq_ci;
+use crate::tags::{self, Tag};
 
 /// 挿入モード（C の `IfMode` 相当）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -98,9 +98,14 @@ pub struct TreeBuilder<'a> {
     afe: Vec<AfeEntry>,
     frag: bool,
     frag_ctx: Option<FragCtx>,
+    /// slim-DOM スイッチ（C の `if_dom_slim` 相当。実ブラウズ経路が true にする）。
+    slim: bool,
 }
 
 use crate::tags_tables::*;
+
+/// slim-DOM で剃られた領域の印（C の `IF_NF_SLIM`。接続・本文を構築しない）。
+pub const NF_SLIM: u8 = 0x01;
 
 impl<'a> TreeBuilder<'a> {
     /// 新規ビルダー。
@@ -125,7 +130,26 @@ impl<'a> TreeBuilder<'a> {
             afe: Vec::new(),
             frag: false,
             frag_ctx: None,
+            slim: false,
         }
+    }
+
+    // ---- slim-DOM（法則「画面描画に関係ないものは DOM しない」。C の under_slim / slim_root_tag 相当） ----
+    //
+    // 剃るのは template の *子孫と本文のみ*。script は v0.3 の akl 実行配線のため DOM
+    // 保持（C の凍結コメントどおり）。root 要素自体は marker として接続し、子孫の生成
+    // ノードは stack 規則のため生成自体は行うが木に接続しない。判定は stack 走査。
+    // 注意: C の foreign_insert は slim を検査しない（foreign 要素は接続される）という
+    // quirk があり、差分 fuzz が要求する byte-parity のため本実装も再現する。
+
+    /// stack を遡って 1 つでも slim フラグ持ちがあれば true（C の `under_slim` 相当）。
+    fn under_slim(&self) -> bool {
+        if !self.slim {
+            return false;
+        }
+        self.stack
+            .iter()
+            .any(|&n| self.dom.node(n).flags & NF_SLIM != 0)
     }
 
     // ---- 基本スタック操作 ----
@@ -185,7 +209,11 @@ impl<'a> TreeBuilder<'a> {
                 has_script = true;
             }
             if tok.tag == tags::TAG_UNKNOWN {
-                node.name = tok.tag_raw.iter().map(|&c| c.to_ascii_lowercase()).collect();
+                node.name = tok
+                    .tag_raw
+                    .iter()
+                    .map(|&c| c.to_ascii_lowercase())
+                    .collect();
                 if tok.tag_raw.len() == 15 && str_eq_ci(&node.name, b"selectedcontent") {
                     has_selectedcontent = true;
                 }
@@ -279,7 +307,18 @@ impl<'a> TreeBuilder<'a> {
 
     fn insert_element(&mut self, tok: &Tok, do_push: bool) {
         let n = self.make_element(tok);
-        self.append_placed(n);
+        if self.slim {
+            let u = self.under_slim();
+            if u || tok.tag == TAG_TEMPLATE {
+                self.dom.node_mut(n).flags |= NF_SLIM;
+            }
+            // 剃り領域の子孫は木に接続しない（node は stack 規則のため残る）。
+            if !u {
+                self.append_placed(n);
+            }
+        } else {
+            self.append_placed(n);
+        }
         if do_push {
             self.push(n);
         }
@@ -371,8 +410,7 @@ impl<'a> TreeBuilder<'a> {
                 return;
             }
             match tg {
-                TAG_DD | TAG_DT | TAG_LI | TAG_OPTGROUP | TAG_OPTION | TAG_P | TAG_RP
-                | TAG_RT => {
+                TAG_DD | TAG_DT | TAG_LI | TAG_OPTGROUP | TAG_OPTION | TAG_P | TAG_RP | TAG_RT => {
                     self.pop();
                 }
                 _ => return,
@@ -388,22 +426,9 @@ impl<'a> TreeBuilder<'a> {
                 return;
             }
             match node.tag {
-                TAG_CAPTION
-                | TAG_COLGROUP
-                | TAG_DD
-                | TAG_DT
-                | TAG_LI
-                | TAG_OPTGROUP
-                | TAG_OPTION
-                | TAG_P
-                | TAG_RP
-                | TAG_RT
-                | TAG_TBODY
-                | TAG_TD
-                | TAG_TFOOT
-                | TAG_TH
-                | TAG_THEAD
-                | TAG_TR => {
+                TAG_CAPTION | TAG_COLGROUP | TAG_DD | TAG_DT | TAG_LI | TAG_OPTGROUP
+                | TAG_OPTION | TAG_P | TAG_RP | TAG_RT | TAG_TBODY | TAG_TD | TAG_TFOOT
+                | TAG_TH | TAG_THEAD | TAG_TR => {
                     self.pop();
                 }
                 _ => return,
@@ -505,6 +530,9 @@ impl<'a> TreeBuilder<'a> {
         if text.is_empty() {
             return;
         }
+        if self.under_slim() {
+            return; // 表示しない subtree の本文は構築しない（C と同型）
+        }
         let (parent, before) = self.place();
         // before がある（foster の兄挿入）時は「直前の兄が TEXT ならそこに連結」。
         let merge_to: Option<NodeId> = if let Some(b) = before {
@@ -542,6 +570,9 @@ impl<'a> TreeBuilder<'a> {
     fn pend_add(&mut self, text: &[u8]) {
         if text.is_empty() {
             return;
+        }
+        if self.under_slim() {
+            return; // 保留 buffer にすら溜めない（C と同型）
         }
         self.pend.extend_from_slice(text);
         if text.iter().any(|&c| !c.is_ascii_whitespace()) {
@@ -637,9 +668,9 @@ impl<'a> TreeBuilder<'a> {
                     return true;
                 }
                 match node.tag {
-                    TAG_TR | TAG_TD | TAG_TH | TAG_TBODY | TAG_THEAD | TAG_TFOOT
-                    | TAG_CAPTION | TAG_COLGROUP | TAG_COL | TAG_TABLE | TAG_TEMPLATE
-                    | TAG_SCRIPT | TAG_STYLE | TAG_META | TAG_LINK | TAG_NOFRAMES => {}
+                    TAG_TR | TAG_TD | TAG_TH | TAG_TBODY | TAG_THEAD | TAG_TFOOT | TAG_CAPTION
+                    | TAG_COLGROUP | TAG_COL | TAG_TABLE | TAG_TEMPLATE | TAG_SCRIPT
+                    | TAG_STYLE | TAG_META | TAG_LINK | TAG_NOFRAMES => {}
                     _ => return true,
                 }
             }
@@ -845,7 +876,10 @@ impl<'a> TreeBuilder<'a> {
             return false;
         }
         if node.ns == Ns::Mathml {
-            return matches!(node.tag, TAG_MI | TAG_MO | TAG_MN | TAG_MS | TAG_MTEXT | TAG_ANNOTATION_XML);
+            return matches!(
+                node.tag,
+                TAG_MI | TAG_MO | TAG_MN | TAG_MS | TAG_MTEXT | TAG_ANNOTATION_XML
+            );
         }
         if node.ns == Ns::Svg {
             return node.tag == TAG_FOREIGNOBJECT || node.tag == TAG_DESC || node.tag == TAG_TITLE;
@@ -998,7 +1032,10 @@ impl<'a> TreeBuilder<'a> {
                 self.afe.remove(o);
             }
         }
-        self.afe.push(AfeEntry { node: n, marker: false });
+        self.afe.push(AfeEntry {
+            node: n,
+            marker: false,
+        });
     }
 
     fn afe_insert_marker(&mut self) {
@@ -1061,7 +1098,13 @@ impl<'a> TreeBuilder<'a> {
 
     fn afe_insert_at(&mut self, pos: usize, n: NodeId) {
         let pos = pos.min(self.afe.len());
-        self.afe.insert(pos, AfeEntry { node: n, marker: false });
+        self.afe.insert(
+            pos,
+            AfeEntry {
+                node: n,
+                marker: false,
+            },
+        );
     }
 
     fn clone_element(&mut self, src: NodeId) -> NodeId {
@@ -1249,44 +1292,44 @@ impl<'a> TreeBuilder<'a> {
             } else {
                 self.dom.root
             };
-        let mut bookmark = fi + 1;
-        let mut last_node = furthest;
-        let mut ni = fb;
-        let mut inner = 0u32;
-        loop {
-            inner += 1; // 12.1
-            if ni == 0 {
-                break;
-            }
-            ni -= 1;
-            let mut node = self.stack[ni];
-            if node == fe {
-                break;
-            }
-            // 12.4: inner > 3 なら AFE から node を除去（WHATWG 打ち切り規則）
-            if inner > 3 {
-                if let Some(rm) = self.afe_find_node(node) {
-                    self.afe_remove_at(rm);
+            let mut bookmark = fi + 1;
+            let mut last_node = furthest;
+            let mut ni = fb;
+            let mut inner = 0u32;
+            loop {
+                inner += 1; // 12.1
+                if ni == 0 {
+                    break;
                 }
+                ni -= 1;
+                let mut node = self.stack[ni];
+                if node == fe {
+                    break;
+                }
+                // 12.4: inner > 3 なら AFE から node を除去（WHATWG 打ち切り規則）
+                if inner > 3 {
+                    if let Some(rm) = self.afe_find_node(node) {
+                        self.afe_remove_at(rm);
+                    }
+                }
+                // 12.5: AFE に無い node は stack から除去して次へ
+                let a2 = self.afe_find_node(node);
+                if a2.is_none() {
+                    self.stack_remove_at(ni);
+                    continue;
+                }
+                let a2 = a2.unwrap();
+                let clone = self.clone_element(node);
+                self.afe[a2].node = clone;
+                self.stack[ni] = clone;
+                node = clone;
+                if last_node == furthest {
+                    bookmark = a2 + 1;
+                }
+                self.dom.detach(last_node);
+                self.dom.append_child(node, last_node);
+                last_node = node;
             }
-            // 12.5: AFE に無い node は stack から除去して次へ
-            let a2 = self.afe_find_node(node);
-            if a2.is_none() {
-                self.stack_remove_at(ni);
-                continue;
-            }
-            let a2 = a2.unwrap();
-            let clone = self.clone_element(node);
-            self.afe[a2].node = clone;
-            self.stack[ni] = clone;
-            node = clone;
-            if last_node == furthest {
-                bookmark = a2 + 1;
-            }
-            self.dom.detach(last_node);
-            self.dom.append_child(node, last_node);
-            last_node = node;
-        }
             self.dom.detach(last_node);
             let (parent, before) = self.place_for(ancestor);
             match before {
@@ -1509,8 +1552,7 @@ impl<'a> TreeBuilder<'a> {
                 self.dom.append_child(self.dom.root, d);
             }
             TokKind::Comment => {
-                let c = self.make_comment(&tok);
-                self.dom.append_child(self.dom.root, c);
+                self.insert_comment_root(&tok);
             }
             TokKind::Text => {
                 let ws = Self::peel_leading_ws(&tok.text);
@@ -1540,6 +1582,49 @@ impl<'a> TreeBuilder<'a> {
             self.dom.node_mut(n).pi_target = tok.pi_target.clone();
         }
         n
+    }
+
+    /// コメント挿入（under_slim ゲート = C の `insert_comment` 冒頭と同型）。
+    /// slim-DOM の剃り領域ではノード生成自体を行わない（`; nodes=N` 計数の一致）。
+    fn insert_comment_root(&mut self, tok: &Tok) {
+        if self.under_slim() {
+            return;
+        }
+        let c = self.make_comment(tok);
+        self.dom.append_child(self.dom.root, c);
+    }
+
+    /// コメント挿入（parent = html or root。ゲート同上）。
+    fn insert_comment_html(&mut self, tok: &Tok) {
+        if self.under_slim() {
+            return;
+        }
+        let c = self.make_comment(tok);
+        let parent = self.html.unwrap_or(self.dom.root);
+        self.dom.append_child(parent, c);
+    }
+
+    /// コメント挿入（parent = stack top。ゲート同上）。
+    fn insert_comment_top(&mut self, tok: &Tok) {
+        if self.under_slim() {
+            return;
+        }
+        let c = self.make_comment(tok);
+        let parent = self.top();
+        self.dom.append_child(parent, c);
+    }
+
+    /// コメント挿入（foster 考慮の place()。C の `insert_comment_placed` 相当）。
+    fn insert_comment_placed(&mut self, tok: &Tok) {
+        if self.under_slim() {
+            return;
+        }
+        let c = self.make_comment(tok);
+        let (parent, before) = self.place();
+        match before {
+            Some(b) => self.dom.insert_child_before(parent, c, b),
+            None => self.dom.append_child(parent, c),
+        }
     }
 
     fn ensure_html(&mut self) {
@@ -1581,8 +1666,7 @@ impl<'a> TreeBuilder<'a> {
 
     fn step_before_html(&mut self, tok: Tok) {
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            self.dom.append_child(self.dom.root, c);
+            self.insert_comment_root(&tok);
             return;
         }
         if tok.kind == TokKind::Text {
@@ -1624,9 +1708,7 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            let parent = self.html.unwrap_or(self.dom.root);
-            self.dom.append_child(parent, c);
+            self.insert_comment_html(&tok);
             return;
         }
         if tok.kind == TokKind::End
@@ -1661,9 +1743,7 @@ impl<'a> TreeBuilder<'a> {
 
     fn step_in_head(&mut self, tok: Tok) {
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            let parent = self.top();
-            self.dom.append_child(parent, c);
+            self.insert_comment_top(&tok);
             return;
         }
         if tok.kind == TokKind::Text {
@@ -1759,12 +1839,7 @@ impl<'a> TreeBuilder<'a> {
 
     fn step_in_head_noscript(&mut self, tok: Tok) {
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            let (parent, before) = self.place();
-            match before {
-                Some(b) => self.dom.insert_child_before(parent, c, b),
-                None => self.dom.append_child(parent, c),
-            }
+            self.insert_comment_placed(&tok);
             return;
         }
         if tok.kind == TokKind::Text && tok.text.iter().all(|&c| c.is_ascii_whitespace()) {
@@ -1785,8 +1860,8 @@ impl<'a> TreeBuilder<'a> {
                     self.dom.n_errors += 1;
                     return;
                 }
-                TAG_BASEFONT | TAG_BGSOUND | TAG_LINK | TAG_META | TAG_NOFRAMES
-                | TAG_SCRIPT | TAG_STYLE => {
+                TAG_BASEFONT | TAG_BGSOUND | TAG_LINK | TAG_META | TAG_NOFRAMES | TAG_SCRIPT
+                | TAG_STYLE => {
                     self.step_in_head(tok);
                     if self.mode == Mode::InHead {
                         self.mode = Mode::InHeadNoscript;
@@ -1818,9 +1893,7 @@ impl<'a> TreeBuilder<'a> {
 
     fn step_after_head(&mut self, tok: Tok) {
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            let parent = self.top();
-            self.dom.append_child(parent, c);
+            self.insert_comment_top(&tok);
             return;
         }
         if tok.kind == TokKind::Text {
@@ -1923,7 +1996,13 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn merge_attrs(&mut self, dst: NodeId, tok: &Tok) {
-        let existing: Vec<Vec<u8>> = self.dom.node(dst).attrs.iter().map(|a| a.name.clone()).collect();
+        let existing: Vec<Vec<u8>> = self
+            .dom
+            .node(dst)
+            .attrs
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
         for a in &tok.attrs {
             if existing.iter().any(|n| str_eq_ci(n, &a.name)) {
                 continue;
@@ -1950,12 +2029,7 @@ impl<'a> TreeBuilder<'a> {
                 return;
             }
             TokKind::Comment => {
-                let c = self.make_comment(&tok);
-                let (parent, before) = self.place();
-                match before {
-                    Some(b) => self.dom.insert_child_before(parent, c, b),
-                    None => self.dom.append_child(parent, c),
-                }
+                self.insert_comment_placed(&tok);
                 return;
             }
             TokKind::Doctype => {
@@ -1988,7 +2062,10 @@ impl<'a> TreeBuilder<'a> {
             if self.frag
                 && self.stack.len() <= 1
                 && t == TAG_INPUT
-                && self.frag_ctx.as_ref().is_some_and(|fc| fc.ns == Ns::Html && fc.tag == TAG_SELECT)
+                && self
+                    .frag_ctx
+                    .as_ref()
+                    .is_some_and(|fc| fc.ns == Ns::Html && fc.tag == TAG_SELECT)
             {
                 self.dom.n_errors += 1;
                 return;
@@ -2133,7 +2210,10 @@ impl<'a> TreeBuilder<'a> {
                 self.afe_push(top);
                 return;
             }
-            if matches!(t, TAG_BASE | TAG_BASEFONT | TAG_BGSOUND | TAG_LINK | TAG_META) {
+            if matches!(
+                t,
+                TAG_BASE | TAG_BASEFONT | TAG_BGSOUND | TAG_LINK | TAG_META
+            ) {
                 self.insert_element(&tok, false);
                 return;
             }
@@ -2156,8 +2236,8 @@ impl<'a> TreeBuilder<'a> {
             }
             if !self.has_open(TAG_TEMPLATE) {
                 match t {
-                    TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_FRAME | TAG_TBODY
-                    | TAG_TD | TAG_TFOOT | TAG_TH | TAG_THEAD | TAG_TR => {
+                    TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_FRAME | TAG_TBODY | TAG_TD
+                    | TAG_TFOOT | TAG_TH | TAG_THEAD | TAG_TR => {
                         self.dom.n_errors += 1;
                         return;
                     }
@@ -2220,45 +2300,12 @@ impl<'a> TreeBuilder<'a> {
                 self.close_heading_if_open();
             }
             match t {
-                TAG_P
-                | TAG_DIV
-                | TAG_UL
-                | TAG_OL
-                | TAG_DL
-                | TAG_PRE
-                | TAG_LISTING
-                | TAG_BLOCKQUOTE
-                | TAG_ADDRESS
-                | TAG_ARTICLE
-                | TAG_ASIDE
-                | TAG_FOOTER
-                | TAG_HEADER
-                | TAG_MAIN
-                | TAG_NAV
-                | TAG_SECTION
-                | TAG_FIELDSET
-                | TAG_FIGURE
-                | TAG_FIGCAPTION
-                | TAG_CENTER
-                | TAG_DETAILS
-                | TAG_DIALOG
-                | TAG_DIR
-                | TAG_MENU
-                | TAG_HGROUP
-                | TAG_SEARCH
-                | TAG_SUMMARY
-                | TAG_LI
-                | TAG_DD
-                | TAG_DT
-                | TAG_H1
-                | TAG_H2
-                | TAG_H3
-                | TAG_H4
-                | TAG_H5
-                | TAG_H6
-                | TAG_RB
-                | TAG_RP
-                | TAG_RT
+                TAG_P | TAG_DIV | TAG_UL | TAG_OL | TAG_DL | TAG_PRE | TAG_LISTING
+                | TAG_BLOCKQUOTE | TAG_ADDRESS | TAG_ARTICLE | TAG_ASIDE | TAG_FOOTER
+                | TAG_HEADER | TAG_MAIN | TAG_NAV | TAG_SECTION | TAG_FIELDSET | TAG_FIGURE
+                | TAG_FIGCAPTION | TAG_CENTER | TAG_DETAILS | TAG_DIALOG | TAG_DIR | TAG_MENU
+                | TAG_HGROUP | TAG_SEARCH | TAG_SUMMARY | TAG_LI | TAG_DD | TAG_DT | TAG_H1
+                | TAG_H2 | TAG_H3 | TAG_H4 | TAG_H5 | TAG_H6 | TAG_RB | TAG_RP | TAG_RT
                 | TAG_RTC => {
                     self.insert_element(&tok, true);
                     return;
@@ -2281,8 +2328,10 @@ impl<'a> TreeBuilder<'a> {
                         self.frameset_ok = false;
                     }
                 } else {
-                    if matches!(t, TAG_AREA | TAG_BR | TAG_EMBED | TAG_IMG | TAG_KEYGEN | TAG_WBR)
-                    {
+                    if matches!(
+                        t,
+                        TAG_AREA | TAG_BR | TAG_EMBED | TAG_IMG | TAG_KEYGEN | TAG_WBR
+                    ) {
                         self.frameset_ok = false;
                         self.afe_reconstruct();
                     }
@@ -2405,34 +2454,11 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
         match t {
-            TAG_ADDRESS
-            | TAG_ARTICLE
-            | TAG_ASIDE
-            | TAG_BLOCKQUOTE
-            | TAG_BUTTON
-            | TAG_CENTER
-            | TAG_DIR
-            | TAG_DIV
-            | TAG_DL
-            | TAG_FIELDSET
-            | TAG_FIGCAPTION
-            | TAG_FIGURE
-            | TAG_FOOTER
-            | TAG_HEADER
-            | TAG_LISTING
-            | TAG_MAIN
-            | TAG_MENU
-            | TAG_NAV
-            | TAG_OL
-            | TAG_PRE
-            | TAG_SECTION
-            | TAG_UL
-            | TAG_DETAILS
-            | TAG_DIALOG
-            | TAG_HGROUP
-            | TAG_SEARCH
-            | TAG_SUMMARY
-            | TAG_SELECT => {
+            TAG_ADDRESS | TAG_ARTICLE | TAG_ASIDE | TAG_BLOCKQUOTE | TAG_BUTTON | TAG_CENTER
+            | TAG_DIR | TAG_DIV | TAG_DL | TAG_FIELDSET | TAG_FIGCAPTION | TAG_FIGURE
+            | TAG_FOOTER | TAG_HEADER | TAG_LISTING | TAG_MAIN | TAG_MENU | TAG_NAV | TAG_OL
+            | TAG_PRE | TAG_SECTION | TAG_UL | TAG_DETAILS | TAG_DIALOG | TAG_HGROUP
+            | TAG_SEARCH | TAG_SUMMARY | TAG_SELECT => {
                 self.end_in_scope(t, ScopeKind::Default, false);
                 return;
             }
@@ -2451,12 +2477,7 @@ impl<'a> TreeBuilder<'a> {
                 return;
             }
             TokKind::Comment => {
-                let c = self.make_comment(&tok);
-                let (parent, before) = self.place();
-                match before {
-                    Some(b) => self.dom.insert_child_before(parent, c, b),
-                    None => self.dom.append_child(parent, c),
-                }
+                self.insert_comment_placed(&tok);
                 return;
             }
             TokKind::Doctype => {
@@ -2555,8 +2576,8 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
         match tok.tag {
-            TAG_BODY | TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_HTML | TAG_TBODY
-            | TAG_TD | TAG_TFOOT | TAG_TH | TAG_THEAD | TAG_TR => {
+            TAG_BODY | TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_HTML | TAG_TBODY | TAG_TD
+            | TAG_TFOOT | TAG_TH | TAG_THEAD | TAG_TR => {
                 self.dom.n_errors += 1;
             }
             _ => self.foster_body(tok),
@@ -2582,8 +2603,8 @@ impl<'a> TreeBuilder<'a> {
         }
         if tok.kind == TokKind::Start {
             match tok.tag {
-                TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_TBODY | TAG_TD | TAG_TFOOT
-                | TAG_TH | TAG_THEAD | TAG_TR => {
+                TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_TBODY | TAG_TD | TAG_TFOOT | TAG_TH
+                | TAG_THEAD | TAG_TR => {
                     if !self.has_in_table_scope(TAG_CAPTION) {
                         self.dom.n_errors += 1;
                         return;
@@ -2608,8 +2629,8 @@ impl<'a> TreeBuilder<'a> {
         }
         if tok.kind == TokKind::End {
             match tok.tag {
-                TAG_BODY | TAG_COL | TAG_COLGROUP | TAG_HTML | TAG_TBODY | TAG_TD
-                | TAG_TFOOT | TAG_TH | TAG_THEAD | TAG_TR => {
+                TAG_BODY | TAG_COL | TAG_COLGROUP | TAG_HTML | TAG_TBODY | TAG_TD | TAG_TFOOT
+                | TAG_TH | TAG_THEAD | TAG_TR => {
                     self.dom.n_errors += 1;
                     return;
                 }
@@ -2654,12 +2675,7 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            let (parent, before) = self.place();
-            match before {
-                Some(b) => self.dom.insert_child_before(parent, c, b),
-                None => self.dom.append_child(parent, c),
-            }
+            self.insert_comment_placed(&tok);
             return;
         }
         if tok.kind == TokKind::Doctype {
@@ -2776,8 +2792,8 @@ impl<'a> TreeBuilder<'a> {
                     self.step(tok);
                     return;
                 }
-                TAG_BODY | TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_HTML | TAG_TR
-                | TAG_TD | TAG_TH => {
+                TAG_BODY | TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_HTML | TAG_TR | TAG_TD
+                | TAG_TH => {
                     self.dom.n_errors += 1;
                     return;
                 }
@@ -2858,8 +2874,7 @@ impl<'a> TreeBuilder<'a> {
                     self.end_tr_reprocess(tok);
                     return;
                 }
-                TAG_BODY | TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_HTML | TAG_TD
-                | TAG_TH => {
+                TAG_BODY | TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_HTML | TAG_TD | TAG_TH => {
                     self.dom.n_errors += 1;
                     return;
                 }
@@ -2886,8 +2901,8 @@ impl<'a> TreeBuilder<'a> {
         }
         if tok.kind == TokKind::Start {
             match tok.tag {
-                TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_TBODY | TAG_TD | TAG_TH
-                | TAG_THEAD | TAG_TFOOT | TAG_TR => {
+                TAG_CAPTION | TAG_COL | TAG_COLGROUP | TAG_TBODY | TAG_TD | TAG_TH | TAG_THEAD
+                | TAG_TFOOT | TAG_TR => {
                     self.dom.n_errors += 1;
                     if !self.has_in_table_scope(TAG_TD) && !self.has_in_table_scope(TAG_TH) {
                         return;
@@ -2928,7 +2943,11 @@ impl<'a> TreeBuilder<'a> {
             self.append_text(s);
             return;
         }
-        let buf: Vec<u8> = s.iter().copied().filter(|&c| c.is_ascii_whitespace()).collect();
+        let buf: Vec<u8> = s
+            .iter()
+            .copied()
+            .filter(|&c| c.is_ascii_whitespace())
+            .collect();
         self.append_text(&buf);
         self.dom.n_errors += 1;
     }
@@ -2939,12 +2958,7 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            let (parent, before) = self.place();
-            match before {
-                Some(b) => self.dom.insert_child_before(parent, c, b),
-                None => self.dom.append_child(parent, c),
-            }
+            self.insert_comment_placed(&tok);
             return;
         }
         if tok.kind == TokKind::Doctype {
@@ -2995,12 +3009,7 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            let (parent, before) = self.place();
-            match before {
-                Some(b) => self.dom.insert_child_before(parent, c, b),
-                None => self.dom.append_child(parent, c),
-            }
+            self.insert_comment_placed(&tok);
             return;
         }
         if tok.kind == TokKind::Doctype {
@@ -3032,8 +3041,7 @@ impl<'a> TreeBuilder<'a> {
             return;
         }
         if tok.kind == TokKind::Comment {
-            let c = self.make_comment(&tok);
-            self.dom.append_child(self.dom.root, c);
+            self.insert_comment_root(&tok);
             return;
         }
         if tok.kind == TokKind::Doctype {
@@ -3067,8 +3075,8 @@ impl<'a> TreeBuilder<'a> {
             return false;
         }
         if tok.kind == TokKind::Start {
-            let is_math_ip = ns == Ns::Mathml
-                && matches!(tag, TAG_MI | TAG_MO | TAG_MN | TAG_MS | TAG_MTEXT);
+            let is_math_ip =
+                ns == Ns::Mathml && matches!(tag, TAG_MI | TAG_MO | TAG_MN | TAG_MS | TAG_MTEXT);
             if is_math_ip && tok.tag != TAG_MGLYPH && tok.tag != TAG_MALIGNMARK {
                 return false;
             }
@@ -3085,8 +3093,8 @@ impl<'a> TreeBuilder<'a> {
                     }
                 }
             }
-            let is_html_ip = ns == Ns::Svg
-                && (tag == TAG_FOREIGNOBJECT || tag == TAG_DESC || tag == TAG_TITLE);
+            let is_html_ip =
+                ns == Ns::Svg && (tag == TAG_FOREIGNOBJECT || tag == TAG_DESC || tag == TAG_TITLE);
             if is_html_ip {
                 return false;
             }
@@ -3106,10 +3114,10 @@ impl<'a> TreeBuilder<'a> {
         if ns == Ns::Html {
             return false;
         }
-        let is_math_ip = ns == Ns::Mathml
-            && matches!(tag, TAG_MI | TAG_MO | TAG_MN | TAG_MS | TAG_MTEXT);
-        let is_html_ip = ns == Ns::Svg
-            && (tag == TAG_FOREIGNOBJECT || tag == TAG_DESC || tag == TAG_TITLE);
+        let is_math_ip =
+            ns == Ns::Mathml && matches!(tag, TAG_MI | TAG_MO | TAG_MN | TAG_MS | TAG_MTEXT);
+        let is_html_ip =
+            ns == Ns::Svg && (tag == TAG_FOREIGNOBJECT || tag == TAG_DESC || tag == TAG_TITLE);
         if is_math_ip || is_html_ip {
             return false;
         }
@@ -3128,53 +3136,17 @@ impl<'a> TreeBuilder<'a> {
 
     fn is_breakout_start(tok: &Tok) -> bool {
         match tok.tag {
-            TAG_B
-            | TAG_BIG
-            | TAG_BLOCKQUOTE
-            | TAG_BODY
-            | TAG_BR
-            | TAG_CENTER
-            | TAG_CODE
-            | TAG_DD
-            | TAG_DIV
-            | TAG_DL
-            | TAG_DT
-            | TAG_EM
-            | TAG_H1
-            | TAG_H2
-            | TAG_H3
-            | TAG_H4
-            | TAG_H5
-            | TAG_H6
-            | TAG_HEAD
-            | TAG_HR
-            | TAG_I
-            | TAG_IMG
-            | TAG_LI
-            | TAG_LISTING
-            | TAG_MENU
-            | TAG_META
-            | TAG_NOBR
-            | TAG_OL
-            | TAG_P
-            | TAG_PRE
-            | TAG_RUBY
-            | TAG_S
-            | TAG_SMALL
-            | TAG_SPAN
-            | TAG_STRONG
-            | TAG_STRIKE
-            | TAG_SUB
-            | TAG_SUP
-            | TAG_TABLE
-            | TAG_TT
-            | TAG_U
-            | TAG_UL
-            | TAG_VAR => true,
-            TAG_FONT => tok
-                .attrs
-                .iter()
-                .any(|a| str_eq_ci(&a.name, b"color") || str_eq_ci(&a.name, b"face") || str_eq_ci(&a.name, b"size")),
+            TAG_B | TAG_BIG | TAG_BLOCKQUOTE | TAG_BODY | TAG_BR | TAG_CENTER | TAG_CODE
+            | TAG_DD | TAG_DIV | TAG_DL | TAG_DT | TAG_EM | TAG_H1 | TAG_H2 | TAG_H3 | TAG_H4
+            | TAG_H5 | TAG_H6 | TAG_HEAD | TAG_HR | TAG_I | TAG_IMG | TAG_LI | TAG_LISTING
+            | TAG_MENU | TAG_META | TAG_NOBR | TAG_OL | TAG_P | TAG_PRE | TAG_RUBY | TAG_S
+            | TAG_SMALL | TAG_SPAN | TAG_STRONG | TAG_STRIKE | TAG_SUB | TAG_SUP | TAG_TABLE
+            | TAG_TT | TAG_U | TAG_UL | TAG_VAR => true,
+            TAG_FONT => tok.attrs.iter().any(|a| {
+                str_eq_ci(&a.name, b"color")
+                    || str_eq_ci(&a.name, b"face")
+                    || str_eq_ci(&a.name, b"size")
+            }),
             _ => false,
         }
     }
@@ -3546,9 +3518,7 @@ impl<'a> TreeBuilder<'a> {
             Mode::InTemplate => self.step_in_template(tok),
             Mode::AfterBody => {
                 if tok.kind == TokKind::Comment {
-                    let c = self.make_comment(&tok);
-                    let parent = self.html.unwrap_or(self.dom.root);
-                    self.dom.append_child(parent, c);
+                    self.insert_comment_html(&tok);
                     return;
                 }
                 if tok.kind == TokKind::Text && tok.text.iter().all(|&c| c.is_ascii_whitespace()) {
@@ -3573,8 +3543,7 @@ impl<'a> TreeBuilder<'a> {
             }
             Mode::AfterAfterBody => {
                 if tok.kind == TokKind::Comment {
-                    let c = self.make_comment(&tok);
-                    self.dom.append_child(self.dom.root, c);
+                    self.insert_comment_root(&tok);
                     return;
                 }
                 if tok.kind == TokKind::Text && tok.text.iter().all(|&c| c.is_ascii_whitespace()) {
@@ -3594,7 +3563,9 @@ impl<'a> TreeBuilder<'a> {
 
     fn peel_leading_ws(s: &[u8]) -> usize {
         let mut n = 0;
-        while n < s.len() && (s[n] == b' ' || s[n] == b'\t' || s[n] == b'\n' || s[n] == b'\x0c' || s[n] == b'\r') {
+        while n < s.len()
+            && (s[n] == b' ' || s[n] == b'\t' || s[n] == b'\n' || s[n] == b'\x0c' || s[n] == b'\r')
+        {
             n += 1;
         }
         n
@@ -3709,18 +3680,35 @@ impl<'a> TreeBuilder<'a> {
 
 /// HTML 文書をパースして `Dom` を構築（C の `if_parse_html` 相当）。
 pub fn parse_html(input: &[u8]) -> Dom {
+    parse_html_opts(input, false)
+}
+
+/// slim-DOM スイッチ付き全文書解析（C の `if_dom_slim=true` での `if_parse_html` 相当）。
+pub fn parse_html_opts(input: &[u8], slim: bool) -> Dom {
     let dom = Dom::new();
     let tok = Tokenizer::new(input);
-    let tb = TreeBuilder::new(dom, tok);
-    tb.parse(None)
+    let mut tb = TreeBuilder::new(dom, tok);
+    tb.slim = slim;
+    let mut d = tb.parse(None);
+    // 解析時カウンタの凍結（C の n_nodes 増分規約と同集合。script 由来の事後増分は含まない）
+    d.n_nodes = d.nodes.len() as u32;
+    d
 }
 
 /// fragment 解析（WHATWG 13.4。`ctx` は `"body"` / `"svg path"` 等）。
 pub fn parse_html_fragment(input: &[u8], ctx: &str) -> Dom {
+    parse_html_fragment_opts(input, ctx, false)
+}
+
+/// slim-DOM スイッチ付き fragment 解析。
+pub fn parse_html_fragment_opts(input: &[u8], ctx: &str, slim: bool) -> Dom {
     let dom = Dom::new();
     let tok = Tokenizer::new(input);
-    let tb = TreeBuilder::new(dom, tok);
-    tb.parse(Some(ctx))
+    let mut tb = TreeBuilder::new(dom, tok);
+    tb.slim = slim;
+    let mut d = tb.parse(Some(ctx));
+    d.n_nodes = d.nodes.len() as u32;
+    d
 }
 
 // ---- customizable select: <selectedcontent> への選択中 option の clone ----
@@ -3890,7 +3878,9 @@ mod tests {
 
     #[test]
     fn basic_structure() {
-        let dom = parse_html(b"<html><head><title>My Title</title></head><body><p>Hello</p></body></html>");
+        let dom = parse_html(
+            b"<html><head><title>My Title</title></head><body><p>Hello</p></body></html>",
+        );
         assert_eq!(dom.title, b"My Title");
         // body のテキスト
         let body = dom.find_tag_dfs(tags::tag_id(b"body")).unwrap();
@@ -3978,9 +3968,7 @@ mod tests {
     #[test]
     fn wpt_doctype_public_system() {
         let s = wpt(b"<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \"http://x\">");
-        assert!(s.starts_with(
-            "| <!DOCTYPE html \"-//W3C//DTD XHTML 1.0//EN\" \"http://x\">\n"
-        ));
+        assert!(s.starts_with("| <!DOCTYPE html \"-//W3C//DTD XHTML 1.0//EN\" \"http://x\">\n"));
     }
 
     #[test]

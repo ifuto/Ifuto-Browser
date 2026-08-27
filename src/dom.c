@@ -270,25 +270,16 @@ static bool sel_part_parse(const char *s, u32 n, SelPart *out) {
 static bool sel_part_matches(const IfNode *n, const SelPart *p) {
     if (n->kind != IF_NODE_ELEMENT) return false;
     if (p->tag_n) {
-        const char *tn = if_tag_name(n->tag);
-        if (n->tag == IF_TAG_UNKNOWN) {
-            /* 未知タグ: 名前文字列と CI 比較 */
-            u32 l = (u32)strlen(tn);
-            if (l != p->tag_n) return false;
-            for (u32 i = 0; i < l; i++) {
-                char a = tn[i], b = p->tag[i];
-                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
-                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
-                if (a != b) return false;
-            }
-        } else {
-            if (p->tag_n != (u32)strlen(tn)) return false;
-            for (u32 i = 0; i < p->tag_n; i++) {
-                char a = tn[i], b = p->tag[i];
-                if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
-                if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
-                if (a != b) return false;
-            }
+        /* 実タグ名（u.tag_name: 既知=canonical lowercase、未知=原文）と CI 比較。
+         * 旧実装は未知タグ経路で if_tag_name(UNKNOWN)=NULL を strlen して SEGV
+         * していた（既知経路と統合: 既知タグは u.tag_name ≡ canonical で同値）。 */
+        IfStr tn = n->u.tag_name;
+        if (tn.n != p->tag_n) return false;
+        for (u32 i = 0; i < tn.n; i++) {
+            char a = tn.p[i], b = p->tag[i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) return false;
         }
     }
     if (p->id_n) {
@@ -376,11 +367,12 @@ static u32 ebt_rec(IfNode *cur, u16 tag_id, bool any, const char *tag, u32 tn,
         if (any) match = true;
         else if (tag_id != IF_TAG_UNKNOWN) match = cur->tag == tag_id;
         else {
-            const char *nm = if_tag_name(cur->tag);
-            u32 l = (u32)strlen(nm);
-            match = l == tn;
-            for (u32 i = 0; match && i < l; i++) {
-                char a = nm[i], b = tag[i];
+            /* 未知タグ名照合は実タグ名（u.tag_name）と CI 比較。
+             * 旧実装は if_tag_name(cur->tag)=NULL（未知要素）を strlen して SEGV。 */
+            IfStr nm = cur->u.tag_name;
+            match = nm.n == tn;
+            for (u32 i = 0; match && i < nm.n; i++) {
+                char a = nm.p[i], b = tag[i];
                 if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
                 if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
                 if (a != b) match = false;

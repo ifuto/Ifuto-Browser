@@ -14,6 +14,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ifuto-cli"
+version = "0.1.0"
+dependencies = [
+ "ifuto-core",
+ "ifuto-ffi",
+]
+
+[[package]]
 name = "ifuto-core"
 version = "0.1.0"
 

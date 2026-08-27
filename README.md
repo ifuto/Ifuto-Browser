@@ -83,6 +83,10 @@ IP 直打ち URL の SAN 検証は BearSSL の制限で不可 — docs/CHARSET.m
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) — 設計固定点・不変条件・明示近似・残存攻撃面・ロードマップ
 - [BENCH.md](BENCH.md) — 計測ベースライン（ラチェット規則つき）
+- [docs/RUST_MIGRATION.md](docs/RUST_MIGRATION.md) — C→Rust 移行のフェーズ台帳
+  （現在地: フェーズ 8-z — CLI 全観測モードを Rust 単体で完動、C↔Rust 差分 fuzz
+  累計 98,133 cases / 0 mismatch の byte-exact。速度・メモリは C 優位の現状を
+  BENCH.md「C vs Rust 比較」に全量記載。GUI は未移植）
 
 ## プロジェクトの規律（抜粋）
 

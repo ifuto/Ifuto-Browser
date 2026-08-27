@@ -135,15 +135,18 @@ def emit_rust(blob, aux32, rows):
     A("// CPython html.entities (= WHATWG entities.json 由来)。設計凍結は docs/HTML.md")
     A("")
     A("/// 名前連結 blob（NUL 無し。offset + len で参照）。")
+    A("#[rustfmt::skip]")
     A("pub const NAMES: &[u8] = &[")
     for i in range(0, len(blob), 24):
         A("    " + ",".join(str(b) for b in blob[i:i + 24]) + ",")
     A("];")
     A("")
     A("/// astral 単一 cp の本体（cp1==0xFFFF のとき cp2 がこの index）。")
+    A("#[rustfmt::skip]")
     A("pub const AUX32: &[u32] = &[%s];" % ", ".join("0x%X" % x for x in aux32))
     A("")
     A("/// 各エントリ: (name_off, name_len, flags, cp1, cp2)。")
+    A("#[rustfmt::skip]")
     A("pub const NAMED: &[(u16, u8, u8, u16, u16)] = &[")
     for off, ln, flags, c1, c2, nm in rows:
         A("    (%u, %u, %u, 0x%X, 0x%X), // %s" % (off, ln, flags, c1, c2, nm))

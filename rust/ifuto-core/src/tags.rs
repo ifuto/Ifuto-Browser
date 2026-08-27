@@ -16,7 +16,7 @@
 //! `&str` の長さが `str.len()` から自動導出されるため、この検査が不要になる。
 
 use crate::strutil::str_eq_ci;
-use crate::tags_tables::{F_RCDATA, F_RAW, F_VOID, TAGS};
+use crate::tags_tables::{F_RAW, F_RCDATA, F_VOID, TAGS};
 
 /// タグ ID（C の `u16 tag` / `IfTag` 相当。`0` = UNKNOWN）。
 pub type Tag = u16;
@@ -32,7 +32,9 @@ pub fn tag_name(tag: Tag) -> Option<&'static str> {
     if tag == TAG_UNKNOWN {
         return None;
     }
-    TAGS.get(tag as usize).map(|(n, _)| *n).filter(|n| !n.is_empty())
+    TAGS.get(tag as usize)
+        .map(|(n, _)| *n)
+        .filter(|n| !n.is_empty())
 }
 
 /// 既知タグの ID（未知は [`TAG_UNKNOWN`]）。名前は大文字小文字無視。C の `if_tag_id` 相当。
@@ -57,7 +59,8 @@ pub fn is_rawtext(tag: Tag) -> bool {
 
 /// rcdata 要素か（`<title>` 等）。C の `if_tag_is_rcdata` 相当。
 pub fn is_rcdata(tag: Tag) -> bool {
-    TAGS.get(tag as usize).is_some_and(|(_, f)| f & F_RCDATA != 0)
+    TAGS.get(tag as usize)
+        .is_some_and(|(_, f)| f & F_RCDATA != 0)
 }
 
 #[cfg(test)]
@@ -122,7 +125,10 @@ mod tests {
         }
         // 表の name は全て小文字 canonical（C の「canonical lowercase name」）
         for (n, _f) in TAGS.iter().skip(1) {
-            assert!(n.bytes().all(|b| !b.is_ascii_uppercase()), "{n} が小文字でない");
+            assert!(
+                n.bytes().all(|b| !b.is_ascii_uppercase()),
+                "{n} が小文字でない"
+            );
         }
     }
 

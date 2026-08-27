@@ -146,18 +146,21 @@ def emit_rust(jis208, jis212, ext):
     A("pub const IF_JIS_CELLS: usize = 8836;")
     A("")
     A("/// JIS X 0208 面（SJIS pointer / EUC ku-ten 共通の一次索引）→ Unicode BMP（無効 0）。")
+    A("#[rustfmt::skip]")
     A("pub const JIS208: &[u16] = &[")
     for i in range(0, JIS_CELLS, 16):
         A("    " + ",".join("0x%04x" % c if c else "0" for c in jis208[i:i + 16]) + ",")
     A("];")
     A("")
     A("/// JIS X 0212 面（EUC-JP SS3 0x8F）→ Unicode BMP（無効 0）。")
+    A("#[rustfmt::skip]")
     A("pub const JIS212: &[u16] = &[")
     for i in range(0, JIS_CELLS, 16):
         A("    " + ",".join("0x%04x" % c if c else "0" for c in jis212[i:i + 16]) + ",")
     A("];")
     A("")
     A("/// cp932 専有/異義バイト対。各要素 = key<<16 | codepoint（key = lead<<8|trail、昇順）。")
+    A("#[rustfmt::skip]")
     A("pub const SJIS_EXT: &[u32] = &[")
     for i in range(0, len(ext), 8):
         A("    " + ",".join("0x%08x" % ((k << 16) | c) for k, c in ext[i:i + 8]) + ",")

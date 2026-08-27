@@ -16,8 +16,8 @@
 // 各 unsafe 操作には本文内の `// SAFETY:` コメントを付す。
 #![allow(clippy::missing_safety_doc)]
 
-use akl_core::bytecode::{HandleVTab, Runtime, VmError};
 use akl_core::builtins::install_builtins;
+use akl_core::bytecode::{HandleVTab, Runtime, VmError};
 use akl_core::codegen::compile;
 use akl_core::obj::Obj;
 use akl_core::parser::Parser;
@@ -30,7 +30,8 @@ use std::os::raw::{c_char, c_int, c_void};
 type CAklVal = u64;
 
 /// C 側 `AklNativeFn`。
-type CAklNativeFn = unsafe extern "C" fn(*mut AklRT, CAklVal, c_int, *const CAklVal, *mut c_void) -> CAklVal;
+type CAklNativeFn =
+    unsafe extern "C" fn(*mut AklRT, CAklVal, c_int, *const CAklVal, *mut c_void) -> CAklVal;
 
 /// C 側 `AklModuleLoader`。
 type CAklModuleLoader = unsafe extern "C" fn(
@@ -47,10 +48,20 @@ type CAklModuleLoader = unsafe extern "C" fn(
 #[derive(Clone, Copy)]
 pub struct CAklHandleVTab {
     tag: *const c_char,
-    get: Option<unsafe extern "C" fn(*mut AklRT, *mut c_void, *const c_char, u32, *mut CAklVal) -> bool>,
+    get: Option<
+        unsafe extern "C" fn(*mut AklRT, *mut c_void, *const c_char, u32, *mut CAklVal) -> bool,
+    >,
     set: Option<unsafe extern "C" fn(*mut AklRT, *mut c_void, *const c_char, u32, CAklVal) -> bool>,
     call: Option<
-        unsafe extern "C" fn(*mut AklRT, *mut c_void, *const c_char, u32, c_int, *const CAklVal, *mut CAklVal) -> bool,
+        unsafe extern "C" fn(
+            *mut AklRT,
+            *mut c_void,
+            *const c_char,
+            u32,
+            c_int,
+            *const CAklVal,
+            *mut CAklVal,
+        ) -> bool,
     >,
 }
 
@@ -63,8 +74,19 @@ pub struct AklRT {
     natives: Vec<(CAklNativeFn, *mut c_void)>,
     /// C ハンドル vtable 登録表（`Obj::Handle.data` がこの index を指す）。
     vtables: Vec<*const CAklHandleVTab>,
-    /// C vtable ポインタ → leaked `HandleVTab`（tag 込みで 1 回だけ作る）のキャッシュ。
+    /// C vtable ポインタ → `HandleVTab`（tag 込みで 1 回だけ作る）のキャッシュ。
     handle_vtab_cache: Vec<(*const CAklHandleVTab, &'static HandleVTab)>,
+    /// `handle_vtab_for` が生成した `HandleVTab` の所有権（`Box` のヒープ領域は
+    /// Vec 伸長では動かない。cache 内の `&'static` はここを指す）。
+    /// 宣言位置は `rt` より後: フィールドは宣言順に drop されるため Runtime 解体
+    /// （その heap 内 `Obj::Handle` が vtab 参照を保持）の追跡中にも Box は生存し、
+    /// 最後にここで解放される。akl-core にカスタム Drop は無く参照先は読まれない。
+    /// lint: この Box はアドレス安定化のために必須（cache の `&'static` が Box の
+    /// ヒープ領域を指し、Vec 伸長で動いてはならない）— vec_box は誤検出。
+    #[allow(clippy::vec_box)]
+    owned_vtabs: Vec<Box<HandleVTab>>,
+    /// 同上。C tag 文字列のコピーの所有権（cache 内 `HandleVTab.tag` が指す）。
+    owned_tags: Vec<Box<str>>,
     /// 汎用 foreign アダプタの登録 index（遅延 1 回）。
     foreign_idx: Option<u32>,
     /// エラー文言バッファ（NUL 終端。C の `rt->err` 相当）。
@@ -141,7 +163,12 @@ unsafe fn val_slice<'a>(p: *const CAklVal, n: c_int) -> &'a [CAklVal] {
 // ---- ホスト（FFI 層）コールバックのアダプタ（安全シグネチャ・unsafe ボディ） ----
 
 /// C ネイティブを呼ぶ汎用アダプタ（`Obj::ForeignNative` から呼ばれる）。
-fn foreign_adapter(rt: &mut Runtime, this: AklVal, args: &[AklVal], data: u64) -> Result<AklVal, VmError> {
+fn foreign_adapter(
+    rt: &mut Runtime,
+    this: AklVal,
+    args: &[AklVal],
+    data: u64,
+) -> Result<AklVal, VmError> {
     let wrapper = rt.host_ctx as *mut AklRT;
     if wrapper.is_null() {
         return Err(VmError::NotCallable);
@@ -151,7 +178,15 @@ fn foreign_adapter(rt: &mut Runtime, this: AklVal, args: &[AklVal], data: u64) -
     let (c_fn, udata) = w.natives[data as usize];
     let argv: Vec<CAklVal> = args.iter().map(|v| v.bits()).collect();
     // SAFETY: c_fn は登録時の AklNativeFn。argv は args のビット列を保持したローカル。
-    let result = unsafe { c_fn(wrapper, this.bits(), args.len() as c_int, argv.as_ptr(), udata) };
+    let result = unsafe {
+        c_fn(
+            wrapper,
+            this.bits(),
+            args.len() as c_int,
+            argv.as_ptr(),
+            udata,
+        )
+    };
     // C ネイティブが akl_native_throw したか
     if w.native_err {
         w.native_err = false;
@@ -172,7 +207,15 @@ fn handle_get_adapter(rt: &mut Runtime, data: u64, ptr: u64, name: &str) -> Opti
     let get = unsafe { (*c_vt).get }?;
     let mut out: CAklVal = 0;
     // SAFETY: get は C vtable のコールバック。name は intern 済み文字列の有効スライス。
-    let ok = unsafe { get(wrapper, ptr as *mut c_void, name.as_ptr() as *const c_char, name.len() as u32, &mut out) };
+    let ok = unsafe {
+        get(
+            wrapper,
+            ptr as *mut c_void,
+            name.as_ptr() as *const c_char,
+            name.len() as u32,
+            &mut out,
+        )
+    };
     if ok {
         Some(AklVal::from_bits(out))
     } else {
@@ -191,11 +234,25 @@ fn handle_set_adapter(rt: &mut Runtime, data: u64, ptr: u64, name: &str, v: AklV
         return false;
     };
     // SAFETY: set は C vtable のコールバック。
-    unsafe { set(wrapper, ptr as *mut c_void, name.as_ptr() as *const c_char, name.len() as u32, v.bits()) }
+    unsafe {
+        set(
+            wrapper,
+            ptr as *mut c_void,
+            name.as_ptr() as *const c_char,
+            name.len() as u32,
+            v.bits(),
+        )
+    }
 }
 
 /// C ハンドルの `call` アダプタ。
-fn handle_call_adapter(rt: &mut Runtime, data: u64, ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal> {
+fn handle_call_adapter(
+    rt: &mut Runtime,
+    data: u64,
+    ptr: u64,
+    name: &str,
+    args: &[AklVal],
+) -> Option<AklVal> {
     let wrapper = rt.host_ctx as *mut AklRT;
     // SAFETY: host_ctx は akl_new が初期化。data は vtables index。
     let w = unsafe { &*wrapper };
@@ -230,7 +287,8 @@ fn handle_vtab_for(rt: &mut AklRT, vt: *const CAklHandleVTab) -> &'static Handle
             return hv;
         }
     }
-    // tag を C 文字列からコピーして 'static 化（leak。vtable 数は少数）。
+    // tag を C 文字列からコピーしてヒープ保持（leak ではなく AklRT 所有。
+    // `&'static` の見かけは FFI 境界のライフタイム延長で、実寿命は akl_free まで）。
     // SAFETY: vt は呼び出し側が有効な AklHandleVTab を渡す契約。
     let tag: &'static str = unsafe {
         if (*vt).tag.is_null() {
@@ -238,15 +296,22 @@ fn handle_vtab_for(rt: &mut AklRT, vt: *const CAklHandleVTab) -> &'static Handle
         } else {
             let c = std::ffi::CStr::from_ptr((*vt).tag);
             let s = c.to_str().unwrap_or("Handle");
-            Box::leak(s.to_string().into_boxed_str())
+            rt.owned_tags.push(s.to_string().into_boxed_str());
+            let boxed: &str = rt.owned_tags.last().unwrap();
+            // SAFETY: Box<str> のヒープデータは Vec 伸長では動かず、
+            // 解放は AklRT drop（akl_free。rt 本体より後）まで起きない。
+            &*(boxed as *const str)
         }
     };
-    let hv: &'static HandleVTab = Box::leak(Box::new(HandleVTab {
+    rt.owned_vtabs.push(Box::new(HandleVTab {
         tag,
         get: handle_get_adapter,
         set: handle_set_adapter,
         call: handle_call_adapter,
     }));
+    let bp: *const HandleVTab = &**rt.owned_vtabs.last().unwrap();
+    // SAFETY: 同上。Box のヒープ領域は Vec 伸長で動かず、akl_free まで生存。
+    let hv: &'static HandleVTab = unsafe { &*bp };
     rt.handle_vtab_cache.push((vt, hv));
     hv
 }
@@ -265,6 +330,8 @@ pub unsafe extern "C" fn akl_new() -> *mut AklRT {
         natives: Vec::new(),
         vtables: Vec::new(),
         handle_vtab_cache: Vec::new(),
+        owned_vtabs: Vec::new(),
+        owned_tags: Vec::new(),
         foreign_idx: None,
         err: [0; 256],
         err_len: 0,
@@ -380,7 +447,10 @@ pub unsafe extern "C" fn akl_call_this(
         .iter()
         .map(|v| AklVal::from_bits(*v))
         .collect();
-    match rt.rt.call_value(AklVal::from_bits(f), AklVal::from_bits(thisv), &args) {
+    match rt
+        .rt
+        .call_value(AklVal::from_bits(f), AklVal::from_bits(thisv), &args)
+    {
         Ok(v) => {
             if !out.is_null() {
                 // SAFETY: out は呼び出し側の有効ポインタ。
@@ -495,7 +565,10 @@ pub unsafe extern "C" fn akl_as_str(rt: *mut AklRT, v: CAklVal, len: *mut u32) -
         return std::ptr::null();
     }
     let id = val.get_obj();
-    if !matches!(rt.rt.heap.get(id), Some(Obj::Str(_)) | Some(Obj::Rope { .. })) {
+    if !matches!(
+        rt.rt.heap.get(id),
+        Some(Obj::Str(_)) | Some(Obj::Rope { .. })
+    ) {
         return std::ptr::null();
     }
     rt.rt.flatten_rope_in_place(id);
@@ -633,7 +706,10 @@ pub unsafe extern "C" fn akl_is_object(rt: *mut AklRT, v: CAklVal) -> bool {
         return false;
     }
     // SAFETY: rt は akl_new 由来。
-    matches!(unsafe { (*rt).rt.heap.get(val.get_obj()) }, Some(Obj::Obj(_)))
+    matches!(
+        unsafe { (*rt).rt.heap.get(val.get_obj()) },
+        Some(Obj::Obj(_))
+    )
 }
 
 /// `akl_is_handle`: ハンドルか。
@@ -647,12 +723,20 @@ pub unsafe extern "C" fn akl_is_handle(rt: *mut AklRT, v: CAklVal) -> bool {
         return false;
     }
     // SAFETY: rt は akl_new 由来。
-    matches!(unsafe { (*rt).rt.heap.get(val.get_obj()) }, Some(Obj::Handle { .. }))
+    matches!(
+        unsafe { (*rt).rt.heap.get(val.get_obj()) },
+        Some(Obj::Handle { .. })
+    )
 }
 
 /// `akl_prop_set`: プレーンオブジェクトのプロパティ設定。
 #[no_mangle]
-pub unsafe extern "C" fn akl_prop_set(rt: *mut AklRT, obj: CAklVal, name: *const c_char, v: CAklVal) -> bool {
+pub unsafe extern "C" fn akl_prop_set(
+    rt: *mut AklRT,
+    obj: CAklVal,
+    name: *const c_char,
+    v: CAklVal,
+) -> bool {
     if rt.is_null() {
         return false;
     }
@@ -677,7 +761,11 @@ pub unsafe extern "C" fn akl_prop_set(rt: *mut AklRT, obj: CAklVal, name: *const
 
 /// `akl_prop_get`: プレーンオブジェクトのプロパティ取得（無ければ undefined）。
 #[no_mangle]
-pub unsafe extern "C" fn akl_prop_get(rt: *mut AklRT, obj: CAklVal, name: *const c_char) -> CAklVal {
+pub unsafe extern "C" fn akl_prop_get(
+    rt: *mut AklRT,
+    obj: CAklVal,
+    name: *const c_char,
+) -> CAklVal {
     if rt.is_null() {
         return AklVal::UNDEF.bits();
     }
@@ -692,7 +780,11 @@ pub unsafe extern "C" fn akl_prop_get(rt: *mut AklRT, obj: CAklVal, name: *const
         Some(id) => id,
         None => return AklVal::UNDEF.bits(),
     };
-    rt.rt.heap.prop_get(objval.get_obj(), name_id).map(|v| v.bits()).unwrap_or(AklVal::UNDEF.bits())
+    rt.rt
+        .heap
+        .prop_get(objval.get_obj(), name_id)
+        .map(|v| v.bits())
+        .unwrap_or(AklVal::UNDEF.bits())
 }
 
 /// `akl_global_set`: グローバル変数を値に束縛。
@@ -767,7 +859,11 @@ pub unsafe extern "C" fn akl_native_register(
 
 /// `akl_mknative`: C ネイティブの関数値を生成（束縛はしない）。
 #[no_mangle]
-pub unsafe extern "C" fn akl_mknative(rt: *mut AklRT, fn_: CAklNativeFn, udata: *mut c_void) -> CAklVal {
+pub unsafe extern "C" fn akl_mknative(
+    rt: *mut AklRT,
+    fn_: CAklNativeFn,
+    udata: *mut c_void,
+) -> CAklVal {
     if rt.is_null() {
         return AklVal::UNDEF.bits();
     }
@@ -793,7 +889,11 @@ pub unsafe extern "C" fn akl_mknative(rt: *mut AklRT, fn_: CAklNativeFn, udata: 
 
 /// `akl_mkhandle`: C ハンドル（DOM 要素等）の値を生成。
 #[no_mangle]
-pub unsafe extern "C" fn akl_mkhandle(rt: *mut AklRT, vt: *const CAklHandleVTab, ptr: *mut c_void) -> CAklVal {
+pub unsafe extern "C" fn akl_mkhandle(
+    rt: *mut AklRT,
+    vt: *const CAklHandleVTab,
+    ptr: *mut c_void,
+) -> CAklVal {
     if rt.is_null() || vt.is_null() {
         return AklVal::UNDEF.bits();
     }
@@ -802,7 +902,11 @@ pub unsafe extern "C" fn akl_mkhandle(rt: *mut AklRT, vt: *const CAklHandleVTab,
     rt.vtables.push(vt);
     let data = (rt.vtables.len() - 1) as u64;
     let hv = handle_vtab_for(rt, vt);
-    match rt.rt.heap.alloc(Obj::Handle { vtab: hv, data, ptr: ptr as u64 }) {
+    match rt.rt.heap.alloc(Obj::Handle {
+        vtab: hv,
+        data,
+        ptr: ptr as u64,
+    }) {
         Ok(id) => AklVal::mk_obj(id).bits(),
         Err(_) => {
             set_err(rt, "oom: handle");
@@ -851,7 +955,11 @@ pub unsafe extern "C" fn akl_cojit_count(_rt: *mut AklRT) -> u32 {
 
 /// `akl_set_module_loader`（保持のみ。Rust 側 import は簡易近似でローダ未使用）。
 #[no_mangle]
-pub unsafe extern "C" fn akl_set_module_loader(rt: *mut AklRT, loader: CAklModuleLoader, udata: *mut c_void) {
+pub unsafe extern "C" fn akl_set_module_loader(
+    rt: *mut AklRT,
+    loader: CAklModuleLoader,
+    udata: *mut c_void,
+) {
     if rt.is_null() {
         return;
     }
@@ -877,7 +985,12 @@ pub unsafe extern "C" fn akl_set_module_base(rt: *mut AklRT, base: *const c_char
 /// `akl_eval_module`: モジュールとして評価（Rust 側は import/export をグローバル近似
 /// しているため `akl_eval` と同一挙動）。
 #[no_mangle]
-pub unsafe extern "C" fn akl_eval_module(rt: *mut AklRT, src: *const c_char, _base: *const c_char, out: *mut CAklVal) -> bool {
+pub unsafe extern "C" fn akl_eval_module(
+    rt: *mut AklRT,
+    src: *const c_char,
+    _base: *const c_char,
+    out: *mut CAklVal,
+) -> bool {
     unsafe { akl_eval(rt, src, out) }
 }
 
@@ -945,7 +1058,10 @@ mod tests {
     unsafe fn akl_global_get_test(rt: *mut AklRT, name: &str) -> CAklVal {
         let rt = unsafe { &mut *rt };
         let id = rt.rt.intern(name).unwrap();
-        rt.rt.global_get(id).map(|v| v.bits()).unwrap_or(AklVal::UNDEF.bits())
+        rt.rt
+            .global_get(id)
+            .map(|v| v.bits())
+            .unwrap_or(AklVal::UNDEF.bits())
     }
 
     #[test]
@@ -955,7 +1071,9 @@ mod tests {
         let mut out: CAklVal = 0;
         let ok = unsafe { akl_eval(rt, c.as_ptr(), &mut out) };
         assert!(!ok);
-        let err = unsafe { std::ffi::CStr::from_ptr(akl_error(rt)) }.to_string_lossy().into_owned();
+        let err = unsafe { std::ffi::CStr::from_ptr(akl_error(rt)) }
+            .to_string_lossy()
+            .into_owned();
         assert!(!err.is_empty());
         unsafe { akl_free(rt) };
     }
@@ -969,7 +1087,9 @@ mod tests {
         let mut out: CAklVal = 0;
         let ok = unsafe { akl_eval(rt, c.as_ptr(), &mut out) };
         assert!(!ok);
-        let err = unsafe { std::ffi::CStr::from_ptr(akl_error(rt)) }.to_string_lossy().into_owned();
+        let err = unsafe { std::ffi::CStr::from_ptr(akl_error(rt)) }
+            .to_string_lossy()
+            .into_owned();
         assert!(err.contains("budget"), "err = {err}");
         unsafe { akl_free(rt) };
     }
@@ -1005,7 +1125,13 @@ mod tests {
     // ---- C ネイティブ登録（foreign_adapter）と ハンドル（DOM 相当）の e2e ----
 
     /// C ネイティブ: double(x) = x * 2。
-    unsafe extern "C" fn double_native(_rt: *mut AklRT, _self: CAklVal, argc: c_int, argv: *const CAklVal, _udata: *mut c_void) -> CAklVal {
+    unsafe extern "C" fn double_native(
+        _rt: *mut AklRT,
+        _self: CAklVal,
+        argc: c_int,
+        argv: *const CAklVal,
+        _udata: *mut c_void,
+    ) -> CAklVal {
         if argc < 1 {
             return AklVal::UNDEF.bits();
         }
@@ -1024,7 +1150,9 @@ mod tests {
     fn native_register_and_call() {
         let rt = unsafe { akl_new() };
         let name = CString::new("double").unwrap();
-        assert!(unsafe { akl_native_register(rt, name.as_ptr(), double_native, std::ptr::null_mut()) });
+        assert!(unsafe {
+            akl_native_register(rt, name.as_ptr(), double_native, std::ptr::null_mut())
+        });
 
         // double(21) = 42（double 値を返す。=== で数値統一比較）
         let (ok, v) = eval(rt, "double(21) === 42;");
@@ -1047,7 +1175,13 @@ mod tests {
     fn handle_roundtrip() {
         // ハンドルの最小 vtable（get のみ。tag あり）
         // get コールバック: "title" なら 999 を返す
-        unsafe extern "C" fn t_get(_rt: *mut AklRT, _ptr: *mut c_void, name: *const c_char, len: u32, out: *mut CAklVal) -> bool {
+        unsafe extern "C" fn t_get(
+            _rt: *mut AklRT,
+            _ptr: *mut c_void,
+            name: *const c_char,
+            len: u32,
+            out: *mut CAklVal,
+        ) -> bool {
             // SAFETY: name は len バイトの有効バッファ（C vtable 契約）。
             let bytes = unsafe { std::slice::from_raw_parts(name as *const u8, len as usize) };
             let name = std::str::from_utf8(bytes).unwrap_or("");
@@ -1067,7 +1201,8 @@ mod tests {
 
         let rt = unsafe { akl_new() };
         // ハンドルをグローバル document に束縛
-        let handle = unsafe { akl_mkhandle(rt, vt as *const CAklHandleVTab, 0xdead as *mut c_void) };
+        let handle =
+            unsafe { akl_mkhandle(rt, vt as *const CAklHandleVTab, 0xdead as *mut c_void) };
         assert!(unsafe { akl_is_handle(rt, handle) });
         let doc = CString::new("document").unwrap();
         assert!(unsafe { akl_global_set(rt, doc.as_ptr(), handle) });

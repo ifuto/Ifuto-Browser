@@ -560,7 +560,11 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     /// ソースからパーサを作る。
     pub fn new(src: &'a str) -> Self {
-        Self { lx: Lexer::new(src), peeked: None, super_class: None }
+        Self {
+            lx: Lexer::new(src),
+            peeked: None,
+            super_class: None,
+        }
     }
 
     /// 現在の行番号（エラー報告用）。
@@ -647,18 +651,28 @@ impl<'a> Parser<'a> {
             self.bump()?;
             let rhs = self.parse_expr()?; // 代入は右結合
             return match lhs {
-                Expr::Ident(name) => Ok(Expr::Assign { name, rhs: Box::new(rhs) }),
-                Expr::Index { obj, index } => {
-                    Ok(Expr::IndexAssign { obj, index, rhs: Box::new(rhs) })
-                }
-                Expr::Member { obj, name } => {
-                    Ok(Expr::MemberAssign { obj, name, rhs: Box::new(rhs) })
-                }
+                Expr::Ident(name) => Ok(Expr::Assign {
+                    name,
+                    rhs: Box::new(rhs),
+                }),
+                Expr::Index { obj, index } => Ok(Expr::IndexAssign {
+                    obj,
+                    index,
+                    rhs: Box::new(rhs),
+                }),
+                Expr::Member { obj, name } => Ok(Expr::MemberAssign {
+                    obj,
+                    name,
+                    rhs: Box::new(rhs),
+                }),
                 // 分割代入（式文 `[a, b] = expr` / `({a} = expr)`）
                 Expr::Arr(_) | Expr::ObjLit(_) => {
                     let pattern = expr_to_pattern(lhs)
                         .ok_or_else(|| ParseError("invalid destructuring pattern".into()))?;
-                    Ok(Expr::DestructureAssign { pattern, rhs: Box::new(rhs) })
+                    Ok(Expr::DestructureAssign {
+                        pattern,
+                        rhs: Box::new(rhs),
+                    })
                 }
                 _ => Err(ParseError("invalid assignment target".into())),
             };
@@ -693,13 +707,23 @@ impl<'a> Parser<'a> {
             self.bump()?;
             let rhs = self.parse_expr()?;
             return match lhs {
-                Expr::Ident(name) => Ok(Expr::CompoundAssign { name, op, rhs: Box::new(rhs) }),
-                Expr::Member { obj, name } => {
-                    Ok(Expr::MemberCompoundAssign { obj, name, op, rhs: Box::new(rhs) })
-                }
-                Expr::Index { obj, index } => {
-                    Ok(Expr::IndexCompoundAssign { obj, index, op, rhs: Box::new(rhs) })
-                }
+                Expr::Ident(name) => Ok(Expr::CompoundAssign {
+                    name,
+                    op,
+                    rhs: Box::new(rhs),
+                }),
+                Expr::Member { obj, name } => Ok(Expr::MemberCompoundAssign {
+                    obj,
+                    name,
+                    op,
+                    rhs: Box::new(rhs),
+                }),
+                Expr::Index { obj, index } => Ok(Expr::IndexCompoundAssign {
+                    obj,
+                    index,
+                    op,
+                    rhs: Box::new(rhs),
+                }),
                 _ => Err(ParseError("invalid assignment target".into())),
             };
         }
@@ -752,7 +776,11 @@ impl<'a> Parser<'a> {
         while self.at_punct(Punct::OrOr)? {
             self.bump()?;
             let rhs = self.parse_and()?;
-            lhs = Expr::Bin { op: BinOp::Or, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op: BinOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -763,7 +791,11 @@ impl<'a> Parser<'a> {
         while self.at_punct(Punct::AndAnd)? {
             self.bump()?;
             let rhs = self.parse_bitor()?;
-            lhs = Expr::Bin { op: BinOp::And, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -774,7 +806,11 @@ impl<'a> Parser<'a> {
         while self.at_punct(Punct::Bor)? {
             self.bump()?;
             let rhs = self.parse_bitxor()?;
-            lhs = Expr::Bin { op: BinOp::BOr, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op: BinOp::BOr,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -785,7 +821,11 @@ impl<'a> Parser<'a> {
         while self.at_punct(Punct::Bxor)? {
             self.bump()?;
             let rhs = self.parse_bitand()?;
-            lhs = Expr::Bin { op: BinOp::BXor, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op: BinOp::BXor,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -796,7 +836,11 @@ impl<'a> Parser<'a> {
         while self.at_punct(Punct::Band)? {
             self.bump()?;
             let rhs = self.parse_equality()?;
-            lhs = Expr::Bin { op: BinOp::BAnd, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op: BinOp::BAnd,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -819,7 +863,11 @@ impl<'a> Parser<'a> {
             let Some(op) = op else { break };
             self.bump()?;
             let rhs = self.parse_relational()?;
-            lhs = Expr::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -844,20 +892,30 @@ impl<'a> Parser<'a> {
                 if self.at_kw(Keyword::Instanceof)? {
                     self.bump()?;
                     let rhs = self.parse_shift()?;
-                    lhs = Expr::Instanceof { lhs: Box::new(lhs), rhs: Box::new(rhs) };
+                    lhs = Expr::Instanceof {
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    };
                     continue;
                 }
                 if self.at_kw(Keyword::In)? {
                     self.bump()?;
                     let rhs = self.parse_shift()?;
-                    lhs = Expr::In { key: Box::new(lhs), obj: Box::new(rhs) };
+                    lhs = Expr::In {
+                        key: Box::new(lhs),
+                        obj: Box::new(rhs),
+                    };
                     continue;
                 }
                 break;
             };
             self.bump()?;
             let rhs = self.parse_shift()?;
-            lhs = Expr::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -878,7 +936,11 @@ impl<'a> Parser<'a> {
             let Some(op) = op else { break };
             self.bump()?;
             let rhs = self.parse_additive()?;
-            lhs = Expr::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -897,7 +959,11 @@ impl<'a> Parser<'a> {
             let Some(op) = op else { break };
             self.bump()?;
             let rhs = self.parse_multiplicative()?;
-            lhs = Expr::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -918,7 +984,11 @@ impl<'a> Parser<'a> {
             let Some(op) = op else { break };
             self.bump()?;
             let rhs = self.parse_unary()?;
-            lhs = Expr::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+            lhs = Expr::Bin {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
         }
         Ok(lhs)
     }
@@ -947,13 +1017,18 @@ impl<'a> Parser<'a> {
         if let Some(op) = op {
             self.bump()?;
             let operand = self.parse_unary()?;
-            return Ok(Expr::Unary { op, operand: Box::new(operand) });
+            return Ok(Expr::Unary {
+                op,
+                operand: Box::new(operand),
+            });
         }
         // delete
         if self.at_kw(Keyword::Delete)? {
             self.bump()?;
             let target = self.parse_unary()?;
-            return Ok(Expr::Delete { target: Box::new(target) });
+            return Ok(Expr::Delete {
+                target: Box::new(target),
+            });
         }
         // new 演算子
         if self.at_kw(Keyword::New)? {
@@ -978,7 +1053,10 @@ impl<'a> Parser<'a> {
                 }
                 self.expect_punct(Punct::RParen, "')'")?;
             }
-            let base = Expr::New { callee: Box::new(callee), args };
+            let base = Expr::New {
+                callee: Box::new(callee),
+                args,
+            };
             // `new Foo(...).method(...)` / `new Foo(...)[i]` の後置連鎖
             return self.parse_postfix_suffix(base);
         }
@@ -994,13 +1072,23 @@ impl<'a> Parser<'a> {
             self.bump()?;
             let operand = self.parse_unary()?;
             return match operand {
-                Expr::Ident(name) => Ok(Expr::IncDec { name, inc, prefix: true }),
-                Expr::Member { obj, name } => {
-                    Ok(Expr::MemberIncDec { obj, name, inc, prefix: true })
-                }
-                Expr::Index { obj, index } => {
-                    Ok(Expr::IndexIncDec { obj, index, inc, prefix: true })
-                }
+                Expr::Ident(name) => Ok(Expr::IncDec {
+                    name,
+                    inc,
+                    prefix: true,
+                }),
+                Expr::Member { obj, name } => Ok(Expr::MemberIncDec {
+                    obj,
+                    name,
+                    inc,
+                    prefix: true,
+                }),
+                Expr::Index { obj, index } => Ok(Expr::IndexIncDec {
+                    obj,
+                    index,
+                    inc,
+                    prefix: true,
+                }),
                 _ => Err(ParseError("invalid increment/decrement target".into())),
             };
         }
@@ -1034,34 +1122,55 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect_punct(Punct::RParen, "')'")?;
-                base = Expr::Call { callee: Box::new(base), args };
+                base = Expr::Call {
+                    callee: Box::new(base),
+                    args,
+                };
             } else if self.at_punct(Punct::Dot)? {
                 self.bump()?;
                 let name = match self.bump()? {
                     Token::Ident(n) => n.to_string(),
                     Token::Kw(kw) => format!("{kw:?}").to_lowercase(),
                     other => {
-                        return Err(ParseError(format!("expected property name after '.', got {other:?}")))
+                        return Err(ParseError(format!(
+                            "expected property name after '.', got {other:?}"
+                        )))
                     }
                 };
-                base = Expr::Member { obj: Box::new(base), name };
+                base = Expr::Member {
+                    obj: Box::new(base),
+                    name,
+                };
             } else if self.at_punct(Punct::LBracket)? {
                 self.bump()?;
                 let index = self.parse_expr()?;
                 self.expect_punct(Punct::RBracket, "']'")?;
-                base = Expr::Index { obj: Box::new(base), index: Box::new(index) };
+                base = Expr::Index {
+                    obj: Box::new(base),
+                    index: Box::new(index),
+                };
             } else if self.at_punct(Punct::Inc)? || self.at_punct(Punct::Dec)? {
                 // 後置 ++ / --
                 let inc = self.at_punct(Punct::Inc)?;
                 self.bump()?;
                 return match base {
-                    Expr::Ident(name) => Ok(Expr::IncDec { name, inc, prefix: false }),
-                    Expr::Member { obj, name } => {
-                        Ok(Expr::MemberIncDec { obj, name, inc, prefix: false })
-                    }
-                    Expr::Index { obj, index } => {
-                        Ok(Expr::IndexIncDec { obj, index, inc, prefix: false })
-                    }
+                    Expr::Ident(name) => Ok(Expr::IncDec {
+                        name,
+                        inc,
+                        prefix: false,
+                    }),
+                    Expr::Member { obj, name } => Ok(Expr::MemberIncDec {
+                        obj,
+                        name,
+                        inc,
+                        prefix: false,
+                    }),
+                    Expr::Index { obj, index } => Ok(Expr::IndexIncDec {
+                        obj,
+                        index,
+                        inc,
+                        prefix: false,
+                    }),
                     _ => Err(ParseError("invalid increment/decrement target".into())),
                 };
             } else {
@@ -1121,7 +1230,11 @@ impl<'a> Parser<'a> {
                 if self.at_punct(Punct::Arrow)? {
                     self.bump()?;
                     let body = self.parse_arrow_body()?;
-                    return Ok(Expr::Arrow { params: vec![name.to_string()], rest: None, body: Box::new(body) });
+                    return Ok(Expr::Arrow {
+                        params: vec![name.to_string()],
+                        rest: None,
+                        body: Box::new(body),
+                    });
                 }
                 Ok(Expr::Ident(name.to_string()))
             }
@@ -1133,7 +1246,11 @@ impl<'a> Parser<'a> {
                     if self.at_punct(Punct::Arrow)? {
                         self.bump()?;
                         let body = self.parse_arrow_body()?;
-                        return Ok(Expr::Arrow { params, rest, body: Box::new(body) });
+                        return Ok(Expr::Arrow {
+                            params,
+                            rest,
+                            body: Box::new(body),
+                        });
                     }
                 }
                 // ロールバックしてグループ式
@@ -1185,14 +1302,19 @@ impl<'a> Parser<'a> {
                                             } else {
                                                 params.first().cloned().unwrap_or_default()
                                             };
-                                            accessor = Some((is_get, name.to_string(), param, body));
+                                            accessor =
+                                                Some((is_get, name.to_string(), param, body));
                                         }
                                     }
                                 }
                             }
                             match accessor {
-                                Some((true, name, _p, body)) => entries.push(ObjEntry::Getter(name, body)),
-                                Some((false, name, p, body)) => entries.push(ObjEntry::Setter(name, p, body)),
+                                Some((true, name, _p, body)) => {
+                                    entries.push(ObjEntry::Getter(name, body))
+                                }
+                                Some((false, name, p, body)) => {
+                                    entries.push(ObjEntry::Setter(name, p, body))
+                                }
                                 None => {
                                     self.restore_state(saved);
                                     let key = match self.bump()? {
@@ -1257,7 +1379,9 @@ impl<'a> Parser<'a> {
                 // 正規表現リテラル /pat/flags（式の開始位置の '/' のみ）
                 self.parse_regex_literal()
             }
-            other => Err(ParseError(format!("unexpected token in expression: {other:?}"))),
+            other => Err(ParseError(format!(
+                "unexpected token in expression: {other:?}"
+            ))),
         }
     }
 
@@ -1320,7 +1444,9 @@ impl<'a> Parser<'a> {
                         Token::Ident(n) => {
                             rest = Some(n.to_string());
                         }
-                        other => return Err(ParseError(format!("expected rest name, got {other:?}"))),
+                        other => {
+                            return Err(ParseError(format!("expected rest name, got {other:?}")))
+                        }
                     }
                     break; // rest は末尾
                 }
@@ -1354,7 +1480,12 @@ impl<'a> Parser<'a> {
             Stmt::Block(s) => s,
             _ => unreachable!(),
         };
-        Ok(Expr::FuncExpr { name, params, rest, body })
+        Ok(Expr::FuncExpr {
+            name,
+            params,
+            rest,
+            body,
+        })
     }
 
     /// `new` の callee をパース（メンバーアクセスの連鎖。呼び出しは含まない）。
@@ -1366,14 +1497,22 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 let name = match self.bump()? {
                     Token::Ident(n) => n.to_string(),
-                    other => return Err(ParseError(format!("expected property name, got {other:?}"))),
+                    other => {
+                        return Err(ParseError(format!("expected property name, got {other:?}")))
+                    }
                 };
-                base = Expr::Member { obj: Box::new(base), name };
+                base = Expr::Member {
+                    obj: Box::new(base),
+                    name,
+                };
             } else if self.at_punct(Punct::LBracket)? {
                 self.bump()?;
                 let index = self.parse_expr()?;
                 self.expect_punct(Punct::RBracket, "']'")?;
-                base = Expr::Index { obj: Box::new(base), index: Box::new(index) };
+                base = Expr::Index {
+                    obj: Box::new(base),
+                    index: Box::new(index),
+                };
             } else {
                 break;
             }
@@ -1388,7 +1527,9 @@ impl<'a> Parser<'a> {
             // （Expr::Arrow の body は Box<Expr> なので、Block を表す専用式は持たず、
             // ここでは式を返す。ブロック本体は codegen 側で特別扱いしないため、
             // 式のみサポートし、ブロックは未対応とする）
-            return Err(ParseError("arrow function with block body is not yet supported".into()));
+            return Err(ParseError(
+                "arrow function with block body is not yet supported".into(),
+            ));
         }
         self.parse_expr()
     }
@@ -1445,7 +1586,10 @@ impl<'a> Parser<'a> {
             };
             if self.eat_punct(Punct::Colon)? {
                 let body = self.parse_stmt()?;
-                return Ok(Stmt::Labeled { label, body: Box::new(body) });
+                return Ok(Stmt::Labeled {
+                    label,
+                    body: Box::new(body),
+                });
             }
             self.restore_state(saved);
         }
@@ -1459,10 +1603,7 @@ impl<'a> Parser<'a> {
             return self.parse_block();
         }
         // キーワード文
-        if self.at_kw(Keyword::Var)?
-            || self.at_kw(Keyword::Let)?
-            || self.at_kw(Keyword::Const)?
-        {
+        if self.at_kw(Keyword::Var)? || self.at_kw(Keyword::Let)? || self.at_kw(Keyword::Const)? {
             return self.parse_var_decl();
         }
         if self.at_kw(Keyword::Return)? {
@@ -1515,7 +1656,9 @@ impl<'a> Parser<'a> {
                 self.bump()?; // function
                 return self.parse_func_decl_rest(false, true);
             }
-            return Err(ParseError("async only supports function declarations".into()));
+            return Err(ParseError(
+                "async only supports function declarations".into(),
+            ));
         }
         if self.at_kw(Keyword::Function)? {
             self.bump()?; // function
@@ -1563,7 +1706,7 @@ impl<'a> Parser<'a> {
     /// `var` / `let` / `const` 宣言（分割代入含む）。
     fn parse_var_decl(&mut self) -> Result<Stmt, ParseError> {
         self.bump()?; // var/let/const
-        // 分割代入: var [a, b] = expr / var {a} = expr
+                      // 分割代入: var [a, b] = expr / var {a} = expr
         if self.at_punct(Punct::LBracket)? || self.at_punct(Punct::LBrace)? {
             let pattern = self.parse_pattern()?;
             if !self.eat_punct(Punct::Assign)? {
@@ -1612,7 +1755,11 @@ impl<'a> Parser<'a> {
                     if self.eat_punct(Punct::Ellipsis)? {
                         let name = match self.bump()? {
                             Token::Ident(n) => n.to_string(),
-                            other => return Err(ParseError(format!("expected rest name, got {other:?}"))),
+                            other => {
+                                return Err(ParseError(format!(
+                                    "expected rest name, got {other:?}"
+                                )))
+                            }
                         };
                         items.push(Pattern::Rest(name));
                         break; // rest は末尾
@@ -1632,7 +1779,11 @@ impl<'a> Parser<'a> {
                     } else {
                         let name = match self.bump()? {
                             Token::Ident(n) => n.to_string(),
-                            other => return Err(ParseError(format!("expected pattern name, got {other:?}"))),
+                            other => {
+                                return Err(ParseError(format!(
+                                    "expected pattern name, got {other:?}"
+                                )))
+                            }
                         };
                         items.push(Pattern::Ident(name));
                     }
@@ -1652,7 +1803,11 @@ impl<'a> Parser<'a> {
                     if self.eat_punct(Punct::Ellipsis)? {
                         let name = match self.bump()? {
                             Token::Ident(n) => n.to_string(),
-                            other => return Err(ParseError(format!("expected rest name, got {other:?}"))),
+                            other => {
+                                return Err(ParseError(format!(
+                                    "expected rest name, got {other:?}"
+                                )))
+                            }
                         };
                         items.push((String::new(), Pattern::ObjRest(name)));
                         break;
@@ -1660,7 +1815,9 @@ impl<'a> Parser<'a> {
                     let key = match self.bump()? {
                         Token::Ident(n) => n.to_string(),
                         Token::Str(s) => s,
-                        other => return Err(ParseError(format!("expected pattern key, got {other:?}"))),
+                        other => {
+                            return Err(ParseError(format!("expected pattern key, got {other:?}")))
+                        }
                     };
                     // {a: x} の形（x はパターン）
                     let val = if self.eat_punct(Punct::Colon)? {
@@ -1669,7 +1826,11 @@ impl<'a> Parser<'a> {
                         } else {
                             match self.bump()? {
                                 Token::Ident(n) => Pattern::Ident(n.to_string()),
-                                other => return Err(ParseError(format!("expected pattern, got {other:?}"))),
+                                other => {
+                                    return Err(ParseError(format!(
+                                        "expected pattern, got {other:?}"
+                                    )))
+                                }
                             }
                         }
                     } else {
@@ -1715,7 +1876,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Stmt::If { cond, then: Box::new(then), else_ })
+        Ok(Stmt::If {
+            cond,
+            then: Box::new(then),
+            else_,
+        })
     }
 
     /// `for (init; cond; step) body` / `for (var x in obj) body` / `for (var x of it) body`。
@@ -1735,14 +1900,24 @@ impl<'a> Parser<'a> {
                 let obj = self.parse_expr()?;
                 self.expect_punct(Punct::RParen, "')'")?;
                 let body = self.parse_stmt()?;
-                return Ok(Stmt::ForIn { name, obj, body: Box::new(body), is_of: false });
+                return Ok(Stmt::ForIn {
+                    name,
+                    obj,
+                    body: Box::new(body),
+                    is_of: false,
+                });
             }
             if self.at_kw(Keyword::Of)? {
                 self.bump()?;
                 let obj = self.parse_expr()?;
                 self.expect_punct(Punct::RParen, "')'")?;
                 let body = self.parse_stmt()?;
-                return Ok(Stmt::ForIn { name, obj, body: Box::new(body), is_of: true });
+                return Ok(Stmt::ForIn {
+                    name,
+                    obj,
+                    body: Box::new(body),
+                    is_of: true,
+                });
             }
             // 通常の for の var init
             let init = if self.eat_punct(Punct::Assign)? {
@@ -1801,7 +1976,12 @@ impl<'a> Parser<'a> {
         };
         self.expect_punct(Punct::RParen, "')'")?;
         let body = self.parse_stmt()?;
-        Ok(Stmt::For { init, cond, step, body: Box::new(body) })
+        Ok(Stmt::For {
+            init,
+            cond,
+            step,
+            body: Box::new(body),
+        })
     }
 
     /// `do { body } while (cond);`。
@@ -1818,7 +1998,10 @@ impl<'a> Parser<'a> {
         if self.at_punct(Punct::Semi)? {
             self.bump()?;
         }
-        Ok(Stmt::DoWhile { body: Box::new(body), cond })
+        Ok(Stmt::DoWhile {
+            body: Box::new(body),
+            cond,
+        })
     }
 
     /// `switch (disc) { case x: ...; default: ... }`。
@@ -1880,14 +2063,22 @@ impl<'a> Parser<'a> {
         self.expect_punct(Punct::LParen, "'('")?;
         let catch_param = match self.bump()? {
             Token::Ident(n) => Some(n.to_string()),
-            other => return Err(ParseError(format!("expected catch parameter, got {other:?}"))),
+            other => {
+                return Err(ParseError(format!(
+                    "expected catch parameter, got {other:?}"
+                )))
+            }
         };
         self.expect_punct(Punct::RParen, "')'")?;
         let catch_body = match self.parse_block()? {
             Stmt::Block(s) => s,
             _ => unreachable!(),
         };
-        Ok(Stmt::Try { try_body, catch_param, catch_body })
+        Ok(Stmt::Try {
+            try_body,
+            catch_param,
+            catch_body,
+        })
     }
 
     /// `while (cond) body`。
@@ -1897,7 +2088,10 @@ impl<'a> Parser<'a> {
         let cond = self.parse_expr()?;
         self.expect_punct(Punct::RParen, "')'")?;
         let body = self.parse_stmt()?;
-        Ok(Stmt::While { cond, body: Box::new(body) })
+        Ok(Stmt::While {
+            cond,
+            body: Box::new(body),
+        })
     }
 
     /// `class C extends P { constructor() {...} method() {...} }`。
@@ -1971,13 +2165,19 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect_punct(Punct::RBrace, "'}'")?;
-        Ok(Stmt::ClassDecl { name, parent, constructor, methods, fields })
+        Ok(Stmt::ClassDecl {
+            name,
+            parent,
+            constructor,
+            methods,
+            fields,
+        })
     }
 
     /// `import name from "spec"`（簡易近似）。
     fn parse_import(&mut self) -> Result<Stmt, ParseError> {
         self.bump()?; // import
-        // 名前束縛（`import x from` / `import { x } from` / `import * as x from` / `import "spec"`）
+                      // 名前束縛（`import x from` / `import { x } from` / `import * as x from` / `import "spec"`）
         let name = match self.peek()? {
             Token::Ident(n) => {
                 let n = n.to_string();
@@ -2017,7 +2217,11 @@ impl<'a> Parser<'a> {
         // モジュール指定子（文字列）
         let spec = match self.bump()? {
             Token::Str(s) => s,
-            other => return Err(ParseError(format!("expected module specifier, got {other:?}"))),
+            other => {
+                return Err(ParseError(format!(
+                    "expected module specifier, got {other:?}"
+                )))
+            }
         };
         if self.at_punct(Punct::Semi)? {
             self.bump()?;
@@ -2028,7 +2232,7 @@ impl<'a> Parser<'a> {
     /// `export name`（簡易近似: 式をエクスポート）。
     fn parse_export(&mut self) -> Result<Stmt, ParseError> {
         self.bump()?; // export
-        // `export function name` / `export const name` / `export default expr`
+                      // `export function name` / `export const name` / `export default expr`
         let name = match self.peek()? {
             Token::Ident(n) => n.to_string(),
             _ => "default".to_string(),
@@ -2060,7 +2264,14 @@ impl<'a> Parser<'a> {
             Stmt::Block(s) => s,
             _ => unreachable!(),
         };
-        Ok(Stmt::FuncDecl { name, params, rest, body, is_gen, is_async })
+        Ok(Stmt::FuncDecl {
+            name,
+            params,
+            rest,
+            body,
+            is_gen,
+            is_async,
+        })
     }
 }
 
@@ -2161,7 +2372,13 @@ mod tests {
         let stmts = parse("function f(a) { return a; } f(1);").unwrap();
         assert_eq!(stmts.len(), 2);
         match &stmts[0] {
-            Stmt::FuncDecl { name, params, rest, body, .. } => {
+            Stmt::FuncDecl {
+                name,
+                params,
+                rest,
+                body,
+                ..
+            } => {
                 assert_eq!(name, "f");
                 assert_eq!(params, &vec!["a".to_string()]);
                 assert_eq!(rest, &None);
@@ -2190,9 +2407,18 @@ mod tests {
         assert_eq!(
             parse("-x; !y; typeof z;").unwrap(),
             vec![
-                Stmt::Expr(Expr::Unary { op: UnaryOp::Neg, operand: Box::new(Expr::Ident("x".into())) }),
-                Stmt::Expr(Expr::Unary { op: UnaryOp::Not, operand: Box::new(Expr::Ident("y".into())) }),
-                Stmt::Expr(Expr::Unary { op: UnaryOp::Typeof, operand: Box::new(Expr::Ident("z".into())) }),
+                Stmt::Expr(Expr::Unary {
+                    op: UnaryOp::Neg,
+                    operand: Box::new(Expr::Ident("x".into()))
+                }),
+                Stmt::Expr(Expr::Unary {
+                    op: UnaryOp::Not,
+                    operand: Box::new(Expr::Ident("y".into()))
+                }),
+                Stmt::Expr(Expr::Unary {
+                    op: UnaryOp::Typeof,
+                    operand: Box::new(Expr::Ident("z".into()))
+                }),
             ]
         );
     }
@@ -2227,7 +2453,12 @@ mod tests {
         // function* 宣言（yield 付き）
         let stmts = parse("function* g() { yield 1; yield 2; }").unwrap();
         match &stmts[0] {
-            Stmt::FuncDecl { is_gen, is_async, body, .. } => {
+            Stmt::FuncDecl {
+                is_gen,
+                is_async,
+                body,
+                ..
+            } => {
                 assert!(*is_gen);
                 assert!(!*is_async);
                 assert_eq!(body.len(), 2);
@@ -2237,7 +2468,9 @@ mod tests {
         // async function 宣言（await 付き）
         let stmts = parse("async function f() { return await 7; }").unwrap();
         match &stmts[0] {
-            Stmt::FuncDecl { is_gen, is_async, .. } => {
+            Stmt::FuncDecl {
+                is_gen, is_async, ..
+            } => {
                 assert!(!*is_gen);
                 assert!(*is_async);
             }
@@ -2258,16 +2491,34 @@ mod tests {
         assert_eq!(parse("this;").unwrap(), vec![Stmt::Expr(Expr::This)]);
         // アロー関数（単一引数）
         let stmts = parse("var f = x => x * 2;").unwrap();
-        assert!(matches!(stmts[0], Stmt::Var { name: _, init: Some(Expr::Arrow { .. }) }));
+        assert!(matches!(
+            stmts[0],
+            Stmt::Var {
+                name: _,
+                init: Some(Expr::Arrow { .. })
+            }
+        ));
         // アロー関数（複数引数）
         let stmts = parse("var g = (a, b) => a + b;").unwrap();
-        assert!(matches!(stmts[0], Stmt::Var { name: _, init: Some(Expr::Arrow { .. }) }));
+        assert!(matches!(
+            stmts[0],
+            Stmt::Var {
+                name: _,
+                init: Some(Expr::Arrow { .. })
+            }
+        ));
     }
 
     #[test]
     fn func_expr_and_switch() {
         let stmts = parse("var f = function(x) { return x; };").unwrap();
-        assert!(matches!(stmts[0], Stmt::Var { name: _, init: Some(Expr::FuncExpr { .. }) }));
+        assert!(matches!(
+            stmts[0],
+            Stmt::Var {
+                name: _,
+                init: Some(Expr::FuncExpr { .. })
+            }
+        ));
         let stmts = parse("switch (x) { case 1: break; default: break; }").unwrap();
         assert!(matches!(stmts[0], Stmt::Switch { .. }));
     }
@@ -2296,11 +2547,19 @@ mod tests {
         );
         assert_eq!(
             parse("++x;").unwrap(),
-            vec![Stmt::Expr(Expr::IncDec { name: "x".into(), inc: true, prefix: true })]
+            vec![Stmt::Expr(Expr::IncDec {
+                name: "x".into(),
+                inc: true,
+                prefix: true
+            })]
         );
         assert_eq!(
             parse("y--;").unwrap(),
-            vec![Stmt::Expr(Expr::IncDec { name: "y".into(), inc: false, prefix: false })]
+            vec![Stmt::Expr(Expr::IncDec {
+                name: "y".into(),
+                inc: false,
+                prefix: false
+            })]
         );
     }
 

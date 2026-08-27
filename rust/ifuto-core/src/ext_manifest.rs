@@ -56,9 +56,8 @@ pub struct Manifest {
 /// `[A-Za-z0-9_.-]` のみ（表示・パス両安全面の構造排除）。空は false。
 fn is_charset(s: &[u8]) -> bool {
     !s.is_empty()
-        && s.iter().all(|&c| {
-            c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'-'
-        })
+        && s.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'-')
 }
 
 /// 前後の `' ' '\t'` と行末の単一 `'\r'` を除く。
@@ -129,7 +128,9 @@ pub fn parse(src: &[u8]) -> Result<Manifest, String> {
             out.name = String::from_utf8_lossy(val).into_owned();
         } else if key == b"version" {
             if seen_ver {
-                return Err(format!("manifest: line {lineno}: duplicate key \"version\""));
+                return Err(format!(
+                    "manifest: line {lineno}: duplicate key \"version\""
+                ));
             }
             seen_ver = true;
             if !is_charset(val) || val.len() >= VER_CAP {
@@ -142,13 +143,17 @@ pub fn parse(src: &[u8]) -> Result<Manifest, String> {
             }
             seen_entry = true;
             if !is_charset(val) || val.len() >= ENTRY_CAP || val.first() == Some(&b'.') {
-                return Err(format!("manifest: line {lineno}: bad entry (basename only)"));
+                return Err(format!(
+                    "manifest: line {lineno}: bad entry (basename only)"
+                ));
             }
             // charset で '/' '\' は既に排除済み（二重防御の明記）
             out.entry = String::from_utf8_lossy(val).into_owned();
         } else if key == b"permissions" {
             if seen_perm {
-                return Err(format!("manifest: line {lineno}: duplicate key \"permissions\""));
+                return Err(format!(
+                    "manifest: line {lineno}: duplicate key \"permissions\""
+                ));
             }
             seen_perm = true;
             // ',' 区切りトークン走査。E1: ≤1 つの有効ケイパビリティ
@@ -177,7 +182,9 @@ pub fn parse(src: &[u8]) -> Result<Manifest, String> {
                 }
             }
             if n_tok > 1 {
-                return Err(format!("manifest: line {lineno}: E1: at most one permission"));
+                return Err(format!(
+                    "manifest: line {lineno}: E1: at most one permission"
+                ));
             }
             out.perm = perm;
         } else {
@@ -218,7 +225,8 @@ mod tests {
 
     #[test]
     fn unknown_permission() {
-        let e = parse(b"name: badcap\nversion: 0.1\nentry: main.js\npermissions: net\n").unwrap_err();
+        let e =
+            parse(b"name: badcap\nversion: 0.1\nentry: main.js\npermissions: net\n").unwrap_err();
         assert_eq!(e, "manifest: line 4: unknown permission \"net\"");
     }
 

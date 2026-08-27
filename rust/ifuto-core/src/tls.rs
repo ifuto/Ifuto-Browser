@@ -84,7 +84,11 @@ pub fn b64_decode(input: &[u8]) -> Option<Vec<u8>> {
         if seen_nonpad {
             return None; // padding 後の非 padding
         }
-        let v = if (c as usize) < 128 { T[c as usize] } else { -1 };
+        let v = if (c as usize) < 128 {
+            T[c as usize]
+        } else {
+            -1
+        };
         if v < 0 {
             return None;
         }
@@ -149,7 +153,11 @@ struct Der<'a> {
 
 impl<'a> Der<'a> {
     fn new(b: &'a [u8]) -> Self {
-        Der { b, p: 0, lim: b.len() }
+        Der {
+            b,
+            p: 0,
+            lim: b.len(),
+        }
     }
 
     fn byte(&mut self) -> Option<u8> {
@@ -568,8 +576,11 @@ pub fn ta_add(der: &[u8]) -> Option<TrustAnchor> {
         let b = r.peek(1)?[0];
         if b == 0x81 || b == 0x82 {
             // [1] issuerUniqueID / [2] subjectUniqueID: skip
-            let (_l, saved) =
-                r.ctx_open(if b == 0x81 { tag_val::CTX1 } else { tag_val::CTX2 })?;
+            let (_l, saved) = r.ctx_open(if b == 0x81 {
+                tag_val::CTX1
+            } else {
+                tag_val::CTX2
+            })?;
             r.skip_remaining();
             r.close_elt(saved)?;
         } else if b == 0xA3 {
@@ -692,7 +703,10 @@ pub fn ca_load_pem(pem: &[u8]) -> Vec<Vec<u8>> {
 /// PEM バンドルからトラストアンカー列へ（C の `ca_load_pem` 全体相当）。復号・
 /// [`ta_add`] に成功したアンカーだけを返す。
 pub fn ca_load_pem_anchors(pem: &[u8]) -> Vec<TrustAnchor> {
-    ca_load_pem(pem).into_iter().filter_map(|der| ta_add(&der)).collect()
+    ca_load_pem(pem)
+        .into_iter()
+        .filter_map(|der| ta_add(&der))
+        .collect()
 }
 
 #[cfg(test)]

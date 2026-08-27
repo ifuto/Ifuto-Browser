@@ -44,7 +44,10 @@ BEARWARN := -Wno-shadow -Wno-unused-parameter -Wno-sign-compare -Wno-missing-fie
 WFLAGS  := -std=c11 -Wall -Wextra -Wshadow -Wstrict-prototypes -Wwrite-strings
 BASE    := $(WFLAGS) -fno-strict-aliasing -fstack-protector-strong -D_FORTIFY_SOURCE=2
 REL     := -O2 -DNDEBUG -flto -ffunction-sections -fdata-sections
-LDFLAGS_REL := -flto -Wl,--gc-sections -s
+# -static-libgcc（2026-08-24）: libakl_ffi.a（Rust staticlib）が std::backtrace 経由で
+# _Unwind_* を未定義参照し、製品法則「ldd = vdso/libm/libc/ld」に違反していたのを修正。
+# unwinder を libgcc_eh.a から静的に取り込んで libgcc_s.so.1 依存を消す。
+LDFLAGS_REL := -flto -Wl,--gc-sections -static-libgcc -s
 SAN     := -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 
 BUILD   := build

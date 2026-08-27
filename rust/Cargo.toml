@@ -1,5 +1,5 @@
 [workspace]
-members = ["akl-core", "akl-ffi", "ifuto-core", "ifuto-ffi"]
+members = ["akl-core", "akl-ffi", "ifuto-core", "ifuto-ffi", "ifuto-cli"]
 resolver = "2"
 
 # cfg(kani) を check-cfg に登録（cargo 1.80+ の unexpected_cfgs 警告対策）
@@ -18,3 +18,12 @@ debug = true
 [profile.release]
 lto = true
 codegen-units = 1
+# panic=abort（2026-08-24）: 製品法則「ldd = vdso/libm/libc/ld」の維持。
+# Rust の unwind ランタイムは x86_64-linux で libgcc_s の _Unwind_* を要求し、
+# staticlib 経由のリンクで libgcc_s.so.1 の動的依存が混入していた（製品法則違反）。
+# 本プロジェクトは catch_unwind を一切使わない（全 crate で grep 確認済）上、
+# 文化規律「fatal = fail-fast 即死」(common.h) と panic=abort は整合する。
+# また staticlib では panic が extern "C" 境界を越えると即 abort する（Rust 1.81+）
+# ため、実行時挙動は panic=unwind と実質同一だった。dev プロフィール（テスト）は
+# unwind のまま（#[should_panic] 等のテスト機構を壊さない）。
+panic = "abort"

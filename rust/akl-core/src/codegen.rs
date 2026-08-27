@@ -62,9 +62,25 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
     // パス 1: トップレベル関数宣言を収集・登録（box 化ローカルを解析してから）
     let mut funcs: Vec<(String, u32)> = Vec::new();
     for stmt in program {
-        if let Stmt::FuncDecl { name, params, rest, body, is_gen, is_async } = stmt {
+        if let Stmt::FuncDecl {
+            name,
+            params,
+            rest,
+            body,
+            is_gen,
+            is_async,
+        } = stmt
+        {
             let boxed = compute_boxed(params, body);
-            let fidx = c.compile_function(name, params, rest.as_deref(), body, &boxed, *is_gen, *is_async)?;
+            let fidx = c.compile_function(
+                name,
+                params,
+                rest.as_deref(),
+                body,
+                &boxed,
+                *is_gen,
+                *is_async,
+            )?;
             funcs.push((name.clone(), fidx));
         }
     }
@@ -78,7 +94,9 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
     let mut code = Vec::new();
     // 関数宣言の hoist（MakeF + GStore）
     for (name, fidx) in &funcs {
-        let name_id = c.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+        let name_id =
+            c.rt.intern(name)
+                .ok_or_else(|| CompileError("intern failed".into()))?;
         code.push(Op::MakeF(*fidx));
         code.push(Op::GStore(name_id));
     }
@@ -94,7 +112,15 @@ pub fn compile(rt: &mut Runtime, program: &[Stmt]) -> Result<u32, CompileError> 
 
     let n_locals = c.locals.len();
     let fidx = rt.funcs.len() as u32;
-    rt.funcs.push(FuncObj { code, name: None, n_params: 0, rest_slot: None, n_locals, is_gen: false, self_slot: None });
+    rt.funcs.push(FuncObj {
+        code,
+        name: None,
+        n_params: 0,
+        rest_slot: None,
+        n_locals,
+        is_gen: false,
+        self_slot: None,
+    });
     Ok(fidx)
 }
 
@@ -167,7 +193,10 @@ impl Compiler<'_> {
             // boxed パラメータの初期値（do_call が locals に入れた値）を env セルへコピー
             for p in params {
                 if let Some(idx) = boxed.get(p) {
-                    let slot = *self.locals.get(p).ok_or_else(|| CompileError("intern failed".into()))?;
+                    let slot = *self
+                        .locals
+                        .get(p)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
                     code.push(Op::LLoad(slot));
                     code.push(Op::CeStore(0, *idx));
                 }
@@ -187,7 +216,10 @@ impl Compiler<'_> {
 
         let n_locals = self.locals.len();
         let n_params = params.len();
-        let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+        let name_id = self
+            .rt
+            .intern(name)
+            .ok_or_else(|| CompileError("intern failed".into()))?;
         let fidx = self.rt.funcs.len() as u32;
         self.rt.funcs.push(FuncObj {
             code,
@@ -277,7 +309,10 @@ impl Compiler<'_> {
             // boxed パラメータの初期値を env セルへコピー
             for p in params {
                 if let Some(idx) = boxed.get(p) {
-                    let slot = *self.locals.get(p).ok_or_else(|| CompileError("intern failed".into()))?;
+                    let slot = *self
+                        .locals
+                        .get(p)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
                     code.push(Op::LLoad(slot));
                     code.push(Op::CeStore(0, *idx));
                 }
@@ -296,9 +331,20 @@ impl Compiler<'_> {
 
         let n_locals = self.locals.len();
         let n_params = params.len();
-        let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+        let name_id = self
+            .rt
+            .intern(name)
+            .ok_or_else(|| CompileError("intern failed".into()))?;
         let fidx = self.rt.funcs.len() as u32;
-        self.rt.funcs.push(FuncObj { code, name: Some(name_id), n_params, rest_slot, n_locals, is_gen, self_slot: None });
+        self.rt.funcs.push(FuncObj {
+            code,
+            name: Some(name_id),
+            n_params,
+            rest_slot,
+            n_locals,
+            is_gen,
+            self_slot: None,
+        });
 
         self.locals = saved_locals;
         self.captures = saved_captures;
@@ -389,7 +435,10 @@ impl Compiler<'_> {
             // boxed パラメータの初期値を env セルへコピー
             for p in params {
                 if let Some(idx) = boxed.get(p) {
-                    let slot = *self.locals.get(p).ok_or_else(|| CompileError("intern failed".into()))?;
+                    let slot = *self
+                        .locals
+                        .get(p)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
                     code.push(Op::LLoad(slot));
                     code.push(Op::CeStore(0, *idx));
                 }
@@ -408,7 +457,15 @@ impl Compiler<'_> {
         let needs_closure = !self.captures.is_empty();
         let fidx = self.rt.funcs.len() as u32;
         let name_id = name.and_then(|n| self.rt.intern(n));
-        self.rt.funcs.push(FuncObj { code, name: name_id, n_params, rest_slot, n_locals, is_gen: false, self_slot });
+        self.rt.funcs.push(FuncObj {
+            code,
+            name: name_id,
+            n_params,
+            rest_slot,
+            n_locals,
+            is_gen: false,
+            self_slot,
+        });
 
         self.locals = saved_locals;
         self.captures = saved_captures;
@@ -426,9 +483,25 @@ impl Compiler<'_> {
         let mut decls = Vec::new();
         collect_func_decls(body, &mut decls);
         for d in &decls {
-            if let Stmt::FuncDecl { name, params, rest, body, is_gen, is_async } = d {
+            if let Stmt::FuncDecl {
+                name,
+                params,
+                rest,
+                body,
+                is_gen,
+                is_async,
+            } = d
+            {
                 let enclosing_env = self.captures.clone();
-                let fidx = self.compile_nested(name, params, rest.as_deref(), body, &enclosing_env, *is_gen, *is_async)?;
+                let fidx = self.compile_nested(
+                    name,
+                    params,
+                    rest.as_deref(),
+                    body,
+                    &enclosing_env,
+                    *is_gen,
+                    *is_async,
+                )?;
                 code.push(Op::MakeClosure(fidx));
                 self.gen_store(name, code)?;
             }
@@ -443,7 +516,10 @@ impl Compiler<'_> {
             Expr::Num(NumLit::Float(d)) => code.push(Op::ConstD(*d)),
             Expr::Num(NumLit::BigInt(v)) => code.push(Op::BigInt(*v)),
             Expr::Str(s) => {
-                let id = self.rt.intern(s).ok_or_else(|| CompileError("intern failed".into()))?;
+                let id = self
+                    .rt
+                    .intern(s)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
                 code.push(Op::ConstStr(id));
             }
             Expr::Bool(true) => code.push(Op::True),
@@ -557,7 +633,10 @@ impl Compiler<'_> {
                         .ok_or_else(|| CompileError("intern failed".into()))?;
                     if has_spread {
                         // 固定引数数をカウンタに設定 → spread 引数を展開 → MCallDyn
-                        let fixed = args.iter().filter(|a| !matches!(a, Expr::Spread(_))).count();
+                        let fixed = args
+                            .iter()
+                            .filter(|a| !matches!(a, Expr::Spread(_)))
+                            .count();
                         code.push(Op::ConstI(fixed as i32));
                         code.push(Op::GStore(argc_name));
                         for a in args {
@@ -569,7 +648,10 @@ impl Compiler<'_> {
                                 _ => self.gen_expr(a, code)?,
                             }
                         }
-                        code.push(Op::MCallDyn { name: name_id, argc_name });
+                        code.push(Op::MCallDyn {
+                            name: name_id,
+                            argc_name,
+                        });
                     } else {
                         for a in args {
                             self.gen_expr(a, code)?;
@@ -577,7 +659,10 @@ impl Compiler<'_> {
                         if args.len() > u8::MAX as usize {
                             return Err(CompileError("too many arguments".into()));
                         }
-                        code.push(Op::MCallName { name: name_id, argc: args.len() as u8 });
+                        code.push(Op::MCallName {
+                            name: name_id,
+                            argc: args.len() as u8,
+                        });
                     }
                 } else if let Expr::Index { obj, index } = &**callee {
                     // 計算済みキーのメソッド呼び出し `obj[expr](...)`（this=obj）。
@@ -596,7 +681,10 @@ impl Compiler<'_> {
                 } else {
                     self.gen_expr(callee, code)?;
                     if has_spread {
-                        let fixed = args.iter().filter(|a| !matches!(a, Expr::Spread(_))).count();
+                        let fixed = args
+                            .iter()
+                            .filter(|a| !matches!(a, Expr::Spread(_)))
+                            .count();
                         code.push(Op::ConstI(fixed as i32));
                         code.push(Op::GStore(argc_name));
                         for a in args {
@@ -674,8 +762,14 @@ impl Compiler<'_> {
                         ObjEntry::Getter(name, body) => {
                             let enclosing = self.captures.clone();
                             let empty = HashMap::new();
-                            let (fidx, needs_closure) =
-                                self.compile_function_anon(None, &[], None, body, &empty, &enclosing)?;
+                            let (fidx, needs_closure) = self.compile_function_anon(
+                                None,
+                                &[],
+                                None,
+                                body,
+                                &empty,
+                                &enclosing,
+                            )?;
                             code.push(Op::Dup);
                             if needs_closure {
                                 code.push(Op::MakeClosure(fidx));
@@ -692,15 +786,13 @@ impl Compiler<'_> {
                         ObjEntry::Setter(name, param, body) => {
                             let enclosing = self.captures.clone();
                             let empty = HashMap::new();
-                            let params: Vec<String> =
-                                if param.is_empty() { vec![] } else { vec![param.clone()] };
+                            let params: Vec<String> = if param.is_empty() {
+                                vec![]
+                            } else {
+                                vec![param.clone()]
+                            };
                             let (fidx, needs_closure) = self.compile_function_anon(
-                                None,
-                                &params,
-                                None,
-                                body,
-                                &empty,
-                                &enclosing,
+                                None, &params, None, body, &empty, &enclosing,
                             )?;
                             code.push(Op::Dup);
                             if needs_closure {
@@ -775,7 +867,10 @@ impl Compiler<'_> {
                 match &**target {
                     Expr::Member { obj, name } => {
                         self.gen_expr(obj, code)?;
-                        let key_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+                        let key_id = self
+                            .rt
+                            .intern(name)
+                            .ok_or_else(|| CompileError("intern failed".into()))?;
                         code.push(Op::ConstStr(key_id));
                         code.push(Op::Delete);
                     }
@@ -812,7 +907,9 @@ impl Compiler<'_> {
                 code.push(Op::NewRegex(flags_id));
             }
             Expr::Spread(_) | Expr::Rest(_) | Expr::Hole => {
-                return Err(CompileError("spread/rest/hole outside valid context".into()))
+                return Err(CompileError(
+                    "spread/rest/hole outside valid context".into(),
+                ))
             }
             Expr::CompoundAssign { name, op, rhs } => {
                 // x op= y  →  x = x op y（値は新値）
@@ -824,9 +921,18 @@ impl Compiler<'_> {
             }
             Expr::MemberCompoundAssign { obj, name, op, rhs } => {
                 // obj.name op= rhs → obj.name = obj.name op rhs（obj は 1 回評価）
-                let tobj = self.rt.intern("\x01mca_obj").ok_or_else(|| CompileError("intern failed".into()))?;
-                let tval = self.rt.intern("\x01mca_val").ok_or_else(|| CompileError("intern failed".into()))?;
-                let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+                let tobj = self
+                    .rt
+                    .intern("\x01mca_obj")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                let tval = self
+                    .rt
+                    .intern("\x01mca_val")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                let name_id = self
+                    .rt
+                    .intern(name)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
                 self.gen_expr(obj, code)?;
                 code.push(Op::GStore(tobj));
                 code.push(Op::GLoad(tobj));
@@ -838,11 +944,25 @@ impl Compiler<'_> {
                 code.push(Op::GLoad(tval));
                 code.push(Op::PStore(name_id));
             }
-            Expr::IndexCompoundAssign { obj, index, op, rhs } => {
+            Expr::IndexCompoundAssign {
+                obj,
+                index,
+                op,
+                rhs,
+            } => {
                 // obj[idx] op= rhs → obj[idx] = obj[idx] op rhs（obj/index は 1 回評価）
-                let tobj = self.rt.intern("\x01ica_obj").ok_or_else(|| CompileError("intern failed".into()))?;
-                let tidx = self.rt.intern("\x01ica_idx").ok_or_else(|| CompileError("intern failed".into()))?;
-                let tval = self.rt.intern("\x01ica_val").ok_or_else(|| CompileError("intern failed".into()))?;
+                let tobj = self
+                    .rt
+                    .intern("\x01ica_obj")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                let tidx = self
+                    .rt
+                    .intern("\x01ica_idx")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
+                let tval = self
+                    .rt
+                    .intern("\x01ica_val")
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
                 self.gen_expr(obj, code)?;
                 code.push(Op::GStore(tobj));
                 self.gen_expr(index, code)?;
@@ -875,10 +995,20 @@ impl Compiler<'_> {
                     self.gen_store(name, code)?;
                 }
             }
-            Expr::MemberIncDec { obj, name, inc, prefix } => {
+            Expr::MemberIncDec {
+                obj,
+                name,
+                inc,
+                prefix,
+            } => {
                 self.gen_member_incdec(obj, name, *inc, *prefix, code)?;
             }
-            Expr::IndexIncDec { obj, index, inc, prefix } => {
+            Expr::IndexIncDec {
+                obj,
+                index,
+                inc,
+                prefix,
+            } => {
                 self.gen_index_incdec(obj, index, *inc, *prefix, code)?;
             }
             Expr::LogicalAssign { target, op, rhs } => {
@@ -987,12 +1117,23 @@ impl Compiler<'_> {
             Expr::This => {
                 code.push(Op::This);
             }
-            Expr::FuncExpr { name, params, rest, body } => {
+            Expr::FuncExpr {
+                name,
+                params,
+                rest,
+                body,
+            } => {
                 // 関数式: 関数をコンパイルして MakeF/MakeClosure で生成
                 let enclosing_env = self.captures.clone();
                 let boxed = compute_boxed(params, body);
-                let (fidx, needs_closure) =
-                    self.compile_function_anon(name.as_deref(), params, rest.as_deref(), body, &boxed, &enclosing_env)?;
+                let (fidx, needs_closure) = self.compile_function_anon(
+                    name.as_deref(),
+                    params,
+                    rest.as_deref(),
+                    body,
+                    &boxed,
+                    &enclosing_env,
+                )?;
                 // 名前付き関数式は自分自身を束縛（簡易: グローバルに置く近似は避け、
                 // ローカルスコープの自己参照は未対応のため名前は無視）
                 let _ = name;
@@ -1007,8 +1148,14 @@ impl Compiler<'_> {
                 let stmts = vec![Stmt::Return(Some((**body).clone()))];
                 let enclosing_env = self.captures.clone();
                 let boxed = compute_boxed(params, &stmts);
-                let (fidx, needs_closure) =
-                    self.compile_function_anon(None, params, rest.as_deref(), &stmts, &boxed, &enclosing_env)?;
+                let (fidx, needs_closure) = self.compile_function_anon(
+                    None,
+                    params,
+                    rest.as_deref(),
+                    &stmts,
+                    &boxed,
+                    &enclosing_env,
+                )?;
                 if needs_closure {
                     code.push(Op::MakeClosure(fidx));
                 } else {
@@ -1091,7 +1238,12 @@ impl Compiler<'_> {
                     code[idx] = Op::Jmp(continue_target as u32);
                 }
             }
-            Stmt::For { init, cond, step, body } => {
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
                 // init（ループ前）
                 match init {
                     Some(ForInit::Var { name, init }) => {
@@ -1137,7 +1289,12 @@ impl Compiler<'_> {
                     code[idx] = Op::Jmp(step_target as u32);
                 }
             }
-            Stmt::ForIn { name, obj, body, is_of } => {
+            Stmt::ForIn {
+                name,
+                obj,
+                body,
+                is_of,
+            } => {
                 // for-of: 配列をイテレート / for-in: オブジェクトのキーをイテレート。
                 // 対象を一時グローバルに退避し、インデックス i で回す。
                 self.gen_expr(obj, code)?;
@@ -1153,14 +1310,20 @@ impl Compiler<'_> {
                         .rt
                         .intern("\x01forin_keys")
                         .ok_or_else(|| CompileError("intern failed".into()))?;
-                    let obj_id = self.rt.intern("Object").ok_or_else(|| CompileError("intern failed".into()))?;
+                    let obj_id = self
+                        .rt
+                        .intern("Object")
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
                     code.push(Op::GLoad(obj_id)); // Object
-                    let keys_name = self.rt.intern("keys").ok_or_else(|| CompileError("intern failed".into()))?;
+                    let keys_name = self
+                        .rt
+                        .intern("keys")
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
                     code.push(Op::PLoad(keys_name)); // Object.keys
                     code.push(Op::GLoad(tmp_obj)); // obj
                     code.push(Op::Call(1)); // Object.keys(obj)
                     code.push(Op::GStore(keys_obj)); // keys = ...
-                    // 対象を keys 配列に差し替え
+                                                     // 対象を keys 配列に差し替え
                     let tmp_actual = self
                         .rt
                         .intern("\x01forin_actual")
@@ -1181,7 +1344,10 @@ impl Compiler<'_> {
                     .intern("\x01forin_actual")
                     .ok_or_else(|| CompileError("intern failed".into()))?;
                 let i_name = "\x01forin_i";
-                let i_id = self.rt.intern(i_name).ok_or_else(|| CompileError("intern failed".into()))?;
+                let i_id = self
+                    .rt
+                    .intern(i_name)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
                 code.push(Op::ConstI(0));
                 code.push(Op::GStore(i_id));
                 let loop_start = code.len();
@@ -1309,7 +1475,13 @@ impl Compiler<'_> {
                 self.gen_expr(init, code)?;
                 self.gen_destructure(pattern, code)?;
             }
-            Stmt::ClassDecl { name, parent, constructor, methods, fields } => {
+            Stmt::ClassDecl {
+                name,
+                parent,
+                constructor,
+                methods,
+                fields,
+            } => {
                 // メソッドを先にコンパイル
                 let enclosing_env = self.captures.clone();
                 let empty_boxed = HashMap::new();
@@ -1383,7 +1555,11 @@ impl Compiler<'_> {
                 code.push(Op::SetFnProto); // ctor.prototype = proto（fn_protos 登録）→ [ctor]
                 self.gen_store(name, code)?; // []
             }
-            Stmt::Try { try_body, catch_param, catch_body } => {
+            Stmt::Try {
+                try_body,
+                catch_param,
+                catch_body,
+            } => {
                 // TryPush(catch_pc) を発行 → try 本体 → TryPop → Jmp(end)
                 // catch_pc: 例外値がスタックに積まれている → catch 変数に束縛 → catch 本体
                 // end:
@@ -1414,7 +1590,10 @@ impl Compiler<'_> {
                 // モジュール解決は未対応。name があれば undefined で初期化する。
                 if let Some(n) = name {
                     // グローバルに undefined を束縛（未解決参照を防ぐ）
-                    let id = self.rt.intern(n).ok_or_else(|| CompileError("intern failed".into()))?;
+                    let id = self
+                        .rt
+                        .intern(n)
+                        .ok_or_else(|| CompileError("intern failed".into()))?;
                     if self.rt.global_get(id).is_none() {
                         code.push(Op::Undef);
                         code.push(Op::GStore(id));
@@ -1424,7 +1603,10 @@ impl Compiler<'_> {
             Stmt::Export { name, value } => {
                 // 簡易近似: export は値式をグローバルに束縛する（モジュール namespace は未対応）
                 self.gen_expr(value, code)?;
-                let id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+                let id = self
+                    .rt
+                    .intern(name)
+                    .ok_or_else(|| CompileError("intern failed".into()))?;
                 code.push(Op::GStore(id));
             }
             Stmt::Switch { disc, cases } => {
@@ -1593,7 +1775,10 @@ impl Compiler<'_> {
             // `arguments` は関数の全引数（配列）。local/param に無ければマジック参照。
             code.push(Op::Arguments);
         } else {
-            let id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+            let id = self
+                .rt
+                .intern(name)
+                .ok_or_else(|| CompileError("intern failed".into()))?;
             code.push(Op::GLoad(id));
         }
         Ok(())
@@ -1606,7 +1791,10 @@ impl Compiler<'_> {
         } else if let Some(slot) = self.locals.get(name) {
             code.push(Op::LStore(*slot));
         } else {
-            let id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+            let id = self
+                .rt
+                .intern(name)
+                .ok_or_else(|| CompileError("intern failed".into()))?;
             code.push(Op::GStore(id));
         }
         Ok(())
@@ -1639,10 +1827,22 @@ impl Compiler<'_> {
         prefix: bool,
         code: &mut Vec<Op>,
     ) -> Result<(), CompileError> {
-        let tobj = self.rt.intern("\x01mio_obj").ok_or_else(|| CompileError("intern failed".into()))?;
-        let tval = self.rt.intern("\x01mio_val").ok_or_else(|| CompileError("intern failed".into()))?;
-        let told = self.rt.intern("\x01mio_old").ok_or_else(|| CompileError("intern failed".into()))?;
-        let name_id = self.rt.intern(name).ok_or_else(|| CompileError("intern failed".into()))?;
+        let tobj = self
+            .rt
+            .intern("\x01mio_obj")
+            .ok_or_else(|| CompileError("intern failed".into()))?;
+        let tval = self
+            .rt
+            .intern("\x01mio_val")
+            .ok_or_else(|| CompileError("intern failed".into()))?;
+        let told = self
+            .rt
+            .intern("\x01mio_old")
+            .ok_or_else(|| CompileError("intern failed".into()))?;
+        let name_id = self
+            .rt
+            .intern(name)
+            .ok_or_else(|| CompileError("intern failed".into()))?;
         let op = if inc { Op::Add } else { Op::Sub };
         self.gen_expr(obj, code)?;
         code.push(Op::GStore(tobj));
@@ -1682,10 +1882,22 @@ impl Compiler<'_> {
         prefix: bool,
         code: &mut Vec<Op>,
     ) -> Result<(), CompileError> {
-        let tobj = self.rt.intern("\x01iio_obj").ok_or_else(|| CompileError("intern failed".into()))?;
-        let tidx = self.rt.intern("\x01iio_idx").ok_or_else(|| CompileError("intern failed".into()))?;
-        let tval = self.rt.intern("\x01iio_val").ok_or_else(|| CompileError("intern failed".into()))?;
-        let told = self.rt.intern("\x01iio_old").ok_or_else(|| CompileError("intern failed".into()))?;
+        let tobj = self
+            .rt
+            .intern("\x01iio_obj")
+            .ok_or_else(|| CompileError("intern failed".into()))?;
+        let tidx = self
+            .rt
+            .intern("\x01iio_idx")
+            .ok_or_else(|| CompileError("intern failed".into()))?;
+        let tval = self
+            .rt
+            .intern("\x01iio_val")
+            .ok_or_else(|| CompileError("intern failed".into()))?;
+        let told = self
+            .rt
+            .intern("\x01iio_old")
+            .ok_or_else(|| CompileError("intern failed".into()))?;
         let op = if inc { Op::Add } else { Op::Sub };
         self.gen_expr(obj, code)?;
         code.push(Op::GStore(tobj));
@@ -1768,7 +1980,11 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
                     collect_vars(body, locals);
                 }
             }
-            Stmt::Try { try_body, catch_param, catch_body } => {
+            Stmt::Try {
+                try_body,
+                catch_param,
+                catch_body,
+            } => {
                 collect_vars(try_body, locals);
                 if let Some(p) = catch_param {
                     if !locals.contains_key(p) {
@@ -1804,7 +2020,11 @@ fn collect_vars(stmts: &[Stmt], locals: &mut HashMap<String, u32>) {
 }
 
 /// 分割代入パターンから、束縛されていない名前（＝書き込み先として外側を参照）を収集。
-fn free_pattern_refs(pattern: &crate::parser::Pattern, bound: &HashSet<String>, out: &mut HashSet<String>) {
+fn free_pattern_refs(
+    pattern: &crate::parser::Pattern,
+    bound: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
     match pattern {
         crate::parser::Pattern::Ident(name)
         | crate::parser::Pattern::Rest(name)
@@ -1875,7 +2095,11 @@ fn collect_func_decls(stmts: &[Stmt], out: &mut Vec<Stmt>) {
                     collect_func_decls(cbody, out);
                 }
             }
-            Stmt::Try { try_body, catch_body, .. } => {
+            Stmt::Try {
+                try_body,
+                catch_body,
+                ..
+            } => {
                 collect_func_decls(try_body, out);
                 collect_func_decls(catch_body, out);
             }
@@ -1935,7 +2159,12 @@ fn free_refs(stmts: &[Stmt], bound: &HashSet<String>, out: &mut HashSet<String>)
                 free_expr_refs(cond, bound, out);
                 free_refs(std::slice::from_ref(body), bound, out);
             }
-            Stmt::For { init, cond, step, body } => {
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
                 if let Some(ForInit::Expr(e)) = init {
                     free_expr_refs(e, bound, out);
                 }
@@ -1968,7 +2197,11 @@ fn free_refs(stmts: &[Stmt], bound: &HashSet<String>, out: &mut HashSet<String>)
                 }
             }
             Stmt::Throw(e) => free_expr_refs(e, bound, out),
-            Stmt::Try { try_body, catch_body, .. } => {
+            Stmt::Try {
+                try_body,
+                catch_body,
+                ..
+            } => {
                 free_refs(try_body, bound, out);
                 free_refs(catch_body, bound, out);
             }
@@ -2014,7 +2247,9 @@ fn free_expr_refs(expr: &Expr, bound: &HashSet<String>, out: &mut HashSet<String
             free_expr_refs(obj, bound, out);
             free_expr_refs(rhs, bound, out);
         }
-        Expr::IndexCompoundAssign { obj, index, rhs, .. } => {
+        Expr::IndexCompoundAssign {
+            obj, index, rhs, ..
+        } => {
             free_expr_refs(obj, bound, out);
             free_expr_refs(index, bound, out);
             free_expr_refs(rhs, bound, out);
@@ -2086,7 +2321,9 @@ fn free_expr_refs(expr: &Expr, bound: &HashSet<String>, out: &mut HashSet<String
             free_expr_refs(then, bound, out);
             free_expr_refs(else_, bound, out);
         }
-        Expr::FuncExpr { name, params, body, .. } => {
+        Expr::FuncExpr {
+            name, params, body, ..
+        } => {
             let inner = nested_bound(bound, params, body, name.as_deref());
             free_refs(body, &inner, out);
         }
@@ -2133,12 +2370,7 @@ fn free_expr_refs(expr: &Expr, bound: &HashSet<String>, out: &mut HashSet<String
             }
         }
         Expr::Rest(_) | Expr::Hole | Expr::Regex { .. } => {}
-        Expr::This
-        | Expr::Num(_)
-        | Expr::Str(_)
-        | Expr::Bool(_)
-        | Expr::Null
-        | Expr::Undef => {}
+        Expr::This | Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Undef => {}
     }
 }
 
@@ -2181,7 +2413,12 @@ fn collect_boxed_stmt(stmt: &Stmt, outer: &HashSet<String>, boxed: &mut HashMap<
             collect_boxed_expr(cond, outer, boxed);
             collect_boxed_stmt(body, outer, boxed);
         }
-        Stmt::For { init, cond, step, body } => {
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
             if let Some(ForInit::Expr(e)) = init {
                 collect_boxed_expr(e, outer, boxed);
             }
@@ -2211,7 +2448,11 @@ fn collect_boxed_stmt(stmt: &Stmt, outer: &HashSet<String>, boxed: &mut HashMap<
                 }
             }
         }
-        Stmt::Try { try_body, catch_body, .. } => {
+        Stmt::Try {
+            try_body,
+            catch_body,
+            ..
+        } => {
             for s in try_body {
                 collect_boxed_stmt(s, outer, boxed);
             }
@@ -2219,14 +2460,20 @@ fn collect_boxed_stmt(stmt: &Stmt, outer: &HashSet<String>, boxed: &mut HashMap<
                 collect_boxed_stmt(s, outer, boxed);
             }
         }
-        Stmt::ClassDecl { .. } | Stmt::Import { .. } | Stmt::Empty | Stmt::Break(_) | Stmt::Continue(_) => {}
+        Stmt::ClassDecl { .. }
+        | Stmt::Import { .. }
+        | Stmt::Empty
+        | Stmt::Break(_)
+        | Stmt::Continue(_) => {}
     }
 }
 
 /// 式からネスト関数（FuncExpr / Arrow）を探して boxed に反映する。
 fn collect_boxed_expr(expr: &Expr, outer: &HashSet<String>, boxed: &mut HashMap<String, u32>) {
     match expr {
-        Expr::FuncExpr { name, params, body, .. } => {
+        Expr::FuncExpr {
+            name, params, body, ..
+        } => {
             box_nested(params, body, name.as_deref(), outer, boxed);
         }
         Expr::Arrow { params, rest, body } => {
@@ -2355,7 +2602,8 @@ mod tests {
             .map_err(|e| CompileError(e.0))?;
         let mut rt = Runtime::new();
         let fidx = compile(&mut rt, &program)?;
-        rt.run(fidx, &[]).map_err(|e| CompileError(format!("{e:?}")))
+        rt.run(fidx, &[])
+            .map_err(|e| CompileError(format!("{e:?}")))
     }
 
     #[test]
@@ -2368,8 +2616,14 @@ mod tests {
 
     #[test]
     fn variables() {
-        assert_eq!(run_src("var x = 10; x + 5;").unwrap(), crate::AklVal::mk_int(15));
-        assert_eq!(run_src("var x = 1; x = 2; x;").unwrap(), crate::AklVal::mk_int(2));
+        assert_eq!(
+            run_src("var x = 10; x + 5;").unwrap(),
+            crate::AklVal::mk_int(15)
+        );
+        assert_eq!(
+            run_src("var x = 1; x = 2; x;").unwrap(),
+            crate::AklVal::mk_int(2)
+        );
     }
 
     #[test]
@@ -2398,7 +2652,9 @@ mod tests {
     #[test]
     fn string_concat() {
         // 文字列連結の結果が "ab" であることを内容で確認（ROPE 連結。intern id は非決定的）
-        let program = crate::parser::Parser::new("\"a\" + \"b\";").parse_program().unwrap();
+        let program = crate::parser::Parser::new("\"a\" + \"b\";")
+            .parse_program()
+            .unwrap();
         let mut rt = Runtime::new();
         let fidx = compile(&mut rt, &program).unwrap();
         let v = rt.run(fidx, &[]).unwrap();
@@ -2417,7 +2673,9 @@ mod tests {
 
     #[test]
     fn typeof_unary() {
-        let program = crate::parser::Parser::new("typeof 5;").parse_program().unwrap();
+        let program = crate::parser::Parser::new("typeof 5;")
+            .parse_program()
+            .unwrap();
         let mut rt = Runtime::new();
         let fidx = compile(&mut rt, &program).unwrap();
         let v = rt.run(fidx, &[]).unwrap();
@@ -2429,8 +2687,14 @@ mod tests {
 
     #[test]
     fn if_else() {
-        assert_eq!(run_src("if (1 < 2) { 10; } else { 20; }").unwrap(), crate::AklVal::mk_int(10));
-        assert_eq!(run_src("if (1 > 2) { 10; } else { 20; }").unwrap(), crate::AklVal::mk_int(20));
+        assert_eq!(
+            run_src("if (1 < 2) { 10; } else { 20; }").unwrap(),
+            crate::AklVal::mk_int(10)
+        );
+        assert_eq!(
+            run_src("if (1 > 2) { 10; } else { 20; }").unwrap(),
+            crate::AklVal::mk_int(20)
+        );
     }
 
     #[test]
@@ -2445,7 +2709,10 @@ mod tests {
 
     #[test]
     fn array_literal_and_index() {
-        assert_eq!(run_src("[10, 20, 30][1];").unwrap(), crate::AklVal::mk_int(20));
+        assert_eq!(
+            run_src("[10, 20, 30][1];").unwrap(),
+            crate::AklVal::mk_int(20)
+        );
         assert_eq!(
             run_src("var a = [1, 2, 3]; a[2];").unwrap(),
             crate::AklVal::mk_int(3)
@@ -2525,8 +2792,14 @@ mod tests {
 
     #[test]
     fn ternary_expr() {
-        assert_eq!(run_src("1 < 2 ? 10 : 20;").unwrap(), crate::AklVal::mk_int(10));
-        assert_eq!(run_src("1 > 2 ? 10 : 20;").unwrap(), crate::AklVal::mk_int(20));
+        assert_eq!(
+            run_src("1 < 2 ? 10 : 20;").unwrap(),
+            crate::AklVal::mk_int(10)
+        );
+        assert_eq!(
+            run_src("1 > 2 ? 10 : 20;").unwrap(),
+            crate::AklVal::mk_int(20)
+        );
     }
 
     #[test]
@@ -2555,11 +2828,26 @@ mod tests {
 
     #[test]
     fn inc_dec() {
-        assert_eq!(run_src("var x = 5; ++x;").unwrap(), crate::AklVal::mk_int(6));
-        assert_eq!(run_src("var x = 5; x++;").unwrap(), crate::AklVal::mk_int(5));
-        assert_eq!(run_src("var x = 5; x++; x;").unwrap(), crate::AklVal::mk_int(6));
-        assert_eq!(run_src("var x = 5; --x;").unwrap(), crate::AklVal::mk_int(4));
-        assert_eq!(run_src("var x = 5; x--; x;").unwrap(), crate::AklVal::mk_int(4));
+        assert_eq!(
+            run_src("var x = 5; ++x;").unwrap(),
+            crate::AklVal::mk_int(6)
+        );
+        assert_eq!(
+            run_src("var x = 5; x++;").unwrap(),
+            crate::AklVal::mk_int(5)
+        );
+        assert_eq!(
+            run_src("var x = 5; x++; x;").unwrap(),
+            crate::AklVal::mk_int(6)
+        );
+        assert_eq!(
+            run_src("var x = 5; --x;").unwrap(),
+            crate::AklVal::mk_int(4)
+        );
+        assert_eq!(
+            run_src("var x = 5; x--; x;").unwrap(),
+            crate::AklVal::mk_int(4)
+        );
     }
 
     #[test]
@@ -2678,10 +2966,19 @@ mod tests {
 
     #[test]
     fn arrow_function() {
-        assert_eq!(run_src("var f = x => x * 2; f(21);").unwrap(), crate::AklVal::mk_int(42));
-        assert_eq!(run_src("var g = (a, b) => a + b; g(1, 2);").unwrap(), crate::AklVal::mk_int(3));
+        assert_eq!(
+            run_src("var f = x => x * 2; f(21);").unwrap(),
+            crate::AklVal::mk_int(42)
+        );
+        assert_eq!(
+            run_src("var g = (a, b) => a + b; g(1, 2);").unwrap(),
+            crate::AklVal::mk_int(3)
+        );
         // 即時実行
-        assert_eq!(run_src("(x => x + 1)(41);").unwrap(), crate::AklVal::mk_int(42));
+        assert_eq!(
+            run_src("(x => x + 1)(41);").unwrap(),
+            crate::AklVal::mk_int(42)
+        );
     }
 
     #[test]
@@ -2699,7 +2996,10 @@ mod tests {
     #[test]
     fn switch_statement() {
         assert_eq!(
-            run_src("var x = 2; switch (x) { case 1: 10; break; case 2: 20; break; default: 30; } 20;").unwrap(),
+            run_src(
+                "var x = 2; switch (x) { case 1: 10; break; case 2: 20; break; default: 30; } 20;"
+            )
+            .unwrap(),
             crate::AklVal::mk_int(20)
         );
         // switch の結果は break 前の式文の値ではなく、後続の文の値を見る
@@ -2715,7 +3015,10 @@ mod tests {
         ";
         assert_eq!(run_src(src).unwrap(), crate::AklVal::mk_int(20));
         assert_eq!(
-            run_src("function f(x) { switch (x) { case 1: return 10; default: return 99; } } f(5);").unwrap(),
+            run_src(
+                "function f(x) { switch (x) { case 1: return 10; default: return 99; } } f(5);"
+            )
+            .unwrap(),
             crate::AklVal::mk_int(99)
         );
     }
@@ -2744,8 +3047,14 @@ mod tests {
 
     #[test]
     fn in_and_delete() {
-        assert_eq!(run_src("var o = {a: 1}; \"a\" in o;").unwrap(), crate::AklVal::TRUE);
-        assert_eq!(run_src("var o = {a: 1}; \"b\" in o;").unwrap(), crate::AklVal::FALSE);
+        assert_eq!(
+            run_src("var o = {a: 1}; \"a\" in o;").unwrap(),
+            crate::AklVal::TRUE
+        );
+        assert_eq!(
+            run_src("var o = {a: 1}; \"b\" in o;").unwrap(),
+            crate::AklVal::FALSE
+        );
         assert_eq!(
             run_src("var o = {a: 1}; delete o.a; \"a\" in o;").unwrap(),
             crate::AklVal::FALSE

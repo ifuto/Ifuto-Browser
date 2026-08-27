@@ -30,7 +30,9 @@ pub fn str_eq_ci(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b).all(|(x, y)| ascii_lower(*x) == ascii_lower(*y))
+    a.iter()
+        .zip(b)
+        .all(|(x, y)| ascii_lower(*x) == ascii_lower(*y))
 }
 
 /// 空白のみか（C の `if_str_is_ws_only` 相当）。

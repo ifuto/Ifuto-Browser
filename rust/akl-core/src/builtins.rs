@@ -31,15 +31,23 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
 
     // console.log
     let console_id = rt.intern("console").ok_or(VmError::Oom)?;
-    let console = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let console = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let log = rt.register_native(console_log)?;
     let log_name = rt.intern("log").ok_or(VmError::Oom)?;
-    rt.heap.prop_set(console, log_name, log).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(console, log_name, log)
+        .map_err(|_| VmError::Oom)?;
     rt.global_set(console_id, AklVal::mk_obj(console));
 
     // Math オブジェクト
     let math_id = rt.intern("Math").ok_or(VmError::Oom)?;
-    let math = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let math = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     for (name, f) in [
         ("abs", math_abs as crate::bytecode::NativeFn),
         ("floor", math_floor),
@@ -68,9 +76,14 @@ pub fn install_builtins(rt: &mut Runtime) -> Result<(), VmError> {
     // prototype を構築する。
     {
         let s_id = rt.intern("String").ok_or(VmError::Oom)?;
-        let s_obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+        let s_obj = rt
+            .heap
+            .alloc(Obj::Obj(Vec::new()))
+            .map_err(|_| VmError::Oom)?;
         let ctor = rt.register_native(string_ctor)?;
-        rt.heap.prop_set(s_obj, rt.ctor_name, ctor).map_err(|_| VmError::Oom)?;
+        rt.heap
+            .prop_set(s_obj, rt.ctor_name, ctor)
+            .map_err(|_| VmError::Oom)?;
         rt.global_set(s_id, AklVal::mk_obj(s_obj));
     }
 
@@ -211,7 +224,11 @@ fn console_log(rt: &mut Runtime, _this: AklVal, args: &[AklVal]) -> Result<AklVa
 }
 
 /// 1 引数の数値 native ヘルパ。
-fn unary_math(rt: &mut Runtime, args: &[AklVal], f: impl Fn(f64) -> f64) -> Result<AklVal, VmError> {
+fn unary_math(
+    rt: &mut Runtime,
+    args: &[AklVal],
+    f: impl Fn(f64) -> f64,
+) -> Result<AklVal, VmError> {
     let v = args.first().copied().unwrap_or(AklVal::UNDEF);
     let d = to_number(rt, v);
     Ok(AklVal::from_f64(f(d)))
@@ -288,10 +305,7 @@ fn parse_int(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
         (false, s)
     };
     // radix（0 / undefined / NaN は自動判定: 0x なら 16、それ以外 10）
-    let raw_radix = a
-        .get(1)
-        .map(|r| to_number(rt, *r))
-        .unwrap_or(0.0);
+    let raw_radix = a.get(1).map(|r| to_number(rt, *r)).unwrap_or(0.0);
     let raw_radix = if raw_radix.is_nan() { 0.0 } else { raw_radix };
     let radix = if raw_radix == 0.0 {
         if rest.starts_with("0x") || rest.starts_with("0X") {
@@ -311,7 +325,10 @@ fn parse_int(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     } else {
         rest
     };
-    let digits: String = digits_src.chars().take_while(|c| c.is_digit(radix)).collect();
+    let digits: String = digits_src
+        .chars()
+        .take_while(|c| c.is_digit(radix))
+        .collect();
     if digits.is_empty() {
         return Ok(AklVal::from_f64(f64::NAN));
     }
@@ -411,7 +428,9 @@ fn regexp_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     let flags_val = a.get(1).copied().unwrap_or(AklVal::UNDEF);
     let flags = if flags_val.is_obj() {
         match rt.heap.get(flags_val.get_obj()) {
-            Some(Obj::Arr(items)) => to_js_string(rt, items.first().copied().unwrap_or(AklVal::UNDEF)),
+            Some(Obj::Arr(items)) => {
+                to_js_string(rt, items.first().copied().unwrap_or(AklVal::UNDEF))
+            }
             _ => to_js_string(rt, flags_val),
         }
     } else {
@@ -419,7 +438,10 @@ fn regexp_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     };
     let id = rt
         .heap
-        .alloc(Obj::RegExp { pattern: pattern.into_boxed_str(), flags: flags.into_boxed_str() })
+        .alloc(Obj::RegExp {
+            pattern: pattern.into_boxed_str(),
+            flags: flags.into_boxed_str(),
+        })
         .map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
@@ -429,9 +451,14 @@ fn symbol_ctor(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, Vm
     // 一意な文字列で近似（`typeof` が "symbol" にはならないが、lodash は `typeof Symbol`
     // を環境判定に使うだけなので関数であれば十分）。`\x01tag = "Symbol"` を付けて
     // `_.isSymbol(Symbol("x"))` が `Object.prototype.toString` で true になるようにする。
-    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let id = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let tag = rt.intern("Symbol").ok_or(VmError::Oom)?;
-    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(tag)).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(id, rt.tag_name, AklVal::mk_obj(tag))
+        .map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
 
@@ -444,8 +471,10 @@ fn is_finite(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
 /// `Function.prototype.toString.call(fn)` → 関数ソース近似（lodash の native 検出用）。
 fn function_to_string(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
     let s = if this.is_obj()
-        && matches!(rt.heap.get(this.get_obj()), Some(Obj::Func { .. }) | Some(Obj::Native(_)))
-    {
+        && matches!(
+            rt.heap.get(this.get_obj()),
+            Some(Obj::Func { .. }) | Some(Obj::Native(_))
+        ) {
         "function () { [native code] }"
     } else {
         "function () {}"
@@ -466,7 +495,11 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
     // globalThis（プロパティアクセスをグローバル解決に写像するハンドル）
     let gt = rt
         .heap
-        .alloc(Obj::Handle { vtab: &crate::bytecode::GLOBAL_THIS_VT, data: 0, ptr: 0 })
+        .alloc(Obj::Handle {
+            vtab: &crate::bytecode::GLOBAL_THIS_VT,
+            data: 0,
+            ptr: 0,
+        })
         .map_err(|_| VmError::Oom)?;
     let gt_name = rt.intern("globalThis").ok_or(VmError::Oom)?;
     rt.global_set(gt_name, AklVal::mk_obj(gt));
@@ -474,10 +507,18 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
     // Function: constructor + prototype（call/apply/bind/toString）。lodash の
     // `funcProto = Function.prototype; funcProto.toString.call(...)` に必要。
     let fn_id = rt.intern("Function").ok_or(VmError::Oom)?;
-    let fn_obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let fn_obj = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let ctor = rt.register_native(function_ctor)?;
-    rt.heap.prop_set(fn_obj, rt.ctor_name, ctor).map_err(|_| VmError::Oom)?;
-    let fn_proto = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(fn_obj, rt.ctor_name, ctor)
+        .map_err(|_| VmError::Oom)?;
+    let fn_proto = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     for (name, f) in [
         ("toString", function_to_string as crate::bytecode::NativeFn),
         ("call", func_call),
@@ -486,10 +527,14 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
     ] {
         let v = rt.register_native(f)?;
         let nid = rt.intern(name).ok_or(VmError::Oom)?;
-        rt.heap.prop_set(fn_proto, nid, v).map_err(|_| VmError::Oom)?;
+        rt.heap
+            .prop_set(fn_proto, nid, v)
+            .map_err(|_| VmError::Oom)?;
     }
     let proto_name = rt.intern("prototype").ok_or(VmError::Oom)?;
-    rt.heap.prop_set(fn_obj, proto_name, AklVal::mk_obj(fn_proto)).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(fn_obj, proto_name, AklVal::mk_obj(fn_proto))
+        .map_err(|_| VmError::Oom)?;
     rt.global_set(fn_id, AklVal::mk_obj(fn_obj));
 
     // Boolean
@@ -502,7 +547,10 @@ fn install_global_this_and_ctors(rt: &mut Runtime) -> Result<(), VmError> {
 
     // Array（constructor + isArray）
     let arr_id = rt.intern("Array").ok_or(VmError::Oom)?;
-    let arr = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let arr = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let ctor = rt.register_native(array_ctor)?;
     rt.array_ctor = ctor;
     rt.heap
@@ -612,9 +660,21 @@ fn str_substring(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal,
     let s = this_str(rt, this);
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len() as i64;
-    let start = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0).clamp(0, n) as usize;
-    let end = a.get(1).map(|v| to_number(rt, *v) as i64).unwrap_or(n).clamp(0, n) as usize;
-    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    let start = a
+        .first()
+        .map(|v| to_number(rt, *v) as i64)
+        .unwrap_or(0)
+        .clamp(0, n) as usize;
+    let end = a
+        .get(1)
+        .map(|v| to_number(rt, *v) as i64)
+        .unwrap_or(n)
+        .clamp(0, n) as usize;
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
     let out: String = chars[lo..hi].iter().collect();
     let id = rt.intern(&out).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
@@ -625,7 +685,11 @@ fn str_substr(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len() as i64;
     let start = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
-    let start = if start < 0 { (n + start).max(0) } else { start.min(n) } as usize;
+    let start = if start < 0 {
+        (n + start).max(0)
+    } else {
+        start.min(n)
+    } as usize;
     let len = a.get(1).map(|v| to_number(rt, *v) as i64).unwrap_or(n);
     let len = if len < 0 { 0 } else { len as usize };
     let end = (start + len).min(chars.len());
@@ -685,8 +749,14 @@ fn str_slice(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     let start = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
     let end = a.get(1).map(|v| to_number(rt, *v) as i64);
     let n = chars.len() as i64;
-    let start = if start < 0 { (n + start).max(0) } else { start.min(n) } as usize;
-    let end = end.map(|e| if e < 0 { (n + e).max(0) } else { e.min(n) } as usize).unwrap_or(chars.len());
+    let start = if start < 0 {
+        (n + start).max(0)
+    } else {
+        start.min(n)
+    } as usize;
+    let end = end
+        .map(|e| if e < 0 { (n + e).max(0) } else { e.min(n) } as usize)
+        .unwrap_or(chars.len());
     let out: String = chars[start..end.max(start)].iter().collect();
     let id = rt.intern(&out).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
@@ -708,17 +778,33 @@ fn str_ends_with(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal,
 }
 fn str_repeat(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let s = this_str(rt, this);
-    let n = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0).max(0) as usize;
+    let n = a
+        .first()
+        .map(|v| to_number(rt, *v) as i64)
+        .unwrap_or(0)
+        .max(0) as usize;
     let out = s.repeat(n);
     let id = rt.intern(&out).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
 
 /// `padStart` / `padEnd` の共通実装。`from_end` が true なら padEnd。
-fn str_pad(rt: &mut Runtime, this: AklVal, a: &[AklVal], from_end: bool) -> Result<AklVal, VmError> {
+fn str_pad(
+    rt: &mut Runtime,
+    this: AklVal,
+    a: &[AklVal],
+    from_end: bool,
+) -> Result<AklVal, VmError> {
     let s = this_str(rt, this);
-    let target = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0).max(0) as usize;
-    let pad = a.get(1).map(|v| to_js_string(rt, *v)).unwrap_or_else(|| " ".to_string());
+    let target = a
+        .first()
+        .map(|v| to_number(rt, *v) as i64)
+        .unwrap_or(0)
+        .max(0) as usize;
+    let pad = a
+        .get(1)
+        .map(|v| to_js_string(rt, *v))
+        .unwrap_or_else(|| " ".to_string());
     let chars: Vec<char> = s.chars().collect();
     if chars.len() >= target {
         let id = rt.intern(&s).ok_or(VmError::Oom)?;
@@ -774,9 +860,11 @@ fn str_match(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     if let Some((pattern, flags)) = regex_of(rt, rx_v) {
         let flag_num = flags_to_num(&flags);
         let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
-        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
-        VmError::Thrown(AklVal::mk_obj(msg))
-    })?;
+            let msg = rt
+                .intern(&format!("SyntaxError: invalid regexp: {e}"))
+                .unwrap_or(0);
+            VmError::Thrown(AklVal::mk_obj(msg))
+        })?;
         if flags.contains('g') {
             // g フラグ: 全マッチの配列
             let matches = rx.find_all(&s);
@@ -825,9 +913,11 @@ fn str_replace(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, V
     let out = if let Some((pattern, flags)) = regex_of(rt, rx_v) {
         let flag_num = flags_to_num(&flags);
         let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
-        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
-        VmError::Thrown(AklVal::mk_obj(msg))
-    })?;
+            let msg = rt
+                .intern(&format!("SyntaxError: invalid regexp: {e}"))
+                .unwrap_or(0);
+            VmError::Thrown(AklVal::mk_obj(msg))
+        })?;
         let global = flags.contains('g');
         if callable {
             replace_regex_fn(rt, &s, &rx, repl_v, global)?
@@ -921,7 +1011,9 @@ fn regex_exec(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
     };
     let flag_num = flags_to_num(&flags);
     let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
-        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
+        let msg = rt
+            .intern(&format!("SyntaxError: invalid regexp: {e}"))
+            .unwrap_or(0);
         VmError::Thrown(AklVal::mk_obj(msg))
     })?;
     match rx.find(&s) {
@@ -945,7 +1037,9 @@ fn regex_test(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
     };
     let flag_num = flags_to_num(&flags);
     let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
-        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
+        let msg = rt
+            .intern(&format!("SyntaxError: invalid regexp: {e}"))
+            .unwrap_or(0);
         VmError::Thrown(AklVal::mk_obj(msg))
     })?;
     Ok(AklVal::from_bool(rx.find(&s).is_some()))
@@ -957,9 +1051,11 @@ fn str_search(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
     if let Some((pattern, flags)) = regex_of(rt, rx_v) {
         let flag_num = flags_to_num(&flags);
         let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
-        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
-        VmError::Thrown(AklVal::mk_obj(msg))
-    })?;
+            let msg = rt
+                .intern(&format!("SyntaxError: invalid regexp: {e}"))
+                .unwrap_or(0);
+            VmError::Thrown(AklVal::mk_obj(msg))
+        })?;
         match rx.find(&s) {
             Some(caps) => {
                 let idx = s.find(&caps[0]).unwrap_or(0);
@@ -978,9 +1074,11 @@ fn str_split(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     let mut parts: Vec<String> = if let Some((pattern, flags)) = regex_of(rt, sep) {
         let flag_num = flags_to_num(&flags);
         let rx = crate::regex::Regex::compile(&pattern, flag_num).map_err(|e| {
-        let msg = rt.intern(&format!("SyntaxError: invalid regexp: {e}")).unwrap_or(0);
-        VmError::Thrown(AklVal::mk_obj(msg))
-    })?;
+            let msg = rt
+                .intern(&format!("SyntaxError: invalid regexp: {e}"))
+                .unwrap_or(0);
+            VmError::Thrown(AklVal::mk_obj(msg))
+        })?;
         crate::regex::split(&s, &rx)
     } else {
         let needle = to_js_string(rt, sep);
@@ -1061,13 +1159,22 @@ fn install_array_methods(rt: &mut Runtime) -> Result<(), VmError> {
 /// メソッド表（name → native）から prototype オブジェクトを構築し、コンストラクタ
 /// オブジェクト `ctor` の `prototype` プロパティに設定する（`Array.prototype.slice`
 /// 等の `.prototype.X` 参照用。インスタンスメソッド解決はメソッド表経由で別に行う）。
-fn attach_prototype(rt: &mut Runtime, ctor: ObjId, methods: &[(ObjId, AklVal)]) -> Result<(), VmError> {
-    let proto = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+fn attach_prototype(
+    rt: &mut Runtime,
+    ctor: ObjId,
+    methods: &[(ObjId, AklVal)],
+) -> Result<(), VmError> {
+    let proto = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     for (n, v) in methods {
         rt.heap.prop_set(proto, *n, *v).map_err(|_| VmError::Oom)?;
     }
     let proto_name = rt.intern("prototype").ok_or(VmError::Oom)?;
-    rt.heap.prop_set(ctor, proto_name, AklVal::mk_obj(proto)).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(ctor, proto_name, AklVal::mk_obj(proto))
+        .map_err(|_| VmError::Oom)?;
     Ok(())
 }
 
@@ -1081,7 +1188,11 @@ fn this_arr(rt: &Runtime, this: AklVal) -> Vec<AklVal> {
 }
 
 fn arr_push(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::mk_int(0)) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::mk_int(0));
+    };
     if let Some(Obj::Arr(v)) = rt.heap.get_mut(id) {
         v.extend_from_slice(a);
         let n = v.len();
@@ -1091,7 +1202,11 @@ fn arr_push(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmEr
     }
 }
 fn arr_pop(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     match rt.heap.get_mut(id) {
         Some(Obj::Arr(v)) => Ok(v.pop().unwrap_or(AklVal::UNDEF)),
         _ => Ok(AklVal::UNDEF),
@@ -1100,7 +1215,10 @@ fn arr_pop(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmEr
 fn arr_join(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let items = this_arr(rt, this);
     // 区切り省略時は ","（JS の Array.prototype.join 既定）。
-    let sep = a.first().map(|v| str_of(rt, *v)).unwrap_or_else(|| ",".to_string());
+    let sep = a
+        .first()
+        .map(|v| str_of(rt, *v))
+        .unwrap_or_else(|| ",".to_string());
     // undefined/null 要素は空文字（JS の join 準拠）
     let parts: Vec<String> = items
         .iter()
@@ -1148,8 +1266,16 @@ fn arr_slice(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
     let items = this_arr(rt, this);
     let n = items.len() as i64;
     let start = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
-    let start = if start < 0 { (n + start).max(0) } else { start.min(n) } as usize;
-    let end = a.get(1).map(|v| to_number(rt, *v) as i64).map(|e| if e < 0 { (n + e).max(0) } else { e.min(n) } as usize).unwrap_or(items.len());
+    let start = if start < 0 {
+        (n + start).max(0)
+    } else {
+        start.min(n)
+    } as usize;
+    let end = a
+        .get(1)
+        .map(|v| to_number(rt, *v) as i64)
+        .map(|e| if e < 0 { (n + e).max(0) } else { e.min(n) } as usize)
+        .unwrap_or(items.len());
     let out: Vec<AklVal> = items[start..end.max(start)].to_vec();
     let id = rt.heap.alloc(Obj::Arr(out)).map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
@@ -1214,7 +1340,11 @@ fn arr_reduce(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
 }
 
 fn arr_shift(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     match rt.heap.get_mut(id) {
         Some(Obj::Arr(v)) => {
             if v.is_empty() {
@@ -1228,7 +1358,11 @@ fn arr_shift(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, Vm
 }
 
 fn arr_unshift(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::mk_int(0)) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::mk_int(0));
+    };
     match rt.heap.get_mut(id) {
         Some(Obj::Arr(v)) => {
             let mut new_items = a.to_vec();
@@ -1262,7 +1396,11 @@ fn arr_includes(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, 
 }
 
 fn arr_reverse(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     match rt.heap.get_mut(id) {
         Some(Obj::Arr(v)) => {
             v.reverse();
@@ -1325,7 +1463,11 @@ fn arr_every(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
 }
 
 fn arr_sort(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let mut items = this_arr(rt, this);
     let cmp = a.first().copied().unwrap_or(AklVal::UNDEF);
     let has_cmp = cmp.is_obj()
@@ -1350,10 +1492,8 @@ fn arr_sort(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmEr
         }
     } else {
         // デフォルトは文字列化比較（JS の sort 既定）。借用回避のため文字列キーを先に作る。
-        let mut keyed: Vec<(String, AklVal)> = items
-            .iter()
-            .map(|v| (to_js_string(rt, *v), *v))
-            .collect();
+        let mut keyed: Vec<(String, AklVal)> =
+            items.iter().map(|v| (to_js_string(rt, *v), *v)).collect();
         keyed.sort_by(|x, y| x.0.cmp(&y.0));
         items = keyed.into_iter().map(|(_, v)| v).collect();
     }
@@ -1364,17 +1504,30 @@ fn arr_sort(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmEr
 }
 
 fn arr_splice(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let mut items = this_arr(rt, this);
     let n = items.len() as i64;
     let start = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(0);
-    let start = if start < 0 { (n + start).max(0) } else { start.min(n) } as usize;
+    let start = if start < 0 {
+        (n + start).max(0)
+    } else {
+        start.min(n)
+    } as usize;
     let delete_count = a
         .get(1)
         .map(|v| to_number(rt, *v) as i64)
         .unwrap_or(n - start as i64)
         .max(0) as usize;
-    let removed: Vec<AklVal> = items.splice(start..(start + delete_count).min(items.len()), a[2..].to_vec()).collect();
+    let removed: Vec<AklVal> = items
+        .splice(
+            start..(start + delete_count).min(items.len()),
+            a[2..].to_vec(),
+        )
+        .collect();
     if let Some(Obj::Arr(v)) = rt.heap.get_mut(id) {
         *v = items;
     }
@@ -1384,7 +1537,11 @@ fn arr_splice(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
 
 fn arr_flat(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let items = this_arr(rt, this);
-    let depth = a.first().map(|v| to_number(rt, *v) as i64).unwrap_or(1).max(0) as usize;
+    let depth = a
+        .first()
+        .map(|v| to_number(rt, *v) as i64)
+        .unwrap_or(1)
+        .max(0) as usize;
     let mut out = Vec::new();
     fn flatten(rt: &Runtime, items: &[AklVal], depth: usize, out: &mut Vec<AklVal>) {
         for v in items {
@@ -1463,7 +1620,10 @@ fn install_map_set(rt: &mut Runtime) -> Result<(), VmError> {
     // （`new Promise(...)` と `Promise.resolve(...)` の両方に対応）。インスタンス
     // メソッド（then/catch）は `rt.promise_methods` 経由。
     let promise_id = rt.intern("Promise").ok_or(VmError::Oom)?;
-    let promise = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let promise = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let ctor = rt.register_native(promise_ctor)?;
     rt.heap
         .prop_set(promise, rt.ctor_name, ctor)
@@ -1552,7 +1712,9 @@ fn map_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmErro
         if iterable.is_obj() {
             if let Some(Obj::Arr(pairs)) = rt.heap.get(iterable.get_obj()) {
                 for pair in pairs.iter() {
-                    if let Some(Obj::Arr(entry)) = pair.is_obj().then(|| rt.heap.get(pair.get_obj())).flatten() {
+                    if let Some(Obj::Arr(entry)) =
+                        pair.is_obj().then(|| rt.heap.get(pair.get_obj())).flatten()
+                    {
                         let k = entry.first().copied().unwrap_or(AklVal::UNDEF);
                         let v = entry.get(1).copied().unwrap_or(AklVal::UNDEF);
                         if !kv.iter().any(|(ek, _)| *ek == k) {
@@ -1588,7 +1750,10 @@ fn promise_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
     // 呼ぶ近似（マイクロタスクは実行しない。then コールバックは後で消化されない）。
     let id = rt
         .heap
-        .alloc(Obj::Promise { state: 0, value: AklVal::UNDEF })
+        .alloc(Obj::Promise {
+            state: 0,
+            value: AklVal::UNDEF,
+        })
         .map_err(|_| VmError::Oom)?;
     let exec = a.first().copied().unwrap_or(AklVal::UNDEF);
     if is_callable(rt, exec) {
@@ -1622,7 +1787,11 @@ fn promise_catch(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal
 }
 
 fn map_set(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let key = a.first().copied().unwrap_or(AklVal::UNDEF);
     let val = a.get(1).copied().unwrap_or(AklVal::UNDEF);
     if let Some(Obj::Map(kv)) = rt.heap.get_mut(id) {
@@ -1637,16 +1806,28 @@ fn map_set(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     }
 }
 fn map_get(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let key = a.first().copied().unwrap_or(AklVal::UNDEF);
     if let Some(Obj::Map(kv)) = rt.heap.get(id) {
-        Ok(kv.iter().find(|(k, _)| *k == key).map(|(_, v)| *v).unwrap_or(AklVal::UNDEF))
+        Ok(kv
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| *v)
+            .unwrap_or(AklVal::UNDEF))
     } else {
         Ok(AklVal::UNDEF)
     }
 }
 fn map_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::FALSE) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::FALSE);
+    };
     let key = a.first().copied().unwrap_or(AklVal::UNDEF);
     if let Some(Obj::Map(kv)) = rt.heap.get(id) {
         Ok(AklVal::from_bool(kv.iter().any(|(k, _)| *k == key)))
@@ -1655,7 +1836,11 @@ fn map_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     }
 }
 fn set_add(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let val = a.first().copied().unwrap_or(AklVal::UNDEF);
     if let Some(Obj::Set(items)) = rt.heap.get_mut(id) {
         if !items.contains(&val) {
@@ -1667,7 +1852,11 @@ fn set_add(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
     }
 }
 fn set_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::FALSE) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::FALSE);
+    };
     let val = a.first().copied().unwrap_or(AklVal::UNDEF);
     if let Some(Obj::Set(items)) = rt.heap.get(id) {
         Ok(AklVal::from_bool(items.contains(&val)))
@@ -1677,7 +1866,11 @@ fn set_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmErr
 }
 
 fn set_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::FALSE) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::FALSE);
+    };
     let val = a.first().copied().unwrap_or(AklVal::UNDEF);
     if let Some(Obj::Set(items)) = rt.heap.get_mut(id) {
         let before = items.len();
@@ -1689,7 +1882,11 @@ fn set_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
 }
 
 fn set_clear(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     if let Some(Obj::Set(items)) = rt.heap.get_mut(id) {
         items.clear();
     }
@@ -1697,7 +1894,11 @@ fn set_clear(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, Vm
 }
 
 fn set_values(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let items = if let Some(Obj::Set(items)) = rt.heap.get(id) {
         items.clone()
     } else {
@@ -1708,7 +1909,11 @@ fn set_values(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, V
 }
 
 fn set_for_each(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
     let items = if let Some(Obj::Set(items)) = rt.heap.get(id) {
         items.clone()
@@ -1723,7 +1928,11 @@ fn set_for_each(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, 
 }
 
 fn map_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::FALSE) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::FALSE);
+    };
     let key = a.first().copied().unwrap_or(AklVal::UNDEF);
     if let Some(Obj::Map(kv)) = rt.heap.get_mut(id) {
         let before = kv.len();
@@ -1735,7 +1944,11 @@ fn map_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, Vm
 }
 
 fn map_clear(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     if let Some(Obj::Map(kv)) = rt.heap.get_mut(id) {
         kv.clear();
     }
@@ -1743,7 +1956,11 @@ fn map_clear(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, Vm
 }
 
 fn map_keys(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let keys: Vec<AklVal> = if let Some(Obj::Map(kv)) = rt.heap.get(id) {
         kv.iter().map(|(k, _)| *k).collect()
     } else {
@@ -1754,7 +1971,11 @@ fn map_keys(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmE
 }
 
 fn map_values(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let vals: Vec<AklVal> = if let Some(Obj::Map(kv)) = rt.heap.get(id) {
         kv.iter().map(|(_, v)| *v).collect()
     } else {
@@ -1765,7 +1986,11 @@ fn map_values(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, V
 }
 
 fn map_for_each(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = if this.is_obj() { this.get_obj() } else { return Ok(AklVal::UNDEF) };
+    let id = if this.is_obj() {
+        this.get_obj()
+    } else {
+        return Ok(AklVal::UNDEF);
+    };
     let cb = a.first().copied().unwrap_or(AklVal::UNDEF);
     let kv = if let Some(Obj::Map(kv)) = rt.heap.get(id) {
         kv.clone()
@@ -1787,7 +2012,10 @@ fn object_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
         return Ok(v);
     }
     if v.is_null() || v.is_undef() {
-        let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+        let id = rt
+            .heap
+            .alloc(Obj::Obj(Vec::new()))
+            .map_err(|_| VmError::Oom)?;
         return Ok(AklVal::mk_obj(id));
     }
     Ok(v)
@@ -1796,10 +2024,15 @@ fn object_ctor(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
 /// Object 静的メソッド（keys/values/assign）+ Object.prototype を登録。
 fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
     let obj_id = rt.intern("Object").ok_or(VmError::Oom)?;
-    let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let obj = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     // constructor（`Object(x)` の関数呼び出し用）
     let ctor = rt.register_native(object_ctor)?;
-    rt.heap.prop_set(obj, rt.ctor_name, ctor).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(obj, rt.ctor_name, ctor)
+        .map_err(|_| VmError::Oom)?;
     for (name, f) in [
         ("keys", obj_keys as crate::bytecode::NativeFn),
         ("values", obj_values),
@@ -1826,9 +2059,15 @@ fn install_object_methods(rt: &mut Runtime) -> Result<(), VmError> {
     }
     // Object.prototype（toString / hasOwnProperty / propertyIsEnumerable。
     // lodash の getTag / hasOwnProperty.call 用）
-    let proto = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let proto = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     for (name, f) in [
-        ("toString", object_proto_to_string as crate::bytecode::NativeFn),
+        (
+            "toString",
+            object_proto_to_string as crate::bytecode::NativeFn,
+        ),
         ("hasOwnProperty", object_proto_has_own_property),
         ("propertyIsEnumerable", object_proto_property_is_enumerable),
     ] {
@@ -1891,7 +2130,11 @@ fn object_tag(rt: &Runtime, v: AklVal) -> String {
 }
 
 /// `Object.prototype.toString.call(v)` → `[object X]`。
-fn object_proto_to_string(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
+fn object_proto_to_string(
+    rt: &mut Runtime,
+    this: AklVal,
+    _a: &[AklVal],
+) -> Result<AklVal, VmError> {
     let tag = object_tag(rt, this);
     let id = rt.intern(&format!("[object {tag}]")).ok_or(VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
@@ -1900,7 +2143,10 @@ fn object_proto_to_string(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Resu
 /// `Object.create(proto)` → 新オブジェクト（`[[Prototype]]` = proto）。
 fn obj_create(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let proto = a.first().copied().unwrap_or(AklVal::NULL);
-    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let id = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     if proto.is_obj() {
         rt.obj_set_proto(id, proto.get_obj())?;
     }
@@ -1923,8 +2169,15 @@ fn obj_get_prototype_of(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<Ak
 }
 
 /// `Object.getOwnPropertySymbols(obj)` → 空配列（Symbol 未実装の近似）。
-fn obj_get_own_property_symbols(rt: &mut Runtime, _t: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = rt.heap.alloc(Obj::Arr(Vec::new())).map_err(|_| VmError::Oom)?;
+fn obj_get_own_property_symbols(
+    rt: &mut Runtime,
+    _t: AklVal,
+    _a: &[AklVal],
+) -> Result<AklVal, VmError> {
+    let id = rt
+        .heap
+        .alloc(Obj::Arr(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
 
@@ -1936,7 +2189,11 @@ fn obj_define_property(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<Akl
     let vname = rt.intern("value").ok_or(VmError::Oom)?;
     let val = if desc.is_obj() {
         if let Some(Obj::Obj(props)) = rt.heap.get(desc.get_obj()) {
-            props.iter().find(|(n, _)| *n == vname).map(|(_, v)| *v).unwrap_or(AklVal::UNDEF)
+            props
+                .iter()
+                .find(|(n, _)| *n == vname)
+                .map(|(_, v)| *v)
+                .unwrap_or(AklVal::UNDEF)
         } else {
             AklVal::UNDEF
         }
@@ -1945,7 +2202,9 @@ fn obj_define_property(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<Akl
     };
     if obj.is_obj() {
         let key_id = rt.intern(&key).ok_or(VmError::Oom)?;
-        rt.heap.prop_set(obj.get_obj(), key_id, val).map_err(|_| VmError::Oom)?;
+        rt.heap
+            .prop_set(obj.get_obj(), key_id, val)
+            .map_err(|_| VmError::Oom)?;
     }
     Ok(obj)
 }
@@ -2049,7 +2308,10 @@ fn obj_entries(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmE
 /// `Object.fromEntries([[key, value], ...])` → オブジェクト。
 fn obj_from_entries(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     let v = a.first().copied().unwrap_or(AklVal::UNDEF);
-    let obj_id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let obj_id = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     // 借用回避: エントリ列を値コピーしてから再構築
     let entries: Vec<AklVal> = if v.is_obj() {
         match rt.heap.get(v.get_obj()) {
@@ -2076,7 +2338,9 @@ fn obj_from_entries(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal
         // キーを文字列化して intern
         let ks = to_js_string(rt, k);
         let kid = rt.intern(&ks).ok_or(VmError::Oom)?;
-        rt.heap.prop_set(obj_id, kid, val).map_err(|_| VmError::Oom)?;
+        rt.heap
+            .prop_set(obj_id, kid, val)
+            .map_err(|_| VmError::Oom)?;
     }
     Ok(AklVal::mk_obj(obj_id))
 }
@@ -2084,7 +2348,10 @@ fn obj_from_entries(rt: &mut Runtime, _t: AklVal, a: &[AklVal]) -> Result<AklVal
 /// JSON.stringify / JSON.parse を登録（簡易版）。
 fn install_json(rt: &mut Runtime) -> Result<(), VmError> {
     let json_id = rt.intern("JSON").ok_or(VmError::Oom)?;
-    let json = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let json = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let f = rt.register_native(json_stringify)?;
     let nid = rt.intern("stringify").ok_or(VmError::Oom)?;
     rt.heap.prop_set(json, nid, f).map_err(|_| VmError::Oom)?;
@@ -2312,9 +2579,7 @@ impl<'a> JsonParser<'a> {
                                 self.pos += 2;
                                 if let Some(lo) = self.hex4() {
                                     if (0xDC00..=0xDFFF).contains(&lo) {
-                                        cp = 0x10000
-                                            + ((cp - 0xD800) << 10)
-                                            + (lo - 0xDC00);
+                                        cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
                                     } else {
                                         self.pos = save;
                                     }
@@ -2386,9 +2651,7 @@ impl<'a> JsonParser<'a> {
         if self.pos < self.s.len() && (self.s[self.pos] == b'e' || self.s[self.pos] == b'E') {
             is_int = false;
             self.pos += 1;
-            if self.pos < self.s.len()
-                && (self.s[self.pos] == b'+' || self.s[self.pos] == b'-')
-            {
+            if self.pos < self.s.len() && (self.s[self.pos] == b'+' || self.s[self.pos] == b'-') {
                 self.pos += 1;
             }
             while self.pos < self.s.len() && self.s[self.pos].is_ascii_digit() {
@@ -2497,14 +2760,22 @@ impl<'a> JsonParser<'a> {
 }
 
 /// 値（関数）を呼ぶ（native またはバイトコード関数）。簡易実装。
-fn call_native(rt: &mut Runtime, f: AklVal, this: AklVal, args: &[AklVal]) -> Result<AklVal, VmError> {
+fn call_native(
+    rt: &mut Runtime,
+    f: AklVal,
+    this: AklVal,
+    args: &[AklVal],
+) -> Result<AklVal, VmError> {
     if !f.is_obj() {
         return Ok(AklVal::UNDEF);
     }
     let id = f.get_obj();
     if let Some(Obj::Native(nidx)) = rt.heap.get(id) {
         let nidx = *nidx;
-        let nf = rt.native_fns.get(nidx as usize).ok_or(VmError::NotCallable)?;
+        let nf = rt
+            .native_fns
+            .get(nidx as usize)
+            .ok_or(VmError::NotCallable)?;
         let nf = *nf;
         return nf(rt, this, args);
     }
@@ -2559,7 +2830,13 @@ fn parse_iso_date(s: &str) -> f64 {
         }
     };
     let year = match read_uint(&mut i) {
-        Some(v) => if neg { -v } else { v },
+        Some(v) => {
+            if neg {
+                -v
+            } else {
+                v
+            }
+        }
         None => return f64::NAN,
     };
     let mut month = 1i64;
@@ -2618,16 +2895,17 @@ fn parse_iso_date(s: &str) -> f64 {
     }
     // 末尾 Z 等は無視（UTC 近似）
     let days = crate::bytecode::days_from_civil(year as i32, month as u32, day as u32);
-    days as f64 * 86_400_000.0
-        + ((hour * 3600 + minute * 60 + second) as f64) * 1000.0
-        + ms as f64
+    days as f64 * 86_400_000.0 + ((hour * 3600 + minute * 60 + second) as f64) * 1000.0 + ms as f64
 }
 
 /// `Date` を登録。Date グローバルは `constructor` + `now`/`parse`/`UTC` を持つ
 /// `Obj::Obj`。インスタンスは `Obj::Date`、メソッドは `rt.date_methods` 経由。
 fn install_date(rt: &mut Runtime) -> Result<(), VmError> {
     let date_id = rt.intern("Date").ok_or(VmError::Oom)?;
-    let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let obj = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     // constructor（new Date() / Date() 用のフォールバック解決対象）
     let ctor = rt.register_native(date_ctor)?;
     rt.date_ctor = ctor;
@@ -2742,11 +3020,18 @@ fn install_error_ctors(rt: &mut Runtime) -> Result<(), VmError> {
     let ctor_k = rt.intern("constructor").ok_or(VmError::Oom)?;
     let name_k = rt.intern("name").ok_or(VmError::Oom)?;
     for (name, f) in ctors {
-        let obj = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+        let obj = rt
+            .heap
+            .alloc(Obj::Obj(Vec::new()))
+            .map_err(|_| VmError::Oom)?;
         let ctor = rt.register_native(*f)?;
-        rt.heap.prop_set(obj, ctor_k, ctor).map_err(|_| VmError::Oom)?;
+        rt.heap
+            .prop_set(obj, ctor_k, ctor)
+            .map_err(|_| VmError::Oom)?;
         let name_id = rt.intern(name).ok_or(VmError::Oom)?;
-        rt.heap.prop_set(obj, name_k, AklVal::mk_obj(name_id)).map_err(|_| VmError::Oom)?;
+        rt.heap
+            .prop_set(obj, name_k, AklVal::mk_obj(name_id))
+            .map_err(|_| VmError::Oom)?;
         rt.global_set(name_id, AklVal::mk_obj(obj));
     }
     Ok(())
@@ -2754,20 +3039,35 @@ fn install_error_ctors(rt: &mut Runtime) -> Result<(), VmError> {
 
 /// `new Error(msg)` 系の共通実装。`this`（`Op::New` が用意した [[Prototype]] 済み
 /// オブジェクト）に name / message / toString / `\x01tag` を設定して返す。
-fn error_ctor_impl(rt: &mut Runtime, this: AklVal, a: &[AklVal], name: &str) -> Result<AklVal, VmError> {
+fn error_ctor_impl(
+    rt: &mut Runtime,
+    this: AklVal,
+    a: &[AklVal],
+    name: &str,
+) -> Result<AklVal, VmError> {
     let id = if this.is_obj() {
         this.get_obj()
     } else {
-        rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?
+        rt.heap
+            .alloc(Obj::Obj(Vec::new()))
+            .map_err(|_| VmError::Oom)?
     };
     let name_id = rt.intern(name).ok_or(VmError::Oom)?;
     let name_k = rt.intern("name").ok_or(VmError::Oom)?;
     let msg_k = rt.intern("message").ok_or(VmError::Oom)?;
-    rt.heap.prop_set(id, name_k, AklVal::mk_obj(name_id)).map_err(|_| VmError::Oom)?;
-    let msg = a.first().copied().filter(|v| !v.is_undef()).unwrap_or(AklVal::UNDEF);
+    rt.heap
+        .prop_set(id, name_k, AklVal::mk_obj(name_id))
+        .map_err(|_| VmError::Oom)?;
+    let msg = a
+        .first()
+        .copied()
+        .filter(|v| !v.is_undef())
+        .unwrap_or(AklVal::UNDEF);
     rt.heap.prop_set(id, msg_k, msg).map_err(|_| VmError::Oom)?;
     // `\x01tag` = name（Object.prototype.toString が [object Error] 等を返す）
-    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(name_id)).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(id, rt.tag_name, AklVal::mk_obj(name_id))
+        .map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
 
@@ -2780,7 +3080,11 @@ fn error_ctor_type_error(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result
 fn error_ctor_range_error(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
     error_ctor_impl(rt, this, a, "RangeError")
 }
-fn error_ctor_syntax_error(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
+fn error_ctor_syntax_error(
+    rt: &mut Runtime,
+    this: AklVal,
+    a: &[AklVal],
+) -> Result<AklVal, VmError> {
     error_ctor_impl(rt, this, a, "SyntaxError")
 }
 
@@ -2798,9 +3102,14 @@ fn install_weak_collections(rt: &mut Runtime) -> Result<(), VmError> {
 
 /// WeakMap コンストラクタ。タグ付き OBJ を返す（get/set/has/delete は自身に実装）。
 fn weakmap_ctor(rt: &mut Runtime, _this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let id = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let tag = rt.intern("WeakMap").ok_or(VmError::Oom)?;
-    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(tag)).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(id, rt.tag_name, AklVal::mk_obj(tag))
+        .map_err(|_| VmError::Oom)?;
     // get/set/has/delete（lodash の metaMap = new WeakMap 用。文字列キー近似）
     for (name, f) in [
         ("get", weakmap_get as NativeFn),
@@ -2849,14 +3158,18 @@ fn weakmap_key(rt: &mut Runtime, key: AklVal) -> Option<ObjId> {
 }
 
 fn weakmap_get(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let Some(d) = weakmap_data(rt, this) else { return Ok(AklVal::UNDEF) };
+    let Some(d) = weakmap_data(rt, this) else {
+        return Ok(AklVal::UNDEF);
+    };
     let Some(kid) = weakmap_key(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) else {
         return Ok(AklVal::UNDEF);
     };
     Ok(rt.heap.prop_get(d, kid).unwrap_or(AklVal::UNDEF))
 }
 fn weakmap_set(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let Some(d) = weakmap_data(rt, this) else { return Ok(AklVal::UNDEF) };
+    let Some(d) = weakmap_data(rt, this) else {
+        return Ok(AklVal::UNDEF);
+    };
     let Some(kid) = weakmap_key(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) else {
         return Ok(this);
     };
@@ -2865,14 +3178,18 @@ fn weakmap_set(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, V
     Ok(this)
 }
 fn weakmap_has(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let Some(d) = weakmap_data(rt, this) else { return Ok(AklVal::FALSE) };
+    let Some(d) = weakmap_data(rt, this) else {
+        return Ok(AklVal::FALSE);
+    };
     let Some(kid) = weakmap_key(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) else {
         return Ok(AklVal::FALSE);
     };
     Ok(AklVal::from_bool(rt.heap.prop_get(d, kid).is_some()))
 }
 fn weakmap_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    let Some(d) = weakmap_data(rt, this) else { return Ok(AklVal::FALSE) };
+    let Some(d) = weakmap_data(rt, this) else {
+        return Ok(AklVal::FALSE);
+    };
     let Some(kid) = weakmap_key(rt, a.first().copied().unwrap_or(AklVal::UNDEF)) else {
         return Ok(AklVal::FALSE);
     };
@@ -2888,9 +3205,14 @@ fn weakmap_delete(rt: &mut Runtime, this: AklVal, a: &[AklVal]) -> Result<AklVal
 
 /// WeakSet コンストラクタ。タグ付き OBJ を返す（lodash の isWeakSet 用）。
 fn weakset_ctor(rt: &mut Runtime, _this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
-    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+    let id = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let tag = rt.intern("WeakSet").ok_or(VmError::Oom)?;
-    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(tag)).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(id, rt.tag_name, AklVal::mk_obj(tag))
+        .map_err(|_| VmError::Oom)?;
     Ok(AklVal::mk_obj(id))
 }
 
@@ -2901,7 +3223,10 @@ fn install_typed_arrays(rt: &mut Runtime) -> Result<(), VmError> {
     for (i, tag) in TYPED_ARRAY_TAGS.iter().enumerate() {
         let fid = rt
             .heap
-            .alloc(Obj::ForeignNative { idx, data: i as u64 })
+            .alloc(Obj::ForeignNative {
+                idx,
+                data: i as u64,
+            })
             .map_err(|_| VmError::Oom)?;
         let gid = rt.intern(tag).ok_or(VmError::Oom)?;
         rt.global_set(gid, AklVal::mk_obj(fid));
@@ -2931,19 +3256,34 @@ fn typed_array_foreign(
     a: &[AklVal],
     data: u64,
 ) -> Result<AklVal, VmError> {
-    let tag = TYPED_ARRAY_TAGS.get(data as usize).copied().unwrap_or("Object");
+    let tag = TYPED_ARRAY_TAGS
+        .get(data as usize)
+        .copied()
+        .unwrap_or("Object");
     typed_array_ctor(rt, _this, a, tag)
 }
 
 /// TypedArray / ArrayBuffer コンストラクタの共通実装。タグ付き OBJ + `.length`。
-fn typed_array_ctor(rt: &mut Runtime, _this: AklVal, a: &[AklVal], tag: &str) -> Result<AklVal, VmError> {
-    let id = rt.heap.alloc(Obj::Obj(Vec::new())).map_err(|_| VmError::Oom)?;
+fn typed_array_ctor(
+    rt: &mut Runtime,
+    _this: AklVal,
+    a: &[AklVal],
+    tag: &str,
+) -> Result<AklVal, VmError> {
+    let id = rt
+        .heap
+        .alloc(Obj::Obj(Vec::new()))
+        .map_err(|_| VmError::Oom)?;
     let tag_id = rt.intern(tag).ok_or(VmError::Oom)?;
-    rt.heap.prop_set(id, rt.tag_name, AklVal::mk_obj(tag_id)).map_err(|_| VmError::Oom)?;
+    rt.heap
+        .prop_set(id, rt.tag_name, AklVal::mk_obj(tag_id))
+        .map_err(|_| VmError::Oom)?;
     if tag != "ArrayBuffer" {
         let len = to_number(rt, a.first().copied().unwrap_or(AklVal::UNDEF));
         if len >= 0.0 && len <= 0x7FFF_FFFF as f64 {
-            rt.heap.prop_set(id, rt.length_id, AklVal::mk_int(len as i32)).map_err(|_| VmError::Oom)?;
+            rt.heap
+                .prop_set(id, rt.length_id, AklVal::mk_int(len as i32))
+                .map_err(|_| VmError::Oom)?;
         }
     }
     Ok(AklVal::mk_obj(id))
@@ -2963,7 +3303,13 @@ fn install_timers(rt: &mut Runtime) -> Result<(), VmError> {
 
 /// `setTimeout(fn, ms)` → タイマー ID（数字）。fn は関数でなければ TypeError。
 fn set_timeout(rt: &mut Runtime, _this: AklVal, a: &[AklVal]) -> Result<AklVal, VmError> {
-    if a.is_empty() || !a[0].is_obj() || !matches!(rt.heap.get(a[0].get_obj()), Some(Obj::Func { .. }) | Some(Obj::Native(_)) | Some(Obj::ForeignNative { .. })) {
+    if a.is_empty()
+        || !a[0].is_obj()
+        || !matches!(
+            rt.heap.get(a[0].get_obj()),
+            Some(Obj::Func { .. }) | Some(Obj::Native(_)) | Some(Obj::ForeignNative { .. })
+        )
+    {
         let msg = rt.intern("TypeError: not a function").unwrap_or(0);
         return Err(VmError::Thrown(AklVal::mk_obj(msg)));
     }
@@ -2983,7 +3329,11 @@ fn date_get_time(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal
     }
 }
 
-fn date_field(rt: &Runtime, this: AklVal, f: impl Fn(crate::bytecode::DateFields) -> i32) -> AklVal {
+fn date_field(
+    rt: &Runtime,
+    this: AklVal,
+    f: impl Fn(crate::bytecode::DateFields) -> i32,
+) -> AklVal {
     match date_ms(rt, this) {
         Some(ms) => {
             let fields = crate::bytecode::date_utc_fields(ms);
@@ -3014,11 +3364,7 @@ fn date_get_minutes(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<Akl
 fn date_get_seconds(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
     Ok(date_field(rt, this, |f| f.second as i32))
 }
-fn date_get_milliseconds(
-    rt: &mut Runtime,
-    this: AklVal,
-    _a: &[AklVal],
-) -> Result<AklVal, VmError> {
+fn date_get_milliseconds(rt: &mut Runtime, this: AklVal, _a: &[AklVal]) -> Result<AklVal, VmError> {
     Ok(date_field(rt, this, |f| f.millisecond as i32))
 }
 
@@ -3070,7 +3416,13 @@ mod tests {
         rt.console_out.push(format!("set {name} = {s}"));
         true
     }
-    fn h_call(rt: &mut Runtime, _data: u64, _ptr: u64, name: &str, args: &[AklVal]) -> Option<AklVal> {
+    fn h_call(
+        rt: &mut Runtime,
+        _data: u64,
+        _ptr: u64,
+        name: &str,
+        args: &[AklVal],
+    ) -> Option<AklVal> {
         if name == "getElementById" {
             let arg = args.first().map(|v| rt.flatten_str(*v)).unwrap_or_default();
             let id = rt.intern(&format!("found:{arg}"))?;
@@ -3087,13 +3439,19 @@ mod tests {
     };
 
     fn run_src(src: &str) -> Result<(AklVal, Vec<String>), String> {
-        let program = crate::parser::Parser::new(src).parse_program().map_err(|e| e.0)?;
+        let program = crate::parser::Parser::new(src)
+            .parse_program()
+            .map_err(|e| e.0)?;
         let mut rt = Runtime::new();
         install_builtins(&mut rt).map_err(|e| format!("{e:?}"))?;
         // テスト用に document ハンドルを束縛
         let handle = rt
             .heap
-            .alloc(Obj::Handle { vtab: &H_VT, data: 0, ptr: 0x1234 })
+            .alloc(Obj::Handle {
+                vtab: &H_VT,
+                data: 0,
+                ptr: 0x1234,
+            })
             .map_err(|e| format!("{e:?}"))?;
         let doc_name = rt.intern("document").unwrap();
         rt.global_set(doc_name, AklVal::mk_obj(handle));
@@ -3111,20 +3469,41 @@ mod tests {
     #[test]
     fn math() {
         assert_eq!(run_src("Math.abs(-5);").unwrap().0, AklVal::from_f64(5.0));
-        assert_eq!(run_src("Math.floor(3.7);").unwrap().0, AklVal::from_f64(3.0));
+        assert_eq!(
+            run_src("Math.floor(3.7);").unwrap().0,
+            AklVal::from_f64(3.0)
+        );
         assert_eq!(run_src("Math.ceil(3.2);").unwrap().0, AklVal::from_f64(4.0));
-        assert_eq!(run_src("Math.max(1, 5, 3);").unwrap().0, AklVal::from_f64(5.0));
-        assert_eq!(run_src("Math.min(1, 5, 3);").unwrap().0, AklVal::from_f64(1.0));
+        assert_eq!(
+            run_src("Math.max(1, 5, 3);").unwrap().0,
+            AklVal::from_f64(5.0)
+        );
+        assert_eq!(
+            run_src("Math.min(1, 5, 3);").unwrap().0,
+            AklVal::from_f64(1.0)
+        );
         assert_eq!(run_src("Math.sqrt(9);").unwrap().0, AklVal::from_f64(3.0));
-        assert_eq!(run_src("Math.pow(2, 10);").unwrap().0, AklVal::from_f64(1024.0));
+        assert_eq!(
+            run_src("Math.pow(2, 10);").unwrap().0,
+            AklVal::from_f64(1024.0)
+        );
     }
 
     #[test]
     fn global_funcs() {
-        assert_eq!(run_src("parseInt(\"42\");").unwrap().0, AklVal::from_f64(42.0));
-        assert_eq!(run_src("parseInt(\"-7\");").unwrap().0, AklVal::from_f64(-7.0));
+        assert_eq!(
+            run_src("parseInt(\"42\");").unwrap().0,
+            AklVal::from_f64(42.0)
+        );
+        assert_eq!(
+            run_src("parseInt(\"-7\");").unwrap().0,
+            AklVal::from_f64(-7.0)
+        );
         assert_eq!(run_src("isNaN(\"abc\");").unwrap().0, AklVal::TRUE);
-        assert_eq!(run_src("Number(\"3.5\");").unwrap().0, AklVal::from_f64(3.5));
+        assert_eq!(
+            run_src("Number(\"3.5\");").unwrap().0,
+            AklVal::from_f64(3.5)
+        );
     }
 
     #[test]
@@ -3134,27 +3513,42 @@ mod tests {
         assert!(v.is_obj());
         // 内容を Runtime から取得できないので、intern 経由で確認するのは
         // テストヘルパが無いため、別の方法: "HELLO" との比較式で確認
-        assert_eq!(run_src("\"hello\".toUpperCase() === \"HELLO\";").unwrap().0, AklVal::TRUE);
+        assert_eq!(
+            run_src("\"hello\".toUpperCase() === \"HELLO\";").unwrap().0,
+            AklVal::TRUE
+        );
         assert_eq!(run_src("\"abc\".length;").unwrap().0, AklVal::mk_int(3));
-        assert_eq!(run_src("\"hello\".indexOf(\"l\");").unwrap().0, AklVal::mk_int(2));
-        assert_eq!(run_src("\"hello\".includes(\"ell\");").unwrap().0, AklVal::TRUE);
+        assert_eq!(
+            run_src("\"hello\".indexOf(\"l\");").unwrap().0,
+            AklVal::mk_int(2)
+        );
+        assert_eq!(
+            run_src("\"hello\".includes(\"ell\");").unwrap().0,
+            AklVal::TRUE
+        );
     }
 
     #[test]
     fn array_methods_higher_order() {
         // map
         assert_eq!(
-            run_src("var a = [1, 2, 3]; a.map(function(x) { return x * 2; })[1];").unwrap().0,
+            run_src("var a = [1, 2, 3]; a.map(function(x) { return x * 2; })[1];")
+                .unwrap()
+                .0,
             AklVal::mk_int(4)
         );
         // filter
         assert_eq!(
-            run_src("var a = [1, 2, 3, 4]; a.filter(function(x) { return x % 2 === 0; }).length;").unwrap().0,
+            run_src("var a = [1, 2, 3, 4]; a.filter(function(x) { return x % 2 === 0; }).length;")
+                .unwrap()
+                .0,
             AklVal::mk_int(2)
         );
         // reduce
         assert_eq!(
-            run_src("var a = [1, 2, 3, 4]; a.reduce(function(acc, x) { return acc + x; }, 0);").unwrap().0,
+            run_src("var a = [1, 2, 3, 4]; a.reduce(function(acc, x) { return acc + x; }, 0);")
+                .unwrap()
+                .0,
             AklVal::mk_int(10)
         );
     }
@@ -3165,8 +3559,14 @@ mod tests {
         assert_eq!(run_src("[1, 2, 3].shift();").unwrap().0, AklVal::mk_int(1));
         assert_eq!(run_src("[2, 3].unshift(1);").unwrap().0, AklVal::mk_int(3));
         assert_eq!(run_src("[1, 2, 3].includes(2);").unwrap().0, AklVal::TRUE);
-        assert_eq!(run_src("[1, 2, 3].concat([4, 5]).length;").unwrap().0, AklVal::mk_int(5));
-        assert_eq!(run_src("[1, 2, 3].join(\"-\") === \"1-2-3\";").unwrap().0, AklVal::TRUE);
+        assert_eq!(
+            run_src("[1, 2, 3].concat([4, 5]).length;").unwrap().0,
+            AklVal::mk_int(5)
+        );
+        assert_eq!(
+            run_src("[1, 2, 3].join(\"-\") === \"1-2-3\";").unwrap().0,
+            AklVal::TRUE
+        );
         assert_eq!(run_src("[1, 2, 3].at(1);").unwrap().0, AklVal::mk_int(2));
         assert_eq!(run_src("[1, 2, 3].at(-1);").unwrap().0, AklVal::mk_int(3));
     }
@@ -3174,19 +3574,27 @@ mod tests {
     #[test]
     fn array_methods_find_some_every() {
         assert_eq!(
-            run_src("[1, 2, 3, 4].find(function(x) { return x > 2; });").unwrap().0,
+            run_src("[1, 2, 3, 4].find(function(x) { return x > 2; });")
+                .unwrap()
+                .0,
             AklVal::mk_int(3)
         );
         assert_eq!(
-            run_src("[1, 2, 3].findIndex(function(x) { return x === 2; });").unwrap().0,
+            run_src("[1, 2, 3].findIndex(function(x) { return x === 2; });")
+                .unwrap()
+                .0,
             AklVal::mk_int(1)
         );
         assert_eq!(
-            run_src("[1, 2, 3].some(function(x) { return x > 2; });").unwrap().0,
+            run_src("[1, 2, 3].some(function(x) { return x > 2; });")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(
-            run_src("[1, 2, 3].every(function(x) { return x > 0; });").unwrap().0,
+            run_src("[1, 2, 3].every(function(x) { return x > 0; });")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
     }
@@ -3198,7 +3606,9 @@ mod tests {
             AklVal::mk_int(1)
         );
         assert_eq!(
-            run_src("var a = [1, 2, 3, 4]; a.splice(1, 2); a.length;").unwrap().0,
+            run_src("var a = [1, 2, 3, 4]; a.splice(1, 2); a.length;")
+                .unwrap()
+                .0,
             AklVal::mk_int(2)
         );
         assert_eq!(
@@ -3218,7 +3628,9 @@ mod tests {
             AklVal::mk_int(2)
         );
         assert_eq!(
-            run_src("var o = {a: 1}; Object.assign(o, {b: 2}); o.b;").unwrap().0,
+            run_src("var o = {a: 1}; Object.assign(o, {b: 2}); o.b;")
+                .unwrap()
+                .0,
             AklVal::mk_int(2)
         );
     }
@@ -3227,7 +3639,9 @@ mod tests {
     fn regex_methods() {
         // マッチ
         assert_eq!(
-            run_src("\"abc123\".match(/[0-9]+/)[0] === \"123\";").unwrap().0,
+            run_src("\"abc123\".match(/[0-9]+/)[0] === \"123\";")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         // search
@@ -3237,7 +3651,9 @@ mod tests {
         );
         // replace
         assert_eq!(
-            run_src("\"hello world\".replace(/world/, \"there\") === \"hello there\";").unwrap().0,
+            run_src("\"hello world\".replace(/world/, \"there\") === \"hello there\";")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         // split
@@ -3250,11 +3666,15 @@ mod tests {
     #[test]
     fn map_set() {
         assert_eq!(
-            run_src("var m = new Map(); m.set(\"a\", 1); m.get(\"a\");").unwrap().0,
+            run_src("var m = new Map(); m.set(\"a\", 1); m.get(\"a\");")
+                .unwrap()
+                .0,
             AklVal::mk_int(1)
         );
         assert_eq!(
-            run_src("var m = new Map(); m.set(\"a\", 1); m.has(\"a\");").unwrap().0,
+            run_src("var m = new Map(); m.set(\"a\", 1); m.has(\"a\");")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(
@@ -3274,22 +3694,31 @@ mod tests {
             AklVal::TRUE
         );
         assert_eq!(
-            run_src("JSON.stringify(\"hi\") === \"\\\"hi\\\"\";").unwrap().0,
+            run_src("JSON.stringify(\"hi\") === \"\\\"hi\\\"\";")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(
-            run_src("JSON.stringify([1, 2, 3]) === \"[1,2,3]\";").unwrap().0,
+            run_src("JSON.stringify([1, 2, 3]) === \"[1,2,3]\";")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(
-            run_src("JSON.stringify({a: 1}) === \"{\\\"a\\\":1}\";").unwrap().0,
+            run_src("JSON.stringify({a: 1}) === \"{\\\"a\\\":1}\";")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
     }
 
     #[test]
     fn json_parse() {
-        assert_eq!(run_src("JSON.parse(\"42\");").unwrap().0, AklVal::mk_int(42));
+        assert_eq!(
+            run_src("JSON.parse(\"42\");").unwrap().0,
+            AklVal::mk_int(42)
+        );
         assert_eq!(
             run_src("JSON.parse(\"1.5\") === 1.5;").unwrap().0,
             AklVal::TRUE
@@ -3310,12 +3739,16 @@ mod tests {
         );
         // ネスト
         assert_eq!(
-            run_src("JSON.parse(\"{\\\"a\\\": [1, {\\\"b\\\": 2}]}\").a[1].b;").unwrap().0,
+            run_src("JSON.parse(\"{\\\"a\\\": [1, {\\\"b\\\": 2}]}\").a[1].b;")
+                .unwrap()
+                .0,
             AklVal::mk_int(2)
         );
         // エスケープ
         assert_eq!(
-            run_src("JSON.parse(\"\\\"a\\\\nb\\\"\") === \"a\\nb\";").unwrap().0,
+            run_src("JSON.parse(\"\\\"a\\\\nb\\\"\") === \"a\\nb\";")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
     }
@@ -3354,7 +3787,9 @@ mod tests {
             AklVal::mk_int(2)
         );
         assert_eq!(
-            run_src("Object.fromEntries([[\"a\", 1], [\"b\", 2]]).b;").unwrap().0,
+            run_src("Object.fromEntries([[\"a\", 1], [\"b\", 2]]).b;")
+                .unwrap()
+                .0,
             AklVal::mk_int(2)
         );
     }
@@ -3368,7 +3803,9 @@ mod tests {
         );
         // メソッド呼び出し → vtable.call
         assert_eq!(
-            run_src("document.getElementById(\"a\") === \"found:a\";").unwrap().0,
+            run_src("document.getElementById(\"a\") === \"found:a\";")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         // ブラケットアクセス → vtable.get（文字列キー）
@@ -3402,10 +3839,7 @@ mod tests {
             run_src("var x = 7; x ||= 5; x;").unwrap().0,
             AklVal::mk_int(7)
         );
-        assert_eq!(
-            run_src("var x; x ??= 3; x;").unwrap().0,
-            AklVal::mk_int(3)
-        );
+        assert_eq!(run_src("var x; x ??= 3; x;").unwrap().0, AklVal::mk_int(3));
         assert_eq!(
             run_src("var x = 0; x ??= 3; x;").unwrap().0,
             AklVal::mk_int(0)
@@ -3451,17 +3885,23 @@ mod tests {
 
     #[test]
     fn object_spread() {
-        assert_eq!(
-            run_src("var b = {w: 100, h: 50}; var o = {w: 0, h: 60, z: 1}; o;").unwrap().0.is_obj(),
-            true
+        assert!(
+            run_src("var b = {w: 100, h: 50}; var o = {w: 0, h: 60, z: 1}; o;")
+                .unwrap()
+                .0
+                .is_obj()
         );
         // {...b, h: 60} で h が上書きされる
         assert_eq!(
-            run_src("var b = {w: 100, h: 50}; var o = {...b, h: 60}; o.h;").unwrap().0,
+            run_src("var b = {w: 100, h: 50}; var o = {...b, h: 60}; o.h;")
+                .unwrap()
+                .0,
             AklVal::mk_int(60)
         );
         assert_eq!(
-            run_src("var b = {w: 100, h: 50}; var o = {...b, h: 60}; o.w;").unwrap().0,
+            run_src("var b = {w: 100, h: 50}; var o = {...b, h: 60}; o.w;")
+                .unwrap()
+                .0,
             AklVal::mk_int(100)
         );
     }
@@ -3504,11 +3944,15 @@ mod tests {
         );
         // getTime / getUTCFullYear / getUTCDate / getUTCSeconds
         assert_eq!(
-            run_src("var d = new Date(0); d.getTime() === 0;").unwrap().0,
+            run_src("var d = new Date(0); d.getTime() === 0;")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(
-            run_src("var d = new Date(0); d.getUTCFullYear();").unwrap().0,
+            run_src("var d = new Date(0); d.getUTCFullYear();")
+                .unwrap()
+                .0,
             AklVal::mk_int(1970)
         );
         assert_eq!(
@@ -3529,15 +3973,21 @@ mod tests {
         );
         // 時刻フィールド（3661 秒 = 01:01:01）
         assert_eq!(
-            run_src("var d = new Date(3661000); d.getUTCSeconds();").unwrap().0,
+            run_src("var d = new Date(3661000); d.getUTCSeconds();")
+                .unwrap()
+                .0,
             AklVal::mk_int(1)
         );
         assert_eq!(
-            run_src("var d = new Date(3661000); d.getUTCMinutes();").unwrap().0,
+            run_src("var d = new Date(3661000); d.getUTCMinutes();")
+                .unwrap()
+                .0,
             AklVal::mk_int(1)
         );
         assert_eq!(
-            run_src("var d = new Date(3661000); d.getUTCHours();").unwrap().0,
+            run_src("var d = new Date(3661000); d.getUTCHours();")
+                .unwrap()
+                .0,
             AklVal::mk_int(1)
         );
     }
@@ -3546,13 +3996,17 @@ mod tests {
     fn bigint_arithmetic() {
         // 加算・乗算（BigInt === BigInt は値比較）・typeof・==（数値との比較）
         assert_eq!(
-            run_src("9007199254740993n + 1n === 9007199254740994n;").unwrap().0,
+            run_src("9007199254740993n + 1n === 9007199254740994n;")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(run_src("10n * 3n === 30n;").unwrap().0, AklVal::TRUE);
         assert_eq!(run_src("typeof 10n === 'bigint';").unwrap().0, AklVal::TRUE);
         assert_eq!(
-            run_src("((10n == 10) ? 'yes' : 'no') === 'yes';").unwrap().0,
+            run_src("((10n == 10) ? 'yes' : 'no') === 'yes';")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(run_src("10n === 10n;").unwrap().0, AklVal::TRUE);
@@ -3580,7 +4034,9 @@ mod tests {
         assert_eq!(run_src("0 || 2;").unwrap().0, AklVal::mk_int(2));
         // 短絡で未宣言グローバルも評価されない（typeof と組み合わせた環境検出）
         assert_eq!(
-            run_src("(typeof noSuchGlobal == 'object' && noSuchGlobal) ? 1 : 2;").unwrap().0,
+            run_src("(typeof noSuchGlobal == 'object' && noSuchGlobal) ? 1 : 2;")
+                .unwrap()
+                .0,
             AklVal::mk_int(2)
         );
     }
@@ -3588,15 +4044,21 @@ mod tests {
     #[test]
     fn object_proto_to_string() {
         assert_eq!(
-            run_src("Object.prototype.toString.call([]) === '[object Array]';").unwrap().0,
+            run_src("Object.prototype.toString.call([]) === '[object Array]';")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(
-            run_src("Object.prototype.toString.call({}) === '[object Object]';").unwrap().0,
+            run_src("Object.prototype.toString.call({}) === '[object Object]';")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
         assert_eq!(
-            run_src("Object.prototype.hasOwnProperty.call({a: 1}, 'a');").unwrap().0,
+            run_src("Object.prototype.hasOwnProperty.call({a: 1}, 'a');")
+                .unwrap()
+                .0,
             AklVal::TRUE
         );
     }

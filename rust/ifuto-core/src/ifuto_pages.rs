@@ -116,12 +116,16 @@ fn page_settings(b: &mut Hb) {
     b.s(NAV);
     b.s("<h2>エンジン（akl = Aklus JS）</h2><pre>");
     b.s("同梱形態          : 同一リポジトリで build/akl として単独配布（make install-akl で導入可）\n");
-    b.s("ブラウザ内実行    : DOM 結合は v0.4 台帳（現行は ifuto 本体に未リンク＝220KB 天井維持）\n");
+    b.s(
+        "ブラウザ内実行    : DOM 結合は v0.4 台帳（現行は ifuto 本体に未リンク＝220KB 天井維持）\n",
+    );
     b.s("JIT               : 永久不採用（実行可能書き込みページは構造的にゼロ）\n");
     b.s("CoJIT（AOT 特化） : 既定 ON（kill switch: akl_set_cojit / docs: BENCH.md）\n");
     b.s("budget 既定       : 命令 10M、try 深さ 1024、スタック段 4096\n");
     b.s("</pre><h2>セキュリティ</h2><pre>");
-    b.s("akl 単体ランナー   : seccomp-BPF サンドボックス強制（既定 ON。--no-sandbox で明示解除）\n");
+    b.s(
+        "akl 単体ランナー   : seccomp-BPF サンドボックス強制（既定 ON。--no-sandbox で明示解除）\n",
+    );
     b.s("ブラウザプロセス   : sandbox primitive 実装済み（src/sandbox.c。chrome profile 適用は v0.2 台帳）\n");
     b.s("パース多層防御     : 全入力は共通パーサ + budget fail-stop（docs: ARCHITECTURE.md）\n");
     b.s("</pre><h2>メモリ方針</h2><pre>");
@@ -187,7 +191,9 @@ fn page_history(b: &mut Hb, history: Option<&[u8]>) {
                         }
                     }
                 }
-                let (Some(t1), Some(t2)) = (t1, t2) else { continue };
+                let (Some(t1), Some(t2)) = (t1, t2) else {
+                    continue;
+                };
                 b.s("<li>[");
                 b.esc(&tsv[ls..t1]); // epoch
                 b.s("] <a href=\"");
@@ -236,9 +242,11 @@ fn page_memory(b: &mut Hb, tabs: &[TabInfo], rp: &RasterPick) {
     b.s(" / view: ");
     b.kb(tot_view);
     b.s("</p>");
-    b.s("<p>方針（ユーザ法則）: 「メモリは使わなければ使わないほど良い」\
+    b.s(
+        "<p>方針（ユーザ法則）: 「メモリは使わなければ使わないほど良い」\
 — arena はタブ寿命で保持し、view は再レイアウトで破棄・再構築。\
-巨大 IDM の正確な係数（実測）は BENCH.md の「巨大 IDM 計測」節。</p>");
+巨大 IDM の正確な係数（実測）は BENCH.md の「巨大 IDM 計測」節。</p>",
+    );
 
     // raster backend 決定欄
     let n_cand = rp.name.len();
@@ -312,7 +320,9 @@ pub fn ifuto_page(
             b.s(PAGE_STYLE);
             b.s("未知の内部ページ");
             b.s(NAV);
-            b.s("<p>ifuto://settings ifuto://history ifuto://memory ifuto://about があります。</p>");
+            b.s(
+                "<p>ifuto://settings ifuto://history ifuto://memory ifuto://about があります。</p>",
+            );
         }
     }
     b.s("</body></html>");
@@ -327,7 +337,9 @@ mod tests {
     fn settings_page() {
         let html = ifuto_page("ifuto://settings", None, &[], &RasterPick::default()).unwrap();
         let s = String::from_utf8(html).unwrap();
-        assert!(s.starts_with("<html><head><title>ifuto://settings</title></head><body><h1>Ifuto 設定"));
+        assert!(
+            s.starts_with("<html><head><title>ifuto://settings</title></head><body><h1>Ifuto 設定")
+        );
         assert!(s.contains("JIT               : 永久不採用"));
         assert!(s.ends_with("</body></html>"));
     }
@@ -355,11 +367,23 @@ mod tests {
     fn history_escapes() {
         // url/title に & < > を含む（" は C と同様 escape しない）
         let tsv = "100\tA&B\t<a>\n200\tT<U>\t<b>\n";
-        let html = ifuto_page("ifuto://history", Some(tsv.as_bytes()), &[], &RasterPick::default()).unwrap();
+        let html = ifuto_page(
+            "ifuto://history",
+            Some(tsv.as_bytes()),
+            &[],
+            &RasterPick::default(),
+        )
+        .unwrap();
         let s = String::from_utf8(html).unwrap();
         // 最新が先頭
-        assert!(s.contains("<li>[200] <a href=\"&lt;b&gt;\">T&lt;U&gt;</a> &lt;b&gt;</li>"), "got: {s}");
-        assert!(s.contains("<li>[100] <a href=\"&lt;a&gt;\">A&amp;B</a> &lt;a&gt;</li>"), "got: {s}");
+        assert!(
+            s.contains("<li>[200] <a href=\"&lt;b&gt;\">T&lt;U&gt;</a> &lt;b&gt;</li>"),
+            "got: {s}"
+        );
+        assert!(
+            s.contains("<li>[100] <a href=\"&lt;a&gt;\">A&amp;B</a> &lt;a&gt;</li>"),
+            "got: {s}"
+        );
     }
 
     #[test]

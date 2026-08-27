@@ -5,6 +5,7 @@
 pub const IF_JIS_CELLS: usize = 8836;
 
 /// JIS X 0208 面（SJIS pointer / EUC ku-ten 共通の一次索引）→ Unicode BMP（無効 0）。
+#[rustfmt::skip]
 pub const JIS208: &[u16] = &[
     0x3000,0x3001,0x3002,0xff0c,0xff0e,0x30fb,0xff1a,0xff1b,0xff1f,0xff01,0x309b,0x309c,0x00b4,0xff40,0x00a8,0xff3e,
     0xffe3,0xff3f,0x30fd,0x30fe,0x309d,0x309e,0x3003,0x4edd,0x3005,0x3006,0x3007,0x30fc,0x2015,0x2010,0xff0f,0xff3c,
@@ -562,6 +563,7 @@ pub const JIS208: &[u16] = &[
 ];
 
 /// JIS X 0212 面（EUC-JP SS3 0x8F）→ Unicode BMP（無効 0）。
+#[rustfmt::skip]
 pub const JIS212: &[u16] = &[
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -1119,6 +1121,7 @@ pub const JIS212: &[u16] = &[
 ];
 
 /// cp932 専有/異義バイト対。各要素 = key<<16 | codepoint（key = lead<<8|trail、昇順）。
+#[rustfmt::skip]
 pub const SJIS_EXT: &[u32] = &[
     0x8160ff5e,0x81612225,0x817cff0d,0x8191ffe0,0x8192ffe1,0x81caffe2,0x87402460,0x87412461,
     0x87422462,0x87432463,0x87442464,0x87452465,0x87462466,0x87472467,0x87482468,0x87492469,

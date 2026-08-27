@@ -33,10 +33,16 @@
 //! - link span 収集・deco 装飾 op（dump に現れない。描画層移行時に移植）
 //! - rdtsc プロファイリング（`IF_LAYOUT_PROF`）
 
-use crate::css::{resolve_len, Len, Style, D_BLOCK, D_INLINE, D_LIST_ITEM, D_NONE, TA_CENTER,
-                 TA_LEFT, TA_RIGHT, U_AUTO, U_PCT, WS_NORMAL, WS_PRE};
+use crate::css::{
+    resolve_len, Len, Style, D_BLOCK, D_INLINE, D_LIST_ITEM, D_NONE, TA_CENTER, TA_LEFT, TA_RIGHT,
+    U_AUTO, U_PCT, WS_NORMAL, WS_PRE,
+};
 use crate::dom::{Dom, NodeId, NodeKind};
-use crate::tags_tables::{TAG_BODY, TAG_BR, TAG_HR, TAG_HTML, TAG_IMG};
+use crate::tags::Tag;
+use crate::tags_tables::{
+    TAG_A, TAG_BLOCKQUOTE, TAG_BODY, TAG_BR, TAG_HR, TAG_HTML, TAG_IMG, TAG_OL, TAG_SECTION,
+    TAG_TABLE, TAG_TBODY, TAG_THEAD, TAG_TR, TAG_UL,
+};
 
 /// セル幅の px 換算（C の `IF_CHAR_W_PX`）。
 pub const CHAR_W_PX: f32 = 8.0;
@@ -89,6 +95,12 @@ pub struct BoxNode {
     pub h: i32,
     /// LINE の text-align。
     pub text_align: u8,
+    /// LINE のみ: C の `IF_LF_DIRECT_BYTES` 相当。**wrap 走査のタイミングまで含めて**
+    /// C と同じ規則で畳まれる（glyph スキャンは wrap 確定より先に走り、kill は
+    /// スキャン時点の現行ラインにだけ効く。折り返し境界に乗った 0 幅/不正グリフは
+    /// 次行では検査をすり抜ける — C の quirk で、このフラグはそのまま再現する。
+    /// 発行側はこのフラグを見て raw bytes を出す）。
+    pub direct: bool,
     /// 子ボックス。
     pub children: Vec<BoxNode>,
 }
@@ -109,6 +121,92 @@ struct Lc<'a> {
     dom: &'a Dom,
     styles: &'a [Option<Style>],
     root_fs: f32,
+    // --- seg merge 忠実化のための C arena 追跡モデル（下記 Prov 参照） ---
+    /// 合成文字列アリーナの bump 位置写し（`syn_alloc` のみが進める）。
+    syn_pos: std::cell::Cell<usize>,
+    /// C `pieces_scratch_cap` 写し（grow イベント検知用）。
+    pieces_cap: std::cell::Cell<u32>,
+    /// C `links_cap` / `n_links` 写し（collect_link の grow 検知用）。
+    links_cap: std::cell::Cell<u32>,
+    n_links: std::cell::Cell<u32>,
+    /// C `prec_scratch_cap` 写し。
+    prec_cap: std::cell::Cell<u32>,
+    /// テキストノード 1 枚ごとの由来 id 発行器。
+    prov_seq: std::cell::Cell<u32>,
+}
+
+/// seg merge の由来位置クラス（C の `wrap_push_merge` の `pm_end == p` ポインタ
+/// 比較の追跡モデル）。C の merge は「同一バッファ上で直前 seg の終端ポインタ ==
+/// 今回の先頭ポインタ」でのみ成立する。バッファ実体ごとの位置クラス:
+///
+/// - `Src(id)`: テキストノード 1 枚の文字列。同一スライス内のオフセット隣接のみ
+///   成立し、ピース跨ぎは id 不一致で必ず不成立（実ポインタ比較と同値: DOM の
+///   隣接テキストノードはパーサ/run accumulator が併合済みで、独立バッファの
+///   ポインタが隣り合うことはあり得ない）。
+/// - `Syn`: 合成文字列（img 占位 `[img: …]` 等）を置くアリーナのオフセット。
+///   C は placeholder を arena bump + 8B アラインで確保するため、「直前
+///   placeholder 長 %8 == 0 かつ間に他の arena alloc が無い」とき次の
+///   placeholder とポインタ隣接し、2 つの占位が 1 seg に合体する（dump-layout の
+///   `segs=N` にだけ観測される C の allocator 人工物）。`syn_alloc` が bump 位置を、
+///   `flat_grow_model`（pieces/links/prec の grow イベント）と `syn_foreign` が
+///   介入 alloc を追跡する。
+/// - `Never`: 静的文字列（折り畳み空白 " " 等）。絶対に merge しない。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Prov {
+    Src(u32),
+    Syn,
+    Never,
+}
+
+/// `push_merge` の由来 span。C のポインタ対 `(p, len)` の追跡モデルを 1 値に束ねる
+/// （merge 判定は `pm_end == p` ⇔ `prev.end == next.start` のみに使う）。
+#[derive(Clone, Copy)]
+struct ProvSpan {
+    prov: Prov,
+    start: usize,
+    end: usize,
+}
+
+impl ProvSpan {
+    fn new(prov: Prov, start: usize, end: usize) -> Self {
+        ProvSpan { prov, start, end }
+    }
+}
+
+impl<'a> Lc<'a> {
+    /// テキストノード 1 枚に由来 id を発行。
+    fn fresh_prov(&self) -> Prov {
+        let id = self.prov_seq.get();
+        self.prov_seq.set(id + 1);
+        Prov::Src(id)
+    }
+
+    /// 合成文字列のアリーナ確保（8B アライン bump）。(start, end) を返す。
+    fn syn_alloc(&self, len: usize) -> (usize, usize) {
+        let start = (self.syn_pos.get() + 7) & !7;
+        self.syn_pos.set(start + len);
+        (start, start + len)
+    }
+
+    /// 合成文字列以外の arena アロケーション（bump 前進 = 隣接鎖の切断）。
+    /// 量の追跡は不要で「正に進んだ」ことだけが merge 可否に効く。
+    fn syn_foreign(&self) {
+        self.syn_pos.set(((self.syn_pos.get() + 7) & !7) + 8);
+    }
+
+    /// C `if_arena_grow` の写し: need > cap で cap 倍増 + arena alloc 畳み込み。
+    fn grow_model(&self, cap: &std::cell::Cell<u32>, need: u32) {
+        let cur = cap.get();
+        if need <= cur {
+            return;
+        }
+        let mut nc = if cur == 0 { 8 } else { cur };
+        while nc < need {
+            nc *= 2;
+        }
+        cap.set(nc);
+        self.syn_foreign();
+    }
 }
 
 /// 幾何（margin/padding/border/width/height の解決済み値。C の `IfGeomEnt` 相当）。
@@ -135,10 +233,22 @@ const STYLE_FALLBACK: Style = Style {
     bg: 0,
     font_size: 16.0,
     line_height: 0.0,
-    width: Len { v: 0.0, unit: U_AUTO },
-    height: Len { v: 0.0, unit: U_AUTO },
-    margin: [Len { v: 0.0, unit: U_AUTO }; 4],
-    padding: [Len { v: 0.0, unit: U_AUTO }; 4],
+    width: Len {
+        v: 0.0,
+        unit: U_AUTO,
+    },
+    height: Len {
+        v: 0.0,
+        unit: U_AUTO,
+    },
+    margin: [Len {
+        v: 0.0,
+        unit: U_AUTO,
+    }; 4],
+    padding: [Len {
+        v: 0.0,
+        unit: U_AUTO,
+    }; 4],
     border_w: [0.0; 4],
     border_color: 0,
     display: D_BLOCK,
@@ -230,8 +340,12 @@ struct Wrap<'a> {
     align_st: Style,
     /// 直前 seg のスタイル（merge 判定用）。
     pm_st: Option<Style>,
-    /// 直前 seg のソース終端オフセット（現ピース内。merge 判定用。合成 push は `None`）。
-    pm_end: Option<usize>,
+    /// 直前 seg の由来位置キー（由来クラス, 終端オフセット。merge 判定用。
+    /// C `pm_end`（ポインタ）の追跡モデル。`Prov::Never` の push では `None`）。
+    pm_key: Option<(Prov, usize)>,
+    /// 現行ラインの全グリフが `IF_LF_DIRECT_BYTES` 条件を満たす（C の同名。次行は
+    /// `end_line` で `true` に再初期化 — kill が現行にだけ効く C の規約をそのまま持つ）。
+    direct_all: bool,
     /// LINE ボックスの出力先（親ボックスの子列）。
     lines: &'a mut Vec<BoxNode>,
 }
@@ -247,7 +361,7 @@ fn lw_glyph_width(cp: u32) -> i32 {
 
 impl<'a> Wrap<'a> {
     /// 新規 seg を push（merge なし）。C の `wrap_push_seg` 相当。
-    fn push_seg(&mut self, text: &[u8], x: i32, width: i32, st: Style, src_end: Option<usize>) {
+    fn push_seg(&mut self, text: &[u8], x: i32, width: i32, st: Style, prov: Prov, end: usize) {
         if text.is_empty() {
             return;
         }
@@ -258,28 +372,55 @@ impl<'a> Wrap<'a> {
             st,
         });
         self.pm_st = Some(st);
-        self.pm_end = src_end;
+        self.pm_key = if prov == Prov::Never {
+            None
+        } else {
+            Some((prov, end))
+        };
     }
 
-    /// 直前 seg と style が同じでソース上連続なら拡張する合体 push。C の `wrap_push_merge`。
-    fn push_merge(&mut self, text: &[u8], src_off: usize, x: i32, width: i32, st: Style) {
+    /// 直前 seg と style・由来が同じで位置上連続なら拡張する合体 push。
+    /// C の `wrap_push_merge`（`pm_st == st && pm_end == p` のポインタ比較）の写し。
+    fn push_merge(&mut self, text: &[u8], sp: ProvSpan, x: i32, width: i32, st: Style) {
         if text.is_empty() {
             return;
         }
-        if !self.segs.is_empty() && self.pm_st == Some(st) && self.pm_end == Some(src_off) {
+        if !self.segs.is_empty()
+            && self.pm_st == Some(st)
+            && sp.prov != Prov::Never
+            && self.pm_key == Some((sp.prov, sp.start))
+        {
             let last = self.segs.last_mut().unwrap();
             last.text.extend_from_slice(text);
             last.w += width;
-            self.pm_end = Some(src_off + text.len());
+            self.pm_key = Some((sp.prov, sp.end));
             return;
         }
-        self.push_seg(text, x, width, st, Some(src_off + text.len()));
+        self.push_seg(text, x, width, st, sp.prov, sp.end);
     }
 
     /// 行尾の折り畳み空白 pop（C の `wrap_pop_last_seg` 相当）。
     fn pop_last_seg(&mut self) {
         self.segs.pop();
-        self.pm_st = None;
+        self.pm_st = None; // 陳腐化防止（次 push は必ず push_seg 経由で再設定）
+        self.pm_key = None;
+    }
+
+    /// デコード済み 1 グリフの byte-direct 妥当性を畳み込む。C の `wrap_note_direct` 相当。
+    /// 条件: `gw>0`（`gw==0` はセルを生成しないためバイト列とセル列が乖離）かつ
+    /// U+FFFD 置換発生時は元バイトが正に EF BF BD（enc∘dec 恒等の唯一の許容例）。
+    fn note_direct(&mut self, base: &[u8], from: usize, to: usize, cp: u32, gw: i32) {
+        if gw == 0 {
+            self.direct_all = false;
+        }
+        if cp == crate::utf8::REPLACEMENT
+            && !(to - from == 3
+                && base[from] == 0xEF
+                && base[from + 1] == 0xBF
+                && base[from + 2] == 0xBD)
+        {
+            self.direct_all = false;
+        }
     }
 
     /// 行を確定し LINE ボックスを出力。C の `wrap_end_line` 相当。
@@ -305,6 +446,8 @@ impl<'a> Wrap<'a> {
                 s.x += shift;
             }
         }
+        let direct = self.direct_all;
+        self.direct_all = true; // 次行は既定で有効（無効化は note_direct で畳む）
         let line = BoxNode {
             kind: BoxKind::Line,
             node: None,
@@ -315,6 +458,7 @@ impl<'a> Wrap<'a> {
             w: self.line_w,
             h: rows,
             text_align: align,
+            direct,
             children: Vec::new(),
         };
         self.y += rows;
@@ -323,6 +467,7 @@ impl<'a> Wrap<'a> {
 }
 
 /// テキスト 1 ピースを流し込む。C の `wrap_text` 相当。
+#[allow(clippy::too_many_arguments)]
 fn wrap_text(
     w: &mut Wrap,
     text: &[u8],
@@ -330,6 +475,8 @@ fn wrap_text(
     pre: bool,
     max_lh: &mut f32,
     any: &mut bool,
+    prov: Prov,
+    base: usize,
 ) {
     let fs = st.font_size;
     let lh = if st.line_height > 0.0 {
@@ -346,10 +493,9 @@ fn wrap_text(
     let mut i = 0usize;
     let mut cx = w.line_w;
 
-    // ピース境界で merge 追跡をリセット（ソースが不連続）
-    w.pm_st = None;
-    w.pm_end = None;
-
+    // C にはピース境界での pm リセットは無い（merge 追跡は由来位置の等値性に
+    // 委ねる。異なる由来は Prov 比較で必ず不成立、同一由来内ではオフセット連続性が
+    // 実ポインタ隣接と同値）。`base + o` がピース内オフセット o の由来位置。
     while i < n {
         let b0 = s[i];
         if is_ws(b0) {
@@ -362,10 +508,18 @@ fn wrap_text(
             }
             if pre {
                 let adv: i32 = if b0 == b'\t' { 8 } else { 1 };
+                // ' '(0x20) のみセル列とバイト列が一致（\t は前進 8、他は gw==0 で非発行セル）
                 if b0 != b' ' {
-                    w.push_seg(&s[i..i + 1], w.content_x + cx, adv, st, Some(i + 1));
+                    w.direct_all = false;
+                    w.push_seg(&s[i..i + 1], w.content_x + cx, adv, st, prov, base + i + 1);
                 } else {
-                    w.push_merge(&s[i..i + 1], i, w.content_x + cx, 1, st);
+                    w.push_merge(
+                        &s[i..i + 1],
+                        ProvSpan::new(prov, base + i, base + i + 1),
+                        w.content_x + cx,
+                        1,
+                        st,
+                    );
                 }
                 cx += adv;
                 i += 1;
@@ -381,9 +535,15 @@ fn wrap_text(
             i = wsend;
             if cx > 0 && cx < w.content_w {
                 if last_ws == b' ' {
-                    w.push_merge(&s[wsend - 1..wsend], wsend - 1, w.content_x + cx, 1, st);
+                    w.push_merge(
+                        &s[wsend - 1..wsend],
+                        ProvSpan::new(prov, base + wsend - 1, base + wsend),
+                        w.content_x + cx,
+                        1,
+                        st,
+                    );
                 } else {
-                    w.push_seg(b" ", w.content_x + cx, 1, st, None);
+                    w.push_seg(b" ", w.content_x + cx, 1, st, Prov::Never, 0);
                 }
                 cx += 1;
             }
@@ -405,6 +565,7 @@ fn wrap_text(
             let mut save = i;
             let cp = crate::utf8::decode(s, &mut save);
             let gw = lw_glyph_width(cp);
+            w.note_direct(s, i, save, cp, gw);
             i = save;
             if gw == 2 {
                 atom_w = 2;
@@ -418,6 +579,7 @@ fn wrap_text(
                     let mut s2 = i;
                     let cp2 = crate::utf8::decode(s, &mut s2);
                     let gw2 = lw_glyph_width(cp2);
+                    w.note_direct(s, i, s2, cp2, gw2);
                     if gw2 == 2 {
                         break;
                     }
@@ -459,13 +621,20 @@ fn wrap_text(
                 let gs = g;
                 let cp3 = crate::utf8::decode(&s[..atom_end], &mut g);
                 let gw3 = lw_glyph_width(cp3);
+                w.note_direct(s, gs, g, cp3, gw3);
                 let gwidth = if gw3 == 2 { 2 } else { 1 };
                 if cx > 0 && cx + gwidth > w.content_w {
                     w.end_line(*max_lh);
                     cx = 0;
                     *max_lh = lh;
                 }
-                w.push_merge(&s[gs..g], gs, w.content_x + cx, gwidth, st);
+                w.push_merge(
+                    &s[gs..g],
+                    ProvSpan::new(prov, base + gs, base + g),
+                    w.content_x + cx,
+                    gwidth,
+                    st,
+                );
                 cx += gwidth;
             }
             continue;
@@ -473,7 +642,7 @@ fn wrap_text(
 
         w.push_merge(
             &s[atom_start..atom_end],
-            atom_start,
+            ProvSpan::new(prov, base + atom_start, base + atom_end),
             w.content_x + cx,
             atom_w,
             st,
@@ -488,17 +657,34 @@ struct Piece {
     text: Str,
     st: Style,
     br: bool,
+    /// 由来位置クラス（merge 追跡。テキストは `Src(固有 id)`、img 占位は `Syn`）。
+    prov: Prov,
+    /// 由来位置の起点（`Syn` では合成アリーナの start。`Src` では 0）。
+    base: usize,
 }
 
-fn flatten_into(pieces: &mut Vec<Piece>, lc: &Lc, n: NodeId, st: Style) {
+/// C の `flat_push` 相当（pieces scratch の grow イベントを追跡モデルに畳む）。
+fn flat_push(pieces: &mut Vec<Piece>, lc: &Lc, p: Piece) {
+    lc.grow_model(&lc.pieces_cap, pieces.len() as u32 + 1);
+    pieces.push(p);
+}
+
+fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, st: Style) {
     let node = lc.dom.node(n);
     match node.kind {
         NodeKind::Text => {
-            pieces.push(Piece {
-                text: node.name.clone(),
-                st,
-                br: false,
-            });
+            let prov = lc.fresh_prov();
+            flat_push(
+                pieces,
+                lc,
+                Piece {
+                    text: node.name.clone(),
+                    st,
+                    br: false,
+                    prov,
+                    base: 0,
+                },
+            );
         }
         NodeKind::Element => {
             let est = lc.styles[n as usize].unwrap_or(st);
@@ -507,11 +693,17 @@ fn flatten_into(pieces: &mut Vec<Piece>, lc: &Lc, n: NodeId, st: Style) {
             }
             match node.tag {
                 TAG_BR => {
-                    pieces.push(Piece {
-                        text: Vec::new(),
-                        st: est,
-                        br: true,
-                    });
+                    flat_push(
+                        pieces,
+                        lc,
+                        Piece {
+                            text: Vec::new(),
+                            st: est,
+                            br: true,
+                            prov: Prov::Never,
+                            base: 0,
+                        },
+                    );
                     return;
                 }
                 TAG_IMG => {
@@ -520,18 +712,50 @@ fn flatten_into(pieces: &mut Vec<Piece>, lc: &Lc, n: NodeId, st: Style) {
                     let mut text = b"[img: ".to_vec();
                     text.extend_from_slice(&alt[..m]);
                     text.push(b']');
-                    pieces.push(Piece {
-                        text,
-                        st: est,
-                        br: false,
-                    });
+                    // C は placeholder を layout arena に 8B アライン bump 確保する
+                    // （連続 placeholder がポインタ隣接し得る = merge の追跡対象）。
+                    let (base, _) = lc.syn_alloc(text.len());
+                    flat_push(
+                        pieces,
+                        lc,
+                        Piece {
+                            text,
+                            st: est,
+                            br: false,
+                            prov: Prov::Syn,
+                            base,
+                        },
+                    );
+                    return;
+                }
+                TAG_A => {
+                    // C の collect_link + flat_push_prec の grow イベント写し
+                    // （links/prec 配列の arena alloc が合成 placeholder の隣接鎖を切る）。
+                    let ln0 = lc.n_links.get();
+                    let href_ok = lc.dom.attr(n, b"href").is_some_and(|h| !h.is_empty());
+                    if href_ok {
+                        lc.grow_model(&lc.links_cap, ln0 + 1);
+                        lc.n_links.set(ln0 + 1);
+                    }
+                    // rec = !no_boxlink && n_links != ln0。本経路（non-linear 写し）では
+                    // no_boxlink=false 固定のため rec == href_ok。
+                    let rec = href_ok;
+                    let mut c = node.first_child;
+                    while let Some(cid) = c {
+                        flatten_into(pieces, n_prec, lc, cid, est);
+                        c = lc.dom.node(cid).next_sibling;
+                    }
+                    if rec && *n_prec < 4096 {
+                        lc.grow_model(&lc.prec_cap, *n_prec + 1);
+                        *n_prec += 1;
+                    }
                     return;
                 }
                 _ => {}
             }
             let mut c = node.first_child;
             while let Some(cid) = c {
-                flatten_into(pieces, lc, cid, est);
+                flatten_into(pieces, n_prec, lc, cid, est);
                 c = lc.dom.node(cid).next_sibling;
             }
         }
@@ -558,7 +782,8 @@ fn layout_ifc(
         line_w: 0,
         align_st: base_st,
         pm_st: None,
-        pm_end: None,
+        pm_key: None,
+        direct_all: true,
         lines,
     };
     let mut max_lh = if base_st.line_height > 0.0 {
@@ -570,20 +795,27 @@ fn layout_ifc(
 
     // flatten（DOM をピース列へ）
     let mut pieces = Vec::new();
+    let mut n_prec = 0u32; // ブロック内の <a> span 収集数（C の f->n_prec 写し）
     let mut c = Some(cur);
     while let Some(cid) = c {
         let cnode = lc.dom.node(cid);
         if cnode.kind == NodeKind::Element {
-            let cst = lc.styles[cid as usize].unwrap_or(base_st);
-            if cst.display == D_NONE {
-                c = cnode.next_sibling;
-                continue;
-            }
-            if cst.display != D_INLINE {
-                break; // ブロック子: run 終了
+            // C の run walk は「style が貼っていない要素はゲート不発」で
+            // flatten を継続する（--no-style では block 指定の要素すら
+            // run を終わらせない = 全文が 1 つの IFC に融合する quirk。
+            // style 未適用時の再現に必要）。自身の style が無い要素は
+            // 継承値でゲートせず、Some のときだけ D_NONE/D_INLINE を見る。
+            if let Some(cst) = lc.styles[cid as usize] {
+                if cst.display == D_NONE {
+                    c = cnode.next_sibling;
+                    continue;
+                }
+                if cst.display != D_INLINE {
+                    break; // ブロック子: run 終了
+                }
             }
         }
-        flatten_into(&mut pieces, lc, cid, base_st);
+        flatten_into(&mut pieces, &mut n_prec, lc, cid, base_st);
         c = lc.dom.node(cid).next_sibling;
     }
 
@@ -607,6 +839,8 @@ fn layout_ifc(
             ppre,
             &mut max_lh,
             &mut any_text,
+            piece.prov,
+            piece.base,
         );
     }
     if !w.segs.is_empty() || any_text {
@@ -635,12 +869,21 @@ fn layout_element(lc: &Lc, node: NodeId, st: Style, ax: i32, ay: i32, avail_w: i
             w: g.bl + g.pl + g.content_w + g.pr + g.brd,
             h: g.bt + 1 + g.bbo,
             text_align: 0,
+            direct: false,
             children: Vec::new(),
         };
     }
 
     let mut children = Vec::new();
-    let content_h = layout_children(lc, node, st, content_x, content_y, g.content_w, &mut children);
+    let content_h = layout_children(
+        lc,
+        node,
+        st,
+        content_x,
+        content_y,
+        g.content_w,
+        &mut children,
+    );
     let content_h = if g.height_spec >= 0 && g.height_spec > content_h {
         g.height_spec // 指定高はクリップせず拡張のみ
     } else {
@@ -657,8 +900,28 @@ fn layout_element(lc: &Lc, node: NodeId, st: Style, ax: i32, ay: i32, avail_w: i
         w: g.bl + g.pl + g.content_w + g.pr + g.brd,
         h: g.bt + g.pt + content_h + g.pb + g.bbo,
         text_align: 0,
+        direct: false,
         children,
     }
+}
+
+/// 「純ブロック容器」タグ集合。C `layout.c` の `ws_sink_parent` 相当（`md.c` の
+/// `mo_ws_sink` と同じ集合）。md fast-DOM はこれら直下の ws-only TEXT を剥がすが、
+/// 旧 DOM では当該 ws TEXT が ifc 経由で `prev_mb` を 0 にしていたので、剥がし後も
+/// 同じ容器の兄弟では相殺を無効化して逐語同値を保つ（`layout_children` 参照）。
+fn ws_sink_parent(tag: Tag) -> bool {
+    matches!(
+        tag,
+        TAG_BODY
+            | TAG_BLOCKQUOTE
+            | TAG_TABLE
+            | TAG_THEAD
+            | TAG_TBODY
+            | TAG_TR
+            | TAG_UL
+            | TAG_OL
+            | TAG_SECTION
+    )
 }
 
 /// node の子を走査して配置し、content 高を返す。C の `layout_children` 相当。
@@ -673,6 +936,8 @@ fn layout_children(
 ) -> i32 {
     let mut y = content_y;
     let mut prev_mb = 0;
+    // ws 相殺補正は親タグのみの関数 → ループ不変（C と同じ構成）
+    let sinkp = lc.dom.md_ws_stripped && ws_sink_parent(lc.dom.node(node).tag);
     let mut c = lc.dom.node(node).first_child;
     while let Some(cid) = c {
         let cnode = lc.dom.node(cid);
@@ -699,6 +964,11 @@ fn layout_children(
         children.push(child);
         y += child_h;
         prev_mb = cg.mb;
+        if sinkp {
+            // 旧 DOM では sink 容器直下の ws TEXT が ifc 経由で必ず prev_mb を 0 に
+            // していた → 剥がし後の同値補正（C `layout.c` / `md.c` 参照）
+            prev_mb = 0;
+        }
         c = cnode.next_sibling;
     }
     y - content_y
@@ -711,6 +981,12 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
         dom,
         styles,
         root_fs: 16.0,
+        syn_pos: std::cell::Cell::new(0),
+        pieces_cap: std::cell::Cell::new(0),
+        links_cap: std::cell::Cell::new(0),
+        n_links: std::cell::Cell::new(0),
+        prec_cap: std::cell::Cell::new(0),
+        prov_seq: std::cell::Cell::new(0),
     };
 
     let mut body: Option<NodeId> = None;
@@ -746,6 +1022,7 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
                 w: 0,
                 h: 0,
                 text_align: 0,
+                direct: false,
                 children: Vec::new(),
             },
             width: width_cells,
@@ -798,7 +1075,9 @@ fn dump_box(b: &BoxNode, dom: &Dom, depth: usize, out: &mut Vec<u8>) {
             out.extend_from_slice(b"\"\n");
         }
         BoxKind::Block => {
-            out.extend_from_slice(format!("BLOCK x={} y={} w={} h={}", b.x, b.y, b.w, b.h).as_bytes());
+            out.extend_from_slice(
+                format!("BLOCK x={} y={} w={} h={}", b.x, b.y, b.w, b.h).as_bytes(),
+            );
             if let Some(nid) = b.node {
                 out.push(b' ');
                 out.push(b'<');
@@ -853,7 +1132,10 @@ mod tests {
         // body(8px margin=1行) → p(1em margin=1行) → LINE "hello"
         assert!(d.contains("BLOCK x=1 y=1 w=98 h=2 <body>"), "got: {d}");
         assert!(d.contains("BLOCK x=1 y=2 w=98 h=1 <p>"), "got: {d}");
-        assert!(d.contains("LINE x=1 y=2 w=5 h=1 segs=1 \"hello\""), "got: {d}");
+        assert!(
+            d.contains("LINE x=1 y=2 w=5 h=1 segs=1 \"hello\""),
+            "got: {d}"
+        );
     }
 
     #[test]

@@ -272,7 +272,11 @@ pub struct TlsClient {
 impl TlsClient {
     /// TLS ハンドシェイク込みで接続（C の `if_tls_client` 相当）。失敗で分類文字列
     /// （`"ca"` / `"tls"` / `"cert"` / `"send"` / `"recv"`）を返す。
-    pub fn connect(stream: TcpStream, host: &str, anchors: &[TrustAnchor]) -> Result<Self, &'static str> {
+    pub fn connect(
+        stream: TcpStream,
+        host: &str,
+        anchors: &[TrustAnchor],
+    ) -> Result<Self, &'static str> {
         if anchors.is_empty() {
             return Err("ca");
         }
@@ -292,12 +296,7 @@ impl TlsClient {
             let scp = tls.sc.as_mut_ptr() as *mut c_void;
             let xcp = tls.xc.as_mut_ptr() as *mut c_void;
             let iobufp = tls.iobuf.as_mut_ptr() as *mut u8;
-            br_ssl_client_init_full(
-                scp,
-                xcp,
-                tls._anchor_vec.as_ptr(),
-                tls._anchor_vec.len(),
-            );
+            br_ssl_client_init_full(scp, xcp, tls._anchor_vec.as_ptr(), tls._anchor_vec.len());
             ifuto_br_ssl_engine_set_versions(scp, BR_TLS12 as c_uint, BR_TLS12 as c_uint);
             br_ssl_engine_set_buffer(scp, iobufp, BR_SSL_BUFSIZE_BIDI, 1);
             if br_ssl_client_reset(scp, host_c.as_ptr(), 0) == 0 {
@@ -334,7 +333,11 @@ impl TlsClient {
                 if e == BR_ERR_OK {
                     return RunResult::Eof; // close_notify 正常
                 }
-                return RunResult::Err(if (33..=63).contains(&e) { "cert" } else { "tls" });
+                return RunResult::Err(if (33..=63).contains(&e) {
+                    "cert"
+                } else {
+                    "tls"
+                });
             }
             if state & target != 0 {
                 return RunResult::Ok;

@@ -125,7 +125,10 @@ mod tests {
 
     #[test]
     fn get_prop_basic() {
-        assert_eq!(style_get_prop(b"color: blue;", b"color"), Some(&b"blue"[..]));
+        assert_eq!(
+            style_get_prop(b"color: blue;", b"color"),
+            Some(&b"blue"[..])
+        );
         assert_eq!(style_get_prop(b"color:blue", b"color"), Some(&b"blue"[..]));
         // CI
         assert_eq!(style_get_prop(b"COLOR: red", b"color"), Some(&b"red"[..]));
@@ -147,10 +150,19 @@ mod tests {
         // 空 style → 追加
         assert_eq!(style_set_prop(b"", b"color", b"blue"), b"color:blue");
         // 既存置換（C は末尾 ';' を付けない）
-        assert_eq!(style_set_prop(b"color:red;", b"color", b"blue"), b"color:blue");
-        assert_eq!(style_set_prop(b"color:red", b"color", b"blue"), b"color:blue");
+        assert_eq!(
+            style_set_prop(b"color:red;", b"color", b"blue"),
+            b"color:blue"
+        );
+        assert_eq!(
+            style_set_prop(b"color:red", b"color", b"blue"),
+            b"color:blue"
+        );
         // CI 置換
-        assert_eq!(style_set_prop(b"COLOR:red;", b"color", b"blue"), b"color:blue");
+        assert_eq!(
+            style_set_prop(b"COLOR:red;", b"color", b"blue"),
+            b"color:blue"
+        );
         // 複数 prop の一部を置換（保持セグメントの ';' は残る）
         assert_eq!(
             style_set_prop(b"margin:1px;color:red;padding:2px;", b"color", b"blue"),
@@ -162,6 +174,10 @@ mod tests {
     fn set_prop_matches_c_quirks() {
         // 空セグメントの重複防止（`;;` → `;`）
         let out = style_set_prop(b"a:1;;", b"color", b"blue");
-        assert!(!out.windows(2).any(|w| w == b";;"), "got: {:?}", String::from_utf8_lossy(&out));
+        assert!(
+            !out.windows(2).any(|w| w == b";;"),
+            "got: {:?}",
+            String::from_utf8_lossy(&out)
+        );
     }
 }

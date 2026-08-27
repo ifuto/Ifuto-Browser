@@ -218,14 +218,17 @@ mod tests {
         let n = NAMED.len();
         assert_eq!(n, 2125, "エントリ数が生成時と乖離");
         // 全エントリ名で find が自分自身を返す（ソート順の一貫性）
-        for i in 0..n {
-            let nm = name_of(&NAMED[i]);
+        for (i, e) in NAMED.iter().enumerate() {
+            let nm = name_of(e);
             let found = find(nm).expect("自分自身を find できない");
-            assert_eq!(found, i, "エントリ {i} ({nm:?}) の find が {found} を返した");
+            assert_eq!(
+                found, i,
+                "エントリ {i} ({nm:?}) の find が {found} を返した"
+            );
         }
         // 全エントリのコードポイント列が 1..=2 個かつ非ゼロ
-        for i in 0..n {
-            let cps = codepoints(&NAMED[i]);
+        for (i, e) in NAMED.iter().enumerate() {
+            let cps = codepoints(e);
             assert!(cps.len() == 1 || cps.len() == 2, "エントリ {i} が {cps:?}");
             assert!(cps.iter().all(|&c| c > 0));
         }
@@ -243,8 +246,10 @@ mod tests {
                 // astral 単一 cp: cp2 は AUX32 index（範囲内）
                 assert!((cp2 as usize) < AUX32.len());
             } else if cp2 != 0 {
-                // 2-cp: 両方 BMP（cp1 はここで BMP 確定、cp2 も BMP）
-                assert!(cp1 <= 0xFFFF && cp2 <= 0xFFFF);
+                // 2-cp: 両方 BMP（cp1 はここで BMP 確定、cp2 も BMP）。
+                // cp1/cp2 は u16 のため <= 0xFFFF は型上自明 — u32 に widen して
+                // 「u32 表現でも BMP に収まっている」ことを検査する意図で残す
+                assert!((cp1 as u32) <= 0xFFFF && (cp2 as u32) <= 0xFFFF);
             }
         }
     }

@@ -214,7 +214,11 @@ impl Obj {
                     }
                 }
             }
-            Obj::Func { fidx: _, env, props } => {
+            Obj::Func {
+                fidx: _,
+                env,
+                props,
+            } => {
                 if let Some(e) = env {
                     out.push(*e);
                 }
@@ -441,14 +445,10 @@ impl ObjTable {
     /// プレーンオブジェクト（または関数）のプロパティを name で読む（無ければ None）。
     pub fn prop_get(&self, id: ObjId, name: ObjId) -> Option<AklVal> {
         match self.get(id) {
-            Some(Obj::Obj(props)) => props
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| *v),
-            Some(Obj::Func { props, .. }) => props
-                .iter()
-                .find(|(n, _)| *n == name)
-                .map(|(_, v)| *v),
+            Some(Obj::Obj(props)) => props.iter().find(|(n, _)| *n == name).map(|(_, v)| *v),
+            Some(Obj::Func { props, .. }) => {
+                props.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
+            }
             _ => None,
         }
     }
@@ -533,9 +533,17 @@ mod tests {
     #[test]
     fn env_parent_chain() {
         let mut t = ObjTable::new();
-        let parent = t.alloc(Obj::Env { vals: vec![], parent: None }).unwrap();
+        let parent = t
+            .alloc(Obj::Env {
+                vals: vec![],
+                parent: None,
+            })
+            .unwrap();
         let child = t
-            .alloc(Obj::Env { vals: vec![AklVal::mk_int(7)], parent: Some(parent) })
+            .alloc(Obj::Env {
+                vals: vec![AklVal::mk_int(7)],
+                parent: Some(parent),
+            })
             .unwrap();
         // child をルート → parent も生存（Env の parent 参照を辿る）
         t.gc(&[vec![AklVal::mk_obj(child)]]);
@@ -546,8 +554,19 @@ mod tests {
     #[test]
     fn func_env_is_child() {
         let mut t = ObjTable::new();
-        let env = t.alloc(Obj::Env { vals: vec![AklVal::mk_int(1)], parent: None }).unwrap();
-        let f = t.alloc(Obj::Func { fidx: 0, env: Some(env), props: Vec::new() }).unwrap();
+        let env = t
+            .alloc(Obj::Env {
+                vals: vec![AklVal::mk_int(1)],
+                parent: None,
+            })
+            .unwrap();
+        let f = t
+            .alloc(Obj::Func {
+                fidx: 0,
+                env: Some(env),
+                props: Vec::new(),
+            })
+            .unwrap();
         // f をルート → env も生存（Func の env 参照を辿る）
         t.gc(&[vec![AklVal::mk_obj(f)]]);
         assert_eq!(t.live(), 2);
@@ -578,21 +597,35 @@ mod tests {
     fn arr_map_basic() {
         let mut t = ObjTable::new();
         let src = t
-            .alloc(Obj::Arr(vec![AklVal::mk_int(1), AklVal::mk_int(2), AklVal::mk_int(3)]))
+            .alloc(Obj::Arr(vec![
+                AklVal::mk_int(1),
+                AklVal::mk_int(2),
+                AklVal::mk_int(3),
+            ]))
             .unwrap();
         let dst = t
-            .arr_map(src, |elem, i| AklVal::mk_int(elem.get_int() * 10 + i as i32))
+            .arr_map(src, |elem, i| {
+                AklVal::mk_int(elem.get_int() * 10 + i as i32)
+            })
             .unwrap();
         match t.get(dst) {
             Some(Obj::Arr(v)) => {
-                assert_eq!(v, &vec![AklVal::mk_int(10), AklVal::mk_int(21), AklVal::mk_int(32)]);
+                assert_eq!(
+                    v,
+                    &vec![AklVal::mk_int(10), AklVal::mk_int(21), AklVal::mk_int(32)]
+                );
             }
             _ => panic!("dst は配列であるべき"),
         }
         // 元配列は不変
         assert_eq!(t.arr_get(src, 0), Some(AklVal::mk_int(1)));
         // 非配列 id は Err
-        let env = t.alloc(Obj::Env { vals: vec![], parent: None }).unwrap();
+        let env = t
+            .alloc(Obj::Env {
+                vals: vec![],
+                parent: None,
+            })
+            .unwrap();
         assert!(t.arr_map(env, |e, _| e).is_err());
     }
 
@@ -628,6 +661,9 @@ mod tests {
         assert_eq!(t.prop_get(o, key), Some(AklVal::mk_int(10)));
         // 非オブジェクトは Err
         let arr = t.alloc(Obj::Arr(Vec::new())).unwrap();
-        assert_eq!(t.prop_set(arr, key, AklVal::UNDEF), Err(ObjError::NotObject));
+        assert_eq!(
+            t.prop_set(arr, key, AklVal::UNDEF),
+            Err(ObjError::NotObject)
+        );
     }
 }

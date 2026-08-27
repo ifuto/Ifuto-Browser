@@ -19,8 +19,8 @@
 //! （C の `IfDom` が `arena` を所有するのに対し、Rust の [`Dom`] は `Vec<Node>` を
 //! 所有する。）
 
-use crate::tags::{self, Tag};
 use crate::strutil::str_eq_ci;
+use crate::tags::{self, Tag};
 
 /// 属性（トークナイザの `Attr` をそのまま共有。名前は ASCII lowercase 正規化済み）。
 pub use crate::html_tok::Attr;
@@ -130,6 +130,13 @@ pub struct Dom {
     pub quirks: bool,
     /// `<title>` のテキスト（見つからなければ空）。
     pub title: Vec<u8>,
+    /// パーサが生成したノード数（C の `dom->n_nodes` 相当）。**増分専用の解析時
+    /// カウンタ**で、解析完了時に `nodes.len()` で凍結する（Rust では解析中に
+    /// 生成されるノードは全て計数対象 = C の `new_node`/`sc_clone` と同集合。
+    /// 仮想 fragment context はノードを持たないため両実装とも不算入）。
+    /// script 等による解析後のノード増減は `nodes.len()` にのみ現れ、
+    /// 本カウンタは変わらない（`; nodes=N` 系の全観測点はこちらを出す）。
+    pub n_nodes: u32,
     /// 回復したパースエラー数（統計用）。
     pub n_errors: u32,
     /// `<script>` 要素を観測（script 実行の走査スイッチ）。
@@ -138,6 +145,12 @@ pub struct Dom {
     pub has_style: bool,
     /// `<selectedcontent>` を観測（customizable select の走査スイッチ）。
     pub has_selectedcontent: bool,
+    /// md fast-DOM（`md::md_to_dom_opts`）で構築され、純ブロック容器直下の
+    /// ws-only TEXT が意図的に剥がされている（C の `dom->md_ws_stripped` 相当）。
+    /// layout はこのビットを見て、当該容器内の兄弟マージン相殺を「ws TEXT が間に
+    /// あった旧 DOM と逐語同じ」結果（相殺無効＝`prev_mb=0`）に補正する。
+    /// 集合の定義は `layout::ws_sink_parent`（= C `md.c` の `mo_ws_sink` と同一）。
+    pub md_ws_stripped: bool,
 }
 
 impl Dom {
@@ -151,10 +164,12 @@ impl Dom {
             root,
             quirks: false,
             title: Vec::new(),
+            n_nodes: 1,
             n_errors: 0,
             has_script: false,
             has_style: false,
             has_selectedcontent: false,
+            md_ws_stripped: false,
         }
     }
 
@@ -247,7 +262,9 @@ impl Dom {
     /// `class` 属性に `cls` が含まれるか（空白区切り・case-sensitive）。
     /// C の `if_dom_has_class` 相当。
     pub fn has_class(&self, n: NodeId, cls: &[u8]) -> bool {
-        let Some(v) = self.attr(n, b"class") else { return false };
+        let Some(v) = self.attr(n, b"class") else {
+            return false;
+        };
         let mut i = 0;
         while i < v.len() {
             while i < v.len() && v[i].is_ascii_whitespace() {
@@ -424,7 +441,11 @@ impl Dom {
     pub fn elements_by_tag(&self, root: NodeId, tag: &[u8], cap: usize) -> (usize, Vec<NodeId>) {
         let any = tag.is_empty() || (tag.len() == 1 && tag[0] == b'*');
         let mut ctx = EbtCtx {
-            tag_id: if any { tags::TAG_UNKNOWN } else { tags::tag_id(tag) },
+            tag_id: if any {
+                tags::TAG_UNKNOWN
+            } else {
+                tags::tag_id(tag)
+            },
             any,
             tag,
             cap,
@@ -531,7 +552,10 @@ impl Dom {
                 out.extend_from_slice(b"| ");
                 Self::ser_indent(out, depth);
                 match node.doctype.as_ref() {
-                    None | Some(Doctype { has_name: false, .. }) => {
+                    None
+                    | Some(Doctype {
+                        has_name: false, ..
+                    }) => {
                         out.extend_from_slice(b"<!DOCTYPE >\n");
                     }
                     Some(d) => {
@@ -607,12 +631,7 @@ impl Dom {
             c = self.node(cid).next_sibling;
         }
         out.extend_from_slice(
-            format!(
-                "; nodes={} errors={} title=\"",
-                self.nodes.len(),
-                self.n_errors
-            )
-            .as_bytes(),
+            format!("; nodes={} errors={} title=\"", self.n_nodes, self.n_errors).as_bytes(),
         );
         out.extend_from_slice(&self.title);
         out.extend_from_slice(b"\"\n");
@@ -772,14 +791,18 @@ fn sel_split(sel: &[u8]) -> Option<Vec<SelPart<'_>>> {
     let mut parts = Vec::new();
     let mut i = 0usize;
     while i < sel.len() {
-        while i < sel.len() && (sel[i] == b' ' || sel[i] == b'\t' || sel[i] == b'\n' || sel[i] == b'\r') {
+        while i < sel.len()
+            && (sel[i] == b' ' || sel[i] == b'\t' || sel[i] == b'\n' || sel[i] == b'\r')
+        {
             i += 1;
         }
         if i >= sel.len() {
             break;
         }
         let st = i;
-        while i < sel.len() && !(sel[i] == b' ' || sel[i] == b'\t' || sel[i] == b'\n' || sel[i] == b'\r') {
+        while i < sel.len()
+            && !(sel[i] == b' ' || sel[i] == b'\t' || sel[i] == b'\n' || sel[i] == b'\r')
+        {
             i += 1;
         }
         if parts.len() >= 4 {
@@ -995,8 +1018,14 @@ mod tests {
 
         d.set_text(body, b"new");
         assert_eq!(d.text_content(body), b"new");
-        assert_eq!(d.node(body).first_child, Some(d.node(body).last_child.unwrap()));
-        assert_eq!(d.node(body).first_child.map(|c| d.node(c).kind), Some(NodeKind::Text));
+        assert_eq!(
+            d.node(body).first_child,
+            Some(d.node(body).last_child.unwrap())
+        );
+        assert_eq!(
+            d.node(body).first_child.map(|c| d.node(c).kind),
+            Some(NodeKind::Text)
+        );
 
         // 空 text は全子除去
         d.set_text(body, b"");
@@ -1106,6 +1135,7 @@ mod tests {
         let body = make_elem(&mut d, html, tags::tag_id(b"body"));
         make_text(&mut d, body, b"hello\nworld");
         d.title = b"T".to_vec();
+        d.n_nodes = 4; // 解析時カウンタを模す（手構築は C 同様カウントされない）
         d.n_errors = 3;
 
         let out = d.dump();
@@ -1114,6 +1144,9 @@ mod tests {
         assert!(s.contains("<html>\n"), "got: {s:?}");
         assert!(s.contains("  <body>\n"), "got: {s:?}");
         assert!(s.contains("#text \"hello\\nworld\""), "got: {s:?}");
-        assert!(s.ends_with("; nodes=4 errors=3 title=\"T\"\n"), "got: {s:?}");
+        assert!(
+            s.ends_with("; nodes=4 errors=3 title=\"T\"\n"),
+            "got: {s:?}"
+        );
     }
 }

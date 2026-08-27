@@ -138,6 +138,10 @@ static char *dup_cap(const char *s, u32 cap) {
     return p;
 }
 
+/* 検証フック（tools/zz_chrome_dump.c から static dup_cap へ到達するための薄い shim。
+ * 本番経路からは呼ばれない。差分 fuzz の C オラクル観測点） */
+char *if_chrome_test_dup_cap(const char *s, u32 cap) { return dup_cap(s, cap); }
+
 /* 構造変化の後にだけ呼ぶ自動セーブ（scroll 移動では呼ばない=書込増幅を禁止。
  * C2 原子的なのでクラッシュしても壊れない） */
 static void autosave(IfChrome *c) {
@@ -438,8 +442,12 @@ void if_chrome_relayout(IfChrome *c, i32 width) {
 i32 if_chrome_scroll(IfChrome *c, i32 delta, i32 vh) {
     IfTab *t = if_chrome_cur(c);
     if (!t || !t->lay) return 0;
-    i32 maxs = t->doc_h > vh ? t->doc_h - vh : 0;
-    t->scroll += delta;
+    /* 極端値で符号溢れする（UBSan 指摘。UB は行為未定義）ため、gcc 実効の
+     * 2 の補数 wrap と同値の明示 wrap 演算に置き換える。観測は不変
+     * （差分 fuzz tools/zz_chrome_diff.py で byte 検証済） */
+    i32 maxs = (i32)((u32)t->doc_h - (u32)vh);
+    if (t->doc_h <= vh) maxs = 0;
+    t->scroll = (i32)((u32)t->scroll + (u32)delta);
     if (t->scroll < 0) t->scroll = 0;
     if (t->scroll > maxs) t->scroll = maxs;
     return t->scroll;
@@ -448,7 +456,8 @@ i32 if_chrome_scroll(IfChrome *c, i32 delta, i32 vh) {
 void if_chrome_scroll_to(IfChrome *c, i32 pos, i32 vh) {
     IfTab *t = if_chrome_cur(c);
     if (!t || !t->lay) return;
-    i32 maxs = t->doc_h > vh ? t->doc_h - vh : 0;
+    i32 maxs = (i32)((u32)t->doc_h - (u32)vh);
+    if (t->doc_h <= vh) maxs = 0;
     t->scroll = pos < 0 ? 0 : (pos > maxs ? maxs : pos);
 }
 
@@ -496,9 +505,15 @@ i32 if_chrome_link_move(IfChrome *c, i32 delta) {
     IfTab *t = if_chrome_cur(c);
     if (!t || !t->lay || t->lay->n_links == 0) { t && (t->link_idx = -1); return -1; }
     i32 n = (i32)t->lay->n_links;
-    if (t->link_idx < 0) t->link_idx = (delta >= 0) ? 0 : n - 1;
-    else t->link_idx = (t->link_idx + delta) % n;
-    if (t->link_idx < 0) t->link_idx += n;
+    /* scroll と同じく符号溢れを明示 wrap 化。加えて 2 箇所の UB/crash を排除:
+     * - x % -1 は x86 idiv が INT_MIN で SIGFPE する UB（fuzz がクラッシュを
+     *   検出）。数学的には x % -1 == 0 なのでガード挿入（旧観測が変わるのは
+     *   従来クラッシュしていた入力のみ）
+     * - 末尾の += n も INT_MIN 近傍で符号溢れ UB → 明示 wrap 化 */
+    if (t->link_idx < 0) t->link_idx = (delta >= 0) ? 0 : (i32)((u32)n - 1u);
+    else if (n == -1) t->link_idx = 0;
+    else t->link_idx = (i32)((u32)t->link_idx + (u32)delta) % n;
+    if (t->link_idx < 0) t->link_idx = (i32)((u32)t->link_idx + (u32)n);
     return t->link_idx;
 }
 
@@ -541,6 +556,9 @@ static bool ci_contains(const char *hay, const char *needle) {
     }
     return false;
 }
+
+/* 検証フック（dup_cap フックと同経緯。tools/zz_chrome_dump.c の C オラクル観測点） */
+bool if_chrome_test_ci_contains(const char *h, const char *n) { return ci_contains(h, n); }
 
 i32 if_chrome_find_tabs(const IfChrome *c, const char *query, i32 *idx_out, i32 max) {
     if (max <= 0 || !query || !query[0]) return 0;

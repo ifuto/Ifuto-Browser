@@ -43,7 +43,16 @@ mod tests {
     #[test]
     fn fill_matches_scalar() {
         // C の test_raster.c の任意オフセット・任意長・任意色で一致を再現
-        let vals = [0u32, 0xFFFF_FFFF, 0xFF_FFFF, 0x11_1111, 0x3D5AF1, 0xF5F5F0, 0x00FF00, 0x8000_0001];
+        let vals = [
+            0u32,
+            0xFFFF_FFFF,
+            0xFF_FFFF,
+            0x11_1111,
+            0x3D5AF1,
+            0xF5F5F0,
+            0x00FF00,
+            0x8000_0001,
+        ];
         let ns = [0usize, 1, 2, 3, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 65];
         for &v in &vals {
             for &n in &ns {

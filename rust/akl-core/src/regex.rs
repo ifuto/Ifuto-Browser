@@ -35,7 +35,11 @@ enum RegexNode {
     /// 任意の 1 文字（`.`）。
     Any,
     /// 文字クラス `[...]`（否定フラグ + 文字集合）。
-    Class { negated: bool, chars: Vec<char>, ranges: Vec<(char, char)> },
+    Class {
+        negated: bool,
+        chars: Vec<char>,
+        ranges: Vec<(char, char)>,
+    },
     /// 連結。
     Concat(Vec<RegexNode>),
     /// 代替 `|`。
@@ -45,7 +49,10 @@ enum RegexNode {
     /// グループ（index=捕捉番号）。
     Group(usize, Box<RegexNode>),
     /// 先読み `(?=...)` / `(?!...)`（ゼロ幅。positive=true なら肯定）。
-    LookAhead { positive: bool, inner: Box<RegexNode> },
+    LookAhead {
+        positive: bool,
+        inner: Box<RegexNode>,
+    },
     /// 行頭 `^`。
     Start,
     /// 行末 `$`。
@@ -58,7 +65,12 @@ const FLAG_IGNORE_CASE: u32 = 1;
 impl Regex {
     /// 正規表現をコンパイルする。失敗時はエラーメッセージ。
     pub fn compile(pattern: &str, flags: u32) -> Result<Self, String> {
-        let mut parser = Parser { chars: pattern.chars().collect(), pos: 0, flags, group_count: 0 };
+        let mut parser = Parser {
+            chars: pattern.chars().collect(),
+            pos: 0,
+            flags,
+            group_count: 0,
+        };
         let mut branches = Vec::new();
         branches.push(parser.parse_alt()?);
         while parser.pos < parser.chars.len() {
@@ -70,7 +82,12 @@ impl Regex {
             }
         }
         let ncap = parser.group_count;
-        Ok(Regex { pattern: pattern.to_string(), flags, branches, ncap })
+        Ok(Regex {
+            pattern: pattern.to_string(),
+            flags,
+            branches,
+            ncap,
+        })
     }
 
     /// マッチを試みる。成功時 Some(捕捉グループ)、失敗時 None。
@@ -320,13 +337,19 @@ impl Parser {
                             self.pos += 1;
                             let inner = self.parse_alt()?;
                             self.expect_close_group()?;
-                            return Ok(RegexNode::LookAhead { positive: true, inner: Box::new(inner) });
+                            return Ok(RegexNode::LookAhead {
+                                positive: true,
+                                inner: Box::new(inner),
+                            });
                         }
                         Some('!') => {
                             self.pos += 1;
                             let inner = self.parse_alt()?;
                             self.expect_close_group()?;
-                            return Ok(RegexNode::LookAhead { positive: false, inner: Box::new(inner) });
+                            return Ok(RegexNode::LookAhead {
+                                positive: false,
+                                inner: Box::new(inner),
+                            });
                         }
                         _ => return Err("unsupported group construct".to_string()),
                     }
@@ -359,8 +382,16 @@ impl Parser {
                 self.pos += 1;
                 // 文字クラスエスケープ（\d \w \s と否定形）。範囲/文字集合へ展開する。
                 match e {
-                    'd' => Ok(RegexNode::Class { negated: false, chars: vec![], ranges: vec![('0', '9')] }),
-                    'D' => Ok(RegexNode::Class { negated: true, chars: vec![], ranges: vec![('0', '9')] }),
+                    'd' => Ok(RegexNode::Class {
+                        negated: false,
+                        chars: vec![],
+                        ranges: vec![('0', '9')],
+                    }),
+                    'D' => Ok(RegexNode::Class {
+                        negated: true,
+                        chars: vec![],
+                        ranges: vec![('0', '9')],
+                    }),
                     'w' => Ok(RegexNode::Class {
                         negated: false,
                         chars: vec!['_'],
@@ -391,7 +422,9 @@ impl Parser {
                         self.pos += 1;
                         let h = hi.to_digit(16).ok_or("bad \\x escape")?;
                         let l = lo.to_digit(16).ok_or("bad \\x escape")?;
-                        Ok(RegexNode::Literal(char::from_u32(h * 16 + l).unwrap_or('?')))
+                        Ok(RegexNode::Literal(
+                            char::from_u32(h * 16 + l).unwrap_or('?'),
+                        ))
                     }
                     'n' => Ok(RegexNode::Literal('\n')),
                     't' => Ok(RegexNode::Literal('\t')),
@@ -422,7 +455,11 @@ impl Parser {
         while let Some(c) = self.peek() {
             if c == ']' {
                 self.pos += 1;
-                return Ok(RegexNode::Class { negated, chars, ranges });
+                return Ok(RegexNode::Class {
+                    negated,
+                    chars,
+                    ranges,
+                });
             }
             // 先頭文字（エスケープ処理込み）。None は \d/\s/\w を展開済み。
             let c = match self.read_class_char(&mut chars, &mut ranges)? {
@@ -555,13 +592,19 @@ fn match_at(
                 false
             }
         }
-        RegexNode::Class { negated, chars: cl, ranges } => {
+        RegexNode::Class {
+            negated,
+            chars: cl,
+            ranges,
+        } => {
             if pos >= chars.len() {
                 return false;
             }
             let tc = chars[pos];
             let in_class = cl.iter().any(|c| char_eq(*c, tc, ignore))
-                || ranges.iter().any(|(a, b)| char_in_range(*a, *b, tc, ignore));
+                || ranges
+                    .iter()
+                    .any(|(a, b)| char_in_range(*a, *b, tc, ignore));
             if in_class != *negated {
                 k(pos + 1, caps)
             } else {
