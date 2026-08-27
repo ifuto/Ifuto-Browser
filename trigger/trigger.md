@@ -45,3 +45,5 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # --- 実行ログ: 2026-08-15 git ブランチ方式 + bytecode 型修正後 ---
 
 # --- 実行ログ: 2026-08-15 rust-src 補完 ---
+
+# --- 実行ログ: 2026-08-28 フェーズ 8-z/9-a 反映（8-z byte-exact + chrome 純粋部 + akl-ffi leak 全廃）後の最終確認 ---
