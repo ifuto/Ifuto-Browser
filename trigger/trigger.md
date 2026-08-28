@@ -57,3 +57,5 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 2026-08-28 再実行: akl-ffi コールバックアダプタの Stacked Borrows 根治（参照不生成の生経路化: 180062d）反映後。CMD 5 Miri の緑化を確認（残存指摘があれば同箇所で再発する）。
 
 # 2026-08-28 再実行: akl_native_register &str 往復の SB 違反根治反映後。CMD 5 Miri の full green を確認。
+
+# 2026-08-28 再実行: handle_roundtrip Box::leak 廃止（Miri 漏洩検査）反映後。CMD 5 Miri の full green を確認。
