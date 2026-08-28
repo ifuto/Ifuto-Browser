@@ -1561,3 +1561,75 @@ GUI（`--gui` / `--shot` / `--ui`）と `--ext` の chrome init も依然未移�
 明示拒否形状のみ差分検証済み（8-z 台帳どおり）。zz_chrome fuzz の信頼域は
 `zz_chrome_diff.py` ヘッダのとおり（文字列に NUL/0x01/改行を含まない、
 DUP cap>=1、RES cap の out 観測は 511B まで）。
+
+### フェーズ 10-a: render を行スイープ実装へ全面移植（全グリッド + RowInfo 帳簿の撤廃）
+
+**背景（発見）**: C の CLI render は `if_render_emit_rows_sweep`（行スイープ）で、
+**グリッドを一度も構築しない**（`--stats` の `render_split` が `grid=0.00ms` と
+機械表示する）。対して Rust 旧実装は byte 一致の監査のため paint イベントを
+**全グリッド（16MB コーパスで 852,094 行 × 100 セル × 8B ≒ 682MB）へ畳み込み、
+さらに全行の監査帳簿（RowInfo）を保持**してから発行経路を事後判定していた。
+これは C に存在しない全構造の会費であり、render 段 867.41ms（うち grid 構築
+≈717ms + emit ≈618ms）と 16MB RSS 2,523,504KB の主因だった。本フェーズで
+C と同型のフラット streams（lines / deco / seg_arena）を直接消費する逐次発行へ
+一本化した。
+
+変更（`rust/ifuto-core/src/layout.rs` / `render.rs` の全面改訂）:
+
+- `layout.rs`: `RLine{y,direct,seg_lo,seg_hi}` / `DecoKind{Bg,Border,Hline,Marker}`
+  / `Deco` を追加。`BoxNode.segs: Vec<Seg>` を `seg_lo/seg_hi: u32`（`Layout` の
+  `seg_arena` 内共有区間 = C の `w->seg_base` 共有構造の写し）へ置換。`Layout` に
+  `lines` / `deco` / `seg_arena` を追加。`deco_push` / `deco_patch_h` /
+  `deco_marker_push` を新設し、BG（条件 `(bg&0xFF)>=128` + h 後埋め）/ BORDER
+  （sides ビット写し）/ HLINE（hr: y=g.bt、h=1、BG も bh 後埋め）/ MARKER
+  （li_ord カウンタ。ul は x=bx-2 で clamp 基準は **bx**、ol は x=bx-(m+1) で
+  clamp 基準は **0**、の非対称 quirk と `%u.` の u32 幅を保存）を追記。
+- `render.rs`: **全面書き換え**。`render_emit_sweep` = C `sweep_range` 直列経路の
+  機械的写し（ギャップ一括 '\n' 充填 → deco 開始/期限切れ → blank 行 →
+  no-ansi: cp_free 判定 → try_direct / try_fast（runs≤64、安定挿入ソート、
+  失敗時 truncate 巻き戻し、pos は HLINE で未 clip の元 w 進行の写し）→
+  ansi: try_ansi_fast（BG ピース合成 ≤32、MARKER glyph 検査は **ansi 版のみ**
+  で no-ansi fast は非検査、の非対称保存、失敗時 truncate + cur save 復元）→
+  emit_slow（no-ansi maxx 計算 → 既定充填 → deco paint 追記順 → lines paint →
+  trim / 行末リセット））。`emit_pen` は `u8_dec` + 48B スタックバッファ 1 回
+  追記化（`format!` の一時 String 確保を排除、render ≈290→≈213ms 相当の残差
+  削減）。Grid / RowInfo / render_grid / render_emit / fill_bg / paint_shell 等は
+  **全削除**（写し元が C に存在しない車輪のため）。
+- 呼出側: `ifuto-cli/src/main.rs` と `examples/ifuto.rs` を `render_emit_sweep`
+  呼出に差替。`acc_grid = 0.0`（C の CLI sweep 表示 `grid=0.00` に機械一致）。
+- clippy 静粛化: `int_plus_one`（`d.x+d.w-1 >= 0` → `d.x+d.w > 0`、整数同値）と
+  `collapsible_if`（`&&` 畳み込み、短絡で同値）のみ。いずれも同値変形。
+
+性能（`bench/bench_c_vs_rust.py` paired median、2026-08-28。表全量は BENCH.md /
+`bench/data-20260828.json` / `bench/results/report-20260828.html`）:
+
+- 16MB total: 2,404.21 → **1,632.49ms**（C 127.11ms。18.47× → **12.84×**）
+- 16MB render 段: 867.41 → **67.36ms**（C 22.47ms。38.2× → **3.00×**）
+- 16MB peak RSS: 2,523,504 → **1,383,216KB**（**−1.14GB**。11.85× → 6.50×）
+- 2MB total: 310.94 → 195.10ms（16.71× → 9.82×）、RSS 9.51× → 5.28×
+- ANSI 2MB render 段: C 32.02ms / Rust 38.61ms = **1.21×**（byte 密度の高い
+  ansi 発行ではほぼ肉薄）
+- 起動 wall は Rust 優位を継続（1.61 vs 1.82ms、符号 6:144）
+
+検証（2026-08-28 実走、全て緑）:
+
+- **16MB/2MB IDM の C↔Rust stdout byte-exact**: 16MB ansi(既定) 120,298,176B、
+  16MB no-ansi 15,965,641B、2MB 両モード、`cmp` 一致。
+- **diff fuzz 28,000 cases 追加 / 0 mismatch**（seed 1 ×8,000 / 777 ×8,000 /
+  31337 ×12,000）→ **累計 126,133 cases / 0 mismatch**。
+- WPT tree-construction **1922/1922 × 両バイナリ**（C ASan / Rust release）。
+- `make test` 625,125 checks ×2 / 0、`chk_oracle` 21/21 × 両バイナリ（ASan 側
+  LSan 緑を維持）、golden 1/1 ×2、gui_smoke PASS、ext_smoke 12/12、
+  `make fuzz` 500 iters × 5 標的 0 crash。
+- `cargo test --offline` **334 緑**（ifuto-core 176→177。`li_marker_ul_ol` 追加）、
+  `cargo clippy --workspace --all-targets -- -D warnings` 緑、`cargo fmt --all --check` 緑。
+- 計測ベンチの全 177 ペアで stdout byte 一致 + stderr(scrub) 一致を同時検証。
+
+**未移植・既知の近似（台帳継続）**: 2-way 並列 sweep（C の pthread 分割）は未移植
+（発行バイト列は直列と厳密一致が C で保証済みのため byte 観測では区別不能、
+速度差のみ）。窓グリッド経路（`if_render_grid_rows_into(_cur)`、GUI 用で CLI
+不使用）と raster カーネル自動選択も未移植。**残る最大ギャップは style 段**
+（C 0.01ms lazy vs Rust 552.74ms eager。C の `if_style_lazy_*` に相当する DFS
+訪問時解決の移植が次フェーズ候補）、ついで layout 段（736.33ms。
+IfGeomCache / AVX2 可視ラン / 2-way 並列 layout）、parse 段（258.10ms）、
+read 段（8.71ms。`fs::read` → mmap 案、出力同値・観測不変）。

@@ -30,8 +30,12 @@
 //! - 2-way 並列 layout（`IfLayShard` / pthread）
 //! - 線形モード box 再利用（`box_pool` / `no_boxlink`）
 //! - lazy computed style（`if_style_lazy_*`。md fast-DOM 専用）
-//! - link span 収集・deco 装飾 op（dump に現れない。描画層移行時に移植）
+//! - link span 収集（dump に現れない。リンク出力は store 層で担保）
 //! - rdtsc プロファイリング（`IF_LAYOUT_PROF`）
+//!
+//! 描画層移行で実装済み: 行スイープ用フラット streams（C の `lines_head` /
+//! `deco[]` 相当の [`RLine`] / [`Deco`]）。seg の所有は `Layout::seg_arena` に
+//! 集約し、box 木と streams が区間を共有する（C の `w->seg_base` 共有と同値）。
 
 use crate::css::{
     resolve_len, Len, Style, D_BLOCK, D_INLINE, D_LIST_ITEM, D_NONE, TA_CENTER, TA_LEFT, TA_RIGHT,
@@ -40,8 +44,8 @@ use crate::css::{
 use crate::dom::{Dom, NodeId, NodeKind};
 use crate::tags::Tag;
 use crate::tags_tables::{
-    TAG_A, TAG_BLOCKQUOTE, TAG_BODY, TAG_BR, TAG_HR, TAG_HTML, TAG_IMG, TAG_OL, TAG_SECTION,
-    TAG_TABLE, TAG_TBODY, TAG_THEAD, TAG_TR, TAG_UL,
+    TAG_A, TAG_BLOCKQUOTE, TAG_BODY, TAG_BR, TAG_HR, TAG_HTML, TAG_IMG, TAG_LI, TAG_OL,
+    TAG_SECTION, TAG_TABLE, TAG_TBODY, TAG_THEAD, TAG_TR, TAG_UL,
 };
 
 /// セル幅の px 換算（C の `IF_CHAR_W_PX`）。
@@ -74,6 +78,65 @@ pub enum BoxKind {
     Line,
 }
 
+/// 行レコード（C の `IfRLine` 相当）。seg の実体は `Layout::seg_arena` が
+/// 所有し、box 木の LINE BoxNode と区間を共有する（C の `w->seg_base`
+/// ポインタ共有と同値で二重所有はしない）。
+#[derive(Clone, Copy, Debug)]
+pub struct RLine {
+    /// 行 y（セル。行首の絶対座標）。
+    pub y: i32,
+    /// C の `IF_LF_DIRECT_BYTES` 相当（wrap 時の quirk 畳み込み済み）。
+    pub direct: bool,
+    /// `seg_arena` 内の seg 区間の始端。
+    pub seg_lo: u32,
+    /// `seg_arena` 内の seg 区間の終端（半開 [lo, hi)）。
+    pub seg_hi: u32,
+}
+
+/// 装飾 op 種別（C の `IF_DECO_*`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecoKind {
+    /// 背景塗り（cp は触らず bg のみ後勝ち上書き）。
+    Bg,
+    /// 罫線ボーダ（辺 + 角のグリフ）。
+    Border,
+    /// `<hr>` 罫線（1 行の ─ ラン）。
+    Hline,
+    /// li マーカー（"• " or "N."）。
+    Marker,
+}
+
+/// 装飾 op（C の `IfDeco` 相当）。**追記順が paint/受理順**（Box 開で追記され、
+/// Box 閉で h が後埋めされる C の規約をそのまま持つ）。
+#[derive(Clone, Copy, Debug)]
+pub struct Deco {
+    /// 種別。
+    pub kind: DecoKind,
+    /// 開始セル x。
+    pub x: i32,
+    /// 開始行 y。
+    pub y: i32,
+    /// 幅（セル）。
+    pub w: i32,
+    /// 高さ（セル。`h <= 0` は paint 時に 1 扱い = C の `dh = max(h,1)`）。
+    pub h: i32,
+    /// BG: 未変換の `st.bg` RGBA。BORDER: `st.border_color` RGBA。
+    pub argb: u32,
+    /// BORDER の辺旗（1|2|4|8 = 上右下左。C `d->tlen` の sides 写し）。
+    pub sides: u8,
+    // ---- MARKER 専用（C は d->st へのポインタ + d->text[12]/tlen） ----
+    /// MARKER の発行 pen 原料: `st.color`（未変換 RGBA）。
+    pub m_color: u32,
+    /// MARKER の発行 pen 原料: `st.bg`（未変換 RGBA）。
+    pub m_bg: u32,
+    /// MARKER の装飾旗（bold=1|italic=2|uline=4|strike=8。render 側で pen 化）。
+    pub m_flags: u8,
+    /// MARKER 生バイト（"• " = 4B or "N." ≤ 11B。C `d->text[12]`）。
+    pub text: [u8; 12],
+    /// MARKER 生バイト長。
+    pub tlen: u8,
+}
+
 /// ボックス（C の `IfBox` 相当。子を所有 `Vec` で保持）。
 #[derive(Clone, Debug)]
 pub struct BoxNode {
@@ -83,8 +146,11 @@ pub struct BoxNode {
     pub node: Option<NodeId>,
     /// 計算済みスタイル。
     pub st: Style,
-    /// LINE ペイロード。
-    pub segs: Vec<Seg>,
+    /// LINE ペイロードの seg 区間の始端（`Layout::seg_arena` 内。
+    /// BLOCK では常に `0`）。
+    pub seg_lo: u32,
+    /// LINE ペイロードの seg 区間の終端（半開 [lo, hi)。BLOCK では常に `0`）。
+    pub seg_hi: u32,
     /// border-box の絶対 x（セル）。
     pub x: i32,
     /// border-box の絶対 y（セル）。
@@ -114,6 +180,13 @@ pub struct Layout {
     pub width: i32,
     /// 総コンテンツ高（セル）。
     pub height: i32,
+    /// 行スイープ用フラット行列（C の `lines_head` chunked list 相当。
+    /// 生成順 = y 単調非減少。垂直フローのみの空手形）。
+    pub lines: Vec<RLine>,
+    /// 行スイープ用装飾 op 列（C の `deco[]` 相当。追記順 = paint 順）。
+    pub deco: Vec<Deco>,
+    /// 全文書の seg アリーナ（LINE BoxNode と RLine が区間で共有する唯一の所有）。
+    pub seg_arena: Vec<Seg>,
 }
 
 /// レイアウト文脈（C の `IfLC` 相当。DOM/スタイルへの参照）。
@@ -133,6 +206,27 @@ struct Lc<'a> {
     prec_cap: std::cell::Cell<u32>,
     /// テキストノード 1 枚ごとの由来 id 発行器。
     prov_seq: std::cell::Cell<u32>,
+    // --- 描画層 streams（C の lines_head / deco[] / seg arena 相当） ---
+    /// フラット行列（RefCell 経由で再帰中に追記。C の生ポインタ追記と同順）。
+    rlines: std::cell::RefCell<Vec<RLine>>,
+    /// 装飾 op 列（同上）。
+    deco: std::cell::RefCell<Vec<Deco>>,
+    /// seg アリーナ（行確定時に `Wrap::segs` から移動する唯一の所有先）。
+    seg_arena: std::cell::RefCell<Vec<Seg>>,
+}
+
+/// C の `deco_add` 相当。追記 index を返す（h 後埋め用）。
+fn deco_push(lc: &Lc, d: Deco) -> u32 {
+    let mut v = lc.deco.borrow_mut();
+    v.push(d);
+    (v.len() - 1) as u32
+}
+
+/// C の `lay->deco[idx].h = box->h` 相当（`u32::MAX` = 未追記は no-op）。
+fn deco_patch_h(lc: &Lc, idx: u32, h: i32) {
+    if idx != u32::MAX {
+        lc.deco.borrow_mut()[idx as usize].h = h;
+    }
 }
 
 /// seg merge の由来位置クラス（C の `wrap_push_merge` の `pm_end == p` ポインタ
@@ -348,6 +442,10 @@ struct Wrap<'a> {
     direct_all: bool,
     /// LINE ボックスの出力先（親ボックスの子列）。
     lines: &'a mut Vec<BoxNode>,
+    /// 行スイープ用フラット行列（C の行確定時 IfRLine 追記と同点で記録）。
+    rlines: &'a std::cell::RefCell<Vec<RLine>>,
+    /// seg の最終所有先（行確定時に `self.segs` を drain して移す）。
+    seg_arena: &'a std::cell::RefCell<Vec<Seg>>,
 }
 
 fn is_ws(c: u8) -> bool {
@@ -448,11 +546,29 @@ impl<'a> Wrap<'a> {
         }
         let direct = self.direct_all;
         self.direct_all = true; // 次行は既定で有効（無効化は note_direct で畳む）
+                                // seg を共有アリーナへ移し、box と RLine の両方に区間を配る
+                                // （C の `w->seg_base` が line box と IfRLine に共有される構造の写し）。
+        let seg_lo;
+        let seg_hi;
+        {
+            let mut arena = self.seg_arena.borrow_mut();
+            seg_lo = arena.len() as u32;
+            arena.append(&mut self.segs);
+            seg_hi = arena.len() as u32;
+        }
+        // C は行確定時に y 加算「前」の w->y を IfRLine に記録する（box y と同値）。
+        self.rlines.borrow_mut().push(RLine {
+            y: self.y,
+            direct,
+            seg_lo,
+            seg_hi,
+        });
         let line = BoxNode {
             kind: BoxKind::Line,
             node: None,
             st: self.align_st,
-            segs: std::mem::take(&mut self.segs),
+            seg_lo,
+            seg_hi,
             x: self.content_x,
             y: self.y,
             w: self.line_w,
@@ -785,6 +901,8 @@ fn layout_ifc(
         pm_key: None,
         direct_all: true,
         lines,
+        rlines: &lc.rlines,
+        seg_arena: &lc.seg_arena,
     };
     let mut max_lh = if base_st.line_height > 0.0 {
         base_st.line_height
@@ -857,22 +975,92 @@ fn layout_element(lc: &Lc, node: NodeId, st: Style, ax: i32, ay: i32, avail_w: i
     let content_x = x + g.bl + g.pl;
     let y = ay; // margin-top は呼び出し側（兄弟相殺）で処理済み
     let content_y = y + g.bt + g.pt;
+    let full_w = g.bl + g.pl + g.content_w + g.pr + g.brd;
+
+    // 行スイープ用装飾 op（DFS=paint 順: 親の装飾は子より先に追記される。
+    // C layout.c の deco_add 群の写し。h は box 確定後に後埋め）
+    let deco_bg = if (st.bg & 0xFF) >= 128 {
+        deco_push(
+            lc,
+            Deco {
+                kind: DecoKind::Bg,
+                x,
+                y,
+                w: full_w,
+                h: 0, // 後埋め
+                argb: st.bg,
+                sides: 0,
+                m_color: 0,
+                m_bg: 0,
+                m_flags: 0,
+                text: [0; 12],
+                tlen: 0,
+            },
+        )
+    } else {
+        u32::MAX
+    };
 
     if lc.dom.node(node).tag == TAG_HR {
+        let bh = g.bt + 1 + g.bbo;
+        // paint_shell の HR: bt を除いた行へ罫線（既定フルペン。C と同一）
+        deco_push(
+            lc,
+            Deco {
+                kind: DecoKind::Hline,
+                x,
+                y: y + g.bt,
+                w: full_w,
+                h: 1,
+                argb: 0,
+                sides: 0,
+                m_color: 0,
+                m_bg: 0,
+                m_flags: 0,
+                text: [0; 12],
+                tlen: 0,
+            },
+        );
+        deco_patch_h(lc, deco_bg, bh);
         return BoxNode {
             kind: BoxKind::Block,
             node: Some(node),
             st,
-            segs: Vec::new(),
+            seg_lo: 0,
+            seg_hi: 0,
             x,
             y,
-            w: g.bl + g.pl + g.content_w + g.pr + g.brd,
-            h: g.bt + 1 + g.bbo,
+            w: full_w,
+            h: bh,
             text_align: 0,
             direct: false,
             children: Vec::new(),
         };
     }
+
+    let deco_bd = if (g.bl | g.brd | g.bt | g.bbo) != 0 {
+        let sides =
+            ((g.bt & 1) | ((g.brd & 1) << 1) | ((g.bbo & 1) << 2) | ((g.bl & 1) << 3)) as u8;
+        deco_push(
+            lc,
+            Deco {
+                kind: DecoKind::Border,
+                x,
+                y,
+                w: full_w,
+                h: 0, // 後埋め
+                argb: st.border_color,
+                sides,
+                m_color: 0,
+                m_bg: 0,
+                m_flags: 0,
+                text: [0; 12],
+                tlen: 0,
+            },
+        )
+    } else {
+        u32::MAX
+    };
 
     let mut children = Vec::new();
     let content_h = layout_children(
@@ -890,19 +1078,94 @@ fn layout_element(lc: &Lc, node: NodeId, st: Style, ax: i32, ay: i32, avail_w: i
         content_h
     };
 
+    let bh = g.bt + g.pt + content_h + g.pb + g.bbo;
+    deco_patch_h(lc, deco_bg, bh);
+    deco_patch_h(lc, deco_bd, bh);
     BoxNode {
         kind: BoxKind::Block,
         node: Some(node),
         st,
-        segs: Vec::new(),
+        seg_lo: 0,
+        seg_hi: 0,
         x,
         y,
-        w: g.bl + g.pl + g.content_w + g.pr + g.brd,
-        h: g.bt + g.pt + content_h + g.pb + g.bbo,
+        w: full_w,
+        h: bh,
         text_align: 0,
         direct: false,
         children,
     }
+}
+
+/// C layout.c の MARKER deco 追記（配置は li box 左端手前/上端。x,y はこの時点で
+/// 確定済み）。呼び出し側の事前条件: `c->tag == IF_TAG_LI && display == LIST_ITEM`。
+/// `li_ord` は「この親で自分より前の LIST_ITEM li 数+1」（draw_marker 同値で O(1)）。
+fn deco_marker_push(
+    lc: &Lc,
+    li: NodeId,
+    cst: Style,
+    content_x: i32,
+    ml: i32,
+    y: i32,
+    li_ord: &mut u32,
+) {
+    *li_ord += 1;
+    // 直近の祖先 ul/ol を探す（ネストした li の外には出ない）。render の draw_marker と同値
+    let mut list = TAG_UL;
+    let mut p = lc.dom.node(li).parent;
+    while let Some(pid) = p {
+        let pn = lc.dom.node(pid);
+        if pn.kind == NodeKind::Element && (pn.tag == TAG_UL || pn.tag == TAG_OL) {
+            list = pn.tag;
+            break;
+        }
+        if pn.kind == NodeKind::Element && pn.tag == TAG_LI {
+            break;
+        }
+        p = pn.parent;
+    }
+    let m_flags = (cst.bold as u8)
+        | ((cst.italic as u8) << 1)
+        | ((cst.underline as u8) << 2)
+        | ((cst.strike as u8) << 3);
+    let bx = content_x + ml;
+    let (mx, w, text, tlen) = if list == TAG_UL {
+        let mut mx = bx - 2;
+        if mx < 0 {
+            mx = bx; // C の clamp は 0 ではなく bx（quirk 保存）
+        }
+        let mut t = [0u8; 12];
+        t[..4].copy_from_slice(b"\xE2\x80\xA2 "); // "• "
+        (mx, 2, t, 4u8)
+    } else {
+        // C snprintf("%u.") 相当（u32 最大 10 桁 + '.' = 11B ≤ 12 で truncate しない）
+        let nb = format!("{}.", li_ord);
+        let m = nb.len();
+        let mut mx = bx - (m as i32 + 1);
+        if mx < 0 {
+            mx = 0; // ol は 0 clamp（ul と非対称。C どおり）
+        }
+        let mut t = [0u8; 12];
+        t[..m].copy_from_slice(nb.as_bytes());
+        (mx, m as i32, t, m as u8)
+    };
+    deco_push(
+        lc,
+        Deco {
+            kind: DecoKind::Marker,
+            x: mx,
+            y,
+            w,
+            h: 1,
+            argb: 0,
+            sides: 0,
+            m_color: cst.color,
+            m_bg: cst.bg,
+            m_flags,
+            text,
+            tlen,
+        },
+    );
 }
 
 /// 「純ブロック容器」タグ集合。C `layout.c` の `ws_sink_parent` 相当（`md.c` の
@@ -936,7 +1199,8 @@ fn layout_children(
 ) -> i32 {
     let mut y = content_y;
     let mut prev_mb = 0;
-    // ws 相殺補正は親タグのみの関数 → ループ不変（C と同じ構成）
+    let mut li_ord = 0u32; // ol 番号: この親の LIST_ITEM li を出現順に数える（C の li_ord 写し）
+                           // ws 相殺補正は親タグのみの関数 → ループ不変（C と同じ構成）
     let sinkp = lc.dom.md_ws_stripped && ws_sink_parent(lc.dom.node(node).tag);
     let mut c = lc.dom.node(node).first_child;
     while let Some(cid) = c {
@@ -959,6 +1223,9 @@ fn layout_children(
         let cst = cst.unwrap();
         let cg = geom(&cst, lc.root_fs, content_w);
         y += prev_mb.max(cg.mt); // 兄弟縦マージン相殺: max
+        if cnode.tag == TAG_LI && cst.display == D_LIST_ITEM {
+            deco_marker_push(lc, cid, cst, content_x, cg.ml, y, &mut li_ord);
+        }
         let child = layout_element(lc, cid, cst, content_x, y, content_w);
         let child_h = child.h;
         children.push(child);
@@ -987,6 +1254,9 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
         n_links: std::cell::Cell::new(0),
         prec_cap: std::cell::Cell::new(0),
         prov_seq: std::cell::Cell::new(0),
+        rlines: std::cell::RefCell::new(Vec::new()),
+        deco: std::cell::RefCell::new(Vec::new()),
+        seg_arena: std::cell::RefCell::new(Vec::new()),
     };
 
     let mut body: Option<NodeId> = None;
@@ -1016,7 +1286,8 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
                 kind: BoxKind::Block,
                 node: None,
                 st: STYLE_FALLBACK,
-                segs: Vec::new(),
+                seg_lo: 0,
+                seg_hi: 0,
                 x: 0,
                 y: 0,
                 w: 0,
@@ -1026,6 +1297,9 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
                 children: Vec::new(),
             },
             width: width_cells,
+            lines: Vec::new(),
+            deco: Vec::new(),
+            seg_arena: Vec::new(),
             height: 0,
         };
     };
@@ -1039,16 +1313,20 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
         root,
         width: width_cells,
         height,
+        lines: lc.rlines.into_inner(),
+        deco: lc.deco.into_inner(),
+        seg_arena: lc.seg_arena.into_inner(),
     }
 }
 
 /// ボックス木ダンプ（C の `if_layout_dump` 相当。raw バイトで出力）。
-fn dump_box(b: &BoxNode, dom: &Dom, depth: usize, out: &mut Vec<u8>) {
+fn dump_box(b: &BoxNode, dom: &Dom, arena: &[Seg], depth: usize, out: &mut Vec<u8>) {
     for _ in 0..depth {
         out.extend_from_slice(b"  ");
     }
     match b.kind {
         BoxKind::Line => {
+            let segs = &arena[b.seg_lo as usize..b.seg_hi as usize];
             out.extend_from_slice(
                 format!(
                     "LINE x={} y={} w={} h={} segs={} \"",
@@ -1056,11 +1334,11 @@ fn dump_box(b: &BoxNode, dom: &Dom, depth: usize, out: &mut Vec<u8>) {
                     b.y,
                     b.w,
                     b.h,
-                    b.segs.len()
+                    segs.len()
                 )
                 .as_bytes(),
             );
-            for seg in &b.segs {
+            for seg in segs {
                 for (k, &ch) in seg.text.iter().enumerate() {
                     if k >= 60 {
                         break;
@@ -1086,7 +1364,7 @@ fn dump_box(b: &BoxNode, dom: &Dom, depth: usize, out: &mut Vec<u8>) {
             }
             out.push(b'\n');
             for c in &b.children {
-                dump_box(c, dom, depth + 1, out);
+                dump_box(c, dom, arena, depth + 1, out);
             }
         }
     }
@@ -1095,7 +1373,7 @@ fn dump_box(b: &BoxNode, dom: &Dom, depth: usize, out: &mut Vec<u8>) {
 /// ボックス木を html5lib 的テキストではなくデバッグ形式でダンプ（C の `if_layout_dump`）。
 pub fn layout_dump(dom: &Dom, layout: &Layout) -> Vec<u8> {
     let mut out = Vec::new();
-    dump_box(&layout.root, dom, 0, &mut out);
+    dump_box(&layout.root, dom, &layout.seg_arena, 0, &mut out);
     out
 }
 

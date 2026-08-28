@@ -568,11 +568,12 @@ fn main() {
         exit(0);
     }
 
-    let tg0 = Instant::now();
-    let grid = render::render_grid(&dom, &styles, &lay);
-    let acc_grid = tg0.elapsed().as_secs_f64() * 1000.0;
+    // 行スイープ経路（C の `if_render_emit_rows_sweep` 相当）に一本化。
+    // 全グリッド構築は存在しないため grid 段は C と同じく限 0（render_split の
+    // grid=0.00 表記を C の CLI と同一にする）。
+    let acc_grid = 0.0f64; // C の CLI sweep 経路は grid=0.00 固定（観測一致）
     let tg1 = Instant::now();
-    let out = render::render_emit(&grid, ansi);
+    let out = render::render_emit_sweep(&lay, ansi);
     std::io::stdout().write_all(&out).unwrap();
     let acc_emit = tg1.elapsed().as_secs_f64() * 1000.0;
     let t5 = Instant::now();

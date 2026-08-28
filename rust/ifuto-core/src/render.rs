@@ -1,46 +1,38 @@
-//! セルグリッドレンダラ（ソフトウェアラスタ。C の `src/render_ansi.c` 相当）。
+//! 行スイープレンダラ（C の `src/render_ansi.c` **CLI 行スイープ経路**の機械的写し）。
 //!
-//! | C (render.h / render_ansi.c) | Rust |
+//! | C (render_ansi.c) | Rust |
 //! |---|---|
-//! | `IfGrid` / `IfCell` | [`Grid`] / [`Cell`] |
-//! | `if_render_grid` | [`render_grid`] |
-//! | `if_render_emit` | [`render_emit`] |
+//! | `if_render_emit_rows_sweep` + `sweep_range` | [`render_emit_sweep`] |
+//! | `row_emit_direct` / `row_emit_fast` / `row_emit_ansi_fast` | `try_direct` / `try_fast` / `try_ansi_fast` |
+//! | slow セル行経路（`row_paint_dec`/`row_paint_text` + 発行） | `emit_slow` / `row_paint_dec` / `row_paint_text` |
+//! | `IfLCur`（判定用カーソル） | `Sweep.li`（`Vec<RLine>` 上の添字） |
+//! | `IfPen` | `(u8, u8, u8)` |
 //! | `if_render_extent` | [`render_extent`] |
 //! | `if_rgba_to_ansi` | [`rgba_to_ansi`] |
 //!
-//! # 実装済み
+//! # アーキテクチャ（フェーズ 10-a で全グリッド経路から移行）
 //!
-//! ボックスツリー → セルグリッド（背景塗り・罫線・`<hr>`・li マーカー・テキスト）、
-//! グリッド → 発行バイト列（ansi=256 色 SGR / plain）。golden テスト（`tests/golden/`）
-//! が固定する `--no-ansi` 出力の完全一致が回帰オラクル。
+//! 旧実装は paint イベントを全文書グリッド（`cells[y*w+x]`）+ 行ごとの監査帳簿
+//! （`RowInfo`）へ畳み込んでから発行経路を事後判定していた。これは byte 一致の
+//! ためには正確だが、C が行カーソル + deco active 集合だけで発行できるのに対し
+//! 全行へ帳簿の会費を課す設計だった。本実装は C と同じフラット streams
+//! （[`crate::layout::Layout::lines`] / [`crate::layout::Layout::deco`]) を直接
+//! 消費して行を逐次発行する。全グリッド確保・帳簿・paint 全走査は存在しない。
 //!
-//! # C との違い（所有権による構造的な改善）
-//!
-//! C はグリッドを arena から確保し `cells[(y-y_off)*w+x]` の手動 index で参照する。
-//! Rust では `Vec<Cell>` + `get` で境界検査を保証する。発行は `Vec<u8>` に追記し、
-//! C の行バッファ + fwrite フラッシュの手動管理を排除する。
-//!
-//! # byte-direct 発行（C の fast 経路との byte 一致）
-//!
-//! C の行スイープは direct 旗付き行をセルモデルを経ずに生バイトで発行する
-//! （`row_emit_direct`/`row_emit_fast`/`row_emit_ansi_fast`）。wrap の検査 quirk
-//! （折り返し次行に紛れた 0 幅/不正グリフは direct を殺さない）により、quirk 行の
-//! 生バイト列はセル再エンコードと一致しない。本実装は paint 時に行ごとの監査帳簿
-//! （[`RowInfo`]）を畳み、quirk 行のみ C の受理条件を機械的に写して raw 発行する
-//! （不受理はセル経路 ≡ C slow）。quirk の無い行は raw ≡ セル再エンコードのため
-//! 登録せず常にセル経路で一致する。
+//! 発行規約は C との byte 一致が契約（golden / diff fuzz / WPT が機械監査）:
+//! no-ansi の行末空白 trim・行末リセット無条件・行区切りのみ発行のギャップ一括充填・
+//! byte-direct（direct 旗付き行を raw bytes で直行）/fast（runs 合流発行）/
+//! ansi-fast（BG ピース合成直行）の受理条件・失敗時の slow 降格、全て同値。
 //!
 //! # 未移植（性能最適化・観測不変）
 //!
-//! 以下は発行バイト列に影響しない最適化のため保留する:
-//! - 窓グリッド経路（`if_render_grid_rows_into(_cur)`）と厳密増加カーソル
-//! - 2-way 並列 sweep（pthread）
-//! - `raster.c` の fill カーネル自動選択（全候補が bit-exact 同値。スカラ fill で十分）
-//! - rdtsc プロファイリング
+//! - 2-way 並列 sweep（C の pthread 分割。発行バイト列は直列と厳密一致が C で
+//!   保証済みのため、直列実装は byte 観測で並列実装と区別不能。速度差のみ）
+//! - 窓グリッド経路（`if_render_grid_rows_into(_cur)`。GUI 用で CLI 不使用）
+//! - `raster.c` の fill カーネル自動選択・rdtsc プロファイリング
 
-use crate::css::{Style, D_LIST_ITEM};
-use crate::layout::{BoxKind, BoxNode, Layout};
-use crate::tags_tables::{TAG_HR, TAG_LI, TAG_OL, TAG_UL};
+use crate::css::Style;
+use crate::layout::{BoxKind, BoxNode, Deco, DecoKind, Layout};
 
 /// fg/bg の「端末既定」値（C の `IF_CELL_DEFAULT`）。
 pub const CELL_DEFAULT: u8 = 255;
@@ -54,7 +46,10 @@ pub const F_ULINE: u8 = 4;
 /// セルフラグ: 打ち消し線。
 pub const F_STRIKE: u8 = 8;
 
-/// セル（C の `IfCell` 相当）。
+/// 既定 pen（C の `PDEF`）。
+const PDEF: (u8, u8, u8) = (CELL_DEFAULT, CELL_DEFAULT, 0);
+
+/// セル（C の `IfRCell` 相当。行バッファ 1 枚だけを使い回す）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cell {
     /// コードポイント（0 = 全角 2 セル目の継続セル）。
@@ -75,97 +70,6 @@ impl Default for Cell {
             bg: CELL_DEFAULT,
             flags: 0,
         }
-    }
-}
-
-/// byte-direct 1 seg（C の `IfRRun` IF_RR_BYTES 相当）。
-#[derive(Clone, Debug)]
-struct DirectSeg {
-    /// 開始セル x。
-    x: i32,
-    /// 占有セル幅。
-    w: i32,
-    /// seg の pen（C の `seg_pen`。ansi 発行の遷移用）。
-    pen: (u8, u8, u8),
-    /// 生バイト列（quirk を含み得るためセル再エンコードと一致しないことがある）。
-    raw: Vec<u8>,
-}
-
-/// 行 LINE ボックスの発行用ペイロード（C の fast 経路受理時の LINE 相当）。
-///
-/// wrap の direct 検査には C 由来の quirk（kill されなかった 0 幅/不正グリフが折り返し
-/// 次行に紛れ込む）があり得るため、seg 発行は常に **raw bytes**（quirk が無ければ
-/// raw ≡ セル再エンコードなので byte 不変）。受理時は seg セルのペイント済み色素が
-/// 後勝ち deco で上書きされている可能性を排除し、C と同じく seg 自身の pen で出す。
-#[derive(Clone, Debug, Default)]
-struct DirectLine {
-    /// seg 列（x 昇順）。
-    segs: Vec<DirectSeg>,
-    /// この LINE の paint に使われた draw_text 呼び出し数（= segs.len()）。
-    n_paints: u32,
-    /// wrap 時の direct 旗（C の `IF_LF_DIRECT_BYTES`。fast 受理の必須条件）。
-    direct: bool,
-}
-
-/// li マーカーの発行用ペイロード（C の MARKER run 相当）。
-#[derive(Clone, Debug)]
-struct MarkerRun {
-    /// 占有セル範囲 [x, x+w)。
-    x: i32,
-    w: i32,
-    /// マーカー自身の pen（C の `seg_pen(d->st)`。fast 経路ではrun が最上位層）。
-    pen: (u8, u8, u8),
-    /// 生バイト（"• " or "N."）。
-    raw: Vec<u8>,
-}
-
-/// 行ごとの paint 内訳（fast 経路採否の監査帳簿。C の sweep active deco 台帳相当）。
-#[derive(Clone, Debug, Default)]
-struct RowInfo {
-    /// `draw_text` 呼び出し数（li マーカー含む）。
-    text_paints: u32,
-    /// この行に乗った LINE ボックス数（C の `peek1.y == r` 堕落判定相当）。
-    lines_on_row: u32,
-    /// この行を覆う BG 塗り数（C の ansi `n_bg > 32` 判定相当）。
-    bg_n: u32,
-    /// BORDER 等の未対応 cp 装飾が入った（採用不可。HLINE/BG は含めない）。
-    other_paint: bool,
-    /// li マーカーの run 列（登録順 = C の deco 追記順）。
-    markers: Vec<MarkerRun>,
-    /// `<hr>` 罫線の占有セル範囲（[x0,x1)。C の HLINE deco の [x, x+w)）。
-    hline_spans: Vec<(i32, i32)>,
-    /// この行の LINE ペイロード（同行に 2 個目が来たら None + 毒殺旗）。
-    row_line: Option<DirectLine>,
-    /// 行 LINE 毒殺旗（C の「同行複数 line は堕落して二度と fast に載らない」）。
-    row_line_bad: bool,
-}
-
-/// セルグリッド（C の `IfGrid` 相当。全高グリッド）。
-#[derive(Clone, Debug)]
-pub struct Grid {
-    /// 幅（セル）。
-    pub w: i32,
-    /// 高さ（セル）。
-    pub h: i32,
-    /// セル列（`cells[y * w + x]`）。
-    pub cells: Vec<Cell>,
-    /// 行監査帳簿（byte-direct 発行の採否判定用）。
-    rinfo: Vec<RowInfo>,
-}
-
-impl Grid {
-    fn at(&self, x: i32, y: i32) -> Option<&Cell> {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h {
-            return None;
-        }
-        self.cells.get((y * self.w + x) as usize)
-    }
-
-    fn at_mut(&mut self, x: i32, y: i32) -> Option<&mut Cell> {
-        if x < 0 || y < 0 || x >= self.w || y >= self.h {
-            return None;
-        }
-        self.cells.get_mut((y * self.w + x) as usize)
     }
 }
 
@@ -194,68 +98,722 @@ pub fn rgba_to_ansi(rgba: u32) -> u8 {
     (16 + 36 * rq + 6 * gq + bq) as u8
 }
 
+/// 計算済みスタイル → セル pen（C の `seg_pen` 相当）。
 fn pen(st: Option<&Style>) -> (u8, u8, u8) {
     match st {
-        None => (CELL_DEFAULT, CELL_DEFAULT, 0),
-        Some(st) => {
-            let mut flags = 0u8;
+        None => PDEF,
+        Some(st) => pen_raw(st.color, st.bg, {
+            let mut f = 0u8;
             if st.bold {
-                flags |= F_BOLD;
+                f |= F_BOLD;
             }
             if st.italic {
-                flags |= F_ITALIC;
+                f |= F_ITALIC;
             }
             if st.underline {
-                flags |= F_ULINE;
+                f |= F_ULINE;
             }
             if st.strike {
-                flags |= F_STRIKE;
+                f |= F_STRIKE;
             }
-            (rgba_to_ansi(st.color), rgba_to_ansi(st.bg), flags)
-        }
+            f
+        }),
     }
 }
 
-fn put_cp(g: &mut Grid, x: i32, y: i32, cp: u32, st: Option<&Style>, bg_override: u32) {
-    let Some(c) = g.at_mut(x, y) else { return };
-    let (fg, bg, flags) = pen(st);
-    c.cp = cp;
-    c.fg = fg;
-    c.bg = if bg_override != 0 {
-        rgba_to_ansi(bg_override)
-    } else {
-        bg
-    };
-    c.flags = flags;
+/// 未変換 RGBA + 装飾旗 → セル pen（deco MARKER の保存原料からの変換用。
+/// `seg_pen` と同式を 1 点化するためこちらが正本、`pen` はこちらへの委譲）。
+fn pen_raw(color: u32, bg: u32, flags: u8) -> (u8, u8, u8) {
+    (rgba_to_ansi(color), rgba_to_ansi(bg), flags)
 }
 
-fn fill_bg(g: &mut Grid, x0: i32, y0: i32, w: i32, h: i32, bg: u32) {
-    let idx = rgba_to_ansi(bg);
-    if idx == CELL_DEFAULT && (bg & 0xFF) < 128 {
+/// v ∈ [0,255] の十進化（C の `u8_dec` 写し。snprintf("%u") と同一バイト列を
+/// スタックに出す。pen 遷移は行内で最も熱い 1 発行で、`format!` の一時 String
+/// 確保を許さない）
+fn u8_dec(p: &mut [u8; 3], v: u8) -> usize {
+    if v >= 100 {
+        p[0] = b'0' + v / 100;
+        p[1] = b'0' + (v % 100) / 10;
+        p[2] = b'0' + v % 10;
+        3
+    } else if v >= 10 {
+        p[0] = b'0' + v / 10;
+        p[1] = b'0' + v % 10;
+        2
+    } else {
+        p[0] = b'0' + v;
+        1
+    }
+}
+
+/// SGR 遷移の発行（C の `pen_emit`。reset→bold→italic→uline→strike→fg→bg）。
+fn emit_pen(out: &mut Vec<u8>, p: (u8, u8, u8), cur: &mut (u8, u8, u8)) {
+    if p == *cur {
         return;
     }
-    // 行スイープ経路の deco 有効高 dh = max(h,1) に一致（h=0 の空ボックスも 1 行塗る）
-    let eh = h.max(1);
-    let yy0 = y0.max(0);
-    let yy1 = (y0 + eh).min(g.h);
-    let xx0 = x0.max(0);
-    let xx1 = (x0 + w).min(g.w);
-    for y in yy0..yy1 {
-        // C の ansi n_bg 計数は x 範囲の空否を見ず「deco が行を覆う」だけで畳む
-        g.rinfo[y as usize].bg_n += 1;
-        for x in xx0..xx1 {
-            if let Some(c) = g.at_mut(x, y) {
-                c.bg = idx;
-            }
+    let (fg, bg, flags) = p;
+    // 1 回の SGR 遷移は最大 4+4*4+12+12 = 44B。一時バッファに組んで 1 回で追記する
+    // （extend_from_slice の回数自体も熱い）
+    let mut tmp = [0u8; 48];
+    let mut n = 0usize;
+    tmp[n..n + 4].copy_from_slice(b"\x1b[0m");
+    n += 4;
+    if flags & F_BOLD != 0 {
+        tmp[n..n + 4].copy_from_slice(b"\x1b[1m");
+        n += 4;
+    }
+    if flags & F_ITALIC != 0 {
+        tmp[n..n + 4].copy_from_slice(b"\x1b[3m");
+        n += 4;
+    }
+    if flags & F_ULINE != 0 {
+        tmp[n..n + 4].copy_from_slice(b"\x1b[4m");
+        n += 4;
+    }
+    if flags & F_STRIKE != 0 {
+        tmp[n..n + 4].copy_from_slice(b"\x1b[9m");
+        n += 4;
+    }
+    if fg != CELL_DEFAULT {
+        tmp[n..n + 7].copy_from_slice(b"\x1b[38;5;");
+        n += 7;
+        let mut d = [0u8; 3];
+        let dn = u8_dec(&mut d, fg);
+        tmp[n..n + dn].copy_from_slice(&d[..dn]);
+        n += dn;
+        tmp[n] = b'm';
+        n += 1;
+    }
+    if bg != CELL_DEFAULT {
+        tmp[n..n + 7].copy_from_slice(b"\x1b[48;5;");
+        n += 7;
+        let mut d = [0u8; 3];
+        let dn = u8_dec(&mut d, bg);
+        tmp[n..n + dn].copy_from_slice(&d[..dn]);
+        n += dn;
+        tmp[n] = b'm';
+        n += 1;
+    }
+    out.extend_from_slice(&tmp[..n]);
+    *cur = p;
+}
+
+/// ---- fast 発行の 1 ラン（C の `IfRRun` / `IfRRunA` 相当） ----
+enum Run<'a> {
+    /// seg / MARKER の生バイト（自身 pen 付き）。
+    Bytes {
+        x: i32,
+        w: i32,
+        p: &'a [u8],
+        pen: (u8, u8, u8),
+    },
+    /// `<hr>` 罫線（占有セル幅。セル単位 clip 可の唯一の run）。
+    Hline { x: i32, w: i32 },
+}
+
+impl Run<'_> {
+    fn x(&self) -> i32 {
+        match *self {
+            Run::Bytes { x, .. } => x,
+            Run::Hline { x, .. } => x,
         }
     }
 }
 
-fn draw_text(g: &mut Grid, x: i32, y: i32, text: &[u8], st: Option<&Style>) {
-    if y >= 0 && y < g.h {
-        g.rinfo[y as usize].text_paints += 1;
+/// ---- 行スイープ本体（C の `sweep_range` 直列経路相当） ----
+struct Sweep<'a> {
+    lay: &'a Layout,
+    /// viewport セル幅（C の `mx`。`lay->width` 固定）。
+    mx: i32,
+    /// 発行バッファ（C の IfBB。追記巻き戻しは `truncate` で行う）。
+    out: Vec<u8>,
+    /// 現行 pen（ansi の行を跨ぐ遷移追跡）。
+    cur: (u8, u8, u8),
+    /// deco active 集合（`lay.deco` の添字。追記順保持・期限切れは惰性除去）。
+    active: Vec<usize>,
+    /// deco 走査位置（未消費の先頭）。
+    di: usize,
+    /// lines 走査位置（C の IfLCur。`Vec` 上の添字なので seek 不要）。
+    li: usize,
+    /// slow 行バッファ（`mx` セルを使い回す。C の `IfRCell row[]`）。
+    row: Vec<Cell>,
+}
+
+/// レイアウトの行スイープ発行。C の `if_render_emit_rows_sweep`（直列 sweep_range）
+/// 相当。ansi=1 で 256 色 SGR、0 でプレーン。
+pub fn render_emit_sweep(lay: &Layout, ansi: bool) -> Vec<u8> {
+    let mx = lay.width.max(1);
+    let my = lay.height.max(1);
+    let mut s = Sweep {
+        lay,
+        mx,
+        // 出力は行×(幅+装飾) に比例するため重めに事前確保（再配置の削減のみ。
+        // バイト列には無関係）
+        out: Vec::with_capacity((my as usize).saturating_mul(16).min(1 << 22)),
+        cur: PDEF,
+        active: Vec::new(),
+        di: 0,
+        li: 0,
+        row: vec![Cell::default(); mx as usize],
+    };
+    let mut r = 0i32;
+    while r < my {
+        r = s.emit_row(r, my, ansi);
     }
-    let (fg, bg, flags) = pen(st);
+    s.out
+}
+
+impl<'a> Sweep<'a> {
+    /// 行 r を発行し、次に発行すべき行番号を返す（ギャップ一括充填で r が跳ぶ）。
+    /// C の `sweep_range` の for ループ本体の写し。
+    fn emit_row(&mut self, r: i32, my: i32, ansi: bool) -> i32 {
+        let lay = self.lay;
+        let lines = &lay.lines[..];
+        let deco = &lay.deco[..];
+
+        // ---- ギャップ一括充填（no-ansi 専用） ----
+        if !ansi {
+            let mut nl_y = if self.li < lines.len() {
+                lines[self.li].y
+            } else {
+                my
+            };
+            if nl_y > my {
+                nl_y = my;
+            }
+            if nl_y > r {
+                // (a) active の非 BG deco、(b) 新たに開始する非 BG deco が無ければ
+                // 各行の発行は '\n' のみ（BG は no-ansi で不可視。C と同値）
+                let mut clean = true;
+                for &k in &self.active {
+                    if deco[k].kind != DecoKind::Bg {
+                        clean = false;
+                        break;
+                    }
+                }
+                if clean {
+                    let mut d2 = self.di;
+                    while d2 < deco.len() && deco[d2].y < nl_y {
+                        if deco[d2].kind != DecoKind::Bg {
+                            clean = false;
+                            break;
+                        }
+                        d2 += 1;
+                    }
+                }
+                if clean {
+                    let gap = (nl_y - r) as usize;
+                    self.out.resize(self.out.len() + gap, b'\n');
+                    return nl_y;
+                }
+            }
+        }
+
+        // ---- deco の開始（y <= r）は追記順に active へ ----
+        while self.di < deco.len() && deco[self.di].y <= r {
+            let d = &deco[self.di];
+            let idx = self.di;
+            self.di += 1;
+            let dh = d.h.max(1);
+            if r < d.y + dh {
+                self.active.push(idx);
+            }
+        }
+        // ---- 期限切れ除去（順序保持の compact） ----
+        let mut k = 0;
+        while k < self.active.len() {
+            let d = &deco[self.active[k]];
+            let dh = d.h.max(1);
+            if !(d.y <= r && r < d.y + dh) {
+                self.active.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+
+        let has_line = self.li < lines.len() && lines[self.li].y == r;
+        if !has_line && self.active.is_empty() {
+            // ブランク行（発行規約どおり）
+            if ansi {
+                self.out.resize(self.out.len() + self.mx as usize, b' ');
+                self.out.extend_from_slice(b"\x1b[0m");
+                self.cur = PDEF;
+            }
+            self.out.push(b'\n');
+            return r + 1;
+        }
+
+        // ---- no-ansi: byte-direct / fast 直行 ----
+        if !ansi {
+            let mut cp_free = true;
+            let mut fastable = true;
+            for &k in &self.active {
+                match deco[k].kind {
+                    DecoKind::Bg => {}
+                    DecoKind::Marker | DecoKind::Hline => cp_free = false,
+                    DecoKind::Border => {
+                        cp_free = false;
+                        fastable = false;
+                    }
+                }
+            }
+            if !has_line && cp_free {
+                // BG のみの行は no-ansi では見えない（fill_bg は cp を触らない）
+                self.out.push(b'\n');
+                return r + 1;
+            }
+            if has_line && fastable {
+                let multi = lines.get(self.li + 1).is_some_and(|l| l.y == r);
+                if cp_free && !multi && self.try_direct() {
+                    return r + 1;
+                }
+                if self.try_fast(r) {
+                    return r + 1;
+                }
+            }
+        }
+
+        // ---- ANSI: byte-direct + BG/MARKER/HLINE 合成可能な行は直行 ----
+        if ansi && self.try_ansi_fast(r) {
+            return r + 1;
+        }
+
+        // ---- slow セル経路 ----
+        self.emit_slow(r, ansi);
+        r + 1
+    }
+
+    /// no-ansi byte-direct（C の `row_emit_direct`）。成功時のみ lines カーソルを進める。
+    fn try_direct(&mut self) -> bool {
+        let line = self.lay.lines[self.li];
+        if !line.direct {
+            return false;
+        }
+        let mark = self.out.len();
+        let segs = &self.lay.seg_arena[line.seg_lo as usize..line.seg_hi as usize];
+        let mut pos = 0i32;
+        for s in segs {
+            // C の __builtin_expect 判定: x < pos（非単調/重複）・右端跨ぎは堕落
+            if s.x < pos || s.x + s.w > self.mx {
+                self.out.truncate(mark);
+                return false;
+            }
+            if s.x > pos {
+                let g = (s.x - pos) as usize;
+                self.out.resize(self.out.len() + g, b' ');
+            }
+            self.out.extend_from_slice(&s.text);
+            pos = s.x + s.w;
+        }
+        while self.out.len() > mark && self.out.last() == Some(&b' ') {
+            self.out.pop();
+        }
+        self.out.push(b'\n');
+        self.li += 1;
+        true
+    }
+
+    /// no-ansi runs 合流発行（C の `row_emit_fast`）。受理条件は C の写し。
+    fn try_fast(&mut self, r: i32) -> bool {
+        let lay = self.lay;
+        let lines = &lay.lines[..];
+        let deco = &lay.deco[..];
+        let line = lines[self.li];
+        if !line.direct {
+            return false;
+        }
+        if lines.get(self.li + 1).is_some_and(|l| l.y == r) {
+            return false; // 同行複数行は堕落
+        }
+
+        // ラン集合: segs（x 単調）+ marker/hline。BORDER は未対応、BG は no-ansi で無影響
+        let mut runs: Vec<Run> = Vec::new();
+        {
+            let segs = &lay.seg_arena[line.seg_lo as usize..line.seg_hi as usize];
+            for s in segs {
+                if runs.len() == 64 {
+                    return false;
+                }
+                runs.push(Run::Bytes {
+                    x: s.x,
+                    w: s.w,
+                    p: &s.text,
+                    pen: pen(Some(&s.st)),
+                });
+            }
+        }
+        for &k in &self.active {
+            let d = &deco[k];
+            match d.kind {
+                DecoKind::Bg => continue,
+                DecoKind::Marker => {
+                    if runs.len() == 64 {
+                        return false;
+                    }
+                    runs.push(Run::Bytes {
+                        x: d.x,
+                        w: d.w,
+                        p: &d.text[..d.tlen as usize],
+                        pen: pen_raw(d.m_color, d.m_bg, d.m_flags),
+                    });
+                }
+                DecoKind::Hline => {
+                    if runs.len() == 64 {
+                        return false;
+                    }
+                    runs.push(Run::Hline { x: d.x, w: d.w });
+                }
+                DecoKind::Border => return false, // セル経路へ
+            }
+        }
+        // x 昇順へ挿入ソート（segs は既に単調、deco は小数。C と同一アルゴリズム）
+        for a in 1..runs.len() {
+            let mut c = a;
+            while c > 0 && runs[c - 1].x() > runs[c].x() {
+                runs.swap(c - 1, c);
+                c -= 1;
+            }
+        }
+
+        let mark = self.out.len();
+        let mut pos = 0i32;
+        for run in &runs {
+            if run.x() < pos {
+                self.out.truncate(mark);
+                return false; // 重複はセル経路へ
+            }
+            if run.x() > pos {
+                let ge = if run.x() > self.mx { self.mx } else { run.x() };
+                let gap = ge - pos;
+                if gap < 0 {
+                    self.out.truncate(mark);
+                    return false;
+                }
+                self.out.resize(self.out.len() + gap as usize, b' ');
+                pos = run.x();
+            }
+            if pos >= self.mx {
+                break; // viewport 右端でクリップ
+            }
+            match run {
+                Run::Hline { w, .. } => {
+                    let mut w2 = *w;
+                    if pos + w2 > self.mx {
+                        w2 = self.mx - pos;
+                    }
+                    for _ in 0..w2.max(0) {
+                        self.out.extend_from_slice(b"\xE2\x94\x80"); // ─
+                    }
+                    pos += w; // clip 後も pos は元の w で進む（C と同一規則）
+                }
+                Run::Bytes { w, p, .. } => {
+                    if pos + w > self.mx {
+                        self.out.truncate(mark);
+                        return false; // 右端を跨ぐ bytes run は再構成不能
+                    }
+                    self.out.extend_from_slice(p);
+                    pos += w;
+                }
+            }
+        }
+        while self.out.len() > mark && self.out.last() == Some(&b' ') {
+            self.out.pop();
+        }
+        self.out.push(b'\n');
+        self.li += 1;
+        true
+    }
+
+    /// ANSI runs 合流 + BG ピース合成（C の `row_emit_ansi_fast`）。受理条件は C の写し。
+    fn try_ansi_fast(&mut self, r: i32) -> bool {
+        let lay = self.lay;
+        let lines = &lay.lines[..];
+        let deco = &lay.deco[..];
+        let has_line = self.li < lines.len() && lines[self.li].y == r;
+        let mut line = None;
+        if has_line {
+            let l = lines[self.li];
+            if !l.direct {
+                return false;
+            }
+            if lines.get(self.li + 1).is_some_and(|n| n.y == r) {
+                return false; // 同行複数行は堕落
+            }
+            line = Some(l);
+        }
+
+        // (1) BG 合成: [0,mx) の bg ピース列（active 追記順・後勝ち。<=32 枚まで受理）
+        // ピースは (x0, x1, bg)。x 昇順・非重複を不変条件とする。
+        let mut pc: Vec<(i32, i32, u8)> = vec![(0, self.mx, CELL_DEFAULT)];
+        {
+            let n_bg = self
+                .active
+                .iter()
+                .filter(|&&k| deco[k].kind == DecoKind::Bg)
+                .count();
+            if n_bg > 32 {
+                return false; // 異常系は slow へ
+            }
+            for &k in &self.active {
+                let d = &deco[k];
+                if d.kind != DecoKind::Bg {
+                    continue;
+                }
+                let idx = rgba_to_ansi(d.argb);
+                if idx == CELL_DEFAULT && (d.argb & 0xFF) < 128 {
+                    continue; // row_paint_dec と同一 skip
+                }
+                let x0 = d.x.max(0);
+                let x1 = (d.x + d.w).min(self.mx);
+                if x1 <= x0 {
+                    continue;
+                }
+                let mut tmp: Vec<(i32, i32, u8)> = Vec::with_capacity(pc.len() + 2);
+                for &(px0, px1, pbg) in &pc {
+                    if px1 <= x0 || px0 >= x1 {
+                        tmp.push((px0, px1, pbg));
+                        continue;
+                    }
+                    if px0 < x0 {
+                        tmp.push((px0, x0, pbg));
+                    }
+                    tmp.push((px0.max(x0), px1.min(x1), idx));
+                    if px1 > x1 {
+                        tmp.push((x1, px1, pbg));
+                    }
+                }
+                pc = tmp;
+            }
+        }
+
+        // (2) ラン集合: segs（x 単調）+ MARKER/HLINE（row_emit_fast と同一手順 + pen）
+        let mut runs: Vec<Run> = Vec::new();
+        if let Some(l) = line {
+            let segs = &lay.seg_arena[l.seg_lo as usize..l.seg_hi as usize];
+            for s in segs {
+                if runs.len() == 64 {
+                    return false;
+                }
+                runs.push(Run::Bytes {
+                    x: s.x,
+                    w: s.w,
+                    p: &s.text,
+                    pen: pen(Some(&s.st)),
+                });
+            }
+        }
+        for &k in &self.active {
+            let d = &deco[k];
+            match d.kind {
+                DecoKind::Bg => continue, // 合成済み
+                DecoKind::Marker => {
+                    // text の glyph 検査（wrap_note_direct と同条件。幅和==w も必須）
+                    let t = &d.text[..d.tlen as usize];
+                    let mut i = 0usize;
+                    let mut wsum = 0i32;
+                    while i < t.len() {
+                        let from = i;
+                        let cp = crate::utf8::decode(t, &mut i);
+                        let gw = crate::utf8::glyph_width(cp);
+                        if gw <= 0 {
+                            return false;
+                        }
+                        if cp == crate::utf8::REPLACEMENT
+                            && !(i - from == 3
+                                && t[from] == 0xEF
+                                && t[from + 1] == 0xBF
+                                && t[from + 2] == 0xBD)
+                        {
+                            return false;
+                        }
+                        wsum += gw;
+                    }
+                    if wsum != d.w {
+                        return false;
+                    }
+                    if runs.len() == 64 {
+                        return false;
+                    }
+                    runs.push(Run::Bytes {
+                        x: d.x,
+                        w: d.w,
+                        p: t,
+                        pen: pen_raw(d.m_color, d.m_bg, d.m_flags),
+                    });
+                }
+                DecoKind::Hline => {
+                    if runs.len() == 64 {
+                        return false;
+                    }
+                    runs.push(Run::Hline { x: d.x, w: d.w });
+                }
+                DecoKind::Border => return false,
+            }
+        }
+        for a in 1..runs.len() {
+            let mut c = a;
+            while c > 0 && runs[c - 1].x() > runs[c].x() {
+                runs.swap(c - 1, c);
+                c -= 1;
+            }
+        }
+
+        // (3) 発行: ラン間ギャップはピース駆動、ランは pen 遷移 + 生バイト（巻き戻し可能）
+        let mark = self.out.len();
+        let save = self.cur;
+        let mut pos = 0i32;
+        for run in &runs {
+            if run.x() < pos {
+                self.out.truncate(mark);
+                self.cur = save;
+                return false;
+            }
+            if run.x() > pos {
+                let ge = if run.x() > self.mx { self.mx } else { run.x() };
+                if ge > pos {
+                    self.gap_emit_pieces(&pc, pos, ge);
+                }
+                pos = run.x();
+            }
+            if pos >= self.mx {
+                break;
+            }
+            match run {
+                Run::Hline { w, .. } => {
+                    let mut w2 = *w;
+                    if pos + w2 > self.mx {
+                        w2 = self.mx - pos; // セル単位 clip は HLINE だけ許容
+                    }
+                    if w2 > 0 {
+                        // w<=0 の空ランは細胞を持たない → pen 遷移も発生しない
+                        emit_pen(&mut self.out, PDEF, &mut self.cur);
+                        for _ in 0..w2 {
+                            self.out.extend_from_slice(b"\xE2\x94\x80");
+                        }
+                    }
+                    pos += w;
+                }
+                Run::Bytes { w, p, pen, .. } => {
+                    if pos + w > self.mx {
+                        self.out.truncate(mark);
+                        self.cur = save;
+                        return false;
+                    }
+                    emit_pen(&mut self.out, *pen, &mut self.cur);
+                    self.out.extend_from_slice(p);
+                    pos += w;
+                }
+            }
+        }
+        if self.mx > pos {
+            self.gap_emit_pieces(&pc, pos, self.mx); // 末尾ギャップ
+        }
+        self.out.extend_from_slice(b"\x1b[0m\n");
+        self.cur = PDEF;
+        if has_line {
+            self.li += 1;
+        }
+        true
+    }
+
+    /// BG ピース列の [a,b) 区間を空白 + pen 遷移で発行（C の `gap_emit_pieces`）。
+    fn gap_emit_pieces(&mut self, pc: &[(i32, i32, u8)], a: i32, b: i32) {
+        for &(x0, x1, bg) in pc {
+            if x1 <= a {
+                continue;
+            }
+            if x0 >= b {
+                break; // ピースは x 昇順・非重複
+            }
+            let s = x0.max(a);
+            let e = x1.min(b);
+            emit_pen(&mut self.out, (CELL_DEFAULT, bg, 0), &mut self.cur);
+            self.out.resize(self.out.len() + (e - s) as usize, b' ');
+        }
+    }
+
+    /// slow セル経路（C の sweep_range 末尾の行構成+発行の写し）。
+    fn emit_slow(&mut self, r: i32, ansi: bool) {
+        let lay = self.lay;
+        let lines = &lay.lines[..];
+        let deco = &lay.deco[..];
+        let mut maxx = self.mx;
+        let has_line = self.li < lines.len() && lines[self.li].y == r;
+        if !ansi {
+            maxx = 0;
+            // この行の全 LINE（現行 + 追従する同行）と 非 BG deco から幅を確定
+            let mut j = self.li;
+            while j < lines.len() && lines[j].y == r {
+                let l = lines[j];
+                for s in &lay.seg_arena[l.seg_lo as usize..l.seg_hi as usize] {
+                    if s.x + s.w > maxx {
+                        maxx = s.x + s.w;
+                    }
+                }
+                j += 1;
+            }
+            let _ = has_line;
+            for &k in &self.active {
+                let d = &deco[k];
+                if d.kind == DecoKind::Bg {
+                    continue; // bg は no-ansi 出力に影響しない
+                }
+                if d.x + d.w > maxx {
+                    maxx = d.x + d.w;
+                }
+            }
+            if maxx > self.mx {
+                maxx = self.mx;
+            }
+        }
+
+        // 行構成: [0,maxx) 既定充填 → deco（追記順）→ lines
+        for c in &mut self.row[..maxx as usize] {
+            *c = Cell::default();
+        }
+        let w = maxx;
+        for &k in &self.active {
+            row_paint_dec(&mut self.row, w, &deco[k], r);
+        }
+        while self.li < lines.len() && lines[self.li].y == r {
+            let l = lines[self.li];
+            for s in &lay.seg_arena[l.seg_lo as usize..l.seg_hi as usize] {
+                let (fg, bg, flags) = pen(Some(&s.st));
+                row_paint_text(&mut self.row, w, s.x, &s.text, (fg, bg, flags));
+            }
+            self.li += 1;
+        }
+
+        // 発行（trim・行末リセットの規約は C と同一）
+        let mut last = maxx - 1;
+        if !ansi {
+            while last >= 0 && self.row[last as usize].cp == b' ' as u32 {
+                last -= 1;
+            }
+        }
+        for x in 0..=last {
+            let c = self.row[x as usize];
+            if c.cp == 0 {
+                continue; // 全角 2 セル目
+            }
+            if ansi {
+                emit_pen(&mut self.out, (c.fg, c.bg, c.flags), &mut self.cur);
+            }
+            let mut enc = [0u8; 4];
+            let n = crate::utf8::encode(c.cp, &mut enc);
+            self.out.extend_from_slice(&enc[..n]);
+        }
+        if ansi {
+            self.out.extend_from_slice(b"\x1b[0m");
+            self.cur = PDEF;
+        }
+        self.out.push(b'\n');
+    }
+}
+
+/// テキストの行バッファへの paint（C の `row_paint_text`）。pen はフル上書き。
+fn row_paint_text(row: &mut [Cell], w: i32, x: i32, text: &[u8], pen: (u8, u8, u8)) {
+    let (fg, bg, flags) = pen;
     let mut i = 0usize;
     let mut cx = x;
     while i < text.len() {
@@ -264,244 +822,114 @@ fn draw_text(g: &mut Grid, x: i32, y: i32, text: &[u8], st: Option<&Style>) {
         if gw == 0 {
             continue;
         }
-        if let Some(c) = g.at_mut(cx, y) {
+        if cx >= 0 && cx < w {
+            let c = &mut row[cx as usize];
             c.cp = cp;
             c.fg = fg;
             c.bg = bg;
             c.flags = flags;
         }
-        if gw == 2 {
-            if let Some(c) = g.at_mut(cx + 1, y) {
-                c.cp = 0;
-                c.fg = fg;
-                c.bg = bg;
-                c.flags = flags;
-            }
+        if gw == 2 && cx + 1 >= 0 && cx + 1 < w {
+            let c = &mut row[(cx + 1) as usize];
+            c.cp = 0;
+            c.fg = fg;
+            c.bg = bg;
+            c.flags = flags;
         }
         cx += gw;
     }
 }
 
-/// li マーカーの run ペイロードを帳簿へ（fast 経路の採否・重複検査用）。
-fn mark_marker_run(g: &mut Grid, y: i32, x0: i32, w: i32, pen: (u8, u8, u8), raw: &[u8]) {
-    if y >= 0 && y < g.h {
-        g.rinfo[y as usize].markers.push(MarkerRun {
-            x: x0,
-            w,
-            pen,
-            raw: raw.to_vec(),
-        });
+/// cp 一括ランの paint（C の `row_paint_cprun`）。keep_pen=false は bg/flags を既定に戻す。
+fn row_paint_cprun(
+    row: &mut [Cell],
+    w: i32,
+    mut x0: i32,
+    mut x1: i32,
+    cp: u32,
+    fg: u8,
+    keep_pen: bool,
+) {
+    if x0 < 0 {
+        x0 = 0;
+    }
+    if x1 > w {
+        x1 = w;
+    }
+    let mut x = x0;
+    while x < x1 {
+        let c = &mut row[x as usize];
+        c.cp = cp;
+        c.fg = fg;
+        if !keep_pen {
+            c.bg = CELL_DEFAULT;
+            c.flags = 0;
+        }
+        x += 1;
     }
 }
 
-fn draw_hline(g: &mut Grid, x0: i32, x1: i32, y: i32, st: Option<&Style>) {
-    if y >= 0 && y < g.h {
-        g.rinfo[y as usize].hline_spans.push((x0, x1));
-    }
-    for x in x0..x1 {
-        put_cp(g, x, y, 0x2500, st, 0); // ─
-    }
-}
-
-/// li マーカー（ul: "• "、ol: "N."）。C の行スイープ経路の MARKER deco 相当。
-/// マーカーは `<li>` かつ `display:list-item` のときのみ（任意の `display:list-item`
-/// 要素には描かない。sweep の `c->tag == IF_TAG_LI && display == LIST_ITEM` 条件と同値）。
-fn draw_marker(g: &mut Grid, dom: &crate::dom::Dom, styles: &[Option<Style>], b: &BoxNode) {
-    let Some(li) = b.node else { return };
-    // 直近の祖先 ul/ol を探す（ネストした li の外には出ない）
-    let mut list = TAG_UL;
-    let mut p = dom.node(li).parent;
-    while let Some(pid) = p {
-        let pnode = dom.node(pid);
-        if pnode.kind == crate::dom::NodeKind::Element
-            && (pnode.tag == TAG_UL || pnode.tag == TAG_OL)
-        {
-            list = pnode.tag;
-            break;
-        }
-        if pnode.kind == crate::dom::NodeKind::Element && pnode.tag == TAG_LI {
-            break;
-        }
-        p = pnode.parent;
-    }
-    if list == TAG_UL {
-        let mut mx = b.x - 2;
-        if mx < 0 {
-            mx = b.x;
-        }
-        mark_marker_run(g, b.y, mx, 2, pen(Some(&b.st)), b"\xE2\x80\xA2 ");
-        draw_text(g, mx, b.y, b"\xE2\x80\xA2 ", Some(&b.st)); // "• "
-        return;
-    }
-    // ol: 兄弟内の「list-item の li」を数える（sweep の li_ord と同値）
-    let mut idx = 1u32;
-    let mut s = dom.node(li).parent.and_then(|p| dom.node(p).first_child);
-    while let Some(sid) = s {
-        if sid == li {
-            break;
-        }
-        let snode = dom.node(sid);
-        if snode.kind == crate::dom::NodeKind::Element
-            && snode.tag == TAG_LI
-            && styles[sid as usize].is_some_and(|s| s.display == D_LIST_ITEM)
-        {
-            idx += 1;
-        }
-        s = snode.next_sibling;
-    }
-    let txt = format!("{idx}.");
-    let m = txt.len() as i32;
-    let mut mx = b.x - (m + 1);
-    if mx < 0 {
-        mx = 0;
-    }
-    // C の MARKER deco は w = m（"N." のみ。後続空白セルは run 範囲に含まない）
-    mark_marker_run(g, b.y, mx, m, pen(Some(&b.st)), txt.as_bytes());
-    draw_text(g, mx, b.y, txt.as_bytes(), Some(&b.st));
-}
-
-/// b 自身の装飾（背景/HR/罫線/li マーカー）を描く。子供に進むなら true。
-/// C の行スイープ経路（SLOW）の deco 挿入順 = DFS で「marker(li) → 自 BG → 自 BORDER」
-/// を再現する。これにより:
-///
-/// - 自 BORDER は marker を上書き（`<li style="border">` で ┌ が勝つ）
-/// - 前方兄弟の BORDER は marker に上書きされる（`<dt style="border"><li>` で • が勝つ）
-///
-/// 既知の偏差: C の FAST 経路（罫線なし行）は marker を上層ランとして扱い、子孫 BG に
-/// 上書きされないが、ここでは SLOW の deco 順（子孫 BG が marker の bg を上書き）に一致
-/// させる（`<li><dl style="background">` の clamped marker の 1 ケースのみ FAST と乖離）。
-fn paint_shell(g: &mut Grid, dom: &crate::dom::Dom, styles: &[Option<Style>], b: &BoxNode) -> bool {
-    let st = &b.st;
-
-    // 1) li マーカー（deco 挿入順で自 BG/BORDER より先）
-    if b.node.is_some_and(|n| dom.node(n).tag == TAG_LI) && b.st.display == D_LIST_ITEM {
-        draw_marker(g, dom, styles, b);
-    }
-
-    // 2) 背景
-    if (st.bg & 0xFF) >= 128 {
-        fill_bg(g, b.x, b.y, b.w, b.h, st.bg);
-    }
-
-    if b.node.is_some_and(|n| dom.node(n).tag == TAG_HR) {
-        let off = if st.border_w[0] > 0.0 { 1 } else { 0 };
-        draw_hline(g, b.x, b.x + b.w, b.y + off, None);
-        return false;
-    }
-
-    // 3) 罫線（solid のみ。Unicode 罫線素片）
-    let bc = st.border_color;
-    let fg = rgba_to_ansi(bc);
-    let any = st.border_w[0] > 0.0
-        || st.border_w[1] > 0.0
-        || st.border_w[2] > 0.0
-        || st.border_w[3] > 0.0;
-    if any {
-        // 行スイープ経路の deco 有効高 dh = max(h,1) に一致（左右罫線は h=0 でも 1 行）
-        let eh = b.h.max(1);
-        for y in b.y..b.y + eh {
-            if y >= 0 && y < g.h {
-                g.rinfo[y as usize].other_paint = true;
+/// deco 1 個の行バッファへの paint（C の `row_paint_dec`）。
+fn row_paint_dec(row: &mut [Cell], w: i32, d: &Deco, r: i32) {
+    match d.kind {
+        DecoKind::Bg => {
+            let idx = rgba_to_ansi(d.argb);
+            if idx == CELL_DEFAULT && (d.argb & 0xFF) < 128 {
+                return; // fill_bg と同値の早期 return
+            }
+            let x0 = d.x.max(0);
+            let x1 = (d.x + d.w).min(w);
+            let mut x = x0;
+            while x < x1 {
+                row[x as usize].bg = idx;
+                x += 1;
             }
         }
-        for x in b.x..b.x + b.w {
-            if st.border_w[0] > 0.0 {
-                if let Some(c) = g.at_mut(x, b.y) {
-                    c.cp = 0x2500;
-                    c.fg = fg;
-                }
+        DecoKind::Border => {
+            let fg = rgba_to_ansi(d.argb);
+            let sides = d.sides;
+            let y0 = d.y;
+            let y1 = d.y + d.h - 1;
+            if sides & 1 != 0 && r == y0 {
+                row_paint_cprun(row, w, d.x, d.x + d.w, 0x2500, fg, true);
             }
-            if st.border_w[2] > 0.0 {
-                if let Some(c) = g.at_mut(x, b.y + b.h - 1) {
-                    c.cp = 0x2500;
-                    c.fg = fg;
-                }
+            if sides & 4 != 0 && r == y1 {
+                row_paint_cprun(row, w, d.x, d.x + d.w, 0x2500, fg, true);
             }
-        }
-        for y in b.y..b.y + eh {
-            if st.border_w[3] > 0.0 {
-                if let Some(c) = g.at_mut(b.x, y) {
-                    c.cp = 0x2502;
-                    c.fg = fg;
-                }
+            if sides & 8 != 0 {
+                row_paint_cprun(row, w, d.x, d.x + 1, 0x2502, fg, true);
             }
-            if st.border_w[1] > 0.0 {
-                if let Some(c) = g.at_mut(b.x + b.w - 1, y) {
-                    c.cp = 0x2502;
-                    c.fg = fg;
-                }
+            if sides & 2 != 0 {
+                row_paint_cprun(row, w, d.x + d.w - 1, d.x + d.w, 0x2502, fg, true);
             }
-        }
-        let mut set = |x: i32, y: i32, cp: u32| {
-            if let Some(c) = g.at_mut(x, y) {
-                c.cp = cp;
+            // 角（cp のみ上書き。fg は辺で既に塗られている前提の C 規約）
+            if sides & 1 != 0 && sides & 8 != 0 && r == y0 && d.x >= 0 && d.x < w {
+                row[d.x as usize].cp = 0x250C;
             }
-        };
-        if st.border_w[0] > 0.0 && st.border_w[3] > 0.0 {
-            set(b.x, b.y, 0x250C);
-        }
-        if st.border_w[0] > 0.0 && st.border_w[1] > 0.0 {
-            set(b.x + b.w - 1, b.y, 0x2510);
-        }
-        if st.border_w[2] > 0.0 && st.border_w[3] > 0.0 {
-            set(b.x, b.y + b.h - 1, 0x2514);
-        }
-        if st.border_w[2] > 0.0 && st.border_w[1] > 0.0 {
-            set(b.x + b.w - 1, b.y + b.h - 1, 0x2518);
-        }
-    }
-    true
-}
-
-fn paint_box(g: &mut Grid, dom: &crate::dom::Dom, styles: &[Option<Style>], b: &BoxNode) {
-    match b.kind {
-        BoxKind::Line => {
-            if b.y >= 0 && b.y < g.h {
-                let ri = &mut g.rinfo[b.y as usize];
-                ri.lines_on_row += 1;
-                // C の fast 経路受理時に必要な LINE ペイロードを無条件で帳簿へ
-                // （受理の完全判定は発行時に run 列へ展開して行う）。
-                let dl = DirectLine {
-                    segs: b
-                        .segs
-                        .iter()
-                        .map(|s| DirectSeg {
-                            x: s.x,
-                            w: s.w,
-                            pen: pen(Some(&s.st)),
-                            raw: s.text.clone(),
-                        })
-                        .collect(),
-                    n_paints: b.segs.len() as u32,
-                    direct: b.direct,
-                };
-                if ri.row_line.is_some() || ri.row_line_bad {
-                    ri.row_line = None;
-                    ri.row_line_bad = true; // 同行複数 LINE → C は fast を降りる
-                } else {
-                    ri.row_line = Some(dl);
-                }
+            if sides & 1 != 0 && sides & 2 != 0 && r == y0 && d.x + d.w > 0 && d.x + d.w - 1 < w {
+                row[(d.x + d.w - 1) as usize].cp = 0x2510;
             }
-            for s in &b.segs {
-                draw_text(g, s.x, b.y, &s.text, Some(&s.st));
+            if sides & 4 != 0 && sides & 8 != 0 && r == y1 && d.x >= 0 && d.x < w {
+                row[d.x as usize].cp = 0x2514;
+            }
+            if sides & 4 != 0 && sides & 2 != 0 && r == y1 && d.x + d.w > 0 && d.x + d.w - 1 < w {
+                row[(d.x + d.w - 1) as usize].cp = 0x2518;
             }
         }
-        BoxKind::Block => {
-            if paint_shell(g, dom, styles, b) {
-                for c in &b.children {
-                    paint_box(g, dom, styles, c);
-                }
-            }
+        DecoKind::Hline => {
+            row_paint_cprun(row, w, d.x, d.x + d.w, 0x2500, CELL_DEFAULT, false);
+        }
+        DecoKind::Marker => {
+            let p = pen_raw(d.m_color, d.m_bg, d.m_flags);
+            row_paint_text(row, w, d.x, &d.text[..d.tlen as usize], p);
         }
     }
 }
 
 fn grid_max_walk(b: &BoxNode, mx: &mut i32, my: &mut i32) {
     if b.kind == BoxKind::Line {
-        for s in &b.segs {
-            if s.x + s.w > *mx {
-                *mx = s.x + s.w;
-            }
+        if b.x + b.w > *mx {
+            *mx = b.x + b.w;
         }
         if b.y + b.h > *my {
             *my = b.y + b.h;
@@ -519,26 +947,6 @@ fn grid_max_walk(b: &BoxNode, mx: &mut i32, my: &mut i32) {
     }
 }
 
-/// ボックスツリーからセルグリッドを構築。C の `if_render_emit_rows_sweep` 相当の
-/// **CLI 行スイープ経路**に一致させる（ゴールデンテストが固定する出力規約）。
-///
-/// 幅は `lay.width` に固定し、はみ出す seg（右寄せ + ハード分割の `line_w` 残存値に
-/// 起因するオーバーフロー）は右端でクリップする。C の `if_render_grid`（全グリッド
-/// 経路）は `grid_max_walk` で幅を拡張するが、CLI/golden が使う行スイープ経路は
-/// `lay->width` で打ち切るため、こちらを正とする（拡張経路は観測不変の別実装）。
-pub fn render_grid(dom: &crate::dom::Dom, styles: &[Option<Style>], lay: &Layout) -> Grid {
-    let mx = lay.width.max(1);
-    let my = lay.height.max(1);
-    let mut g = Grid {
-        w: mx,
-        h: my,
-        cells: vec![Cell::default(); (mx * my) as usize],
-        rinfo: vec![RowInfo::default(); my as usize],
-    };
-    paint_box(&mut g, dom, styles, &lay.root);
-    g
-}
-
 /// 文書行列 extent（C の `if_render_extent` 相当）。
 pub fn render_extent(lay: &Layout) -> (i32, i32) {
     let mut x = lay.width;
@@ -553,294 +961,6 @@ pub fn render_extent(lay: &Layout) -> (i32, i32) {
     (x, y)
 }
 
-/// SGR 遷移の発行（C の `pen_emit`。reset→bold→italic→uline→strike→fg→bg）。
-fn emit_pen(out: &mut Vec<u8>, p: (u8, u8, u8), cur: &mut (u8, u8, u8)) {
-    if p == *cur {
-        return;
-    }
-    out.extend_from_slice(b"\x1b[0m");
-    if p.2 & F_BOLD != 0 {
-        out.extend_from_slice(b"\x1b[1m");
-    }
-    if p.2 & F_ITALIC != 0 {
-        out.extend_from_slice(b"\x1b[3m");
-    }
-    if p.2 & F_ULINE != 0 {
-        out.extend_from_slice(b"\x1b[4m");
-    }
-    if p.2 & F_STRIKE != 0 {
-        out.extend_from_slice(b"\x1b[9m");
-    }
-    if p.0 != CELL_DEFAULT {
-        out.extend_from_slice(b"\x1b[38;5;");
-        out.extend_from_slice(p.0.to_string().as_bytes());
-        out.push(b'm');
-    }
-    if p.1 != CELL_DEFAULT {
-        out.extend_from_slice(b"\x1b[48;5;");
-        out.extend_from_slice(p.1.to_string().as_bytes());
-        out.push(b'm');
-    }
-    *cur = p;
-}
-
-/// fast 経路の 1 run（x 昇順ソート済みで発行）。C の `IfRRun/IfRRunA` 相当。
-enum RunRef<'a> {
-    /// LINE の seg（raw bytes + 自身 pen）。
-    Seg(&'a DirectSeg),
-    /// li マーカー（raw bytes + 自身 pen）。
-    Marker(&'a MarkerRun),
-    /// `<hr>` 罫線（占有セル幅。開始 x はタプル側。clip 可の唯一の run）。
-    Hline(i32),
-}
-
-/// 監査帳簿から当該行が C の fast 経路（`row_emit_direct`/`row_emit_fast`/
-/// `row_emit_ansi_fast`）を通るか判定し、通る場合のみ発行用 run 列（x 昇順）を返す。
-/// 受理条件は C の機械的写し（違反時は None ≡ C slow セル経路との一致を保つ）:
-///
-/// - 同行の LINE が 0 か 1 個（C の `peek1.y == r` 堕落判定）、居れば direct 旗必須
-/// - 行のテキスト paint が seg + マーカー分だけ（他の paint 源が無い帳簿自己一致）
-/// - BORDER 等の未対応 deco が無い（BG/MARKER/HLINE は受理）
-/// - ansi 時は BG 数 <= 32 かつ MARKER の glyph 検査（全 gw>0・正準置換・幅和==w）
-/// - run 列 ≤ 64・x ソート・非重複・bytes run は右端 clip 整合（HLINE のみ clip 可）
-fn fast_plan<'a>(g: &'a Grid, y: i32, ansi: bool) -> Option<Vec<(i32, RunRef<'a>)>> {
-    let ri = &g.rinfo[y as usize];
-    if ri.other_paint || ri.row_line_bad || ri.lines_on_row > 1 {
-        return None;
-    }
-    if ansi && ri.bg_n > 32 {
-        return None;
-    }
-    let line = ri.row_line.as_ref();
-    match line {
-        Some(dl) => {
-            if !dl.direct {
-                return None; // direct 旗なし LINE は C も slow へ
-            }
-            if ri.text_paints != dl.n_paints + ri.markers.len() as u32 {
-                return None;
-            }
-        }
-        None => {
-            if ri.text_paints != ri.markers.len() as u32 {
-                return None;
-            }
-        }
-    }
-    if ansi {
-        for m in &ri.markers {
-            let t = &m.raw;
-            let mut i = 0usize;
-            let mut wsum = 0i32;
-            while i < t.len() {
-                let from = i;
-                let cp = crate::utf8::decode(t, &mut i);
-                let gw = crate::utf8::glyph_width(cp);
-                if gw <= 0 {
-                    return None;
-                }
-                if cp == crate::utf8::REPLACEMENT
-                    && !(i - from == 3
-                        && t[from] == 0xEF
-                        && t[from + 1] == 0xBF
-                        && t[from + 2] == 0xBD)
-                {
-                    return None;
-                }
-                wsum += gw;
-            }
-            if wsum != m.w {
-                return None;
-            }
-        }
-    }
-    // run 列の構成（stable 挿入ソート = C と同順）と受理検査（写し）
-    let mx = g.w;
-    let mut runs: Vec<(i32, RunRef<'a>)> = Vec::with_capacity(
-        ri.markers.len() + ri.hline_spans.len() + line.map_or(0, |dl| dl.segs.len()),
-    );
-    if let Some(dl) = line {
-        for s in &dl.segs {
-            runs.push((s.x, RunRef::Seg(s)));
-        }
-    }
-    for m in &ri.markers {
-        runs.push((m.x, RunRef::Marker(m)));
-    }
-    for h in &ri.hline_spans {
-        runs.push((h.0, RunRef::Hline(h.1 - h.0)));
-    }
-    if runs.len() > 64 {
-        return None;
-    }
-    for a in 1..runs.len() {
-        let t = runs.remove(a);
-        let mut c = a;
-        while c > 0 && runs[c - 1].0 > t.0 {
-            c -= 1;
-        }
-        runs.insert(c, t);
-    }
-    let mut pos = 0i32;
-    for (x, run) in &runs {
-        if *x < pos {
-            return None; // 重複はセル経路へ
-        }
-        if *x > pos {
-            let ge = if *x > mx { mx } else { *x };
-            if ge - pos < 0 {
-                return None;
-            }
-            pos = *x;
-        }
-        if pos >= mx {
-            break; // viewport 右端でクリップ
-        }
-        match run {
-            RunRef::Hline(w) => {
-                pos += w; // clip 後も pos は元の w で進む（C と同一規則）
-            }
-            RunRef::Seg(s) => {
-                if pos + s.w > mx {
-                    return None; // 右端を跨ぐ bytes run は再構成不能
-                }
-                pos += s.w;
-            }
-            RunRef::Marker(m) => {
-                if pos + m.w > mx {
-                    return None;
-                }
-                pos += m.w;
-            }
-        }
-    }
-    Some(runs)
-}
-
-/// 受理済み fast 行の発行。ギャップはセル（BG ピースと byte 同値）、run は自身の pen で
-/// 生バイトを出す（C の runs 直行と同一バイト列）。no-ansi の行末 trim は C と同じく
-/// バイト 0x20 単位で後処理する。
-fn emit_fast_row(
-    out: &mut Vec<u8>,
-    g: &Grid,
-    y: i32,
-    runs: &[(i32, RunRef)],
-    ansi: bool,
-    cur: &mut (u8, u8, u8),
-) {
-    let row_mark = out.len();
-    let mx = g.w;
-    let mut pos = 0i32;
-    let put_gap = |out: &mut Vec<u8>, from: i32, to: i32, cur: &mut (u8, u8, u8)| {
-        let mut cx = from;
-        while cx < to {
-            let c = g.at(cx, y).unwrap();
-            if c.cp != 0 {
-                if ansi {
-                    emit_pen(out, (c.fg, c.bg, c.flags), cur);
-                }
-                let mut enc = [0u8; 4];
-                let n = crate::utf8::encode(c.cp, &mut enc);
-                out.extend_from_slice(&enc[..n]);
-            }
-            cx += 1;
-        }
-    };
-    for (x, run) in runs {
-        let ge = if *x > mx { mx } else { *x };
-        if ge > pos {
-            put_gap(out, pos, ge, cur);
-        }
-        pos = *x;
-        if pos >= mx {
-            break;
-        }
-        match run {
-            RunRef::Seg(s) => {
-                if ansi {
-                    emit_pen(out, s.pen, cur);
-                }
-                out.extend_from_slice(&s.raw);
-                pos += s.w;
-            }
-            RunRef::Marker(m) => {
-                if ansi {
-                    emit_pen(out, m.pen, cur);
-                }
-                out.extend_from_slice(&m.raw);
-                pos += m.w;
-            }
-            RunRef::Hline(w0) => {
-                let mut w2 = *w0;
-                if pos + w2 > mx {
-                    w2 = mx - pos; // セル単位 clip は HLINE だけ許容
-                }
-                if w2 > 0 {
-                    // w<=0 の空ランは細胞を持たない → pen 遷移も発生しない
-                    if ansi {
-                        emit_pen(out, (CELL_DEFAULT, CELL_DEFAULT, 0), cur);
-                    }
-                    for _ in 0..w2 {
-                        out.extend_from_slice(b"\xE2\x94\x80"); // ─
-                    }
-                }
-                pos += w0;
-            }
-        }
-    }
-    if ansi {
-        if mx > pos {
-            put_gap(out, pos, mx, cur); // 末尾ギャップ
-        }
-        out.extend_from_slice(b"\x1b[0m");
-        *cur = (CELL_DEFAULT, CELL_DEFAULT, 0);
-    } else {
-        while out.len() > row_mark && out.last() == Some(&b' ') {
-            out.pop();
-        }
-    }
-    out.push(b'\n');
-}
-
-/// グリッドを発行バイト列へ。ansi=1 で 256 色 SGR、0 でプレーン。C の `if_render_emit`
-/// （行スイープ経路。byte-direct 行は raw 発行、他はセル再エンコードで C と byte 一致）。
-pub fn render_emit(g: &Grid, ansi: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut cur = (CELL_DEFAULT, CELL_DEFAULT, 0u8); // fg, bg, flags
-
-    for y in 0..g.h {
-        if let Some(runs) = fast_plan(g, y, ansi) {
-            emit_fast_row(&mut out, g, y, &runs, ansi, &mut cur);
-            continue;
-        }
-        let mut last = g.w - 1;
-        if !ansi {
-            while last >= 0 && g.at(last, y).is_some_and(|c| c.cp == b' ' as u32) {
-                last -= 1;
-            }
-        }
-        for x in 0..=last {
-            let c = g.at(x, y).unwrap();
-            if c.cp == 0 {
-                continue; // 全角 2 セル目
-            }
-            if ansi {
-                emit_pen(&mut out, (c.fg, c.bg, c.flags), &mut cur);
-            }
-            let mut enc = [0u8; 4];
-            let n = crate::utf8::encode(c.cp, &mut enc);
-            out.extend_from_slice(&enc[..n]);
-        }
-        // 行末リセット無条件
-        if ansi {
-            out.extend_from_slice(b"\x1b[0m");
-            cur = (CELL_DEFAULT, CELL_DEFAULT, 0);
-        }
-        out.push(b'\n');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,8 +972,7 @@ mod tests {
         let dom = parse_html(html.as_bytes());
         let styles = apply_styles(&dom);
         let lay = layout_build(&dom, &styles, width);
-        let g = render_grid(&dom, &styles, &lay);
-        render_emit(&g, ansi)
+        render_emit_sweep(&lay, ansi)
     }
 
     #[test]
@@ -900,12 +1019,25 @@ mod tests {
         let dom = parse_html(b"<hr>");
         let styles = apply_styles(&dom);
         let lay = layout_build(&dom, &styles, 40);
-        let g = render_grid(&dom, &styles, &lay);
-        // hr 行は ─ で埋まる（body ml=1 なので x=1 から）
-        let out = render_emit(&g, false);
+        let out = render_emit_sweep(&lay, false);
         let s = String::from_utf8(out).unwrap();
+        // hr 行は ─ で埋まる（body ml=1 なので x=1 から）
         assert!(s.trim().starts_with("────────────────"), "got: {s:?}");
         let (mx, my) = render_extent(&lay);
         assert!(mx >= 40 && my >= 1);
+    }
+
+    #[test]
+    fn li_marker_ul_ol() {
+        // ul は "• "、ol は "N." の MARKER deco 経路（no-ansi fast の run 合流）
+        let out = render(
+            "<ul><li>a</li><li>b</li></ul><ol><li>c</li></ol>",
+            30,
+            false,
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("• a"), "got: {s:?}");
+        assert!(s.contains("• b"), "got: {s:?}");
+        assert!(s.contains("1. c"), "got: {s:?}");
     }
 }

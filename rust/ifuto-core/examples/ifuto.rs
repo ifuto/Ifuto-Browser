@@ -141,10 +141,9 @@ fn main() {
                     io::stdout().write_all(out.as_bytes()).unwrap();
                 }
                 _ => {
-                    // render
+                    // render（行スイープ経路）
                     let lay = ifuto_core::layout::layout_build(&dom, &styles, width);
-                    let grid = ifuto_core::render::render_grid(&dom, &styles, &lay);
-                    let out = ifuto_core::render::render_emit(&grid, ansi);
+                    let out = ifuto_core::render::render_emit_sweep(&lay, ansi);
                     io::stdout().write_all(&out).unwrap();
                 }
             }
