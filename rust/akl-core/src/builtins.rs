@@ -3466,6 +3466,9 @@ mod tests {
         assert_eq!(out, vec!["hello 42".to_string()]);
     }
 
+    // Miri では f64::sqrt / powf が近似実装で 1 ulp ずれるため厳密 == は
+    // ネイティブ専用（同上。Math.sqrt(9)/pow(2,10) の厳密性はネイティブで担保）。
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn math() {
         assert_eq!(run_src("Math.abs(-5);").unwrap().0, AklVal::from_f64(5.0));

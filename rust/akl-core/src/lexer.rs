@@ -910,6 +910,10 @@ mod tests {
         }
     }
 
+    // Miri では float intrinsic（powi）が自前近似実装で 1 ulp ずれるため、
+    // 厳密 == 検査はネイティブ専用（CI 2026-08-28 @e9475d0 で確定。ネイティブは
+    // プラットフォーム libm で C オラクルと一致、diff fuzz 150k が機械凍結）。
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn numbers_decimal() {
         assert_eq!(lex_all("0"), vec![Token::Num(NumLit::Int(0)), Token::Eof]);
