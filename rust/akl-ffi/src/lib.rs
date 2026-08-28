@@ -76,17 +76,16 @@ pub struct AklRT {
     vtables: Vec<*const CAklHandleVTab>,
     /// C vtable ポインタ → `HandleVTab`（tag 込みで 1 回だけ作る）のキャッシュ。
     handle_vtab_cache: Vec<(*const CAklHandleVTab, &'static HandleVTab)>,
-    /// `handle_vtab_for` が生成した `HandleVTab` の所有権（`Box` のヒープ領域は
-    /// Vec 伸長では動かない。cache 内の `&'static` はここを指す）。
-    /// 宣言位置は `rt` より後: フィールドは宣言順に drop されるため Runtime 解体
-    /// （その heap 内 `Obj::Handle` が vtab 参照を保持）の追跡中にも Box は生存し、
-    /// 最後にここで解放される。akl-core にカスタム Drop は無く参照先は読まれない。
-    /// lint: この Box はアドレス安定化のために必須（cache の `&'static` が Box の
-    /// ヒープ領域を指し、Vec 伸長で動いてはならない）— vec_box は誤検出。
-    #[allow(clippy::vec_box)]
-    owned_vtabs: Vec<Box<HandleVTab>>,
-    /// 同上。C tag 文字列のコピーの所有権（cache 内 `HandleVTab.tag` が指す）。
-    owned_tags: Vec<Box<str>>,
+    /// `handle_vtab_for` が `Box::into_raw` で生成した `HandleVTab` の所有ポインタ
+    /// （cache の `&'static` はこれらを指す。`akl_free` で `Box::from_raw` して解放）。
+    /// **Box 値として保持しない理由（Miri/Tree Borrows 適合）**: Box を `Vec<Box<T>>`
+    /// で保持すると push/再配置のたびに Box 値がムーブされ、Tree Borrows は
+    /// pointee を Unique retag = 先行の `&'static` 派生タグを殺す。`into_raw` で
+    /// 生ポインタ化しておけば Box 値のムーブは存在せず、参照タグは from_raw による
+    /// 回収まで生存する。ヒープ領域自体も動かない。
+    owned_vtabs: Vec<*mut HandleVTab>,
+    /// 同上。C tag 文字列のコピーの所有ポインタ（`Box<str>` の `into_raw` 由来）。
+    owned_tags: Vec<*mut str>,
     /// 汎用 foreign アダプタの登録 index（遅延 1 回）。
     foreign_idx: Option<u32>,
     /// エラー文言バッファ（NUL 終端。C の `rt->err` 相当）。
@@ -296,22 +295,23 @@ fn handle_vtab_for(rt: &mut AklRT, vt: *const CAklHandleVTab) -> &'static Handle
         } else {
             let c = std::ffi::CStr::from_ptr((*vt).tag);
             let s = c.to_str().unwrap_or("Handle");
-            rt.owned_tags.push(s.to_string().into_boxed_str());
-            let boxed: &str = rt.owned_tags.last().unwrap();
-            // SAFETY: Box<str> のヒープデータは Vec 伸長では動かず、
-            // 解放は AklRT drop（akl_free。rt 本体より後）まで起きない。
-            &*(boxed as *const str)
+            let p: *mut str = Box::into_raw(s.to_string().into_boxed_str());
+            rt.owned_tags.push(p);
+            // SAFETY: p は直上の Box::into_raw 由来。into_raw 後 Box 値は一度も
+            // ムーブされず（Vec には生ポインタで保持）、akl_free までアドレス・
+            // タグともに安定。回収は akl_free が from_raw で 1 回だけ行う。
+            &*p
         }
     };
-    rt.owned_vtabs.push(Box::new(HandleVTab {
+    let hp: *mut HandleVTab = Box::into_raw(Box::new(HandleVTab {
         tag,
         get: handle_get_adapter,
         set: handle_set_adapter,
         call: handle_call_adapter,
     }));
-    let bp: *const HandleVTab = &**rt.owned_vtabs.last().unwrap();
-    // SAFETY: 同上。Box のヒープ領域は Vec 伸長で動かず、akl_free まで生存。
-    let hv: &'static HandleVTab = unsafe { &*bp };
+    rt.owned_vtabs.push(hp);
+    // SAFETY: 同上。into_raw 由来の安定アドレス/タグ。
+    let hv: &'static HandleVTab = unsafe { &*hp };
     rt.handle_vtab_cache.push((vt, hv));
     hv
 }
@@ -354,7 +354,23 @@ pub unsafe extern "C" fn akl_new() -> *mut AklRT {
 pub unsafe extern "C" fn akl_free(rt: *mut AklRT) {
     if !rt.is_null() {
         // SAFETY: rt は akl_new が返した所有ポインタ（呼び出し側の契約）。
-        unsafe { drop(Box::from_raw(rt)) };
+        let mut boxed = unsafe { Box::from_raw(rt) };
+        // handle_vtab_for が Box::into_raw した vtab/tag 群を from_raw で回収する。
+        // akl-core にカスタム Drop は無く（`impl Drop` grep 0 件確認）、本体
+        // （Runtime）の drop は heap 内 `Obj::Handle` の vtab/tag の中身を読まない
+        // ため、先に回収しても安全。`&'static` 参照はこの後 1 度も使われない
+        // （cache も一緒に消える）ので use-after-free は成立しない。
+        let vtabs = std::mem::take(&mut boxed.owned_vtabs);
+        let tags = std::mem::take(&mut boxed.owned_tags);
+        for p in vtabs {
+            // SAFETY: p は handle_vtab_for で into_raw した box（1 回だけ解放）。
+            unsafe { drop(Box::from_raw(p)) };
+        }
+        for p in tags {
+            // SAFETY: 同上（Box<str> の into_raw 由来。同様に 1 回だけ）。
+            unsafe { drop(Box::from_raw(p)) };
+        }
+        drop(boxed);
     }
 }
 

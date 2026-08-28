@@ -1633,3 +1633,29 @@ C と同型のフラット streams（lines / deco / seg_arena）を直接消費�
 訪問時解決の移植が次フェーズ候補）、ついで layout 段（736.33ms。
 IfGeomCache / AVX2 可視ラン / 2-way 並列 layout）、parse 段（258.10ms）、
 read 段（8.71ms。`fs::read` → mmap 案、出力同値・観測不変）。
+
+### フェーズ 9-b: akl-ffi `handle_vtab_for` の `Box::into_raw` 化（Miri/Tree Borrows 適合）+ trigger Miri ログ採取
+
+CI run 33124469058（@59de005）で **CMD 5（Miri）のみ exit 101** 失敗（Miri 緑
+2026-08-15 @2cc4d6d → 赤 2026-08-27 の bisect 区間は 8-z+9-a 全部）。主容疑は
+9-a の leak 全廃で導入した `owned_vtabs: Vec<Box<HandleVTab>>` /
+`owned_tags: Vec<Box<str>>` の構造: **Tree Borrows では Box 値のムーブ
+（Vec push / 再配置）が pointee を Unique retag し、それ以前に作られた
+`&'static` 派生参照のタグを殺す**。akl-ffi の `handle_roundtrip` テストは
+vtab 生成 → `akl_free` を踏むため、この規則に抵触し得る。
+
+修正（`rust/akl-ffi/src/lib.rs`、検証後に確定度を更新する**仮説駆動の修正**）:
+FFI 標準イディオムへ変更 — `Box::into_raw` で生成した**生ポインタを Vec に保持**
+（`Vec<*mut HandleVTab>` / `Vec<*mut str>`。**Box 値のムーブを一度も存在させない**
+ため Unique retag は起きず、参照タグは回収まで生存）。`akl_free` は
+`std::mem::take` で Vec を抜いた後に各要素へ `drop(Box::from_raw(p))` を明示実行、
+最後に `drop(boxed)`（akl-core にカスタム Drop は無く（grep 0 件）、Runtime drop
+中に vtab/tag 中身は読まれないため先回収で安全、と SAFETY コメントで監査下）。
+leak ゼロ性（9-a の成果）は `chk_oracle ./build/ifuto-asan` 21/21 = LSan 緑で
+再確認済み。
+
+**正直注記**: ローカルでは `cargo +nightly miri setup` が crates.io へのネット
+アクセス不可で sysroot を構築できず、根本原因のローカル再現はできていない。
+確証は CI 経由でのみ得られるため、`trigger/trigger.md` の Miri 行に
+`/tmp/miri.log` の result.md 追記（tail -80）を追加し、次回 CI で実エラーが
+読めるようにした。CI 緑を以て確定、赤なら miri.log から再調査。

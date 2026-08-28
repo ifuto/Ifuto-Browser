@@ -22,8 +22,8 @@ cd rust && ../trigger/tc timeout 300 cargo test --workspace
 # --- 4. clippy（警告 = エラー。ログを result.md に追記） ---
 cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
 
-# --- 5. Miri（未定義動作検出。nightly で実行） ---
-cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace
+# --- 5. Miri（未定義動作検出。nightly で実行。ログも result.md へ） ---
+cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
 
 # --- 6. Kani（機械的証明。スカラー純粋関数のみ） ---
 cd rust && ../trigger/tc timeout 900 cargo kani --workspace
