@@ -1659,3 +1659,65 @@ leak ゼロ性（9-a の成果）は `chk_oracle ./build/ifuto-asan` 21/21 = LSa
 確証は CI 経由でのみ得られるため、`trigger/trigger.md` の Miri 行に
 `/tmp/miri.log` の result.md 追記（tail -80）を追加し、次回 CI で実エラーが
 読めるようにした。CI 緑を以て確定、赤なら miri.log から再調査。
+
+### フェーズ 10-b: style 段の消去（IfStyleLazy 移植）+ eager 経路の決定メモ化 — 16MB total 1,041ms（C 比 8.9×）
+
+**問題**: Rust の style 解決は全ノード eager 全走査を、メモ化も intern も無しで
+各ノードに `Vec<Option<Winner>>` をヒープ確保する素朴形で実行していた
+（16MB で 552.74ms、16MB total の 1/3）。C は 3 段機構でこれを消している:
+md fast-DOM × CLI 行スイープでの lazy 要所解決（style 段 0.00ms、layout の
+DFS 訪問時のみ）+ author 無し HTML での決定メモ化 eager（直接マップ + intern）
++ author 有りのみ安全側の全走査。いずれも `st_resolve_memo` / `compute_node`
+一点化で全経路の解決値が同値。
+
+移植（全て C 機構の写し。値は `compute_style` 一点化で全経路 byte 同値）:
+
+- `css.rs`: `compute_node` → pure 値関数 `compute_style` へ分離（C の一点化写し）。
+  `StyleKey`（Style 全フィールドのビット同一性キー。f32 は to_bits）、
+  `StyleIntern`（開放番地・負荷率 0.75・×2 成長。SipHash ではなく u32 語の
+  乗算混合 — lazy は**ノードごとに parent 値の逆引き**を打つため std HashMap の
+  SipHash(112B) は ~140ns/ノード = 16MB で +230ms の無駄と実測同定）、
+  `StyleCache`（直接マップ 2^14。キーは (parent 値の intern idx, k2)。
+  k2: 既知タグ `(tag<<1)|1` / 未知タグは名前バッファのアドレス — DOM 不変なので
+  ABA なし、値同一でない限り hit しない保守性 = C の raw pointer キーの写し）、
+  `StyleLazy`（1/2 スロット LRU + 直接マップ。2 番 hit 時の昇格スワップ、
+  inline style 持ちはメモ通路ごとバイパス、の C 写し）、
+  `style_lazy_ok`（`md_ws_stripped && !has_style && IF_STYLE_LAZY!=0` 写し）。
+- eager もメモ化: `compute_walk` は author シート無しのときだけ `StyleCache`
+  経路（C の if_style_apply の条件写し）。**HTML（author 無し）の style 段は
+  552→77ms**（16MB 測。メモ hit でも旧来は Winner Vec 確保×全ノードだった）。
+- `layout.rs`: `StSrc::{Eager,Lazy}` + `lc_st_of`（C の `lc_st_of` 写し）で st
+  アクセス一点化。lazy 時は ELEMENT → 解決値、非 ELEMENT → pst（継承の意味）。
+  `layout_build` を内部 `build_impl` 化し `layout_build_lazy` を追加
+  （html→body 先行解決と `lazy_rfs = html 算出 font_size` の確定は build_impl 写し）。
+- `main.rs`: `use_lazy_style` ゲート写し（`mode==Render && style_lazy_ok &&
+  !has_script && !has_style`）。lazy 時は `styles` 表の確保すらしない
+  （1.6M × Option<Style> = 80MB の死蔵確保+memset で 76.75ms 消費していた自前の
+  無駄を構造消去。C は if_style_apply 自体を呼ばない）。`collect_links` は
+  スタイル供給クロージャ化（lazy では `display:none` 判定用に解決。UA のみでは
+  display は継承されず (tag|name, inline style) の関数 = parent 非依存で
+  全面走査値と同値、の解析を根拠に None parent で解決。stats の links 数と
+  --links 出力が差分 fuzz と --stats 突合で機械検証）。
+
+検証（2026-08-28 実走、全て緑）:
+
+- 16MB/2MB × ansi/no-ansi 4 経路の C↔Rust stdout **byte-exact** 維持。
+- **lazy ≡ eager の全ノード値一致**: 10 文書バッテリ（ネスト・未知タグ・
+  inline style・display:none 部分木含む）で DFS pre-order 解決突合、
+  md fast-DOM で 3 幅 × 2 モードの render byte 一致（新規 unit test 3 件）。
+- diff fuzz **16,000 cases 追加 / 0 mismatch**（seed 20260828/555。
+  author シート・inline・script 含有の HTML を主に通る eager 側もカバー）→
+  **累計 150,133 cases / 0 mismatch**。
+- cargo test **337 緑**、clippy `-D warnings` 緑、fmt 緑、WPT 1922/1922、golden 1/1。
+
+計測（`bench/data-20260828b.json`、paired median。16MB）: total 1,632.49→
+**1,040.57ms**（C 116.87ms で **8.9×**）、style 552.74→**0.05ms**、RSS
+1,383,216→1,187,932KB（5.6×）。2MB total 195.10→132.83ms（8.8×）、ANSI 2MB
+230.58→158.68ms（4.5×）。startup は **1.4135 vs 1.4135ms で完全互角**（符号 76:73）。
+
+**残照準（嘘をつかない台帳）**: layout 段 736.84ms（C 46.47ms = **15.9×**。lazy
+解決の残オーバーヘッド ~50ms も含む）が最大の残件 — C の IfGeomCache /
+AVX2 可視ラン / no_boxlink / box_pool / 2-way 並列が未移植。parse 239.33ms
+（C 47.53ms = 5.0×、2-slice 並列と fitdom 機構が未移植）、render 58.62ms
+（2.8×）、read 8.71ms 級（fs::read → mmap 案）。RSS も layout 由来の box/seg
+確保嵐が主因と推定（推定。次フェーズで計測確定）。

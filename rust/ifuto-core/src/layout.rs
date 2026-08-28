@@ -189,11 +189,21 @@ pub struct Layout {
     pub seg_arena: Vec<Seg>,
 }
 
+/// スタイル供給源（C の eager `n->style` 経路 / lazy `IfStyleLazy` 経路の 2 経路）。
+enum StSrc<'a> {
+    /// 全面走査の適用済み表（C の `n->style` 読み経路）。
+    Eager(&'a [Option<Style>]),
+    /// 遅延解決（C の `IfStyleLazy`。md fast-DOM・author 無し専用）。
+    Lazy(std::cell::RefCell<crate::css::StyleLazy>),
+}
+
 /// レイアウト文脈（C の `IfLC` 相当。DOM/スタイルへの参照）。
 struct Lc<'a> {
     dom: &'a Dom,
-    styles: &'a [Option<Style>],
+    st_src: StSrc<'a>,
     root_fs: f32,
+    /// lazy 時の rem 基準（C の `lc->lazy_rfs`。html 解決後に 1 度だけ確定）。
+    lazy_rfs: f32,
     // --- seg merge 忠実化のための C arena 追跡モデル（下記 Prov 参照） ---
     /// 合成文字列アリーナの bump 位置写し（`syn_alloc` のみが進める）。
     syn_pos: std::cell::Cell<usize>,
@@ -213,6 +223,22 @@ struct Lc<'a> {
     deco: std::cell::RefCell<Vec<Deco>>,
     /// seg アリーナ（行確定時に `Wrap::segs` から移動する唯一の所有先）。
     seg_arena: std::cell::RefCell<Vec<Seg>>,
+}
+
+/// C の `lc_st_of` 写し（st アクセスの一点化）。戻り値規約:
+/// - eager: 適用済み表の値（`None` 伝播 = --no-style の quirk 再現）
+/// - lazy : ELEMENT → 解決値（値は全面走査と同値）、非 ELEMENT → pst（継承の意味）
+fn lc_st_of(lc: &Lc, n: NodeId, pst: Style) -> Option<Style> {
+    match &lc.st_src {
+        StSrc::Eager(t) => t[n as usize],
+        StSrc::Lazy(lz) => {
+            if lc.dom.node(n).kind == NodeKind::Element {
+                Some(lz.borrow_mut().get(lc.dom, n, Some(&pst), lc.lazy_rfs))
+            } else {
+                Some(pst)
+            }
+        }
+    }
 }
 
 /// C の `deco_add` 相当。追記 index を返す（h 後埋め用）。
@@ -803,7 +829,7 @@ fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, s
             );
         }
         NodeKind::Element => {
-            let est = lc.styles[n as usize].unwrap_or(st);
+            let est = lc_st_of(lc, n, st).unwrap_or(st);
             if est.display == D_NONE {
                 return;
             }
@@ -923,7 +949,8 @@ fn layout_ifc(
             // run を終わらせない = 全文が 1 つの IFC に融合する quirk。
             // style 未適用時の再現に必要）。自身の style が無い要素は
             // 継承値でゲートせず、Some のときだけ D_NONE/D_INLINE を見る。
-            if let Some(cst) = lc.styles[cid as usize] {
+            // lazy 経路では C と同じく ELEMENT は常に解決値を持つ（ゲート発動）。
+            if let Some(cst) = lc_st_of(lc, cid, base_st) {
                 if cst.display == D_NONE {
                     c = cnode.next_sibling;
                     continue;
@@ -1206,7 +1233,7 @@ fn layout_children(
     while let Some(cid) = c {
         let cnode = lc.dom.node(cid);
         let cst = if cnode.kind == NodeKind::Element {
-            lc.styles[cid as usize]
+            lc_st_of(lc, cid, base_st)
         } else {
             None
         };
@@ -1241,13 +1268,30 @@ fn layout_children(
     y - content_y
 }
 
-/// DOM + 計算済みスタイルからレイアウトを構築。C の `if_layout_build` 相当。
+/// DOM + 計算済みスタイルからレイアウトを構築。C の `if_layout_build` 相当
+/// （eager 経路: 全面走査の適用済みスタイル表を読む）。
 pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> Layout {
-    let width_cells = if width_cells < 4 { 4 } else { width_cells };
-    let lc = Lc {
+    build_impl(dom, StSrc::Eager(styles), width_cells)
+}
+
+/// DOM からスタイルを遅延解決しながらレイアウトを構築。C の IfStyleLazy 経路
+/// （`layout_render_sweep` での lazy）写し。`style_lazy_ok` の前提条件
+/// （md_ws_stripped && !has_style）でのみ呼ぶこと。解決値は全面走査と同値。
+pub fn layout_build_lazy(dom: &Dom, width_cells: i32) -> Layout {
+    build_impl(
         dom,
-        styles,
+        StSrc::Lazy(std::cell::RefCell::new(crate::css::StyleLazy::new())),
+        width_cells,
+    )
+}
+
+fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32) -> Layout {
+    let width_cells = if width_cells < 4 { 4 } else { width_cells };
+    let mut lc = Lc {
+        dom,
+        st_src,
         root_fs: 16.0,
+        lazy_rfs: 16.0,
         syn_pos: std::cell::Cell::new(0),
         pieces_cap: std::cell::Cell::new(0),
         links_cap: std::cell::Cell::new(0),
@@ -1260,6 +1304,7 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
     };
 
     let mut body: Option<NodeId> = None;
+    let mut html: Option<NodeId> = None;
     let mut c = dom.node(dom.root).first_child;
     while let Some(cid) = c {
         let cnode = dom.node(cid);
@@ -1269,6 +1314,7 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
                 let gnode = dom.node(gid);
                 if gnode.kind == NodeKind::Element && gnode.tag == TAG_BODY {
                     body = Some(gid);
+                    html = Some(cid);
                     break;
                 }
                 g = gnode.next_sibling;
@@ -1304,7 +1350,20 @@ pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> La
         };
     };
 
-    let bst = styles[body as usize].unwrap_or(STYLE_FALLBACK);
+    // C の build_impl 写し。lazy: html→body の 2 要素だけ先に解決し lazy_rfs を
+    // 確定（html の font_size）、以降は DFS 訪問時に各所で解決する。
+    // eager: 従来どおり適用済み表を読む（無ければ FALLBACK）。
+    let bst = match &lc.st_src {
+        StSrc::Eager(t) => t[body as usize].unwrap_or(STYLE_FALLBACK),
+        StSrc::Lazy(lz) => {
+            let html = html.expect("body 発見時に html も確定");
+            let mut z = lz.borrow_mut();
+            let html_st = z.get(dom, html, None, 16.0);
+            lc.lazy_rfs = html_st.font_size; // compute_walk の HTML 直下 rfs 確定の写し
+            let rfs = lc.lazy_rfs;
+            z.get(dom, body, Some(&html_st), rfs)
+        }
+    };
     let body_fs = bst.font_size;
     let body_mt = len_v(bst.margin[0], body_fs, 16.0, width_cells);
     let root = layout_element(&lc, body, bst, 0, body_mt, width_cells);

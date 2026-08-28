@@ -243,7 +243,10 @@ fn dump_tokens(input: &[u8]) -> Vec<u8> {
 /// - `display:none` の部分木は flatten されない（収集されない）。
 ///   本関数は DOM を文書順 DFS して同じ集合を作る（レイアウトを経由しないため
 ///   分岐を 1 本化できる。収集順 = 文書順であることは差分 fuzz が機械検査する）。
-fn collect_links(dom: &Dom, styles: &[Option<css::Style>]) -> Vec<Vec<u8>> {
+fn collect_links(
+    dom: &Dom,
+    mut st_of: impl FnMut(&Dom, NodeId) -> Option<css::Style>,
+) -> Vec<Vec<u8>> {
     use ifuto_core::tags_tables::{TAG_A, TAG_BODY, TAG_HTML};
     let mut out = Vec::new();
     let mut stack: Vec<NodeId> = Vec::new();
@@ -277,10 +280,7 @@ fn collect_links(dom: &Dom, styles: &[Option<css::Style>]) -> Vec<Vec<u8>> {
             continue;
         }
         // スタイル適用済みで display:none なら部分木ごと対象外（自身は除外済みで到達しない）。
-        let hidden = styles
-            .get(nid as usize)
-            .and_then(|s| s.as_ref())
-            .is_some_and(|s| s.display == css::D_NONE);
+        let hidden = st_of(dom, nid).is_some_and(|s| s.display == css::D_NONE);
         if hidden {
             continue;
         }
@@ -545,7 +545,20 @@ fn main() {
     }
 
     // style（--no-style なら cascade 未実行の正直な姿）
-    let styles: Vec<Option<css::Style>> = if do_style {
+    // lazy style: md fast-DOM × 行スイープ（C の M_RENDER 相当）では style 全面走査を
+    // 消し、layout の DFS 訪問時に必要箇所だけ解決する（解決値は apply_styles と同値。
+    // C の use_lazy_style = if_md_style_lazy_ok(dom) && !has_script && !has_style && M_RENDER
+    // の写し。script 含有文書は script 後 DOM との同値性を eager で確定する）。
+    let style_lazy = do_style
+        && mode == Mode::Render
+        && css::style_lazy_ok(&dom)
+        && !dom.has_script
+        && !dom.has_style;
+    // lazy 時は styles 表自体が不要（C は if_style_apply を呼ばない）ため確保もしない
+    // （1.6M × Option<Style> の死蔵 malloc+memset を構造消去）。eager/--no-style は従来どおり。
+    let styles: Vec<Option<css::Style>> = if style_lazy {
+        Vec::new()
+    } else if do_style {
         css::apply_styles(&dom)
     } else {
         vec![None; dom.nodes.len()]
@@ -558,7 +571,11 @@ fn main() {
         exit(0);
     }
 
-    let lay = layout::layout_build(&dom, &styles, width);
+    let lay = if style_lazy {
+        layout::layout_build_lazy(&dom, width)
+    } else {
+        layout::layout_build(&dom, &styles, width)
+    };
     let t4 = Instant::now();
 
     if mode == Mode::Layout {
@@ -591,7 +608,22 @@ fn main() {
 
     // C はレイアウトが常にリンクを収集する（lay->n_links は --links 旗と無関係に
     // stats へ出る）。収集順・収集集合 = 文書順 DFS（差分 fuzz が機械検査）。
-    let collected = collect_links(&dom, &styles);
+    let collected = if style_lazy {
+        // lazy の display:none 判定は解決値を読む。UA シートのみ（lazy 前提）では
+        // display は継承されず (tag|name, inline style) のみの関数 = parent 非依存で
+        // 全面走査値と同値（layout の DFS で解決される値は同じ intern 系を通る）。
+        // None parent での解決は display 判定専用として正当。
+        let mut lz = css::StyleLazy::new();
+        collect_links(&dom, move |dom2, nid| {
+            Some(if dom2.node(nid).kind == NodeKind::Element {
+                lz.get(dom2, nid, None, 16.0)
+            } else {
+                return None;
+            })
+        })
+    } else {
+        collect_links(&dom, |_, nid| styles.get(nid as usize).copied().flatten())
+    };
     if links && !collected.is_empty() {
         let stdout = std::io::stdout();
         let mut w = stdout.lock();

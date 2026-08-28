@@ -1691,13 +1691,15 @@ const APPLY_ORDER: [u16; P_N] = [
     P_HEIGHT,
 ];
 
-fn compute_node(
+/// 1 要素の決定解決（pure 値関数。C の `compute_node` 一点化の写し: eager walk /
+/// 直接マップ / IfStyleLazy の 3 経路がこの同一手続きを共有する。戻り値は intern 前の
+/// 自由態 style）。
+fn compute_style(
     dom: &Dom,
     n: NodeId,
     parent_st: Option<&Style>,
     root_fs: f32,
     sheets: &[&StyleSheet],
-    out: &mut [Option<Style>],
 ) -> Style {
     // 1) 初期値 + 継承
     let mut st = Style {
@@ -2003,8 +2005,408 @@ fn compute_node(
         }
     }
 
-    out[n as usize] = Some(st);
     st
+}
+
+// ================= 決定メモ化（C の IfStCacheEnt / st_resolve_memo / st_intern 写し） =================
+
+/// 直接マップキャッシュのサイズ（C の `IF_STCACHE_BITS`=14 = 16384 写し）。
+const STCACHE_BITS: u32 = 14;
+const STCACHE_SIZE: usize = 1 << STCACHE_BITS;
+
+/// `Len` のビット同一性キー。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LenKey {
+    v: u32,
+    unit: u8,
+}
+
+impl From<Len> for LenKey {
+    fn from(l: Len) -> Self {
+        LenKey {
+            v: l.v.to_bits(),
+            unit: l.unit,
+        }
+    }
+}
+
+/// `Style` のビット同一性キー（C の memset0 + memcmp 等価を fieldwise ビット抜き出しで
+/// 構造保証。f32 は to_bits、bool は 0/1。値が等しい style は必ず同キー = exact memo の根拠）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct StyleKey {
+    color: u32,
+    bg: u32,
+    font_size: u32,
+    line_height: u32,
+    width: LenKey,
+    height: LenKey,
+    margin: [LenKey; 4],
+    padding: [LenKey; 4],
+    border_w: [u32; 4],
+    border_color: u32,
+    display: u8,
+    text_align: u8,
+    white_space: u8,
+    flags: u8,
+}
+
+impl From<&Style> for StyleKey {
+    fn from(s: &Style) -> Self {
+        let mut flags = 0u8;
+        if s.bold {
+            flags |= 1;
+        }
+        if s.italic {
+            flags |= 2;
+        }
+        if s.underline {
+            flags |= 4;
+        }
+        if s.strike {
+            flags |= 8;
+        }
+        StyleKey {
+            color: s.color,
+            bg: s.bg,
+            font_size: s.font_size.to_bits(),
+            line_height: s.line_height.to_bits(),
+            width: LenKey::from(s.width),
+            height: LenKey::from(s.height),
+            margin: [
+                LenKey::from(s.margin[0]),
+                LenKey::from(s.margin[1]),
+                LenKey::from(s.margin[2]),
+                LenKey::from(s.margin[3]),
+            ],
+            padding: [
+                LenKey::from(s.padding[0]),
+                LenKey::from(s.padding[1]),
+                LenKey::from(s.padding[2]),
+                LenKey::from(s.padding[3]),
+            ],
+            border_w: [
+                s.border_w[0].to_bits(),
+                s.border_w[1].to_bits(),
+                s.border_w[2].to_bits(),
+                s.border_w[3].to_bits(),
+            ],
+            border_color: s.border_color,
+            display: s.display,
+            text_align: s.text_align,
+            white_space: s.white_space,
+            flags,
+        }
+    }
+}
+
+/// C の `IfStyleIntern` 写し（computed style の値 dedup。idx が値の正準名 = parent
+/// 同一性の測り方）。memcmp 等価は StyleKey の bit equality。
+/// key→idx は負荷率 0.75 で ×2 成長する開放番地（C と同機構。SipHash ではなく
+/// u32 語の乗算混合で ~5ns/probe — lazy 解決はノードごとに pk 逆引きを打つため
+/// ここが最頻コストとなる。近似・失敗は無し: probe は必ず StyleKey 完全一致を検査）。
+struct StyleIntern {
+    styles: Vec<(Style, StyleKey)>,
+    /// idx+1（0 = 空）。
+    tab: Vec<u32>,
+    mask: usize,
+}
+
+impl StyleIntern {
+    fn new() -> Self {
+        StyleIntern {
+            styles: Vec::new(),
+            tab: vec![0; 1024],
+            mask: 1023,
+        }
+    }
+
+    /// u32 語列の乗算混合（C st_hash 相当の役割。分布のみが要件で値は無関係）。
+    fn hash_of(k: &StyleKey) -> usize {
+        let words: [u32; 24] = [
+            k.color,
+            k.bg,
+            k.font_size,
+            k.line_height,
+            k.width.v,
+            k.width.unit as u32,
+            k.height.v,
+            k.height.unit as u32,
+            k.margin[0].v,
+            k.margin[0].unit as u32,
+            k.margin[1].v,
+            k.margin[1].unit as u32,
+            k.margin[2].v,
+            k.margin[2].unit as u32,
+            k.margin[3].v,
+            k.margin[3].unit as u32,
+            k.padding[0].v,
+            k.padding[0].unit as u32,
+            k.padding[1].v,
+            k.padding[1].unit as u32,
+            k.padding[2].v,
+            k.padding[2].unit as u32,
+            k.padding[3].v,
+            k.padding[3].unit as u32,
+        ];
+        let mut h = (k.border_w[0] as u64) ^ ((k.border_color as u64) << 32);
+        h = h.wrapping_mul(0x9E3779B97F4A7C15);
+        for (i, &w) in words.iter().enumerate() {
+            let mut x = (w as u64) ^ ((k.border_w[i & 3] as u64) << 21);
+            x ^= (k.display as u64) << 8
+                | (k.text_align as u64) << 16
+                | (k.white_space as u64) << 24
+                | (k.flags as u64) << 1;
+            x = x.wrapping_mul(0x9E3779B97F4A7C15);
+            x ^= x >> 29;
+            h ^= x;
+            h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+        }
+        h ^= h >> 31;
+        h as usize
+    }
+
+    /// C の `st_intern` 写し（同一値は挿入せず既存 idx を返す）。
+    fn intern(&mut self, st: &Style) -> u32 {
+        let k = StyleKey::from(st);
+        if (self.styles.len() as u64) * 4 >= (self.tab.len() as u64) * 3 {
+            // 負荷率 0.75 で ×2（C 写し）
+            let ncap = self.tab.len() * 2;
+            let mut nt = vec![0u32; ncap];
+            let nmask = ncap - 1;
+            for (i, &(_, sk)) in self.styles.iter().enumerate() {
+                let mut j = Self::hash_of(&sk) & nmask;
+                while nt[j] != 0 {
+                    j = (j + 1) & nmask;
+                }
+                nt[j] = i as u32 + 1;
+            }
+            self.tab = nt;
+            self.mask = nmask;
+        }
+        let mut j = Self::hash_of(&k) & self.mask;
+        loop {
+            let e = self.tab[j];
+            if e == 0 {
+                let idx = self.styles.len() as u32;
+                self.styles.push((*st, k));
+                self.tab[j] = idx + 1;
+                return idx;
+            }
+            if self.styles[e as usize - 1].1 == k {
+                return e - 1;
+            }
+            j = (j + 1) & self.mask;
+        }
+    }
+
+    /// 値 → idx の逆引き（pk 写像用。未登録の外来値は intern して一貫化）。
+    fn idx_of(&mut self, st: &Style) -> u32 {
+        self.intern(st)
+    }
+}
+
+/// 直接マップエントリ（C の `IfStCacheEnt` 写し）。pk は parent style の intern idx
+/// への写像（C の parent ポインタに相当。値同値性で正準化できるよう intern 化で
+/// 逆引きする。memcmp 同値性の構造保証は StyleKey の bit equality）。
+#[derive(Clone, Copy)]
+struct CacheEnt {
+    k2: u64,
+    /// parent idx + 1（0 = parent 無し。空エントリは k2==0 で判定 = C の
+    /// 「k2 下位 bit 常 1 で 0 非合法」の写し）。
+    pk: u64,
+    st: u32,
+}
+
+const EMPTY_ENT: CacheEnt = CacheEnt {
+    k2: 0,
+    pk: 0,
+    st: 0,
+};
+
+/// メモキーの k2 成分（C の st_resolve_memo と同一規則）: 既知タグは `(tag<<1)|1`、
+/// 未知タグは名前バッファのアドレス（値同一なら同アドレス、違えば miss のみ =
+/// 保守的。DOM は解決中に不変なので ABA は起きない）。
+fn k2_of(kind: NodeKind, tag: Tag, name: &[u8]) -> u64 {
+    if kind == NodeKind::Element && tag != tags::TAG_UNKNOWN {
+        ((tag as u64) << 1) | 1
+    } else {
+        name.as_ptr() as usize as u64
+    }
+}
+
+/// C の `st_resolve_memo`（tab 経路）写し: (parent 値, k2) で直接マップを引き、
+/// 衝突は必ず verify（pk/k2 の完全一致）→ 再計算（損失ゼロの exact memo）。
+struct StyleCache {
+    tab: Vec<CacheEnt>,
+    intern: StyleIntern,
+}
+
+impl StyleCache {
+    fn new() -> Self {
+        StyleCache {
+            tab: vec![EMPTY_ENT; STCACHE_SIZE],
+            intern: StyleIntern::new(),
+        }
+    }
+
+    /// C のハッシュ写し: (pk>>4)*2654435761 + k2*40503。
+    fn hash_of(pk: u64, k2: u64) -> usize {
+        let h = (pk >> 4)
+            .wrapping_mul(2654435761)
+            .wrapping_add(k2.wrapping_mul(40503));
+        (h as usize) & (STCACHE_SIZE - 1)
+    }
+
+    /// parent 値 → pk 写像（StyleLazy との共通部）。intern map の逆引きで正準化
+    /// する（未登録の外来 style は intern して以後一貫させる。加法のみで副作用なし）。
+    fn pk_of(&mut self, parent: Option<&Style>) -> u64 {
+        match parent {
+            None => 0,
+            Some(p) => self.intern.idx_of(p) as u64 + 1,
+        }
+    }
+
+    /// 解決して intern idx を返す。inline style 持ちは memo 通路ごとバイパス
+    /// （値が結果に効くため。C ゲートの写し）。parent は継承元の style 値。
+    fn resolve(
+        &mut self,
+        dom: &Dom,
+        n: NodeId,
+        parent: Option<&Style>,
+        rfs: f32,
+        sheets: &[&StyleSheet],
+    ) -> u32 {
+        let node = dom.node(n);
+        let inline = dom.attr(n, b"style").is_some();
+        if !inline && node.kind == NodeKind::Element {
+            let pk = self.pk_of(parent);
+            let k2 = k2_of(node.kind, node.tag, &node.name);
+            let h = Self::hash_of(pk, k2);
+            let e = self.tab[h];
+            if e.pk == pk && e.k2 == k2 && e.k2 != 0 {
+                return e.st;
+            }
+            let st = compute_style(dom, n, parent, rfs, sheets);
+            let idx = self.intern.intern(&st);
+            self.tab[h] = CacheEnt { k2, pk, st: idx };
+            idx
+        } else {
+            let st = compute_style(dom, n, parent, rfs, sheets);
+            self.intern.intern(&st)
+        }
+    }
+
+    /// idx → style 値の参照。
+    fn value(&self, idx: u32) -> Style {
+        self.intern.styles[idx as usize].0
+    }
+}
+
+/// 直接マップ + 1/2 スロットメモの遅延解決器（C の `IfStyleLazy` 写し）。
+/// UA シート固定。`style_lazy_ok` の前提（md_ws_stripped && !has_style）でのみ使用する。
+pub struct StyleLazy {
+    cache: StyleCache,
+    ua: StyleSheet,
+    /// 1 番スロット（pk, k2, st。k2==0 は空）。C の m_pk/m_k2/m_st 写し。
+    m1_pk: u64,
+    m1_k2: u64,
+    m1_st: u32,
+    /// 2 番スロット（body 直下の相互追い出し吸収。C の 2 番スロット写し）。
+    m2_pk: u64,
+    m2_k2: u64,
+    m2_st: u32,
+}
+
+impl Default for StyleLazy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StyleLazy {
+    /// C の `if_style_lazy_init` 写し（UA シートは ctx ごとに自前で parse）。
+    pub fn new() -> Self {
+        StyleLazy {
+            cache: StyleCache::new(),
+            ua: parse_stylesheet(UA_SHEET.as_bytes(), 0),
+            m1_pk: 0,
+            m1_k2: 0,
+            m1_st: 0,
+            m2_pk: 0,
+            m2_k2: 0,
+            m2_st: 0,
+        }
+    }
+
+    /// C の `if_style_lazy_get` 写し。parent は継承元 style（None = ルート）。
+    /// pk（parent 値の intern idx 写像）は呼出 1 回計算（LRU/ctab が共用）。
+    pub fn get(&mut self, dom: &Dom, n: NodeId, parent: Option<&Style>, rfs: f32) -> Style {
+        let node = dom.node(n);
+        let inline = dom.attr(n, b"style").is_some();
+        if !inline {
+            let pk = self.cache.pk_of(parent);
+            let k2 = k2_of(node.kind, node.tag, &node.name);
+            // 1 番スロット
+            if self.m1_k2 == k2 && self.m1_pk == pk && k2 != 0 {
+                return self.cache.value(self.m1_st);
+            }
+            // 2 番スロット: ヒット時は 1 番へ昇格スワップ（C 写し）
+            if self.m2_k2 == k2 && self.m2_pk == pk && k2 != 0 {
+                let st2 = self.m2_st;
+                self.m2_st = self.m1_st;
+                self.m2_pk = self.m1_pk;
+                self.m2_k2 = self.m1_k2;
+                self.m1_st = st2;
+                self.m1_pk = pk;
+                self.m1_k2 = k2;
+                return self.cache.value(st2);
+            }
+            // 直接マップ（pk は 1/2 番スロットと同一の 1 回計算分を使い回す）
+            let h = StyleCache::hash_of(pk, k2);
+            let e = self.cache.tab[h];
+            let idx = if e.pk == pk && e.k2 == k2 && e.k2 != 0 {
+                e.st
+            } else {
+                let st = {
+                    let uar: &StyleSheet = &self.ua;
+                    let sheets: &[&StyleSheet] = std::slice::from_ref(&uar);
+                    compute_style(dom, n, parent, rfs, sheets)
+                };
+                let idx = self.cache.intern.intern(&st);
+                self.cache.tab[h] = CacheEnt { k2, pk, st: idx };
+                idx
+            };
+            // 2 番 ← 1 番、1 番 ← 新規（C 写し）
+            self.m2_st = self.m1_st;
+            self.m2_pk = self.m1_pk;
+            self.m2_k2 = self.m1_k2;
+            self.m1_st = idx;
+            self.m1_pk = pk;
+            self.m1_k2 = k2;
+            self.cache.value(idx)
+        } else {
+            // inline style 持ち: memo 通路ごとバイパスして直接 compute+intern（C 写し）
+            let st = {
+                let uar: &StyleSheet = &self.ua;
+                let sheets: &[&StyleSheet] = std::slice::from_ref(&uar);
+                compute_style(dom, n, parent, rfs, sheets)
+            };
+            let idx = self.cache.intern.intern(&st);
+            self.cache.value(idx)
+        }
+    }
+}
+
+/// C の `if_md_style_lazy_ok` 写し: lazy は md fast-DOM（author シート無し）専用。
+/// `IF_STYLE_LAZY=0` の kill switch も同一規約。
+pub fn style_lazy_ok(dom: &Dom) -> bool {
+    if !dom.md_ws_stripped || dom.has_style {
+        return false;
+    }
+    match std::env::var_os("IF_STYLE_LAZY") {
+        Some(v) => v != "0",
+        None => true,
+    }
 }
 
 fn collect_author_sheets(dom: &Dom, n: NodeId, out: &mut Vec<StyleSheet>, order: &mut u32) {
@@ -2036,6 +2438,7 @@ fn first_elem_child(dom: &Dom, n: NodeId) -> Option<NodeId> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_walk(
     dom: &Dom,
     n: NodeId,
@@ -2043,11 +2446,20 @@ fn compute_walk(
     root_fs: f32,
     sheets: &[&StyleSheet],
     out: &mut [Option<Style>],
+    cache: &mut Option<StyleCache>,
 ) {
     if dom.node(n).kind != NodeKind::Element {
         return;
     }
-    let st = compute_node(dom, n, parent_st, root_fs, sheets, out);
+    // C の st_resolve_memo 一点化の写し: cache 有り（UA 専用時）なら決定メモ化経路。
+    let st = match cache {
+        Some(c) => {
+            let idx = c.resolve(dom, n, parent_st, root_fs, sheets);
+            c.value(idx)
+        }
+        None => compute_style(dom, n, parent_st, root_fs, sheets),
+    };
+    out[n as usize] = Some(st);
     let child_rfs = if dom.node(n).tag == tags::tag_id(b"html") {
         st.font_size
     } else {
@@ -2056,7 +2468,7 @@ fn compute_walk(
     let mut c = dom.node(n).first_child;
     while let Some(cid) = c {
         if dom.node(cid).kind == NodeKind::Element {
-            compute_walk(dom, cid, Some(&st), child_rfs, sheets, out);
+            compute_walk(dom, cid, Some(&st), child_rfs, sheets, out, cache);
         }
         c = dom.node(cid).next_sibling;
     }
@@ -2078,7 +2490,14 @@ pub fn apply_styles(dom: &Dom) -> Vec<Option<Style>> {
         sheets.push(sh);
     }
     if let Some(html) = first_elem_child(dom, dom.root) {
-        compute_walk(dom, html, None, 16.0, &sheets, &mut out);
+        // C の if_style_apply の写し: author シート無しのときだけ決定メモ化を有効化
+        // （UA シートはタグセレクタのみで、memo キー (parent 値, tag|name) が完全）。
+        let mut cache = if author.is_empty() {
+            Some(StyleCache::new())
+        } else {
+            None
+        };
+        compute_walk(dom, html, None, 16.0, &sheets, &mut out, &mut cache);
     }
     out
 }
@@ -2260,6 +2679,141 @@ pub fn dump_styles(dom: &Dom, styles: &[Option<Style>]) -> String {
 mod tests {
     use super::*;
     use crate::html_tree::parse_html;
+
+    /// eager 全面走査と lazy 要所解決の全ノード値一致（C の IfStyleLazy 同値性の写し元。
+    /// UA シートのみ = lazy 前提の文書群。DFS pre-order で解決する = layout の訪問規約）。
+    #[test]
+    fn lazy_matches_eager_walk() {
+        let docs: &[&[u8]] = &[
+            b"<!doctype html><p>hello <b>bold</b> world</p>",
+            b"<ul><li>a<li>b<li>c</ul><ol><li>x</ol>",
+            b"<h1>T</h1><h2>S</h2><pre>pre\ntext</pre><blockquote>q</blockquote>",
+            b"<table><tr><td>1<td>2<tr><td>3</table><caption>c</caption>",
+            b"<div><span style=\"color:#f00\">inline</span><b style=\"font-size:20px\">b</b></div>",
+            b"<my-widget>x</my-widget><x-unknown><y-never/></x-unknown>",
+            b"<div><ul><li><b>deep <i>deeper</i></b></li></ul></div>",
+            b"<p style=\"display:none\">hidden <b>child</b></p><p>shown</p>",
+            b"<a href=\"#\">link</a> and <em style=\"background:blue\">e</em>",
+            b"<center>c</center><font>f</font><sub>s</sub><sup>S</sup>",
+        ];
+        for doc in docs {
+            let dom = parse_html(doc);
+            let eager = apply_styles(&dom);
+            assert!(
+                !dom.has_style,
+                "lazy 前提（author 無し）: {:?}",
+                String::from_utf8_lossy(doc)
+            );
+            let mut lz = StyleLazy::new();
+            // layout の DFS pre-order 写しで全 ELEMENT を解決して突合
+            fn walk(
+                dom: &crate::dom::Dom,
+                lz: &mut StyleLazy,
+                n: crate::dom::NodeId,
+                pst: Option<Style>,
+                eager: &[Option<Style>],
+            ) {
+                let node = dom.node(n);
+                let st = if node.kind == crate::dom::NodeKind::Element {
+                    let got = lz.get(dom, n, pst.as_ref(), 16.0);
+                    let want = eager[n as usize].unwrap_or_else(|| {
+                        panic!(
+                            "eager None @ {:?} {n:?}",
+                            String::from_utf8_lossy(&node.name)
+                        )
+                    });
+                    assert_eq!(
+                        got,
+                        want,
+                        "lazy != eager @ {:?}",
+                        String::from_utf8_lossy(&node.name)
+                    );
+                    Some(got)
+                } else {
+                    pst
+                };
+                let mut c = node.first_child;
+                while let Some(cid) = c {
+                    walk(dom, lz, cid, st, eager);
+                    c = dom.node(cid).next_sibling;
+                }
+            }
+            walk(&dom, &mut lz, dom.root, None, &eager);
+        }
+    }
+
+    /// md fast-DOM で lazy render の全パイプライン一致（行スイープの両モード）。
+    #[test]
+    fn lazy_render_matches_eager_render() {
+        let md = b"# Title\n\npara **bold** _it_ `code` text\n\n- a\n- b\n- c\n\n1. x\n2. y\n\n> quote\n\n```\npre block\n```\n\n| h1 | h2 |\n|----|----|\n| a  | b  |\n\n---\n\n[link](http://example.com) tail\n";
+        let dom = crate::md::md_to_dom(md).expect("md fast-DOM");
+        assert!(dom.md_ws_stripped);
+        assert!(style_lazy_ok(&dom));
+        let styles = apply_styles(&dom);
+        for ansi in [false, true] {
+            for width in [20, 60, 100] {
+                let lay_e = crate::layout::layout_build(&dom, &styles, width);
+                let lay_l = crate::layout::layout_build_lazy(&dom, width);
+                let out_e = crate::render::render_emit_sweep(&lay_e, ansi);
+                let out_l = crate::render::render_emit_sweep(&lay_l, ansi);
+                assert_eq!(out_e, out_l, "render byte-diff: ansi={ansi} width={width}");
+            }
+        }
+    }
+
+    /// inline style 持ちはメモ通路を通らない契約 + 同一文書で 2 インスタンスが
+    /// 同じ値を返すこと（intern/キャッシュのページ独立性）。
+    #[test]
+    fn lazy_inline_style_gate_and_ctx_independence() {
+        let doc = b"<p>a</p><p style=\"color:#00f\">b</p><p>c</p><p>d</p>";
+        let dom = parse_html(doc);
+        let mut lz1 = StyleLazy::new();
+        let mut lz2 = StyleLazy::new();
+        let eager = apply_styles(&dom);
+        fn body_children(dom: &crate::dom::Dom) -> Vec<crate::dom::NodeId> {
+            let mut out = Vec::new();
+            let mut c = dom.node(dom.root).first_child;
+            while let Some(cid) = c {
+                let n = dom.node(cid);
+                if n.kind == crate::dom::NodeKind::Element && n.tag == tags::tag_id(b"html") {
+                    let mut g = n.first_child;
+                    while let Some(gid) = g {
+                        let gn = dom.node(gid);
+                        if gn.kind == crate::dom::NodeKind::Element
+                            && gn.tag == tags::tag_id(b"body")
+                        {
+                            let mut k = gn.first_child;
+                            while let Some(kid) = k {
+                                if dom.node(kid).kind == crate::dom::NodeKind::Element {
+                                    out.push(kid);
+                                }
+                                k = dom.node(kid).next_sibling;
+                            }
+                        }
+                        g = gn.next_sibling;
+                    }
+                }
+                c = n.next_sibling;
+            }
+            out
+        }
+        let pst = None; // 値突合のみ（parent 規約は lazy_matches_eager_walk で検証済）
+        for (i, &nid) in body_children(&dom).iter().enumerate() {
+            let want = eager[nid as usize].unwrap();
+            // inline style 持ち（idx 1）もメモバイパスで同値に解決される
+            if i == 1 {
+                let got = lz1.get(&dom, nid, None, 16.0);
+                // parent=None は本来の規約と違う注入: p の親連鎖が無いので
+                // 値は inline 指定の効く部分以外 eager と同値であることだけ確認
+                assert_eq!(got.color, 0x0000FFFF);
+                assert_eq!(got.display, want.display);
+            } else {
+                let g1 = lz1.get(&dom, nid, pst.as_ref(), 16.0);
+                let g2 = lz2.get(&dom, nid, pst.as_ref(), 16.0);
+                assert_eq!(g1, g2);
+            }
+        }
+    }
 
     #[test]
     fn color_parse() {
