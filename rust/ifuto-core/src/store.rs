@@ -645,8 +645,19 @@ end\n"
         assert_eq!(shrink_history(b"short"), None);
         // 縮退（後半の最初の行境界から）
         let mut big = Vec::new();
-        for i in 0..100_000 {
-            big.extend_from_slice(format!("{i}\thttps://x/{i}\n").as_bytes());
+        if cfg!(miri) {
+            // Miri は UB 検出が目的。format! 100k 回のコストを避けるため、行数を
+            // 減らして各行を詰め物で伸ばし、同じ >HISTORY_MAX_BYTES 条件を満たす
+            // （縮退判定・行境界走査のコード経路は同一）。
+            for i in 0..1_000 {
+                big.extend_from_slice(
+                    format!("{i}\thttps://x/{i}{}\n", "a".repeat(600)).as_bytes(),
+                );
+            }
+        } else {
+            for i in 0..100_000 {
+                big.extend_from_slice(format!("{i}\thttps://x/{i}\n").as_bytes());
+            }
         }
         let shrunk = shrink_history(&big).unwrap();
         assert!(shrunk.len() <= HISTORY_MAX_BYTES / 2 + 1000);

@@ -571,7 +571,10 @@ mod tests {
     /// 全バイト対（65536 × 2）の総当たり健全性: クラッシュせず・出力長 ≤ 6・決定的。
     #[test]
     fn oracle_sweep() {
-        for v in 0u32..=0xFFFF {
+        // Miri 下では素数 step に縮小（UB 検出が目的。掃引網羅は通常 test / fuzz）。
+        // 0xFFFF は必ず踏む（chain に明示）。
+        const STEP: usize = if cfg!(miri) { 251 } else { 1 };
+        for v in (0u32..=0xFFFF).step_by(STEP).chain([0xFFFF]) {
             let b = [(v >> 8) as u8, v as u8];
             let s1 = decode(&b, Enc::Sjis);
             let s2 = decode(&b, Enc::EucJp);

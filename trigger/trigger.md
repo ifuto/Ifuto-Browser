@@ -23,7 +23,10 @@ cd rust && ../trigger/tc timeout 300 cargo test --workspace
 cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
 
 # --- 5. Miri（未定義動作検出。nightly で実行。ログも result.md へ） ---
-cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
+# timeout は 600 → 1500 に拡大（2026-08-28: workspace 全件通過に 600s では不足し、
+# ifuto-core 183 件の途中で time kill されていた。データ重い掃引テストは cfg(miri)
+# で縮小済みだが、sysroot 構築 + 330 件の解釈実行は分単位が常態）。
+cd rust && ../trigger/tc timeout 1500 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
 
 # --- 6. Kani（機械的証明。スカラー純粋関数のみ） ---
 cd rust && ../trigger/tc timeout 900 cargo kani --workspace

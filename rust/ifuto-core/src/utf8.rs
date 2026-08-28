@@ -274,14 +274,31 @@ mod tests {
     #[test]
     fn encode_roundtrip_all_codepoints() {
         let mut buf = [0u8; 4];
-        for cp in 0..=0x10FFFFu32 {
+        let check = |buf: &mut [u8; 4], cp: u32| {
             if (0xD800..=0xDFFF).contains(&cp) {
-                continue; // サロゲートはエンコード対象外
+                return; // サロゲートはエンコード対象外
             }
-            let len = encode(cp, &mut buf);
+            let len = encode(cp, buf);
             let mut p = 0;
             assert_eq!(decode(&buf[..len], &mut p), cp, "cp=U+{cp:04X}");
             assert_eq!(p, len);
+        };
+        // Miri は UB 検出が目的（掃引網羅は通常 test / fuzz の責務）。Miri 下では
+        // 粗 step + 分岐境界の明示集合に縮小する（全長掃引は 600s ゲートに載らない）。
+        if cfg!(miri) {
+            for cp in (0u32..=0x10FFFF).step_by(4093) {
+                check(&mut buf, cp);
+            }
+            for &cp in &[
+                0x7Fu32, 0x80, 0x7FF, 0x800, 0xFFF, 0x1000, 0xCFFF, 0xD000, 0xD7FF, 0xE000, 0xFFFF,
+                0x10000, 0xF_FFFF, 0x10_0000, 0x10FFF0, 0x10FFFF,
+            ] {
+                check(&mut buf, cp);
+            }
+        } else {
+            for cp in 0u32..=0x10FFFF {
+                check(&mut buf, cp);
+            }
         }
         // 範囲外（u32 上限を超えない最大）とサロゲートは REPLACEMENT に置換
         for &cp in &[0x110000u32, 0xFFFF_FFFF, 0xD800, 0xDFFF] {
@@ -295,9 +312,11 @@ mod tests {
     /// `band_w2(b0,b1,b2)` ⟹ decode 成功 ∧ 幅 2。
     #[test]
     fn band_w2_implies_valid_wide() {
+        // Miri 下では粗 step に縮小（同上。段判定の機械性質は step 問わず同一）。
+        const STEP: usize = if cfg!(miri) { 17 } else { 1 };
         for b0 in 0xE0u8..=0xEF {
-            for b1 in 0u8..=0xFF {
-                for b2 in 0u8..=0xFF {
+            for b1 in (0u8..=0xFF).step_by(STEP) {
+                for b2 in (0u8..=0xFF).step_by(STEP) {
                     if !band_w2(b0, b1, b2) {
                         continue;
                     }

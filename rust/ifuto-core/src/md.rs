@@ -1788,8 +1788,15 @@ mod tests {
     #[test]
     fn twoslice_equals_serial() {
         let block: &[u8] = b"# t\n\npara with *em* and `code` and [x](/u) tail\n\n- a\n- b\n\n> q\n\n| h1 | h2 |\n| --- | --- |\n| 1 | 2 |\n\n```rust\ncode block\n```\n\n![alt](/i.png)\n\n---\n\n";
-        let mut big = Vec::with_capacity(block.len() * (1 << 20) / block.len() + block.len() * 2);
-        while big.len() < (1 << 20) + 12345 {
+        // Miri 下では 64KB に縮小（本テストは md_to_dom_2slice を直接呼ぶため
+        // 1MB の dispatch 閾値は不関係。等価性を検査する論理経路は同一）。
+        let target = if cfg!(miri) {
+            (1 << 16) + 12345
+        } else {
+            (1 << 20) + 12345
+        };
+        let mut big = Vec::with_capacity(target + block.len());
+        while big.len() < target {
             big.extend_from_slice(block);
         }
         assert!(md_par_scan(&big).is_some(), "分割点が見つかる構文のはず");
@@ -1813,7 +1820,13 @@ mod tests {
     #[test]
     fn par_scan_rejects_footnote() {
         let mut big = Vec::new();
-        while big.len() < (1 << 20) + 101 {
+        // Miri 下では 64KB に縮小（`[^` の大域拒否はサイズ不変の性質）。
+        let target = if cfg!(miri) {
+            (1 << 16) + 101
+        } else {
+            (1 << 20) + 101
+        };
+        while big.len() < target {
             big.extend_from_slice(b"para x\n\n");
         }
         big.extend_from_slice(b"has note[^a] here\n\n[^a]: def\n");
@@ -1825,19 +1838,21 @@ mod tests {
     #[test]
     fn par_scan_never_splits_inside_fence() {
         let mut big = Vec::new();
+        // Miri 下では 64KB に縮小（fence 追跡・分割点条件の論理経路は同一）。
+        let bound: usize = if cfg!(miri) { 1 << 16 } else { 1 << 20 };
         big.extend_from_slice(b"# head\n\n");
-        while big.len() < (1 << 20) / 2 {
+        while big.len() < bound / 2 {
             big.extend_from_slice(b"pre pad\n\n");
         }
         big.extend_from_slice(b"```\n");
-        while big.len() < (1 << 20) + 7777 {
+        while big.len() < bound + 7777 {
             big.extend_from_slice(b"in code\n\n");
         }
         big.extend_from_slice(b"```\n");
         let split = md_par_scan(&big);
         if let Some(p) = split {
             // 分割が見つかる場合、それは fence の外でなければならない
-            assert!(p >= big.len() || p <= (1 << 20) / 2, "fence 内分割は禁物");
+            assert!(p >= big.len() || p <= bound / 2, "fence 内分割は禁物");
         }
     }
 }

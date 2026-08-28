@@ -1910,3 +1910,26 @@ CI 再実行でアダプタ群は緑化（`handle_roundtrip` ok）。次に表�
 で足りるため、テストフレームの `Box` で所有し `akl_free` 後の自然 drop に変更
 （`&*vt as *const` で登録。生ポインタの使用期限中に Box が生存する契約を
 コード構造で表現）。
+
+### 追補（同日・4 件目）: Miri ゲートの実態は「time kill」+ データ重い掃引の cfg(miri) 縮小
+
+Box::leak 対処後も CMD 5 が exit 1。ログ末尾は `charset::tests::oracle_sweep ...`
+の**途中で切断**しており Miri エラー行がない = UB ではなく `timeout 600` による
+強制終了と確定（akl-ffi 6 件 + ifuto-core 183 件は全通過済みで、ifuto-core 走査中に
+600s 到達）。対処は 2 つ:
+
+1. **データ重い掃引テストの cfg(miri) 縮小**（Miri の目的は経路の UB 検出であり、
+   掃引網羅は通常 test / 差分 fuzz の責務。通常実行の網羅性は一切削っていない）:
+   - `utf8::encode_roundtrip_all_codepoints`（全 1.1M → Miri は step 4093 + 分岐境界 15 点）
+   - `utf8::band_w2_implies_valid_wide`（16×256×256 → Miri は b1/b2 を step 17）
+   - `charset::oracle_sweep`（65,536 → Miri は step 251 + 0xFFFF 明示）
+   - `store::test_shrink_history`（format! 100k 行 → Miri は 1k 行×各行伸長で同条件）
+   - `md::twoslice_equals_serial` / `par_scan_rejects_footnote` /
+     `par_scan_never_splits_inside_fence`（1MB → Miri は 64KB。fwrap 直接呼出のため
+     1MB dispatch 閾値は不関係、論理経路は同一）
+2. trigger.md の Miri timeout を 600 → **1500** に拡大（sysroot 構築 + ~330 件の
+   解釈実行は分単位が常態で、600 はワークスペース規模に対して構造的に不足）。
+
+なお前報で「ウォッチャ(gh run watch) exit 0 = 全緑確定」と書いたのは**誤り**。
+`gh run view` は conclusion=failure を返しており、行レベル（trigger/result.md）が
+唯一の正確な証跡。以後の CI 判定は result.md の CMD_RESULT 行のみを信用する。
