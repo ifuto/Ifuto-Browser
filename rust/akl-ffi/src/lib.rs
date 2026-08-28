@@ -160,6 +160,34 @@ unsafe fn val_slice<'a>(p: *const CAklVal, n: c_int) -> &'a [CAklVal] {
 }
 
 // ---- ホスト（FFI 層）コールバックのアダプタ（安全シグネチャ・unsafe ボディ） ----
+//
+// 【Miri/Stacked Borrows 適合ノート】
+// 本節のアダプタは `run_loop` 実行中に呼ばれる。このとき上位フレーム（akl_eval
+// 系）には AklRT box への `&mut` が生存しており、そのタグは強保護されている。
+// ここで `host_ctx`（整数経由・wildcard 来歴）から `&*w` / `&mut *w` のような
+// **参照の再生成**を行うと、その保護タグのポップが必要になり Stacked Borrows
+// 違反（実機では動くが形式的 UB）となる。一方、プレーンな生 read/write は
+// スタック頂上の保護タグ自身が許可するため合法。
+// よって本節では参照を一切生成せず、Vec ヘッダは `ptr::read` で **値コピー**
+// （要素バッファは別割当で保護競合なし）、スカラ/配列は `addr_of[_mut]` 経由の
+// 生アクセスで処理する。
+
+/// box 内 `natives` 登録表の生読み。返す `ManuallyDrop` は Vec ヘッダの値コピー
+/// （所有権の移動ではない。インデックス読み取り専用。二重 drop させないこと）。
+///
+/// SAFETY: `w` は有効な AklRT を指す（akl_new 由来）。
+unsafe fn rd_natives(w: *mut AklRT) -> std::mem::ManuallyDrop<Vec<(CAklNativeFn, *mut c_void)>> {
+    // SAFETY: 上記契約どおり。参照は生成しない。
+    std::mem::ManuallyDrop::new(unsafe { std::ptr::addr_of!((*w).natives).read() })
+}
+
+/// box 内 `vtables` 登録表の生読み（`rd_natives` と同じ契約）。
+///
+/// SAFETY: `w` は有効な AklRT を指す（akl_new 由来）。
+unsafe fn rd_vtables(w: *mut AklRT) -> std::mem::ManuallyDrop<Vec<*const CAklHandleVTab>> {
+    // SAFETY: 上記契約どおり。参照は生成しない。
+    std::mem::ManuallyDrop::new(unsafe { std::ptr::addr_of!((*w).vtables).read() })
+}
 
 /// C ネイティブを呼ぶ汎用アダプタ（`Obj::ForeignNative` から呼ばれる）。
 fn foreign_adapter(
@@ -173,8 +201,8 @@ fn foreign_adapter(
         return Err(VmError::NotCallable);
     }
     // SAFETY: host_ctx は akl_new が自前 AklRT のアドレスで初期化する。
-    let w = unsafe { &mut *wrapper };
-    let (c_fn, udata) = w.natives[data as usize];
+    let natives = unsafe { rd_natives(wrapper) };
+    let (c_fn, udata) = natives[data as usize];
     let argv: Vec<CAklVal> = args.iter().map(|v| v.bits()).collect();
     // SAFETY: c_fn は登録時の AklNativeFn。argv は args のビット列を保持したローカル。
     let result = unsafe {
@@ -186,10 +214,24 @@ fn foreign_adapter(
             udata,
         )
     };
-    // C ネイティブが akl_native_throw したか
-    if w.native_err {
-        w.native_err = false;
-        let msg = std::str::from_utf8(&w.err[..w.err_len]).unwrap_or("native exception");
+    // C ネイティブが akl_native_throw したか（すべて参照不生成の生アクセス）
+    // SAFETY: wrapper は akl_new 由来の有効ポインタ。
+    let native_err = unsafe { std::ptr::addr_of!((*wrapper).native_err).read() };
+    if native_err {
+        // SAFETY: 同上（生書き込み）。
+        unsafe { std::ptr::addr_of_mut!((*wrapper).native_err).write(false) };
+        // SAFETY: 同上（生読み込み。err_len は常に 255 以下）。
+        let err_len = unsafe { std::ptr::addr_of!((*wrapper).err_len).read() };
+        let mut buf = vec![0u8; err_len];
+        // SAFETY: buf は err_len バイト確保済み、err[..err_len] は有効範囲。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                std::ptr::addr_of!((*wrapper).err).cast::<u8>(),
+                buf.as_mut_ptr(),
+                err_len,
+            )
+        };
+        let msg = std::str::from_utf8(&buf).unwrap_or("native exception");
         let msg_id = rt.intern(msg).unwrap_or(0);
         return Err(VmError::Thrown(AklVal::mk_obj(msg_id)));
     }
@@ -200,8 +242,8 @@ fn foreign_adapter(
 fn handle_get_adapter(rt: &mut Runtime, data: u64, ptr: u64, name: &str) -> Option<AklVal> {
     let wrapper = rt.host_ctx as *mut AklRT;
     // SAFETY: host_ctx は akl_new が初期化。data は akl_mkhandle が vtables index で設定。
-    let w = unsafe { &*wrapper };
-    let c_vt = w.vtables[data as usize];
+    let vtables = unsafe { rd_vtables(wrapper) };
+    let c_vt = vtables[data as usize];
     // SAFETY: c_vt は登録時の CAklHandleVTab ポインタ。
     let get = unsafe { (*c_vt).get }?;
     let mut out: CAklVal = 0;
@@ -226,8 +268,8 @@ fn handle_get_adapter(rt: &mut Runtime, data: u64, ptr: u64, name: &str) -> Opti
 fn handle_set_adapter(rt: &mut Runtime, data: u64, ptr: u64, name: &str, v: AklVal) -> bool {
     let wrapper = rt.host_ctx as *mut AklRT;
     // SAFETY: host_ctx は akl_new が初期化。data は vtables index。
-    let w = unsafe { &*wrapper };
-    let c_vt = w.vtables[data as usize];
+    let vtables = unsafe { rd_vtables(wrapper) };
+    let c_vt = vtables[data as usize];
     // SAFETY: c_vt は登録時のポインタ。
     let Some(set) = (unsafe { (*c_vt).set }) else {
         return false;
@@ -254,8 +296,8 @@ fn handle_call_adapter(
 ) -> Option<AklVal> {
     let wrapper = rt.host_ctx as *mut AklRT;
     // SAFETY: host_ctx は akl_new が初期化。data は vtables index。
-    let w = unsafe { &*wrapper };
-    let c_vt = w.vtables[data as usize];
+    let vtables = unsafe { rd_vtables(wrapper) };
+    let c_vt = vtables[data as usize];
     // SAFETY: c_vt は登録時のポインタ。
     let call = unsafe { (*c_vt).call }?;
     let argv: Vec<CAklVal> = args.iter().map(|v| v.bits()).collect();
@@ -937,11 +979,22 @@ pub unsafe extern "C" fn akl_native_throw(rt: *mut AklRT, msg: *const c_char) {
     if rt.is_null() {
         return;
     }
-    // SAFETY: rt は akl_new 由来。msg は NUL 終端。
-    let rt = unsafe { &mut *rt };
+    // SAFETY: msg は NUL 終端（akl.h 契約）。
     let msg = unsafe { cstr(msg) };
-    set_err(rt, msg);
-    rt.native_err = true;
+    // 本関数は eval 実行中のネイティブから呼ばれうる。その間は上位フレームに
+    // AklRT box への `&mut` が生存（強保護）しており、`&mut *rt` の再参照生成は
+    // Stacked Borrows 違反となるため、err / err_len / native_err への書き込みは
+    // 参照不生成の生経路で行う（set_err と同じ収支）。
+    let bytes = msg.as_bytes();
+    let n = bytes.len().min(255);
+    // SAFETY: rt は akl_new 由来の有効ポインタ。err は [u8; 256] で n <= 255。
+    unsafe {
+        let err = std::ptr::addr_of_mut!((*rt).err).cast::<u8>();
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), err, n);
+        err.add(n).write(0);
+        std::ptr::addr_of_mut!((*rt).err_len).write(n);
+        std::ptr::addr_of_mut!((*rt).native_err).write(true);
+    }
 }
 
 // ---- チューニング / モジュール（API 互換。Rust 側は近似のため一部 no-op） ----

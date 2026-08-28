@@ -1853,3 +1853,39 @@ text run アキュムレータの逐ノード再成長だった。
 3. render 段 70.41ms（C 23.73 = 2.97×）。
 4. read 段 ~8.28ms（C 0.02ms。fs::read → `FileExt`/mmap。libstd の read_to_end は
    1 回余分な stat+確保走査を踏む疑い — 要検証ラベル）。
+
+## フェーズ 10-fix: akl-ffi コールバックアダプタの Stacked Borrows 適合（CI Miri ゲート修復）
+
+CI @b879045 の Miri（CMD 5）が `akl-ffi` の `handle_get_adapter` で exit 1
+（「tag `<wildcard>` へのアクセス許可は強保護された Unique の除去を要する」）。
+**10-c/10-d とは無関係の既存件**（直近 3 ラン連続で同一失敗。ifuto 側は
+`#![forbid(unsafe_code)]` のため Miri 上の新規指摘は存在しない）。
+
+### 原因（形式 UB。実機では動く）
+
+`akl_eval` 系が `&mut *rt`（AklRT box 全体の `&mut`）を保持したまま
+`run_loop` を回す間、ホストコールバックアダプタが `rt.host_ctx`（整数経由 =
+wildcard 来歴）から `&*wrapper` / `&mut *wrapper` の**参照を再生成**する。
+Stacked Borrows ではこの grant に保護タグのポップが必要で UB。
+一方プレーンな生 read/write はスタック頂上の保護タグ自身が許可するため合法
+— ここに合法経路がある。
+
+### 修復（挙動不変。参照不生成の生経路へ機械改修）
+
+- `foreign_adapter` / `handle_get_adapter` / `handle_set_adapter` /
+  `handle_call_adapter`: Vec 登録表の読み取りを `&mut *wrapper` 経由から、
+  `ptr::read` による **ヘッダ値コピー + `ManuallyDrop` 舐め**（`rd_natives` /
+  `rd_vtables`）に変更。要素バッファは別割当で保護競合しない。
+  `native_err` / `err_len` / `err[..]` は `addr_of[_mut]` 経由の生 read/write と
+  `copy_nonoverlapping` で処理（例外時のみのコールドパス）。
+- `akl_native_throw`: eval 中のネイティブからの再入路でもあるため同様に
+  生経路へ（`set_err` と同一収支の書き込みを inline）。
+- いずれも C コールバックへ渡す `wrapper` ポインタ値・error 文言収支・
+  戻り値は全て不変。
+
+### 検証
+
+- 通常: workspace test **340 緑**、clippy `-D warnings` 0、fmt clean。
+- Miri（要 crates.io で sysroot 構築）: 本砂箱は crates.io egress 遮断のため
+  ローカル検証不可。**CI トリガで確認する**（下の「合法」を仮定した理屈が
+  崩れた場合は同箇所で再失敗するので即判る）。
