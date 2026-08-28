@@ -1799,3 +1799,57 @@ render 段 1.42×）。startup 1.4740ms（C 1.3960、符号 114:36 で今回は 
 （4.2×。AVX2 可視ラン / fitdom / 2-way 並列 layout / ifc 入口の Wrap 初期化と
 segs Vec 成長の更なる抑制が未実施）、render 75.27ms（3.6×）、read 8.02ms
 （C 0.02ms。fs::read → mmap 案）、RSS 2.19×（stab/syn/arena は残置）。
+
+## フェーズ 10-d — parse 段: NameStr + reserve + run 再利用 + 2-slice 移植（既定 OFF）（2026-08-28）
+
+### 問題（alloc_probe 実測の台帳。16MB md）
+
+parse 段 241.81ms（C 47.68ms = 5.07×時点）の収支を計数アロケータで分解:
+**2.38M allocs / 922MB**。内訳の核心は `Node.name: Vec<u8>` の逐ノード
+malloc+memcpy と `Vec<Node>` 倍増の move 収支（最終 260MB の ~2 倍）、
+text run アキュムレータの逐ノード再成長だった。
+
+### 移植・改善（C の設計に対して safe 側で辿り着ける等価物）
+
+| C | 旧 Rust | 新 Rust |
+|---|---|---|
+| 名前は arena へ bump（0 alloc/ノード） | `name: Vec<u8>`（1 alloc/ノード） | `NameStr`: Static（タグ名 = 0 alloc）/ Inline ≤22B（0 alloc）/ Heap Box（短文以外）。`Deref<Target=[u8]>` で読み側 85 サイトはほぼ無改修 |
+| arena 予約的確保 | nodes 倍増 move | `nodes.reserve(input.len()/10)`（md ではノード数 ≒ 入力/10 が統計的にほぼ正確） |
+| run bump 再利用 | take→from_vec（次 run が 0 から再倍増） | from_bytes+clear で run 容量再利用 |
+| `scan_special` SSE2/AVX2（runtime dispatch） | 10 分岐スカラ scan | 32B チャンク棄却 + 256B LUT（safe の範囲の SIMD 代替。forbid(unsafe) のため intrinsic は不採用） |
+| 2-slice 並列（`md_par_scan` が安全性を証明）| 未移植 | **`md_par_scan` / `md_to_dom_2slice` として移植済み**（scaffold id 規約 root=0..body=3、B 側 stub→A body の恒等写像、Fn 独立性、taint 和集合、MAX_DOM_NODES 同一）。ただし既定は **OFF の opt-in（`IF_MD_PAR=1`）** — 下記の計測根拠 |
+
+### 計測（嘘をつかない。bench/data-20260828d.json、環境騒音 ±20% 注記つき）
+
+- alloc 収支: parse **2.38M→0.76M allocs / 922→402MB**（alloc_probe 同一コーパス実測）。
+- parse 段: 241.81 → **229.26ms**（median。環境が前回より重い中での絶対値。
+  C 比 5.07×→3.90× は C 側の 47.68→58.73ms の悪化込み。同条件 paired)。
+- RSS: 16MB 2.19→**1.95×**、2MB 1.85→**1.66×**（NameStr による per-node 24B→
+  inline/静的化の効果が clean に出た）。
+- 2-slice の honest 台帳（taskset 1-HT/2-HT A/B。ユーザ助言方式）: C は HT で
+  ~1.75× 効くが、Rust 現行は **merge コピー（Node ~165B × B 側全数の転記 ≒ 130MB）
+  + 走査重さで HT ゲインを食い潰し中立〜負**。よって既定 OFF。byte 出力は
+  serial ≡ 2-slice ≡ C parallel で 3 者一致済み（2MB/16MB）。単体テスト
+  `twoslice_equals_serial`（fence/table/link/list 混在 1MB+ で dump byte 一致）、
+  `par_scan_rejects_footnote`（`[^` 拒否）、`par_scan_never_splits_inside_fence`
+  を機械固定。なお Node の痩身化（~165B → C の ~40B 相当の SoA/セル化）は
+  転記量を 4 分の 1 にし 2-slice 採算を変え得る次の主件候補。
+
+### 検証（全て緑）
+
+- cargo test **340 緑**（+3: 2-slice 等価性テスト群）、0 警告。
+- 16MB/2MB × ansi/no-ansi 4 経路 + `--dump-layout` byte-exact 維持。
+- serial ≡ 2-slice（IF_MD_PAR=1）byte 一致（2MB/16MB 両コーパス）。
+- diff fuzz **3,000 件追加 → 累計 161,133 cases / 0 mismatch**。
+
+### 残照準（優先度順の台帳）
+
+1. **Node メモリ痩身化**（~165B → 目標 <64B。attrs/doctype/pi_target/tpl を副テーブル
+   へ。nodes 書き込み ~260MB の激減 + 2-slice merge 転記の軽減 + layout/render の
+   キャッシュ効率。次の最大構造件）。
+2. layout 段 236.16ms（C 3.94×。2-way 並列 layout `layout_shard_run_body` +
+   `md_body_mid` の移植。こちらも merge 転記不要な設計が要る — C は arena 共有で
+   O(1) 接合）。AVX2 可視ランは safe LUT 版で部分代替可能か要検証。
+3. render 段 70.41ms（C 23.73 = 2.97×）。
+4. read 段 ~8.28ms（C 0.02ms。fs::read → `FileExt`/mmap。libstd の read_to_end は
+   1 回余分な stat+確保走査を踏む疑い — 要検証ラベル）。

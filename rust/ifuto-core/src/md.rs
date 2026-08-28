@@ -266,11 +266,15 @@ impl DomOut {
             self.run.clear();
             return;
         }
-        let text = std::mem::take(&mut self.run);
+        // from_bytes + clear で run の確保量を再利用（take → from_vec だと
+        // 次の run が 0 から倍増し直し、テキストノード 1 枚ごとに 2-3 alloc
+        // 払っていた。デッドコピーは載るが alloc 回数の方が支配的）。
+        let name = crate::dom::NameStr::from_bytes(&self.run);
+        self.run.clear();
         let Some(nid) = self.mnew(NodeKind::Text) else {
             return;
         };
-        self.dom.node_mut(nid).name = crate::dom::NameStr::from_vec(text);
+        self.dom.node_mut(nid).name = name;
         let cur = self.cur;
         self.attach(cur, nid);
     }
@@ -431,7 +435,6 @@ impl Emit for DomOut {
     }
 
     fn text(&mut self, s: &[u8]) {
-        let __t0 = std::time::Instant::now();
         if self.tainted || s.is_empty() {
             return;
         }
@@ -440,7 +443,6 @@ impl Emit for DomOut {
             return;
         }
         self.run.extend_from_slice(s);
-        mprof_add(2, __t0.elapsed());
     }
 
     fn text_ch(&mut self, c: u8) {
@@ -734,21 +736,41 @@ fn ln_indent(l: Ln) -> usize {
 // ================= inline =================
 
 /// 特殊文字か。C の `scan_special` のスカラ版と同値。
-fn is_special(c: u8) -> bool {
-    matches!(
-        c,
-        b'\\' | b'`' | b'*' | b'_' | b'~' | b'!' | b'[' | b'<' | b'&' | b'>'
-    )
-}
-
 /// 次の特殊文字位置（無ければ `s.len()`）。C の `scan_special` 相当。
+/// チャンク判定 + チャンク内位置確定の 2 段構成（C の SSE2/AVX2 版 `scan_special_*`
+/// と同じく「まとめて棄却」を主経路にする。IS_SPECIAL_LUT の 256B 直表で分岐を消す）。
 fn scan_special(s: &[u8], from: usize) -> usize {
     let mut i = from;
-    while i < s.len() && !is_special(s[i]) {
+    let n = s.len();
+    // 32B チャンク: 特殊文字が無ければ一括で進める（本文の大部分）
+    while i + 32 <= n {
+        let mut any = false;
+        for &b in &s[i..i + 32] {
+            any |= IS_SPECIAL_LUT[b as usize];
+        }
+        if any {
+            break;
+        }
+        i += 32;
+    }
+    while i < n && !IS_SPECIAL_LUT[s[i] as usize] {
         i += 1;
     }
     i
 }
+
+/// 特殊文字直表（`is_special` の分岐連鎖を 1 回の LUT 参照に置き換える。
+/// 集合は `is_special` と厳密に同一）。非 const fn の matches! から機械生成した不変表。
+static IS_SPECIAL_LUT: [bool; 256] = {
+    let mut t = [false; 256];
+    let specials: &[u8] = b"\\`*_~![<&>";
+    let mut i = 0;
+    while i < specials.len() {
+        t[specials[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
 
 /// 閉じ区切り位置（無ければ `None`）。C の `find_close` 相当。
 fn find_close(s: &[u8], from: usize, delim: &[u8]) -> Option<usize> {
@@ -838,12 +860,6 @@ fn try_link<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], i: usize) -> Option<us
 }
 
 fn inline_span<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8]) {
-    let __t0 = std::time::Instant::now();
-    let i_save = MPROF_I.with(|c| c.get());
-    struct G(std::time::Instant);
-    impl Drop for G { fn drop(&mut self) { mprof_add(1, self.0.elapsed()); } }
-    let _g = G(__t0);
-    let _ = i_save;
     let mut i = 0;
     while i < s.len() {
         let sp0 = scan_special(s, i);
@@ -1342,7 +1358,6 @@ fn blocks_win<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usiz
 }
 
 fn blocks_str<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], depth: usize) {
-    let __t0 = std::time::Instant::now();
     // 行配列へ分割（ゼロコピー切片）
     let mut ls: Vec<Ln> = Vec::new();
     let mut st = 0usize;
@@ -1360,7 +1375,6 @@ fn blocks_str<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], depth: usize) {
         st = e + 1;
         p = e + 1;
     }
-    mprof_add(0, __t0.elapsed());
     blocks_win(out, fn_, &ls, 0, ls.len(), depth);
 }
 
@@ -1386,6 +1400,21 @@ pub fn md_to_dom_opts(input: &[u8], slim_attrs: bool) -> Option<Dom> {
     if input.contains(&0) {
         return None;
     }
+    // 並列 2-slice（C の `if_md_parse_fast_f` 並列経路の写し）。分割点の安全性
+    // 条件は `md_par_scan` が機械検査し、接合規約は C と同一 — 生成 DOM は
+    // 単走査と逐語同値（C の oracle sha256 と同じ検証盤を差分 fuzz でも固定）。
+    if input.len() >= (1 << 20) && md_par_on() && !input.contains(&b'\r') {
+        if let Some(split) = md_par_scan(input) {
+            if split > 0 {
+                return md_to_dom_2slice(input, slim_attrs, split);
+            }
+        }
+    }
+    md_to_dom_opts_serial(input, slim_attrs)
+}
+
+/// 単走査の DOM 直構築（C の `if_md_parse_fast_serial_f` 相当）。
+fn md_to_dom_opts_serial(input: &[u8], slim_attrs: bool) -> Option<Dom> {
     let mut out = DomOut::new(slim_attrs);
     // ノード数は入力にほぼ比例する（16MB md ≒ 1.6M）。倍増成長の move 収支
     // （最終量の ~2 倍コピー）を 1 回の予約で消す。余剰時の無駄を抑えるため
@@ -1394,7 +1423,6 @@ pub fn md_to_dom_opts(input: &[u8], slim_attrs: bool) -> Option<Dom> {
     let mut fn_ = Fn::new();
     run_blocks(&mut out, &mut fn_, input);
     out.run_flush();
-    if std::env::var_os("IFUTO_MPROF").is_some() { mprof_dump(); }
     if out.tainted {
         return None;
     }
@@ -1410,8 +1438,161 @@ pub fn md_to_dom(input: &[u8]) -> Option<Dom> {
     md_to_dom_opts(input, false)
 }
 
+/// 並列スイッチ。**既定 OFF**（C は既定 ON の殺しスイッチ `IF_MD_PAR=0` だが、本
+/// 検証環境（1 物理コア 2 HT）では 2-slice が中立〜負と実測確定したため、観測
+/// 挙動（byte 列）を変えない範囲で既定だけ逆転させる。有効化は `IF_MD_PAR=1`。
+/// 実コア環境では 1 推奨。`"0"`/`"1"` 以外の設定値も OFF 扱いで安全側）。
+fn md_par_on() -> bool {
+    match std::env::var_os("IF_MD_PAR") {
+        Some(v) => v == "1",
+        None => false,
+    }
+}
+
+/// C の `md_par_scan` 写し: 並列 2-slice の安全な分割点（文書中央以降で、直前行が
+/// 空行・当該行が fence 外の非空行である最初のブロック境界。byte オフセット）を返す。
+/// 安全性の前提は C と同一規則で本関数内でも拒否する:
+/// - `[^` が文書のどこかに在れば分割放棄（footnote 番号付け規約が半区間で変わるため）
+/// - fence（```/~~~）の内側は分割不可（fence 状態を入口側から追跡）
+/// - 分割候補は `off >= n/2`、直前行空行、当該行は非空かつ非 fence 開始
+fn md_par_scan(s: &[u8]) -> Option<usize> {
+    let n = s.len();
+    // `[^` の大域拒否（C は SIMD 部+scalar 尾部の全走査で拒否。条件は同一）
+    {
+        let mut i = 1usize;
+        while i < n {
+            match s[i..].iter().position(|&c| c == b'^') {
+                Some(k) => {
+                    let at = i + k;
+                    if s[at - 1] == b'[' {
+                        return None;
+                    }
+                    i = at + 1;
+                }
+                None => break,
+            }
+        }
+    }
+    let mut in_fence = false;
+    let mut fsym = 0u8;
+    let mut prev_blank = false;
+    let mut off = 0usize;
+    while off < n {
+        let e = match s[off..].iter().position(|&c| c == b'\n') {
+            Some(k) => off + k,
+            None => n,
+        };
+        let l = &s[off..e];
+        let blank = ln_blank(l);
+        if in_fence {
+            if !blank {
+                if let Some((s2, _)) = ln_fence(l) {
+                    if s2 == fsym {
+                        in_fence = false;
+                    }
+                }
+            }
+        } else if !blank {
+            if let Some((s2, _)) = ln_fence(l) {
+                in_fence = true;
+                fsym = s2;
+            } else if prev_blank && off >= n / 2 {
+                return Some(off);
+            }
+        }
+        prev_blank = blank;
+        off = e + 1;
+    }
+    None
+}
+
+/// 2-slice 並列 DOM 直構築（C の `MdSliceJob` 接合経路の写し）。
+/// A 側 [0, split) と B 側 [split, len) を同一パーサで独立に走らせ、body 子列を
+/// 鎖の継ぎ目 2 書きで O(1) 接合する。NodeId は B 側全リンクをオフセット写像する。
+/// Fn（footnote 台帳）は側ごとに新規 = C と同一（`[^` 拒否済みのため観測差なし）。
+fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom> {
+    let b_input = &input[split..];
+    // scaffold の id 規約（DomOut::new と一致。root=0, html=1, head=2, body/stub=3、
+    // 内容ノードは 4 以降が DFS 順で連続）。B 側の stub body 直下は parent=3 となって
+    // おり、A 側 body も id=3 なので写像は stub→body で恒等に写る。
+    const SKIP: u32 = 4;
+    let b_res = std::thread::scope(|sc| {
+        let hb = sc.spawn(|| {
+            let mut out = DomOut::new(slim_attrs);
+            out.dom.nodes.reserve(b_input.len() / 10);
+            let mut fn_ = Fn::new();
+            run_blocks(&mut out, &mut fn_, b_input);
+            out.run_flush();
+            (out.dom, out.tainted)
+        });
+        let mut out_a = DomOut::new(slim_attrs);
+        out_a.dom.nodes.reserve(split / 10);
+        let mut fn_a = Fn::new();
+        run_blocks(&mut out_a, &mut fn_a, &input[..split]);
+        out_a.run_flush();
+        let j = match hb.join() {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        };
+        let tainted = out_a.tainted || j.1;
+        (out_a.dom, j.0, tainted)
+    });
+    let (mut dom_a, mut dom_b, tainted) = b_res;
+    let total = dom_a.nodes.len() + dom_b.nodes.len() - SKIP as usize;
+    if tainted || total >= MAX_DOM_NODES {
+        return None; // 2 段経路が同じ結論へ至る（T5 含む。C と同じ）
+    }
+    // B 内容ノードの転記とリンク写像。parent==stub(3) は A 側 body=3 と同一数値で
+    // 恒等に写る（first_child/next_sibling/parent の全 Option<NodeId> が対象）
+    let base = dom_a.nodes.len() as u32;
+    let (bf0, bl0) = (dom_b.nodes[3].first_child, dom_b.nodes[3].last_child);
+    if dom_b.nodes.len() > SKIP as usize {
+        for mut n in dom_b.nodes.drain(SKIP as usize..) {
+            n.parent = map_opt(n.parent, base, SKIP);
+            n.first_child = map_opt(n.first_child, base, SKIP);
+            n.next_sibling = map_opt(n.next_sibling, base, SKIP);
+            dom_a.nodes.push(n);
+        }
+    }
+    let bf = map_opt(bf0, base, SKIP);
+    let bl = map_opt(bl0, base, SKIP);
+    match (dom_a.node(3).first_child, bf) {
+        (_, None) => {}
+        (None, f) => {
+            let b = dom_a.node_mut(3);
+            b.first_child = f;
+            b.last_child = bl;
+        }
+        (Some(_), f) => {
+            let last = dom_a
+                .node(3)
+                .last_child
+                .expect("first_child あるなら last もある");
+            dom_a.node_mut(last).next_sibling = f;
+            dom_a.node_mut(3).last_child = bl;
+        }
+    }
+    dom_a.has_script |= dom_b.has_script;
+    dom_a.has_style |= dom_b.has_style;
+    dom_a.has_selectedcontent |= dom_b.has_selectedcontent;
+    dom_a.md_ws_stripped = true;
+    dom_a.n_nodes = dom_a.nodes.len() as u32;
+    Some(dom_a)
+}
+
+/// B 側 NodeId の写像（stub(3) は A 側 body(3) へ恒等、内容ノードは base へ平行移動）。
+fn map_opt(id: Option<NodeId>, base: u32, skip: u32) -> Option<NodeId> {
+    id.map(|x| {
+        if x == skip - 1 {
+            x // stub body = A body（同一数値）
+        } else {
+            debug_assert!(x >= skip);
+            x - skip + base
+        }
+    })
+}
+
 fn run_blocks<E: Emit>(out: &mut E, fn_: &mut Fn, input: &[u8]) {
-    mprof_reset();
     // CR/CRLF → LF 正規化（'\r' が無ければゼロコピー）
     let normalized: Vec<u8>;
     let s: &[u8] = if input.contains(&b'\r') {
@@ -1598,29 +1779,65 @@ mod tests {
     fn crlf_normalize() {
         assert_eq!(md("a\r\nb\r\n\r\nc"), "<p>a b</p>\n<p>c</p>\n");
     }
-}
 
-// ---- 一時内訳計測（IFUTO_MPROF。コミット時に除去） ----
-thread_local! {
-    static MPROF: std::cell::Cell<[f64; 4]> = std::cell::Cell::new([0.0; 4]);
-    static MPROF_I: std::cell::Cell<u64> = std::cell::Cell::new(0);
-}
-fn mprof_reset() {
-    MPROF.with(|c| c.set([0.0; 4]));
-}
-fn mprof_add(i: usize, d: std::time::Duration) {
-    MPROF.with(|c| {
-        let mut a = c.get();
-        a[i] += d.as_secs_f64() * 1000.0;
-        c.set(a);
-    });
-}
-fn mprof_dump() {
-    MPROF.with(|c| {
-        let a = c.get();
-        eprintln!(
-            "MPROF lnsplit={:.2} inline_span={:.2} dom_text={:.2}",
-            a[0], a[1], a[2]
+    /// 2-slice ≡ 逐次の機械固定（`dom.dump()` の byte 比較）。
+    /// fuzz の差分オラクルは 1MB 未満の文書で発動し、`md_to_dom_2slice` の与件
+    /// （`input.len() >= 1MB`）には恒常的に届かないため、本テストが splice・
+    /// NodeId 写像・Fn 独立性の唯一の直接検査となる。構築物は fence/list/
+    /// blockquote/table/link/img/hr を断面に含む（分割点は fence 外の空行境界）。
+    #[test]
+    fn twoslice_equals_serial() {
+        let block: &[u8] = b"# t\n\npara with *em* and `code` and [x](/u) tail\n\n- a\n- b\n\n> q\n\n| h1 | h2 |\n| --- | --- |\n| 1 | 2 |\n\n```rust\ncode block\n```\n\n![alt](/i.png)\n\n---\n\n";
+        let mut big = Vec::with_capacity(block.len() * (1 << 20) / block.len() + block.len() * 2);
+        while big.len() < (1 << 20) + 12345 {
+            big.extend_from_slice(block);
+        }
+        assert!(md_par_scan(&big).is_some(), "分割点が見つかる構文のはず");
+        let ser = md_to_dom_opts_serial(&big, true).expect("serial");
+        let split = md_par_scan(&big).unwrap();
+        let par = md_to_dom_2slice(&big, true, split).expect("2slice");
+        assert_eq!(
+            ser.dump(),
+            par.dump(),
+            "2-slice と逐次で DOM が逐語一致しなければならない"
         );
-    });
+        // slim=false（全属性保持経路）でも同値
+        let ser2 = md_to_dom_opts_serial(&big, false).expect("serial ns");
+        let par2 = md_to_dom_2slice(&big, false, split).expect("2slice ns");
+        assert_eq!(ser2.dump(), par2.dump());
+    }
+
+    /// 2-slice の安全性前提（`[^` 拒否）の機械固定: footnote 文書では
+    /// `md_par_scan` が分割点を返さない（呼び出し側は逐次経路に落ちる。
+    /// C の number 規約が半区間で変わるのを防ぐ拒否条件の写し）。
+    #[test]
+    fn par_scan_rejects_footnote() {
+        let mut big = Vec::new();
+        while big.len() < (1 << 20) + 101 {
+            big.extend_from_slice(b"para x\n\n");
+        }
+        big.extend_from_slice(b"has note[^a] here\n\n[^a]: def\n");
+        assert!(md_par_scan(&big).is_none());
+    }
+
+    /// fence 内に「空行 + 非空行」の条件が揃っても分割しない（C と同じ前提で
+    /// 安全性を機械固定。fence 全体が [n/2, n) を埋める配置）。
+    #[test]
+    fn par_scan_never_splits_inside_fence() {
+        let mut big = Vec::new();
+        big.extend_from_slice(b"# head\n\n");
+        while big.len() < (1 << 20) / 2 {
+            big.extend_from_slice(b"pre pad\n\n");
+        }
+        big.extend_from_slice(b"```\n");
+        while big.len() < (1 << 20) + 7777 {
+            big.extend_from_slice(b"in code\n\n");
+        }
+        big.extend_from_slice(b"```\n");
+        let split = md_par_scan(&big);
+        if let Some(p) = split {
+            // 分割が見つかる場合、それは fence の外でなければならない
+            assert!(p >= big.len() || p <= (1 << 20) / 2, "fence 内分割は禁物");
+        }
+    }
 }

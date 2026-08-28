@@ -209,7 +209,11 @@ impl<'a> TreeBuilder<'a> {
                 has_script = true;
             }
             if tok.tag == tags::TAG_UNKNOWN {
-                let lc: Vec<u8> = tok.tag_raw.iter().map(|&c| c.to_ascii_lowercase()).collect();
+                let lc: Vec<u8> = tok
+                    .tag_raw
+                    .iter()
+                    .map(|&c| c.to_ascii_lowercase())
+                    .collect();
                 node.name = crate::dom::NameStr::from_vec(lc);
                 if tok.tag_raw.len() == 15 && str_eq_ci(&node.name, b"selectedcontent") {
                     has_selectedcontent = true;
@@ -3194,8 +3198,7 @@ impl<'a> TreeBuilder<'a> {
             let name = self.dom.node(n).name.clone();
             for &(lc, canon) in SVG {
                 if str_eq_ci(&name, lc.as_bytes()) {
-                    self.dom.node_mut(n).name =
-                        crate::dom::NameStr::from_static(canon.as_bytes());
+                    self.dom.node_mut(n).name = crate::dom::NameStr::from_static(canon.as_bytes());
                     break;
                 }
             }

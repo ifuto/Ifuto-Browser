@@ -38,20 +38,8 @@ fn main() {
     let out = ifuto_core::render::render_emit_sweep(&dom, &lay, false);
     let t3 = snap();
     eprintln!("nodes={}", dom.nodes.len());
-    eprintln!(
-        "parse : allocs={} bytes={}",
-        t1.0 - t0.0,
-        t1.1 - t0.1
-    );
-    eprintln!(
-        "layout: allocs={} bytes={}",
-        t2.0 - t1.0,
-        t2.1 - t1.1
-    );
-    eprintln!(
-        "render: allocs={} bytes={}",
-        t3.0 - t2.0,
-        t3.1 - t2.1
-    );
+    eprintln!("parse : allocs={} bytes={}", t1.0 - t0.0, t1.1 - t0.1);
+    eprintln!("layout: allocs={} bytes={}", t2.0 - t1.0, t2.1 - t1.1);
+    eprintln!("render: allocs={} bytes={}", t3.0 - t2.0, t3.1 - t2.1);
     eprintln!("out_bytes={}", out.len());
 }
