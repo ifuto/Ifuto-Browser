@@ -49,3 +49,5 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # --- 実行ログ: 2026-08-28 フェーズ 8-z/9-a 反映（8-z byte-exact + chrome 純粋部 + akl-ffi leak 全廃）後の最終確認 ---
 
 # 2026-08-28 再実行: フェーズ 10-a（render 行スイープ一本化）+ akl-ffi into_raw 化（Miri/Tree Borrows 適合）反映後の検証。特に CMD 5 Miri の結果を確認する。
+
+# 2026-08-28 再々実行: フェーズ 10-b（style lazy 構造消去）+ Miri float intrinsic 近似ずれ対処（2 件 ignore）反映後。CMD 5 Miri の緑化を確認する。
