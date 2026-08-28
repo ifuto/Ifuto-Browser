@@ -51,3 +51,5 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 2026-08-28 再実行: フェーズ 10-a（render 行スイープ一本化）+ akl-ffi into_raw 化（Miri/Tree Borrows 適合）反映後の検証。特に CMD 5 Miri の結果を確認する。
 
 # 2026-08-28 再々実行: フェーズ 10-b（style lazy 構造消去）+ Miri float intrinsic 近似ずれ対処（2 件 ignore）反映後。CMD 5 Miri の緑化を確認する。
+
+# 2026-08-28 再実行: フェーズ 10-c（layout 座標化）+ 10-d（parse NameStr/2-slice）反映後の検証。CMD 5 Miri（2-slice の std::thread::scope / NameStr の Drop 走査）と CMD 3 test（340 緑）に注目。
