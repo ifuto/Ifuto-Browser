@@ -1407,3 +1407,119 @@ source: trigger/trigger.md @ 75e7dbba1dd26269eb8d8fbdc08bfc8c5b5e9c70
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-28T15:09:49Z) rc=0
+```
+==> ブランチ toolchain-bin にアーカイブ（9 分割）があります。取得して展開します
+==> 展開完了
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+```
+
+### clippy 実行 (2026-08-28T15:10:15Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+   Compiling ifuto-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-ffi)
+    Checking ifuto-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-core)
+    Checking akl-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-ffi)
+    Checking ifuto-cli v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.62s
+```
+
+### miri 実行 (2026-08-28T15:35:15Z)
+```
+test ext_manifest::tests::duplicate_key ... ok
+test ext_manifest::tests::empty_perm_token_tolerated ... ok
+test ext_manifest::tests::fuzz_invariants_and_determinism ... ok
+test ext_manifest::tests::missing_all ... ok
+test ext_manifest::tests::missing_colon ... ok
+test ext_manifest::tests::missing_version ... ok
+test ext_manifest::tests::multiple_permissions_rejected ... ok
+test ext_manifest::tests::perm_name_matches ... ok
+test ext_manifest::tests::too_large ... ok
+test ext_manifest::tests::unknown_key ... ok
+test ext_manifest::tests::unknown_permission ... ok
+test ext_manifest::tests::valid_basic ... ok
+test ext_manifest::tests::valid_no_permissions ... ok
+test html_tok::tests::attributes_and_lowercase ... ok
+test html_tok::tests::charrefs ... ok
+test html_tok::tests::comment ... ok
+test html_tok::tests::doctype ... ok
+test html_tok::tests::doctype_public_system ... ok
+test html_tok::tests::nul_in_attr_fffd ... ok
+test html_tok::tests::nul_in_text_dropped ... ok
+test html_tok::tests::numeric_ref_saturate ... ok
+test html_tok::tests::pi ... ok
+test html_tok::tests::rawtext_script ... ok
+test html_tok::tests::rcdata_title_resolves_refs ... ok
+test html_tok::tests::self_closing ... ok
+test html_tok::tests::simple_text ... ok
+test html_tok::tests::start_end_tags ... ok
+test html_tok::tests::two_codepoint_entity ... ok
+test html_tok::tests::void_elements ... ok
+test html_tree::tests::adoption_agency ... ok
+test html_tree::tests::basic_structure ... ok
+test html_tree::tests::has_script_observed ... ok
+test html_tree::tests::implied_html_head_body ... ok
+test html_tree::tests::p_closes_p ... ok
+test html_tree::tests::svg_foreign ... ok
+test html_tree::tests::table_structure ... ok
+test html_tree::tests::title_trimmed ... ok
+test html_tree::tests::wpt_adoption_counter_clamp ... ok
+test html_tree::tests::wpt_annotation_xml_encoding_ci ... ok
+test html_tree::tests::wpt_basic ... ok
+test html_tree::tests::wpt_doctype_bare ... ok
+test html_tree::tests::wpt_doctype_public_system ... ok
+test html_tree::tests::wpt_pi ... ok
+test html_tree::tests::wpt_selectedcontent_clone ... ok
+test html_tree::tests::wpt_template_content ... ok
+test ifuto_pages::tests::about_page ... ok
+test ifuto_pages::tests::history_empty ... ok
+test ifuto_pages::tests::history_escapes ... ok
+test ifuto_pages::tests::memory_table ... ok
+test ifuto_pages::tests::non_ifuto_none ... ok
+test ifuto_pages::tests::settings_page ... ok
+test ifuto_pages::tests::unknown_page ... ok
+test image::tests::bmp_24 ... ok
+test image::tests::png_gray ... ok
+test image::tests::png_rgba ... ok
+test image::tests::rejects ... ok
+test layout::tests::br_break ... ok
+test layout::tests::empty_layout ... ok
+test layout::tests::h1_font_size ... ok
+test layout::tests::hr_special ... ok
+test layout::tests::list_item_block ... ok
+test layout::tests::margin_collapse ... ok
+test layout::tests::simple_block ... ok
+test layout::tests::wide_glyph ... ok
+test layout::tests::wrap_at_width ... ok
+test md::tests::blockquote ... ok
+test md::tests::crlf_normalize ... ok
+test md::tests::fence_and_hr ... ok
+test md::tests::footnote ... ok
+test md::tests::heading ... ok
+test md::tests::inline_fmt ... ok
+test md::tests::link_img_autolink ... ok
+test md::tests::list ... ok
+test md::tests::par_scan_never_splits_inside_fence ... ok
+test md::tests::par_scan_rejects_footnote ... ok
+test md::tests::para_and_break ... ok
+test md::tests::path_ext ... ok
+test md::tests::raw_html_escaped ... ok
+test md::tests::table ... ok
+test md::tests::twoslice_equals_serial ... ```
+# 実行結果 (2026-08-28T15:36:02Z)
+
+source: trigger/trigger.md @ 8473699966f007e9fc1848f685f1fb7f20598302
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [ ] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 1500 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
