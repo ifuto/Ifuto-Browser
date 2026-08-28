@@ -940,3 +940,120 @@ source: trigger/trigger.md @ d355a17fa1ff3489d47874dbebb739a99b76b348
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-28T13:31:31Z) rc=0
+```
+==> ブランチ toolchain-bin にアーカイブ（9 分割）があります。取得して展開します
+==> 展開完了
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+```
+
+### clippy 実行 (2026-08-28T13:31:54Z)
+```
+   Compiling ifuto-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-ffi)
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+    Checking ifuto-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-core)
+    Checking akl-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-ffi)
+    Checking ifuto-cli v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.34s
+```
+
+### miri 実行 (2026-08-28T13:39:27Z)
+```
+1221 |             unsafe { akl_mkhandle(rt, vt as *const CAklHandleVTab, 0xdead as *mut c_void) };
+     |                                                                    ^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+     |
+     = help: this program is using integer-to-pointer casts or (equivalently) `ptr::with_exposed_provenance`, which means that Miri might miss pointer bugs in this program
+     = help: see https://doc.rust-lang.org/nightly/std/ptr/fn.with_exposed_provenance.html for more details on that operation
+     = help: to ensure that Miri does not miss bugs in your program, use Strict Provenance APIs (https://doc.rust-lang.org/nightly/std/ptr/index.html#strict-provenance, https://crates.io/crates/sptr) instead
+     = help: you can then set `MIRIFLAGS=-Zmiri-strict-provenance` to ensure you are not relying on `with_exposed_provenance` semantics
+     = help: alternatively, `MIRIFLAGS=-Zmiri-permissive-provenance` disables this warning
+     = note: this is on thread `tests::handle_r`
+     = note: stack backtrace:
+             0: tests::handle_roundtrip
+                 at akl-ffi/src/lib.rs:1221:68: 1221:89
+             1: tests::handle_roundtrip::{closure#0}
+                 at akl-ffi/src/lib.rs:1191:26: 1191:26
+
+warning: integer-to-pointer cast
+   --> akl-ffi/src/lib.rs:201:19
+    |
+201 |     let wrapper = rt.host_ctx as *mut AklRT;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = note: this is on thread `tests::handle_r`
+    = note: stack backtrace:
+            0: handle_get_adapter
+                at akl-ffi/src/lib.rs:201:19: 201:44
+            1: akl_core::bytecode::Runtime::run_loop
+                at akl-core/src/bytecode.rs:1625:33: 1625:71
+            2: akl_core::bytecode::Runtime::run_with_this_env
+                at akl-core/src/bytecode.rs:1014:15: 1014:53
+            3: akl_core::bytecode::Runtime::run_with_this
+                at akl-core/src/bytecode.rs:969:9: 969:65
+            4: akl_core::bytecode::Runtime::run
+                at akl-core/src/bytecode.rs:959:9: 959:58
+            5: akl_eval
+                at akl-ffi/src/lib.rs:404:11: 404:31
+            6: tests::eval
+                at akl-ffi/src/lib.rs:1028:27: 1028:61
+            7: tests::handle_roundtrip
+                at akl-ffi/src/lib.rs:1227:23: 1227:50
+            8: tests::handle_roundtrip::{closure#0}
+                at akl-ffi/src/lib.rs:1191:26: 1191:26
+
+error: Undefined Behavior: not granting access to tag <wildcard> because that would remove [Unique for <2595476>] which is strongly protected
+   --> akl-ffi/src/lib.rs:203:22
+    |
+203 |     let w = unsafe { &*wrapper };
+    |                      ^^^^^^^^^ Undefined Behavior occurred here
+    |
+    = help: this indicates a potential bug in the program: it performed an invalid operation, but the Stacked Borrows rules it violated are still experimental
+    = help: see https://github.com/rust-lang/unsafe-code-guidelines/blob/master/wip/stacked-borrows.md for further information
+    = note: this is on thread `tests::handle_r`
+    = note: stack backtrace:
+            0: handle_get_adapter
+                at akl-ffi/src/lib.rs:203:22: 203:31
+            1: akl_core::bytecode::Runtime::run_loop
+                at akl-core/src/bytecode.rs:1625:33: 1625:71
+            2: akl_core::bytecode::Runtime::run_with_this_env
+                at akl-core/src/bytecode.rs:1014:15: 1014:53
+            3: akl_core::bytecode::Runtime::run_with_this
+                at akl-core/src/bytecode.rs:969:9: 969:65
+            4: akl_core::bytecode::Runtime::run
+                at akl-core/src/bytecode.rs:959:9: 959:58
+            5: akl_eval
+                at akl-ffi/src/lib.rs:404:11: 404:31
+            6: tests::eval
+                at akl-ffi/src/lib.rs:1028:27: 1028:61
+            7: tests::handle_roundtrip
+                at akl-ffi/src/lib.rs:1227:23: 1227:50
+            8: tests::handle_roundtrip::{closure#0}
+                at akl-ffi/src/lib.rs:1191:26: 1191:26
+
+note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
+
+error: aborting due to 1 previous error; 2 warnings emitted
+
+error: test failed, to rerun pass `-p akl-ffi --lib`
+
+Caused by:
+  process didn't exit successfully: `/home/runner/akl-toolchain/rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/cargo-miri runner /home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/target/miri/x86_64-unknown-linux-gnu/debug/build/akl-ffi/d1a0b609b8c5069e/out/akl_ffi-d1a0b609b8c5069e` (exit status: 1)
+note: test exited abnormally; to see the full output pass --no-capture to the harness.
+```
+# 実行結果 (2026-08-28T13:40:16Z)
+
+source: trigger/trigger.md @ b87904525172bda92a4b974d142f413bb7ddb68c
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [ ] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
