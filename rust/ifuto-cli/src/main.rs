@@ -571,10 +571,13 @@ fn main() {
         exit(0);
     }
 
-    let lay = if style_lazy {
-        layout::layout_build_lazy(&dom, width)
-    } else {
-        layout::layout_build(&dom, &styles, width)
+    // 描画経路は線形モード（C の CLI no_boxlink 相当: box 木を連結しない）。
+    // dump（Mode::Layout）だけが木を必要とするため tree ビルドを使う。
+    let lay = match (mode == Mode::Layout, style_lazy) {
+        (true, true) => layout::layout_build_lazy(&dom, width),
+        (true, false) => layout::layout_build(&dom, &styles, width),
+        (false, true) => layout::layout_build_lazy_linear(&dom, width),
+        (false, false) => layout::layout_build_linear(&dom, &styles, width),
     };
     let t4 = Instant::now();
 
@@ -590,7 +593,7 @@ fn main() {
     // grid=0.00 表記を C の CLI と同一にする）。
     let acc_grid = 0.0f64; // C の CLI sweep 経路は grid=0.00 固定（観測一致）
     let tg1 = Instant::now();
-    let out = render::render_emit_sweep(&lay, ansi);
+    let out = render::render_emit_sweep(&dom, &lay, ansi);
     std::io::stdout().write_all(&out).unwrap();
     let acc_emit = tg1.elapsed().as_secs_f64() * 1000.0;
     let t5 = Instant::now();

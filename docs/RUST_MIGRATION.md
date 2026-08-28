@@ -1721,3 +1721,81 @@ AVX2 可視ラン / no_boxlink / box_pool / 2-way 並列が未移植。parse 239
 （C 47.53ms = 5.0×、2-slice 並列と fitdom 機構が未移植）、render 58.62ms
 （2.8×）、read 8.71ms 級（fs::read → mmap 案）。RSS も layout 由来の box/seg
 確保嵐が主因と推定（推定。次フェーズで計測確定）。
+
+## フェーズ 10-c: layout 段の座標化（seg/piece ゼロコピー + no_boxlink + intern sid 直結）（2026-08-28）
+
+**問題**: 10-b 後の layout 段は 736.84ms（C 46.47ms = 15.9×）で単段として最大の
+残件だった。アルゴリズムは C と同一にもかかわらず定数倍が壊れていた原因は、
+所有権の安易な選択にあった（設計の敗北であって言語のせいではない）:
+
+1. **テキストの所有コピー**: piece 生成で `node.name.clone()`（全可視バイトの
+   malloc+memcpy）、seg 生成で `text.to_vec()` + merge での extend。C は
+   `IfStr{ptr,len}`/`IfSeg.p` で DOM テキストを**指すだけ**。
+2. **Style の値コピー**: `Seg{st: Style}`（~112B）を seg ごとに保持、merge 判定で
+   `pm_st == Some(st)` の field 比較連鎖（~20 フィールド）をアトムごとに実行。
+   C は intern 済み `const IfStyle*` の **ポインタ 1 本比較**。
+3. **lazy メモの parent キー計算**: 解決ごとに parent style 値（~112B）の hash
+   逆引き。C は parent ポインタからの `pk>>4` 乗算で O(1)。
+4. **box 木の常時構築**: 行ごとに LINE BoxNode（Style 値コピー + 子 Vec）を
+   構築・保持。C の CLI 描画経路は `no_boxlink`（streams のみ）で木を連結しない。
+5. **geom の再計算**: IfGeomCache 未移植で (style, rfs, avail_w) ごとに全計算。
+
+移植（全て C 機構の写し＋所有権での構造的等価化）:
+
+- `layout.rs`:
+  - `Seg` を出処座標化（`src: u32`（DOM テキスト NodeId / `SEG_SRC_SYN` /
+    `SEG_SRC_STATIC`）, `start/end: u32`, `x/w: i32`, `sid: u32` = 24B）。
+    `Layout::seg_text/seg_style` が dereference（C のポインタ読みと同値）。
+    seg merge は座標の隣接検査 + `end` 更新のみ（バイトを一切動かさない）。
+    旧来の seg テキスト全コピー（16MB 全可視バイト + 数十万 alloc）を構造消去。
+  - `Piece` は `(Prov=Src(NodeId)|Syn|Never, start, end, sid, br)` の 17B。
+    テキストノードの `name.clone()` を撤廃。
+  - `Layout` に `stab: Vec<Style>`（intern 表。sid → 値で唯一）と
+    `syn_text: Vec<u8>`（合成 arena 実バイト）を追加。`syn_pos/syn_text` は
+    **不変条件 `len == syn_pos`** で C の layout arena bump 配置を厳密再現する
+    （merge 可否が C のポインタ隣接と同値になるための整合条件。`syn_push` /
+    `syn_foreign` の 2 点でしか進まない）。
+  - `Prov::Src` の payload を連番発行器から NodeId 直結へ（一意出処 id が
+    そのまま seg 座標になる。発行器の撤去）。
+  - style intern idx（sid）の全経路導入: `lc_resolve_disp`（解決を display
+    バイト + sid のみで返す。flatten/ifc ゲートから値コピーを全廃）、
+    `lc_st_value`（ブロック子のみ値を引く — geom/deco/marker が全フィールドを
+    要する唯一の経路）、`lc_metrics`（wrap 初期値の 4 field 直読み）。
+    merge 判定の pm 比較は u32 の sid 比較（**値同一 ⇒ sid 唯一**なので C の
+    ポインタ比較と厳密同値。旧実装の field 比較連鎖を O(1) 化）。
+  - `no_boxlink` の移植: `layout_build_linear` / `layout_build_lazy_linear`。
+    LINE box・子 box の連結をせず streams（rlines/deco/seg_arena/stab/
+    syn_text）のみ構築。`main.rs` は描画経路で線形ビルダーを選択
+    （`Mode::Layout` dump のみ従来の tree ビルド。extent は C の規約どおり
+    root 自身 + width/height から計算 = 既存コメントの前提と一致）。
+  - `geom_cached`（直接マップ 4096、key=(sid, rfs, avail_w)）= C の
+    `IfGeomCache` 写し。geom は純粋関数なので衝突上書きの損失ゼロ exact memo。
+- `css.rs`: `StyleLazy::get_id`（parent を intern sid で受け取る。pk = sid+1 で
+  parent 値の hash 逆引きを全消去 — intern は値の正準名なので旧 pk 写像と
+  厳密一致。miss 時のみ intern 表から値を復元して `compute_style` へ渡す一点化）、
+  `get`（公開互換）は idx_of + get_id で再実装（呼び出し意味の不変）、
+  `value/display_at/metrics_at/into_stab`、`StyleIntern` を pub(crate) 化し
+  `value/display_at/metrics_at/into_values` を追加。
+- `render.rs` / `main.rs` / examples: `render_emit_sweep(dom, lay, ansi)` に
+  Dom を通し、seg アクセスを `seg_text/seg_style` 経由に一点化。
+
+検証（2026-08-28 実走、全て緑）:
+
+- 16MB/2MB × ansi/no-ansi 4 経路 + `--dump-layout` 2 経路の C↔Rust
+  stdout **byte-exact** 維持。
+- cargo test **337 緑**、clippy `--all-targets` 警告ゼロ、fmt 緑。
+- diff fuzz **8,000 cases 追加 / 0 mismatch**（seed 777/20260828）→
+  **累計 158,133 cases / 0 mismatch**。
+
+計測（`bench/data-20260828c.json`、paired median。16MB）: total 526.33ms
+（C 117.60ms で **4.47×**。10-b の 8.90× から半減）、**layout 736.84→200.03ms
+（C 比 15.9×→4.2×）**、render 75.27ms（3.6×）、**RSS 1,187,932→465,368KB
+（5.58×→2.19×）**。2MB total 60.03ms（3.96×）、ANSI 2MB 79.84ms（2.51×、
+render 段 1.42×）。startup 1.4740ms（C 1.3960、符号 114:36 で今回は C 優位側。
+帯騒音内であるが偏りは正直記載）。
+
+**残照準（嘘をつかない台帳）**: parse 段 241.81ms（C 47.68ms = **5.07×**。
+2-slice 並列 parse / fitdom が未移植）が新たな最大件。layout 200.03ms
+（4.2×。AVX2 可視ラン / fitdom / 2-way 並列 layout / ifc 入口の Wrap 初期化と
+segs Vec 成長の更なる抑制が未実施）、render 75.27ms（3.6×）、read 8.02ms
+（C 0.02ms。fs::read → mmap 案）、RSS 2.19×（stab/syn/arena は残置）。

@@ -205,20 +205,20 @@ impl DomOut {
         {
             let n = dom.node_mut(html);
             n.tag = TAG_HTML;
-            n.name = b"html".to_vec();
+            n.name = crate::dom::NameStr::from_static(b"html");
         }
         let root = dom.root;
         let head = dom.alloc_node(NodeKind::Element);
         {
             let n = dom.node_mut(head);
             n.tag = TAG_HEAD;
-            n.name = b"head".to_vec();
+            n.name = crate::dom::NameStr::from_static(b"head");
         }
         let body = dom.alloc_node(NodeKind::Element);
         {
             let n = dom.node_mut(body);
             n.tag = TAG_BODY;
-            n.name = b"body".to_vec();
+            n.name = crate::dom::NameStr::from_static(b"body");
         }
         let mut o = DomOut {
             dom,
@@ -270,7 +270,7 @@ impl DomOut {
         let Some(nid) = self.mnew(NodeKind::Text) else {
             return;
         };
-        self.dom.node_mut(nid).name = text;
+        self.dom.node_mut(nid).name = crate::dom::NameStr::from_vec(text);
         let cur = self.cur;
         self.attach(cur, nid);
     }
@@ -312,7 +312,7 @@ impl DomOut {
             let pend_attrs = std::mem::take(&mut self.pend_attrs);
             let n = self.dom.node_mut(nid);
             n.tag = tag;
-            n.name = self.pend_name.as_bytes().to_vec();
+            n.name = crate::dom::NameStr::from_bytes(self.pend_name.as_bytes());
             if !pend_attrs.is_empty() {
                 n.attrs = pend_attrs
                     .iter()
@@ -357,7 +357,7 @@ impl Emit for DomOut {
         {
             let n = self.dom.node_mut(nid);
             n.tag = tag;
-            n.name = name.as_bytes().to_vec();
+            n.name = crate::dom::NameStr::from_bytes(name.as_bytes());
         }
         let cur = self.cur;
         self.attach(cur, nid);
@@ -380,7 +380,7 @@ impl Emit for DomOut {
         {
             let n = self.dom.node_mut(nid);
             n.tag = tag;
-            n.name = name.as_bytes().to_vec();
+            n.name = crate::dom::NameStr::from_bytes(name.as_bytes());
         }
         let cur = self.cur;
         self.attach(cur, nid);
@@ -422,7 +422,7 @@ impl Emit for DomOut {
             self.tainted = true; // 到達不能のはず（emitter は常に対応させる。C と同じ）
             return;
         };
-        if self.dom.node(top).name.as_slice() != name.as_bytes() {
+        if *self.dom.node(top).name != *name.as_bytes() {
             self.tainted = true;
             return;
         }
@@ -431,6 +431,7 @@ impl Emit for DomOut {
     }
 
     fn text(&mut self, s: &[u8]) {
+        let __t0 = std::time::Instant::now();
         if self.tainted || s.is_empty() {
             return;
         }
@@ -439,6 +440,7 @@ impl Emit for DomOut {
             return;
         }
         self.run.extend_from_slice(s);
+        mprof_add(2, __t0.elapsed());
     }
 
     fn text_ch(&mut self, c: u8) {
@@ -836,6 +838,12 @@ fn try_link<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], i: usize) -> Option<us
 }
 
 fn inline_span<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8]) {
+    let __t0 = std::time::Instant::now();
+    let i_save = MPROF_I.with(|c| c.get());
+    struct G(std::time::Instant);
+    impl Drop for G { fn drop(&mut self) { mprof_add(1, self.0.elapsed()); } }
+    let _g = G(__t0);
+    let _ = i_save;
     let mut i = 0;
     while i < s.len() {
         let sp0 = scan_special(s, i);
@@ -1334,6 +1342,7 @@ fn blocks_win<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usiz
 }
 
 fn blocks_str<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], depth: usize) {
+    let __t0 = std::time::Instant::now();
     // 行配列へ分割（ゼロコピー切片）
     let mut ls: Vec<Ln> = Vec::new();
     let mut st = 0usize;
@@ -1351,6 +1360,7 @@ fn blocks_str<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], depth: usize) {
         st = e + 1;
         p = e + 1;
     }
+    mprof_add(0, __t0.elapsed());
     blocks_win(out, fn_, &ls, 0, ls.len(), depth);
 }
 
@@ -1377,9 +1387,14 @@ pub fn md_to_dom_opts(input: &[u8], slim_attrs: bool) -> Option<Dom> {
         return None;
     }
     let mut out = DomOut::new(slim_attrs);
+    // ノード数は入力にほぼ比例する（16MB md ≒ 1.6M）。倍増成長の move 収支
+    // （最終量の ~2 倍コピー）を 1 回の予約で消す。余剰時の無駄を抑えるため
+    // 保守的な係数（~10B/ノード）を使う。
+    out.dom.nodes.reserve(input.len() / 10);
     let mut fn_ = Fn::new();
     run_blocks(&mut out, &mut fn_, input);
     out.run_flush();
+    if std::env::var_os("IFUTO_MPROF").is_some() { mprof_dump(); }
     if out.tainted {
         return None;
     }
@@ -1396,6 +1411,7 @@ pub fn md_to_dom(input: &[u8]) -> Option<Dom> {
 }
 
 fn run_blocks<E: Emit>(out: &mut E, fn_: &mut Fn, input: &[u8]) {
+    mprof_reset();
     // CR/CRLF → LF 正規化（'\r' が無ければゼロコピー）
     let normalized: Vec<u8>;
     let s: &[u8] = if input.contains(&b'\r') {
@@ -1582,4 +1598,29 @@ mod tests {
     fn crlf_normalize() {
         assert_eq!(md("a\r\nb\r\n\r\nc"), "<p>a b</p>\n<p>c</p>\n");
     }
+}
+
+// ---- 一時内訳計測（IFUTO_MPROF。コミット時に除去） ----
+thread_local! {
+    static MPROF: std::cell::Cell<[f64; 4]> = std::cell::Cell::new([0.0; 4]);
+    static MPROF_I: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+fn mprof_reset() {
+    MPROF.with(|c| c.set([0.0; 4]));
+}
+fn mprof_add(i: usize, d: std::time::Duration) {
+    MPROF.with(|c| {
+        let mut a = c.get();
+        a[i] += d.as_secs_f64() * 1000.0;
+        c.set(a);
+    });
+}
+fn mprof_dump() {
+    MPROF.with(|c| {
+        let a = c.get();
+        eprintln!(
+            "MPROF lnsplit={:.2} inline_span={:.2} dom_text={:.2}",
+            a[0], a[1], a[2]
+        );
+    });
 }

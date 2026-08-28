@@ -53,20 +53,30 @@ pub const CHAR_W_PX: f32 = 8.0;
 /// セル高の px 換算（C の `IF_ROW_H_PX`）。
 pub const ROW_H_PX: f32 = 16.0;
 
-/// 文字列スライス（所有 `Vec<u8>`。C の `IfStr` 相当の所有版）。
-type Str = Vec<u8>;
+/// seg テキスト出処の sentinel（`Seg::src` の特殊値）。
+/// C の `IfSeg.p` は DOM テキスト/合成アリーナへの生ポインタで、バイト所有は
+/// しない。Rust では出処 id + 区間で同じゼロコピー構造を型安全に表す。
+/// `text.to_vec()` のコピー嵐（16MB で全可視バイトの memcpy + 数十万 alloc）を
+/// 構造的に消すための座標化。
+pub const SEG_SRC_SYN: u32 = u32::MAX;
+/// 折り畳み空白（" " 1B 固定。C の静的リテラル指し）。
+pub const SEG_SRC_STATIC: u32 = u32::MAX - 1;
 
-/// 表示セグメント（C の `IfSeg` 相当）。
-#[derive(Clone, Debug)]
+/// 表示セグメント（C の `IfSeg` 相当。ポインタ+len を座標で表現）。
+#[derive(Clone, Copy, Debug)]
 pub struct Seg {
-    /// 表示テキスト。
-    pub text: Str,
+    /// テキスト出処: DOM テキストノード id / [`SEG_SRC_SYN`] / [`SEG_SRC_STATIC`]。
+    pub src: u32,
+    /// 出処内の先頭オフセット。
+    pub start: u32,
+    /// 出処内の終端オフセット（半開 [start, end)）。
+    pub end: u32,
     /// 絶対 x（セル）。
     pub x: i32,
     /// 幅（セル）。
     pub w: i32,
-    /// 色・装飾の出処（計算済みスタイル）。
-    pub st: Style,
+    /// 計算済みスタイルの intern idx（`Layout::stab` の添字。C の `const IfStyle*`）。
+    pub sid: u32,
 }
 
 /// ボックス種別（C の `IF_BOX_*`）。
@@ -187,6 +197,29 @@ pub struct Layout {
     pub deco: Vec<Deco>,
     /// 全文書の seg アリーナ（LINE BoxNode と RLine が区間で共有する唯一の所有）。
     pub seg_arena: Vec<Seg>,
+    /// seg sid のスタイル表（intern 済み。C の `IfStyleIntern` 表の写し）。
+    /// sid → 値は唯一（値同一 ⇒ sid 同一）。
+    pub stab: Vec<Style>,
+    /// 合成文字列バッファ（img 占位等を置く C の layout arena bump 写し。
+    /// オフセットは C の arena 配置を収支含めて厳密に再現する — merge 判定が
+    /// C のポインタ隣接と同値になるための整合条件）。
+    pub syn_text: Vec<u8>,
+}
+
+impl Layout {
+    /// seg のテキストバイト列を引く（C の `IfSeg.p[0..len]` 読みと同値）。
+    pub fn seg_text<'a>(&'a self, dom: &'a Dom, s: &'a Seg) -> &'a [u8] {
+        match s.src {
+            SEG_SRC_SYN => &self.syn_text[s.start as usize..s.end as usize],
+            SEG_SRC_STATIC => b" ",
+            n => &dom.node(n).name[s.start as usize..s.end as usize],
+        }
+    }
+
+    /// seg の計算済みスタイルを引く（C の `seg->st` ポインタ dereference と同値）。
+    pub fn seg_style(&self, s: &Seg) -> &Style {
+        &self.stab[s.sid as usize]
+    }
 }
 
 /// スタイル供給源（C の eager `n->style` 経路 / lazy `IfStyleLazy` 経路の 2 経路）。
@@ -204,9 +237,21 @@ struct Lc<'a> {
     root_fs: f32,
     /// lazy 時の rem 基準（C の `lc->lazy_rfs`。html 解決後に 1 度だけ確定）。
     lazy_rfs: f32,
+    /// 線形モード（C の `no_boxlink` 相当。box 木を連結せず streams のみを出す。
+    /// 木構築コスト——LINE box 1 個ごとの Style 値コピー・子 Vec 確保・全 box の
+    /// 保持メモリ——を描画経路から構造的に外す）。
+    no_boxlink: bool,
+    /// eager 経路の style intern（lazy は StyleLazy 内部の intern をそのまま使う）。
+    eager_intern: std::cell::RefCell<crate::css::StyleIntern>,
     // --- seg merge 忠実化のための C arena 追跡モデル（下記 Prov 参照） ---
-    /// 合成文字列アリーナの bump 位置写し（`syn_alloc` のみが進める）。
+    /// 合成文字列アリーナの bump 位置写し（`syn_push` のみが進める）。
+    /// **不変条件: `syn_text.borrow().len() == syn_pos.get()`** を全変更点で保つ
+    /// （オフセットを seg の座標としてそのまま使うための整合条件）。
     syn_pos: std::cell::Cell<usize>,
+    /// 合成文字列の実バイト bump バッファ（`Layout::syn_text` の建造物）。
+    syn_text: std::cell::RefCell<Vec<u8>>,
+    /// 幾何メモ（C の `IfGeomCache` 相当の直接マップ）。
+    geom_cache: std::cell::RefCell<Vec<Option<GeomEnt>>>,
     /// C `pieces_scratch_cap` 写し（grow イベント検知用）。
     pieces_cap: std::cell::Cell<u32>,
     /// C `links_cap` / `n_links` 写し（collect_link の grow 検知用）。
@@ -214,8 +259,6 @@ struct Lc<'a> {
     n_links: std::cell::Cell<u32>,
     /// C `prec_scratch_cap` 写し。
     prec_cap: std::cell::Cell<u32>,
-    /// テキストノード 1 枚ごとの由来 id 発行器。
-    prov_seq: std::cell::Cell<u32>,
     // --- 描画層 streams（C の lines_head / deco[] / seg arena 相当） ---
     /// フラット行列（RefCell 経由で再帰中に追記。C の生ポインタ追記と同順）。
     rlines: std::cell::RefCell<Vec<RLine>>,
@@ -225,19 +268,44 @@ struct Lc<'a> {
     seg_arena: std::cell::RefCell<Vec<Seg>>,
 }
 
-/// C の `lc_st_of` 写し（st アクセスの一点化）。戻り値規約:
-/// - eager: 適用済み表の値（`None` 伝播 = --no-style の quirk 再現）
-/// - lazy : ELEMENT → 解決値（値は全面走査と同値）、非 ELEMENT → pst（継承の意味）
-fn lc_st_of(lc: &Lc, n: NodeId, pst: Style) -> Option<Style> {
+/// `lc_st_of` の style 解決を display バイト + sid のみで返す版（値の 100B コピーを
+/// 伴わない hot path）。C では解決済み `const IfStyle*` からの display 読み 1 命令
+/// だが、旧 Rust は全フィールドの値コピーを払っていた。
+/// 戻り値規約:
+/// - eager: 適用済み表の display（`None` = --no-style quirk 再現。sid は None 継承）
+/// - lazy : ELEMENT → (Some(display), 解決 sid)。parent は psid 直結（値 hash 不在）
+/// - 非 ELEMENT → (None, psid)。呼び出し側は ELEMENT にだけ使う
+fn lc_resolve_disp(lc: &Lc, n: NodeId, psid: u32) -> (Option<u8>, u32) {
     match &lc.st_src {
-        StSrc::Eager(t) => t[n as usize],
+        StSrc::Eager(t) => match &t[n as usize] {
+            Some(s) => (Some(s.display), lc.eager_intern.borrow_mut().intern(s)),
+            None => (None, psid),
+        },
         StSrc::Lazy(lz) => {
             if lc.dom.node(n).kind == NodeKind::Element {
-                Some(lz.borrow_mut().get(lc.dom, n, Some(&pst), lc.lazy_rfs))
+                let mut z = lz.borrow_mut();
+                let sid = z.get_id(lc.dom, n, Some(psid), lc.lazy_rfs);
+                (Some(z.display_at(sid)), sid)
             } else {
-                Some(pst)
+                (None, psid)
             }
         }
+    }
+}
+
+/// sid → style 値のコピー（geom/deco/marker が全フィールドを要する経路でのみ使う）。
+fn lc_st_value(lc: &Lc, sid: u32) -> Style {
+    match &lc.st_src {
+        StSrc::Eager(_) => lc.eager_intern.borrow().value(sid),
+        StSrc::Lazy(lz) => lz.borrow().value(sid),
+    }
+}
+
+/// sid → wrap 用の表示属性直読み（font_size, line_height, white_space, text_align）。
+fn lc_metrics(lc: &Lc, sid: u32) -> (f32, f32, u8, u8) {
+    match &lc.st_src {
+        StSrc::Eager(_) => lc.eager_intern.borrow().metrics_at(sid),
+        StSrc::Lazy(lz) => lz.borrow().metrics_at(sid),
     }
 }
 
@@ -259,17 +327,19 @@ fn deco_patch_h(lc: &Lc, idx: u32, h: i32) {
 /// 比較の追跡モデル）。C の merge は「同一バッファ上で直前 seg の終端ポインタ ==
 /// 今回の先頭ポインタ」でのみ成立する。バッファ実体ごとの位置クラス:
 ///
-/// - `Src(id)`: テキストノード 1 枚の文字列。同一スライス内のオフセット隣接のみ
+/// - `Src(nid)`: テキストノード 1 枚の文字列。同一スライス内のオフセット隣接のみ
 ///   成立し、ピース跨ぎは id 不一致で必ず不成立（実ポインタ比較と同値: DOM の
 ///   隣接テキストノードはパーサ/run accumulator が併合済みで、独立バッファの
-///   ポインタが隣り合うことはあり得ない）。
+///   ポインタが隣り合うことはあり得ない）。NodeId が一意なので出処識別子として
+///   そのまま使い、seg のテキスト参照座標（`Seg::src`）にも直結する。
 /// - `Syn`: 合成文字列（img 占位 `[img: …]` 等）を置くアリーナのオフセット。
 ///   C は placeholder を arena bump + 8B アラインで確保するため、「直前
 ///   placeholder 長 %8 == 0 かつ間に他の arena alloc が無い」とき次の
 ///   placeholder とポインタ隣接し、2 つの占位が 1 seg に合体する（dump-layout の
-///   `segs=N` にだけ観測される C の allocator 人工物）。`syn_alloc` が bump 位置を、
-///   `flat_grow_model`（pieces/links/prec の grow イベント）と `syn_foreign` が
-///   介入 alloc を追跡する。
+///   `segs=N` にだけ観測される C の allocator 人工物）。`syn_push` が bump 位置を、
+///   `grow_model`（pieces/links/prec の grow イベント）経由の `syn_foreign` が
+///   介入 alloc を追跡する。**syn_text 実バイトを同じ bump 配置で積むため、
+///   Syn オフセットは seg 座標としてそのまま有効**。
 /// - `Never`: 静的文字列（折り畳み空白 " " 等）。絶対に merge しない。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Prov {
@@ -294,24 +364,25 @@ impl ProvSpan {
 }
 
 impl<'a> Lc<'a> {
-    /// テキストノード 1 枚に由来 id を発行。
-    fn fresh_prov(&self) -> Prov {
-        let id = self.prov_seq.get();
-        self.prov_seq.set(id + 1);
-        Prov::Src(id)
-    }
-
-    /// 合成文字列のアリーナ確保（8B アライン bump）。(start, end) を返す。
-    fn syn_alloc(&self, len: usize) -> (usize, usize) {
+    /// 合成文字列をアリーナへ確保（8B アライン bump）し実バイトを積む。
+    /// (start, end) を返す。C の layout arena への placeholder 確保の写しで、
+    /// syn_text のオフセット配置は C の arena 配置と厳密に一致する。
+    fn syn_push(&self, bytes: &[u8]) -> (usize, usize) {
         let start = (self.syn_pos.get() + 7) & !7;
-        self.syn_pos.set(start + len);
-        (start, start + len)
+        let mut t = self.syn_text.borrow_mut();
+        t.resize(start, 0);
+        t.extend_from_slice(bytes);
+        self.syn_pos.set(start + bytes.len());
+        (start, start + bytes.len())
     }
 
     /// 合成文字列以外の arena アロケーション（bump 前進 = 隣接鎖の切断）。
     /// 量の追跡は不要で「正に進んだ」ことだけが merge 可否に効く。
+    /// syn_pos/syn_text 不変条件を保つため、占位バイトとして 8B を積む。
     fn syn_foreign(&self) {
-        self.syn_pos.set(((self.syn_pos.get() + 7) & !7) + 8);
+        let end = ((self.syn_pos.get() + 7) & !7) + 8;
+        self.syn_text.borrow_mut().resize(end, 0);
+        self.syn_pos.set(end);
     }
 
     /// C `if_arena_grow` の写し: need > cap で cap 倍増 + arena alloc 畳み込み。
@@ -330,6 +401,7 @@ impl<'a> Lc<'a> {
 }
 
 /// 幾何（margin/padding/border/width/height の解決済み値。C の `IfGeomEnt` 相当）。
+#[derive(Clone, Copy)]
 struct Geom {
     ml: i32,
     mr: i32,
@@ -450,6 +522,42 @@ fn geom(st: &Style, root_fs: f32, avail_w: i32) -> Geom {
     g
 }
 
+/// 幾何メモの直接マップエントリ（C の `IfGeomCache` 相当: (style*, rfs, avail_w) →
+/// Geom。style ポインタの代わりに intern sid を key にする — sid は値の正準名なので
+/// 「同値スタイルの繰り返し geom 計算」が md 文書では圧倒的に多く、直接マップで吸収する）。
+#[derive(Clone, Copy)]
+struct GeomEnt {
+    sid: u32,
+    avail_w: i32,
+    rfs: u32,
+    g: Geom,
+}
+
+/// 直接マップのサイズ（geom は純粋関数なので衝突時は上書きで損失ゼロの exact memo）。
+const GCACHE_SIZE: usize = 4096;
+
+/// (sid, root_fs, avail_w) で直接マップを引き、miss 時のみ geom を計算する（C と同機構）。
+fn geom_cached(lc: &Lc, sid: u32, st: &Style, avail_w: i32) -> Geom {
+    let rfs = lc.root_fs.to_bits();
+    let h = ((sid as usize).wrapping_mul(40503) ^ (avail_w as usize)) & (GCACHE_SIZE - 1);
+    {
+        let tab = lc.geom_cache.borrow();
+        if let Some(e) = &tab[h] {
+            if e.sid == sid && e.avail_w == avail_w && e.rfs == rfs {
+                return e.g;
+            }
+        }
+    }
+    let g = geom(st, lc.root_fs, avail_w);
+    lc.geom_cache.borrow_mut()[h] = Some(GeomEnt {
+        sid,
+        avail_w,
+        rfs,
+        g,
+    });
+    g
+}
+
 /// 折り返し文脈（C の `IfWrap` 相当）。
 struct Wrap<'a> {
     content_x: i32,
@@ -457,17 +565,27 @@ struct Wrap<'a> {
     y: i32,
     segs: Vec<Seg>,
     line_w: i32,
-    align_st: Style,
-    /// 直前 seg のスタイル（merge 判定用）。
-    pm_st: Option<Style>,
+    /// LINE box / text-align の出処（tree モードのみ Some。linear では LINE box を
+    /// 構築しないため値を持たない = 100B 値コピーの消去）。
+    align_st: Option<Style>,
+    /// text-align（end_line のセンタリング/右寄せ計算用。値の有無と独立）。
+    align_ta: u8,
+    /// 直前 seg の style intern idx（merge 判定用。C の `pm_st` ポインタ比較の写し:
+    /// 値同一 ⇒ sid 一意なので sid 比較はポインタ比較と厳密に同値。旧実装の
+    /// Style 値比較（word ごとの field 比較連鎖）を O(1) 化する）。
+    pm_sid: Option<u32>,
     /// 直前 seg の由来位置キー（由来クラス, 終端オフセット。merge 判定用。
     /// C `pm_end`（ポインタ）の追跡モデル。`Prov::Never` の push では `None`）。
     pm_key: Option<(Prov, usize)>,
     /// 現行ラインの全グリフが `IF_LF_DIRECT_BYTES` 条件を満たす（C の同名。次行は
     /// `end_line` で `true` に再初期化 — kill が現行にだけ効く C の規約をそのまま持つ）。
     direct_all: bool,
-    /// LINE ボックスの出力先（親ボックスの子列）。
-    lines: &'a mut Vec<BoxNode>,
+    /// seg 末バイトの読み出し用（行尾空白 trim。座標化の対価として dereference が必要）。
+    dom: &'a Dom,
+    /// 合成バッファ参照（Syn 由来 seg の末バイト読み用）。
+    syn: &'a std::cell::RefCell<Vec<u8>>,
+    /// LINE ボックスの出力先（親ボックスの子列。`no_boxlink` では `None` = 構築しない）。
+    lines: Option<&'a mut Vec<BoxNode>>,
     /// 行スイープ用フラット行列（C の行確定時 IfRLine 追記と同点で記録）。
     rlines: &'a std::cell::RefCell<Vec<RLine>>,
     /// seg の最終所有先（行確定時に `self.segs` を drain して移す）。
@@ -484,18 +602,36 @@ fn lw_glyph_width(cp: u32) -> i32 {
 }
 
 impl<'a> Wrap<'a> {
+    /// seg の末バイトを引く（行尾空白 trim 用。座標の dereference）。
+    fn last_byte(&self, s: &Seg) -> u8 {
+        let i = s.end as usize - 1;
+        match s.src {
+            SEG_SRC_SYN => self.syn.borrow()[i],
+            SEG_SRC_STATIC => b' ',
+            n => self.dom.node(n).name[i],
+        }
+    }
+
     /// 新規 seg を push（merge なし）。C の `wrap_push_seg` 相当。
-    fn push_seg(&mut self, text: &[u8], x: i32, width: i32, st: Style, prov: Prov, end: usize) {
-        if text.is_empty() {
+    /// テキストはコピーせず出処座標のみを保持する（C のポインタ保持と同値）。
+    fn push_seg(&mut self, prov: Prov, start: usize, end: usize, x: i32, width: i32, sid: u32) {
+        if start >= end {
             return;
         }
+        let src = match prov {
+            Prov::Src(n) => n,
+            Prov::Syn => SEG_SRC_SYN,
+            Prov::Never => SEG_SRC_STATIC,
+        };
         self.segs.push(Seg {
-            text: text.to_vec(),
+            src,
+            start: start as u32,
+            end: end as u32,
             x,
             w: width,
-            st,
+            sid,
         });
-        self.pm_st = Some(st);
+        self.pm_sid = Some(sid);
         self.pm_key = if prov == Prov::Never {
             None
         } else {
@@ -505,28 +641,28 @@ impl<'a> Wrap<'a> {
 
     /// 直前 seg と style・由来が同じで位置上連続なら拡張する合体 push。
     /// C の `wrap_push_merge`（`pm_st == st && pm_end == p` のポインタ比較）の写し。
-    fn push_merge(&mut self, text: &[u8], sp: ProvSpan, x: i32, width: i32, st: Style) {
-        if text.is_empty() {
+    fn push_merge(&mut self, sp: ProvSpan, x: i32, width: i32, sid: u32) {
+        if sp.start >= sp.end {
             return;
         }
         if !self.segs.is_empty()
-            && self.pm_st == Some(st)
+            && self.pm_sid == Some(sid)
             && sp.prov != Prov::Never
             && self.pm_key == Some((sp.prov, sp.start))
         {
             let last = self.segs.last_mut().unwrap();
-            last.text.extend_from_slice(text);
+            last.end = sp.end as u32;
             last.w += width;
             self.pm_key = Some((sp.prov, sp.end));
             return;
         }
-        self.push_seg(text, x, width, st, sp.prov, sp.end);
+        self.push_seg(sp.prov, sp.start, sp.end, x, width, sid);
     }
 
     /// 行尾の折り畳み空白 pop（C の `wrap_pop_last_seg` 相当）。
     fn pop_last_seg(&mut self) {
         self.segs.pop();
-        self.pm_st = None; // 陳腐化防止（次 push は必ず push_seg 経由で再設定）
+        self.pm_sid = None; // 陳腐化防止（次 push は必ず push_seg 経由で再設定）
         self.pm_key = None;
     }
 
@@ -558,7 +694,7 @@ impl<'a> Wrap<'a> {
         if rows < 1 {
             rows = 1;
         }
-        let align = self.align_st.text_align;
+        let align = self.align_ta;
         let mut shift = 0;
         if align == TA_CENTER && self.line_w < self.content_w {
             shift = (self.content_w - self.line_w) / 2;
@@ -589,43 +725,46 @@ impl<'a> Wrap<'a> {
             seg_lo,
             seg_hi,
         });
-        let line = BoxNode {
-            kind: BoxKind::Line,
-            node: None,
-            st: self.align_st,
-            seg_lo,
-            seg_hi,
-            x: self.content_x,
-            y: self.y,
-            w: self.line_w,
-            h: rows,
-            text_align: align,
-            direct,
-            children: Vec::new(),
-        };
+        // 線形モード（C no_boxlink）では LINE box を構築しない — RLine に全情報があり、
+        // LINE box の Style 値コピーと子 Vec への push は描画経路の死荷重だった。
+        if let Some(lines) = &mut self.lines {
+            let line = BoxNode {
+                kind: BoxKind::Line,
+                node: None,
+                st: self.align_st.expect("tree モードでは align_st を保持"),
+                seg_lo,
+                seg_hi,
+                x: self.content_x,
+                y: self.y,
+                w: self.line_w,
+                h: rows,
+                text_align: align,
+                direct,
+                children: Vec::new(),
+            };
+            lines.push(line);
+        }
         self.y += rows;
-        self.lines.push(line);
     }
 }
 
 /// テキスト 1 ピースを流し込む。C の `wrap_text` 相当。
+/// テキスト座標は `(prov, base)` + ピース内オフセットで表現（C の `p + i` ポインタ
+/// 演算の写し。バイトは `text` 経由でのみ読み、seg への保持は座標のみ）。
 #[allow(clippy::too_many_arguments)]
 fn wrap_text(
     w: &mut Wrap,
     text: &[u8],
-    st: Style,
+    fs: f32,
+    lh0: f32,
+    sid: u32,
     pre: bool,
     max_lh: &mut f32,
     any: &mut bool,
     prov: Prov,
     base: usize,
 ) {
-    let fs = st.font_size;
-    let lh = if st.line_height > 0.0 {
-        st.line_height
-    } else {
-        fs * 1.2
-    };
+    let lh = if lh0 > 0.0 { lh0 } else { fs * 1.2 };
     if lh > *max_lh {
         *max_lh = lh;
     }
@@ -653,14 +792,13 @@ fn wrap_text(
                 // ' '(0x20) のみセル列とバイト列が一致（\t は前進 8、他は gw==0 で非発行セル）
                 if b0 != b' ' {
                     w.direct_all = false;
-                    w.push_seg(&s[i..i + 1], w.content_x + cx, adv, st, prov, base + i + 1);
+                    w.push_seg(prov, base + i, base + i + 1, w.content_x + cx, adv, sid);
                 } else {
                     w.push_merge(
-                        &s[i..i + 1],
                         ProvSpan::new(prov, base + i, base + i + 1),
                         w.content_x + cx,
                         1,
-                        st,
+                        sid,
                     );
                 }
                 cx += adv;
@@ -678,14 +816,13 @@ fn wrap_text(
             if cx > 0 && cx < w.content_w {
                 if last_ws == b' ' {
                     w.push_merge(
-                        &s[wsend - 1..wsend],
                         ProvSpan::new(prov, base + wsend - 1, base + wsend),
                         w.content_x + cx,
                         1,
-                        st,
+                        sid,
                     );
                 } else {
-                    w.push_seg(b" ", w.content_x + cx, 1, st, Prov::Never, 0);
+                    w.push_seg(Prov::Never, 0, 1, w.content_x + cx, 1, sid);
                 }
                 cx += 1;
             }
@@ -741,14 +878,16 @@ fn wrap_text(
         // 折り返し判定（pre 以外）
         if !pre && cx > 0 && cx + atom_w > w.content_w {
             // 行尾の折り畳み空白を除く
-            if let Some(last) = w.segs.last() {
-                if last.text.last() == Some(&b' ') {
-                    if last.text.len() == 1 {
-                        w.pop_last_seg();
-                    } else if let Some(last) = w.segs.last_mut() {
-                        last.text.pop();
-                        last.w -= 1;
-                    }
+            let trail_ws = match w.segs.last() {
+                Some(last) if w.last_byte(last) == b' ' => Some(last.end - last.start),
+                _ => None,
+            };
+            if let Some(slen) = trail_ws {
+                if slen == 1 {
+                    w.pop_last_seg();
+                } else if let Some(last) = w.segs.last_mut() {
+                    last.end -= 1;
+                    last.w -= 1;
                 }
             }
             w.end_line(*max_lh);
@@ -771,11 +910,10 @@ fn wrap_text(
                     *max_lh = lh;
                 }
                 w.push_merge(
-                    &s[gs..g],
                     ProvSpan::new(prov, base + gs, base + g),
                     w.content_x + cx,
                     gwidth,
-                    st,
+                    sid,
                 );
                 cx += gwidth;
             }
@@ -783,26 +921,30 @@ fn wrap_text(
         }
 
         w.push_merge(
-            &s[atom_start..atom_end],
             ProvSpan::new(prov, base + atom_start, base + atom_end),
             w.content_x + cx,
             atom_w,
-            st,
+            sid,
         );
         cx += atom_w;
     }
     w.line_w = cx;
 }
 
-/// flatten の 1 ピース（C の `IfPiece` 相当）。
+/// flatten の 1 ピース（C の `IfPiece` 相当。テキストは出処座標のみ。
+/// C は `IfStr{ptr,len}` で DOM テキストを指すだけ — 旧 Rust 実装の
+/// `name.clone()`（全テキストの malloc+memcpy 嵐）は設計ミスだった）。
 struct Piece {
-    text: Str,
-    st: Style,
-    br: bool,
-    /// 由来位置クラス（merge 追跡。テキストは `Src(固有 id)`、img 占位は `Syn`）。
+    /// 由来位置クラス（merge 追跡 + テキスト参照。テキストは `Src(NodeId)`、
+    /// img 占位は `Syn`、br ピースは `Never`）。
     prov: Prov,
-    /// 由来位置の起点（`Syn` では合成アリーナの start。`Src` では 0）。
-    base: usize,
+    /// 由来内の先頭（Src は常に 0）。
+    start: u32,
+    /// 由来内の終端（半開）。
+    end: u32,
+    /// 計算済みスタイルの intern idx（値の 100B コピーの代わりに 4B で運ぶ）。
+    sid: u32,
+    br: bool,
 }
 
 /// C の `flat_push` 相当（pieces scratch の grow イベントを追跡モデルに畳む）。
@@ -811,26 +953,26 @@ fn flat_push(pieces: &mut Vec<Piece>, lc: &Lc, p: Piece) {
     pieces.push(p);
 }
 
-fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, st: Style) {
+fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, sid: u32) {
     let node = lc.dom.node(n);
     match node.kind {
         NodeKind::Text => {
-            let prov = lc.fresh_prov();
             flat_push(
                 pieces,
                 lc,
                 Piece {
-                    text: node.name.clone(),
-                    st,
+                    prov: Prov::Src(n),
+                    start: 0,
+                    end: node.name.len() as u32,
+                    sid,
                     br: false,
-                    prov,
-                    base: 0,
                 },
             );
         }
         NodeKind::Element => {
-            let est = lc_st_of(lc, n, st).unwrap_or(st);
-            if est.display == D_NONE {
+            // display 判定に値コピーは要らない（sid + display バイトのみ）。
+            let (disp, esid) = lc_resolve_disp(lc, n, sid);
+            if disp == Some(D_NONE) {
                 return;
             }
             match node.tag {
@@ -839,11 +981,11 @@ fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, s
                         pieces,
                         lc,
                         Piece {
-                            text: Vec::new(),
-                            st: est,
-                            br: true,
                             prov: Prov::Never,
-                            base: 0,
+                            start: 0,
+                            end: 0,
+                            sid: esid,
+                            br: true,
                         },
                     );
                     return;
@@ -856,16 +998,16 @@ fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, s
                     text.push(b']');
                     // C は placeholder を layout arena に 8B アライン bump 確保する
                     // （連続 placeholder がポインタ隣接し得る = merge の追跡対象）。
-                    let (base, _) = lc.syn_alloc(text.len());
+                    let (start, end) = lc.syn_push(&text);
                     flat_push(
                         pieces,
                         lc,
                         Piece {
-                            text,
-                            st: est,
-                            br: false,
                             prov: Prov::Syn,
-                            base,
+                            start: start as u32,
+                            end: end as u32,
+                            sid: esid,
+                            br: false,
                         },
                     );
                     return;
@@ -884,7 +1026,7 @@ fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, s
                     let rec = href_ok;
                     let mut c = node.first_child;
                     while let Some(cid) = c {
-                        flatten_into(pieces, n_prec, lc, cid, est);
+                        flatten_into(pieces, n_prec, lc, cid, esid);
                         c = lc.dom.node(cid).next_sibling;
                     }
                     if rec && *n_prec < 4096 {
@@ -897,7 +1039,7 @@ fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, s
             }
             let mut c = node.first_child;
             while let Some(cid) = c {
-                flatten_into(pieces, n_prec, lc, cid, est);
+                flatten_into(pieces, n_prec, lc, cid, esid);
                 c = lc.dom.node(cid).next_sibling;
             }
         }
@@ -910,32 +1052,37 @@ fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, s
 fn layout_ifc(
     lc: &Lc,
     cur: NodeId,
-    base_st: Style,
+    base_sid: u32,
     content_x: i32,
     y: &mut i32,
     content_w: i32,
-    lines: &mut Vec<BoxNode>,
+    lines: Option<&mut Vec<BoxNode>>,
 ) -> Option<NodeId> {
+    // wrap 初期値は stab の field 直読み（値の 100B コピーを伴わない）。
+    let (fs0, lh0, ws0, ta0) = lc_metrics(lc, base_sid);
     let mut w = Wrap {
         content_x,
         content_w,
         y: *y,
         segs: Vec::new(),
         line_w: 0,
-        align_st: base_st,
-        pm_st: None,
+        align_st: if lc.no_boxlink {
+            None
+        } else {
+            Some(lc_st_value(lc, base_sid))
+        },
+        align_ta: ta0,
+        pm_sid: None,
         pm_key: None,
         direct_all: true,
+        dom: lc.dom,
+        syn: &lc.syn_text,
         lines,
         rlines: &lc.rlines,
         seg_arena: &lc.seg_arena,
     };
-    let mut max_lh = if base_st.line_height > 0.0 {
-        base_st.line_height
-    } else {
-        base_st.font_size * 1.2
-    };
-    let pre = base_st.white_space == WS_PRE;
+    let mut max_lh = if lh0 > 0.0 { lh0 } else { fs0 * 1.2 };
+    let pre = ws0 == WS_PRE;
 
     // flatten（DOM をピース列へ）
     let mut pieces = Vec::new();
@@ -950,44 +1097,51 @@ fn layout_ifc(
             // style 未適用時の再現に必要）。自身の style が無い要素は
             // 継承値でゲートせず、Some のときだけ D_NONE/D_INLINE を見る。
             // lazy 経路では C と同じく ELEMENT は常に解決値を持つ（ゲート発動）。
-            if let Some(cst) = lc_st_of(lc, cid, base_st) {
-                if cst.display == D_NONE {
+            let (disp, _csid) = lc_resolve_disp(lc, cid, base_sid);
+            if let Some(d) = disp {
+                if d == D_NONE {
                     c = cnode.next_sibling;
                     continue;
                 }
-                if cst.display != D_INLINE {
+                if d != D_INLINE {
                     break; // ブロック子: run 終了
                 }
             }
         }
-        flatten_into(&mut pieces, &mut n_prec, lc, cid, base_st);
+        flatten_into(&mut pieces, &mut n_prec, lc, cid, base_sid);
         c = lc.dom.node(cid).next_sibling;
     }
 
-    // wrap 連鎖
+    // wrap 連鎖（テキストは seg にコピーせず、出処座標だけを運ぶ）
+    let syn = lc.syn_text.borrow();
     let mut any_text = false;
     for piece in &pieces {
         if piece.br {
             w.end_line(max_lh);
-            max_lh = if base_st.line_height > 0.0 {
-                base_st.line_height
-            } else {
-                base_st.font_size * 1.2
-            };
+            max_lh = if lh0 > 0.0 { lh0 } else { fs0 * 1.2 };
             continue;
         }
-        let ppre = piece.st.white_space == WS_PRE || pre;
+        let (fs, plh, ws, _ta) = lc_metrics(lc, piece.sid);
+        let ppre = ws == WS_PRE || pre;
+        let bytes: &[u8] = match piece.prov {
+            Prov::Src(nid) => &lc.dom.node(nid).name[..],
+            Prov::Syn => &syn[piece.start as usize..piece.end as usize],
+            Prov::Never => unreachable!("br 以外の Never ピースは生成されない"),
+        };
         wrap_text(
             &mut w,
-            &piece.text,
-            piece.st,
+            bytes,
+            fs,
+            plh,
+            piece.sid,
             ppre,
             &mut max_lh,
             &mut any_text,
             piece.prov,
-            piece.base,
+            piece.start as usize,
         );
     }
+    drop(syn);
     if !w.segs.is_empty() || any_text {
         w.end_line(max_lh);
     }
@@ -996,8 +1150,18 @@ fn layout_ifc(
 }
 
 /// 要素をレイアウトしブロックボックスを返す。C の `layout_element` 相当。
-fn layout_element(lc: &Lc, node: NodeId, st: Style, ax: i32, ay: i32, avail_w: i32) -> BoxNode {
-    let g = geom(&st, lc.root_fs, avail_w);
+/// `sid` は `st` の intern idx（子の style 解決の parent key と ifc の base sid に使う。
+/// C の style ポインタを子へ渡すのと同値）。
+fn layout_element(
+    lc: &Lc,
+    node: NodeId,
+    st: Style,
+    sid: u32,
+    ax: i32,
+    ay: i32,
+    avail_w: i32,
+) -> BoxNode {
+    let g = geom_cached(lc, sid, &st, avail_w);
     let x = ax + g.ml;
     let content_x = x + g.bl + g.pl;
     let y = ay; // margin-top は呼び出し側（兄弟相殺）で処理済み
@@ -1093,7 +1257,7 @@ fn layout_element(lc: &Lc, node: NodeId, st: Style, ax: i32, ay: i32, avail_w: i
     let content_h = layout_children(
         lc,
         node,
-        st,
+        sid,
         content_x,
         content_y,
         g.content_w,
@@ -1218,7 +1382,7 @@ fn ws_sink_parent(tag: Tag) -> bool {
 fn layout_children(
     lc: &Lc,
     node: NodeId,
-    base_st: Style,
+    base_sid: u32,
     content_x: i32,
     content_y: i32,
     content_w: i32,
@@ -1232,30 +1396,38 @@ fn layout_children(
     let mut c = lc.dom.node(node).first_child;
     while let Some(cid) = c {
         let cnode = lc.dom.node(cid);
-        let cst = if cnode.kind == NodeKind::Element {
-            lc_st_of(lc, cid, base_st)
+        let (disp, csid) = if cnode.kind == NodeKind::Element {
+            lc_resolve_disp(lc, cid, base_sid)
         } else {
-            None
+            (None, base_sid)
         };
-        if cst.is_some_and(|s| s.display == D_NONE) {
+        if disp == Some(D_NONE) {
             c = cnode.next_sibling;
             continue;
         }
-        let blockish = cst.is_some_and(|s| s.display == D_BLOCK || s.display == D_LIST_ITEM);
+        let blockish = matches!(disp, Some(D_BLOCK) | Some(D_LIST_ITEM));
         if !blockish {
-            c = layout_ifc(lc, cid, base_st, content_x, &mut y, content_w, children);
+            let lines = if lc.no_boxlink {
+                None
+            } else {
+                Some(&mut *children)
+            };
+            c = layout_ifc(lc, cid, base_sid, content_x, &mut y, content_w, lines);
             prev_mb = 0;
             continue;
         }
-        let cst = cst.unwrap();
-        let cg = geom(&cst, lc.root_fs, content_w);
+        // ブロック子のみ全値を引く（geom/deco/marker が全フィールドを使う）。
+        let cst = lc_st_value(lc, csid);
+        let cg = geom_cached(lc, csid, &cst, content_w);
         y += prev_mb.max(cg.mt); // 兄弟縦マージン相殺: max
         if cnode.tag == TAG_LI && cst.display == D_LIST_ITEM {
             deco_marker_push(lc, cid, cst, content_x, cg.ml, y, &mut li_ord);
         }
-        let child = layout_element(lc, cid, cst, content_x, y, content_w);
+        let child = layout_element(lc, cid, cst, csid, content_x, y, content_w);
         let child_h = child.h;
-        children.push(child);
+        if !lc.no_boxlink {
+            children.push(child);
+        }
         y += child_h;
         prev_mb = cg.mb;
         if sinkp {
@@ -1269,35 +1441,57 @@ fn layout_children(
 }
 
 /// DOM + 計算済みスタイルからレイアウトを構築。C の `if_layout_build` 相当
-/// （eager 経路: 全面走査の適用済みスタイル表を読む）。
+/// （eager 経路: 全面走査の適用済みスタイル表を読む）。box 木は完全連結（dump 用）。
 pub fn layout_build(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> Layout {
-    build_impl(dom, StSrc::Eager(styles), width_cells)
+    build_impl(dom, StSrc::Eager(styles), width_cells, false)
+}
+
+/// [`layout_build`] の線形モード版（C の CLI 描画経路の `no_boxlink` 相当）。
+/// box 木を連結せず streams（lines/deco/seg_arena/stab/syn_text）のみを構築する。
+/// `root` は幅・高さ・座標のみが意味を持つ（children は常に空）。
+pub fn layout_build_linear(dom: &Dom, styles: &[Option<Style>], width_cells: i32) -> Layout {
+    build_impl(dom, StSrc::Eager(styles), width_cells, true)
 }
 
 /// DOM からスタイルを遅延解決しながらレイアウトを構築。C の IfStyleLazy 経路
 /// （`layout_render_sweep` での lazy）写し。`style_lazy_ok` の前提条件
 /// （md_ws_stripped && !has_style）でのみ呼ぶこと。解決値は全面走査と同値。
+/// box 木は完全連結（dump 用）。
 pub fn layout_build_lazy(dom: &Dom, width_cells: i32) -> Layout {
     build_impl(
         dom,
         StSrc::Lazy(std::cell::RefCell::new(crate::css::StyleLazy::new())),
         width_cells,
+        false,
     )
 }
 
-fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32) -> Layout {
+/// [`layout_build_lazy`] の線形モード版（C CLI の lazy+no_boxlink 描画経路）。
+pub fn layout_build_lazy_linear(dom: &Dom, width_cells: i32) -> Layout {
+    build_impl(
+        dom,
+        StSrc::Lazy(std::cell::RefCell::new(crate::css::StyleLazy::new())),
+        width_cells,
+        true,
+    )
+}
+
+fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32, no_boxlink: bool) -> Layout {
     let width_cells = if width_cells < 4 { 4 } else { width_cells };
     let mut lc = Lc {
         dom,
         st_src,
         root_fs: 16.0,
         lazy_rfs: 16.0,
+        no_boxlink,
+        eager_intern: std::cell::RefCell::new(crate::css::StyleIntern::new()),
         syn_pos: std::cell::Cell::new(0),
+        syn_text: std::cell::RefCell::new(Vec::new()),
+        geom_cache: std::cell::RefCell::new(vec![None; GCACHE_SIZE]),
         pieces_cap: std::cell::Cell::new(0),
         links_cap: std::cell::Cell::new(0),
         n_links: std::cell::Cell::new(0),
         prec_cap: std::cell::Cell::new(0),
-        prov_seq: std::cell::Cell::new(0),
         rlines: std::cell::RefCell::new(Vec::new()),
         deco: std::cell::RefCell::new(Vec::new()),
         seg_arena: std::cell::RefCell::new(Vec::new()),
@@ -1327,6 +1521,10 @@ fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32) -> Layout {
     }
 
     let Some(body) = body else {
+        let stab = match lc.st_src {
+            StSrc::Lazy(lz) => lz.into_inner().into_stab(),
+            StSrc::Eager(_) => lc.eager_intern.into_inner().into_values(),
+        };
         return Layout {
             root: BoxNode {
                 kind: BoxKind::Block,
@@ -1346,28 +1544,41 @@ fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32) -> Layout {
             lines: Vec::new(),
             deco: Vec::new(),
             seg_arena: Vec::new(),
+            stab,
+            syn_text: lc.syn_text.into_inner(),
             height: 0,
         };
     };
 
     // C の build_impl 写し。lazy: html→body の 2 要素だけ先に解決し lazy_rfs を
-    // 確定（html の font_size）、以降は DFS 訪問時に各所で解決する。
+    // 確定（html の font_size）、以降は DFS 訪問時に各所で解決する。parent の
+    // memo key は intern sid を直結する（値の hash 逆引きの消去）。
     // eager: 従来どおり適用済み表を読む（無ければ FALLBACK）。
-    let bst = match &lc.st_src {
-        StSrc::Eager(t) => t[body as usize].unwrap_or(STYLE_FALLBACK),
+    let (bst, bsid) = match &lc.st_src {
+        StSrc::Eager(t) => {
+            let st = t[body as usize].unwrap_or(STYLE_FALLBACK);
+            let sid = lc.eager_intern.borrow_mut().intern(&st);
+            (st, sid)
+        }
         StSrc::Lazy(lz) => {
             let html = html.expect("body 発見時に html も確定");
             let mut z = lz.borrow_mut();
-            let html_st = z.get(dom, html, None, 16.0);
+            let hsid = z.get_id(dom, html, None, 16.0);
+            let html_st = z.value(hsid);
             lc.lazy_rfs = html_st.font_size; // compute_walk の HTML 直下 rfs 確定の写し
             let rfs = lc.lazy_rfs;
-            z.get(dom, body, Some(&html_st), rfs)
+            let bsid = z.get_id(dom, body, Some(hsid), rfs);
+            (z.value(bsid), bsid)
         }
     };
     let body_fs = bst.font_size;
     let body_mt = len_v(bst.margin[0], body_fs, 16.0, width_cells);
-    let root = layout_element(&lc, body, bst, 0, body_mt, width_cells);
+    let root = layout_element(&lc, body, bst, bsid, 0, body_mt, width_cells);
     let height = root.y + root.h;
+    let stab = match lc.st_src {
+        StSrc::Lazy(lz) => lz.into_inner().into_stab(),
+        StSrc::Eager(_) => lc.eager_intern.into_inner().into_values(),
+    };
     Layout {
         root,
         width: width_cells,
@@ -1375,17 +1586,19 @@ fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32) -> Layout {
         lines: lc.rlines.into_inner(),
         deco: lc.deco.into_inner(),
         seg_arena: lc.seg_arena.into_inner(),
+        stab,
+        syn_text: lc.syn_text.into_inner(),
     }
 }
 
 /// ボックス木ダンプ（C の `if_layout_dump` 相当。raw バイトで出力）。
-fn dump_box(b: &BoxNode, dom: &Dom, arena: &[Seg], depth: usize, out: &mut Vec<u8>) {
+fn dump_box(b: &BoxNode, dom: &Dom, lay: &Layout, depth: usize, out: &mut Vec<u8>) {
     for _ in 0..depth {
         out.extend_from_slice(b"  ");
     }
     match b.kind {
         BoxKind::Line => {
-            let segs = &arena[b.seg_lo as usize..b.seg_hi as usize];
+            let segs = &lay.seg_arena[b.seg_lo as usize..b.seg_hi as usize];
             out.extend_from_slice(
                 format!(
                     "LINE x={} y={} w={} h={} segs={} \"",
@@ -1398,7 +1611,7 @@ fn dump_box(b: &BoxNode, dom: &Dom, arena: &[Seg], depth: usize, out: &mut Vec<u
                 .as_bytes(),
             );
             for seg in segs {
-                for (k, &ch) in seg.text.iter().enumerate() {
+                for (k, &ch) in lay.seg_text(dom, seg).iter().enumerate() {
                     if k >= 60 {
                         break;
                     }
@@ -1423,7 +1636,7 @@ fn dump_box(b: &BoxNode, dom: &Dom, arena: &[Seg], depth: usize, out: &mut Vec<u
             }
             out.push(b'\n');
             for c in &b.children {
-                dump_box(c, dom, arena, depth + 1, out);
+                dump_box(c, dom, lay, depth + 1, out);
             }
         }
     }
@@ -1432,7 +1645,7 @@ fn dump_box(b: &BoxNode, dom: &Dom, arena: &[Seg], depth: usize, out: &mut Vec<u
 /// ボックス木を html5lib 的テキストではなくデバッグ形式でダンプ（C の `if_layout_dump`）。
 pub fn layout_dump(dom: &Dom, layout: &Layout) -> Vec<u8> {
     let mut out = Vec::new();
-    dump_box(&layout.root, dom, &layout.seg_arena, 0, &mut out);
+    dump_box(&layout.root, dom, layout, 0, &mut out);
     out
 }
 

@@ -143,7 +143,7 @@ fn main() {
                 _ => {
                     // render（行スイープ経路）
                     let lay = ifuto_core::layout::layout_build(&dom, &styles, width);
-                    let out = ifuto_core::render::render_emit_sweep(&lay, ansi);
+                    let out = ifuto_core::render::render_emit_sweep(&dom, &lay, ansi);
                     io::stdout().write_all(&out).unwrap();
                 }
             }

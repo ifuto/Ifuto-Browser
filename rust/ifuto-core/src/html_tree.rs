@@ -209,16 +209,15 @@ impl<'a> TreeBuilder<'a> {
                 has_script = true;
             }
             if tok.tag == tags::TAG_UNKNOWN {
-                node.name = tok
-                    .tag_raw
-                    .iter()
-                    .map(|&c| c.to_ascii_lowercase())
-                    .collect();
+                let lc: Vec<u8> = tok.tag_raw.iter().map(|&c| c.to_ascii_lowercase()).collect();
+                node.name = crate::dom::NameStr::from_vec(lc);
                 if tok.tag_raw.len() == 15 && str_eq_ci(&node.name, b"selectedcontent") {
                     has_selectedcontent = true;
                 }
             } else {
-                node.name = tags::tag_name(tok.tag).unwrap_or("").as_bytes().to_vec();
+                node.name = crate::dom::NameStr::from_static(
+                    tags::tag_name(tok.tag).unwrap_or("").as_bytes(),
+                );
                 if tok.tag == TAG_STYLE {
                     has_style = true;
                 }
@@ -553,14 +552,14 @@ impl<'a> TreeBuilder<'a> {
                 .filter(|&l| self.dom.node(l).kind == NodeKind::Text)
         };
         if let Some(m) = merge_to {
-            let old = self.dom.node(m).name.clone();
-            let mut merged = old;
+            let mut merged = self.dom.node(m).name.to_vec();
             merged.extend_from_slice(text);
+            let merged = crate::dom::NameStr::from_vec(merged);
             self.dom.node_mut(m).name = merged;
             return;
         }
         let n = self.dom.alloc_node(NodeKind::Text);
-        self.dom.node_mut(n).name = text.to_vec();
+        self.dom.node_mut(n).name = crate::dom::NameStr::from_bytes(text);
         match before {
             Some(b) => self.dom.insert_child_before(parent, n, b),
             None => self.dom.append_child(parent, n),
@@ -1577,7 +1576,7 @@ impl<'a> TreeBuilder<'a> {
 
     fn make_comment(&mut self, tok: &Tok) -> NodeId {
         let n = self.dom.alloc_node(NodeKind::Comment);
-        self.dom.node_mut(n).name = tok.text.clone();
+        self.dom.node_mut(n).name = crate::dom::NameStr::from_bytes(&tok.text);
         if tok.is_pi && !tok.pi_target.is_empty() {
             self.dom.node_mut(n).pi_target = tok.pi_target.clone();
         }
@@ -3195,7 +3194,8 @@ impl<'a> TreeBuilder<'a> {
             let name = self.dom.node(n).name.clone();
             for &(lc, canon) in SVG {
                 if str_eq_ci(&name, lc.as_bytes()) {
-                    self.dom.node_mut(n).name = canon.as_bytes().to_vec();
+                    self.dom.node_mut(n).name =
+                        crate::dom::NameStr::from_static(canon.as_bytes());
                     break;
                 }
             }
@@ -3685,7 +3685,9 @@ pub fn parse_html(input: &[u8]) -> Dom {
 
 /// slim-DOM スイッチ付き全文書解析（C の `if_dom_slim=true` での `if_parse_html` 相当）。
 pub fn parse_html_opts(input: &[u8], slim: bool) -> Dom {
-    let dom = Dom::new();
+    let mut dom = Dom::new();
+    // md 直構築と同じく、ノード数 ≒ 入力比例の予約で倍増 move 収支を消す。
+    dom.nodes.reserve(input.len() / 10);
     let tok = Tokenizer::new(input);
     let mut tb = TreeBuilder::new(dom, tok);
     tb.slim = slim;

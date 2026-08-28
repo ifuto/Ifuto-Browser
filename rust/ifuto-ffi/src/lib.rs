@@ -311,7 +311,7 @@ fn elem_get(rt: &mut Runtime, _data: u64, ptr: u64, name: &str) -> Option<AklVal
         "tagName" => {
             let (name, ns) = with_dom(|d| {
                 let node = d.node(n);
-                (node.name.clone(), node.ns)
+                (node.name.to_vec(), node.ns)
             });
             let mut up = name;
             if up.len() >= 64 {

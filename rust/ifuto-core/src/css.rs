@@ -2104,7 +2104,7 @@ impl From<&Style> for StyleKey {
 /// key→idx は負荷率 0.75 で ×2 成長する開放番地（C と同機構。SipHash ではなく
 /// u32 語の乗算混合で ~5ns/probe — lazy 解決はノードごとに pk 逆引きを打つため
 /// ここが最頻コストとなる。近似・失敗は無し: probe は必ず StyleKey 完全一致を検査）。
-struct StyleIntern {
+pub(crate) struct StyleIntern {
     styles: Vec<(Style, StyleKey)>,
     /// idx+1（0 = 空）。
     tab: Vec<u32>,
@@ -2112,7 +2112,7 @@ struct StyleIntern {
 }
 
 impl StyleIntern {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         StyleIntern {
             styles: Vec::new(),
             tab: vec![0; 1024],
@@ -2166,7 +2166,7 @@ impl StyleIntern {
     }
 
     /// C の `st_intern` 写し（同一値は挿入せず既存 idx を返す）。
-    fn intern(&mut self, st: &Style) -> u32 {
+    pub(crate) fn intern(&mut self, st: &Style) -> u32 {
         let k = StyleKey::from(st);
         if (self.styles.len() as u64) * 4 >= (self.tab.len() as u64) * 3 {
             // 負荷率 0.75 で ×2（C 写し）
@@ -2202,6 +2202,27 @@ impl StyleIntern {
     /// 値 → idx の逆引き（pk 写像用。未登録の外来値は intern して一貫化）。
     fn idx_of(&mut self, st: &Style) -> u32 {
         self.intern(st)
+    }
+
+    /// idx → 値のコピー（layout hot path からの参照用）。
+    pub(crate) fn value(&self, idx: u32) -> Style {
+        self.styles[idx as usize].0
+    }
+
+    /// idx → display バイトの直読み（100B の値コピーを避ける layout hot path 用）。
+    pub(crate) fn display_at(&self, idx: u32) -> u8 {
+        self.styles[idx as usize].0.display
+    }
+
+    /// idx → wrap 用の表示属性直読み（font_size, line_height, white_space, text_align）。
+    pub(crate) fn metrics_at(&self, idx: u32) -> (f32, f32, u8, u8) {
+        let s = &self.styles[idx as usize].0;
+        (s.font_size, s.line_height, s.white_space, s.text_align)
+    }
+
+    /// intern 表を値ベクタとして取り出す（`Layout::stab` 構築用）。
+    pub(crate) fn into_values(self) -> Vec<Style> {
+        self.styles.into_iter().map(|(s, _)| s).collect()
     }
 }
 
@@ -2341,14 +2362,25 @@ impl StyleLazy {
     /// C の `if_style_lazy_get` 写し。parent は継承元 style（None = ルート）。
     /// pk（parent 値の intern idx 写像）は呼出 1 回計算（LRU/ctab が共用）。
     pub fn get(&mut self, dom: &Dom, n: NodeId, parent: Option<&Style>, rfs: f32) -> Style {
+        // 外来 parent 値は intern して sid 化（pk の意味は `get_id` と厳密に同じ）。
+        let psid = parent.map(|p| self.cache.intern.idx_of(p));
+        let idx = self.get_id(dom, n, psid, rfs);
+        self.cache.value(idx)
+    }
+
+    /// `get` の intern idx 返し版（layout の hot path 用）。parent は直前の
+    /// `get_id` が返した継承元の sid（None = ルート）。pk は `sid+1` で 1 回も
+    /// 値の hash を打たない（C の parent ポインタ hash に相当する O(1) 化。
+    /// 値同一性 ⇒ intern 表で sid 一意なので、値から逆引きした pk と厳密一致）。
+    pub fn get_id(&mut self, dom: &Dom, n: NodeId, parent: Option<u32>, rfs: f32) -> u32 {
         let node = dom.node(n);
         let inline = dom.attr(n, b"style").is_some();
         if !inline {
-            let pk = self.cache.pk_of(parent);
+            let pk = parent.map(|s| s as u64 + 1).unwrap_or(0);
             let k2 = k2_of(node.kind, node.tag, &node.name);
             // 1 番スロット
             if self.m1_k2 == k2 && self.m1_pk == pk && k2 != 0 {
-                return self.cache.value(self.m1_st);
+                return self.m1_st;
             }
             // 2 番スロット: ヒット時は 1 番へ昇格スワップ（C 写し）
             if self.m2_k2 == k2 && self.m2_pk == pk && k2 != 0 {
@@ -2359,7 +2391,7 @@ impl StyleLazy {
                 self.m1_st = st2;
                 self.m1_pk = pk;
                 self.m1_k2 = k2;
-                return self.cache.value(st2);
+                return st2;
             }
             // 直接マップ（pk は 1/2 番スロットと同一の 1 回計算分を使い回す）
             let h = StyleCache::hash_of(pk, k2);
@@ -2367,10 +2399,11 @@ impl StyleLazy {
             let idx = if e.pk == pk && e.k2 == k2 && e.k2 != 0 {
                 e.st
             } else {
+                let pst: Option<Style> = parent.map(|sid| self.cache.value(sid));
                 let st = {
                     let uar: &StyleSheet = &self.ua;
                     let sheets: &[&StyleSheet] = std::slice::from_ref(&uar);
-                    compute_style(dom, n, parent, rfs, sheets)
+                    compute_style(dom, n, pst.as_ref(), rfs, sheets)
                 };
                 let idx = self.cache.intern.intern(&st);
                 self.cache.tab[h] = CacheEnt { k2, pk, st: idx };
@@ -2383,17 +2416,37 @@ impl StyleLazy {
             self.m1_st = idx;
             self.m1_pk = pk;
             self.m1_k2 = k2;
-            self.cache.value(idx)
+            idx
         } else {
             // inline style 持ち: memo 通路ごとバイパスして直接 compute+intern（C 写し）
+            let pst: Option<Style> = parent.map(|sid| self.cache.value(sid));
             let st = {
                 let uar: &StyleSheet = &self.ua;
                 let sheets: &[&StyleSheet] = std::slice::from_ref(&uar);
-                compute_style(dom, n, parent, rfs, sheets)
+                compute_style(dom, n, pst.as_ref(), rfs, sheets)
             };
-            let idx = self.cache.intern.intern(&st);
-            self.cache.value(idx)
+            self.cache.intern.intern(&st)
         }
+    }
+
+    /// idx → 値のコピー（layout が seg 物理属性を読むとき等に使用）。
+    pub fn value(&self, idx: u32) -> Style {
+        self.cache.value(idx)
+    }
+
+    /// idx → display バイトの直読み（値コピーを避ける layout hot path 用）。
+    pub fn display_at(&self, idx: u32) -> u8 {
+        self.cache.intern.display_at(idx)
+    }
+
+    /// idx → wrap 用の表示属性直読み（font_size, line_height, white_space, text_align）。
+    pub fn metrics_at(&self, idx: u32) -> (f32, f32, u8, u8) {
+        self.cache.intern.metrics_at(idx)
+    }
+
+    /// intern 表を値ベクタとして取り出す（`Layout::stab` 構築用。sid 体系を保持したまま移譲）。
+    pub fn into_stab(self) -> Vec<Style> {
+        self.cache.intern.into_values()
     }
 }
 
@@ -2754,8 +2807,8 @@ mod tests {
             for width in [20, 60, 100] {
                 let lay_e = crate::layout::layout_build(&dom, &styles, width);
                 let lay_l = crate::layout::layout_build_lazy(&dom, width);
-                let out_e = crate::render::render_emit_sweep(&lay_e, ansi);
-                let out_l = crate::render::render_emit_sweep(&lay_l, ansi);
+                let out_e = crate::render::render_emit_sweep(&dom, &lay_e, ansi);
+                let out_l = crate::render::render_emit_sweep(&dom, &lay_l, ansi);
                 assert_eq!(out_e, out_l, "render byte-diff: ansi={ansi} width={width}");
             }
         }

@@ -223,6 +223,8 @@ impl Run<'_> {
 /// ---- 行スイープ本体（C の `sweep_range` 直列経路相当） ----
 struct Sweep<'a> {
     lay: &'a Layout,
+    /// seg テキスト座標の dereference 用（C の IfSeg ポインタ読みと同値）。
+    dom: &'a crate::dom::Dom,
     /// viewport セル幅（C の `mx`。`lay->width` 固定）。
     mx: i32,
     /// 発行バッファ（C の IfBB。追記巻き戻しは `truncate` で行う）。
@@ -241,11 +243,12 @@ struct Sweep<'a> {
 
 /// レイアウトの行スイープ発行。C の `if_render_emit_rows_sweep`（直列 sweep_range）
 /// 相当。ansi=1 で 256 色 SGR、0 でプレーン。
-pub fn render_emit_sweep(lay: &Layout, ansi: bool) -> Vec<u8> {
+pub fn render_emit_sweep(dom: &crate::dom::Dom, lay: &Layout, ansi: bool) -> Vec<u8> {
     let mx = lay.width.max(1);
     let my = lay.height.max(1);
     let mut s = Sweep {
         lay,
+        dom,
         mx,
         // 出力は行×(幅+装飾) に比例するため重めに事前確保（再配置の削減のみ。
         // バイト列には無関係）
@@ -402,7 +405,7 @@ impl<'a> Sweep<'a> {
                 let g = (s.x - pos) as usize;
                 self.out.resize(self.out.len() + g, b' ');
             }
-            self.out.extend_from_slice(&s.text);
+            self.out.extend_from_slice(self.lay.seg_text(self.dom, s));
             pos = s.x + s.w;
         }
         while self.out.len() > mark && self.out.last() == Some(&b' ') {
@@ -437,8 +440,8 @@ impl<'a> Sweep<'a> {
                 runs.push(Run::Bytes {
                     x: s.x,
                     w: s.w,
-                    p: &s.text,
-                    pen: pen(Some(&s.st)),
+                    p: lay.seg_text(self.dom, s),
+                    pen: pen(Some(lay.seg_style(s))),
                 });
             }
         }
@@ -597,8 +600,8 @@ impl<'a> Sweep<'a> {
                 runs.push(Run::Bytes {
                     x: s.x,
                     w: s.w,
-                    p: &s.text,
-                    pen: pen(Some(&s.st)),
+                    p: lay.seg_text(self.dom, s),
+                    pen: pen(Some(lay.seg_style(s))),
                 });
             }
         }
@@ -778,8 +781,14 @@ impl<'a> Sweep<'a> {
         while self.li < lines.len() && lines[self.li].y == r {
             let l = lines[self.li];
             for s in &lay.seg_arena[l.seg_lo as usize..l.seg_hi as usize] {
-                let (fg, bg, flags) = pen(Some(&s.st));
-                row_paint_text(&mut self.row, w, s.x, &s.text, (fg, bg, flags));
+                let (fg, bg, flags) = pen(Some(lay.seg_style(s)));
+                row_paint_text(
+                    &mut self.row,
+                    w,
+                    s.x,
+                    lay.seg_text(self.dom, s),
+                    (fg, bg, flags),
+                );
             }
             self.li += 1;
         }
@@ -972,7 +981,7 @@ mod tests {
         let dom = parse_html(html.as_bytes());
         let styles = apply_styles(&dom);
         let lay = layout_build(&dom, &styles, width);
-        render_emit_sweep(&lay, ansi)
+        render_emit_sweep(&dom, &lay, ansi)
     }
 
     #[test]
@@ -1019,7 +1028,7 @@ mod tests {
         let dom = parse_html(b"<hr>");
         let styles = apply_styles(&dom);
         let lay = layout_build(&dom, &styles, 40);
-        let out = render_emit_sweep(&lay, false);
+        let out = render_emit_sweep(&dom, &lay, false);
         let s = String::from_utf8(out).unwrap();
         // hr 行は ─ で埋まる（body ml=1 なので x=1 から）
         assert!(s.trim().starts_with("────────────────"), "got: {s:?}");

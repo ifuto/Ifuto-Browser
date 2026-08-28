@@ -54,6 +54,120 @@ pub enum Ns {
     Mathml,
 }
 
+/// 小文字列最適化つきの不変名バッファ（`Node::name` 用）。
+///
+/// なぜ `Vec<u8>` ではないのか: 16MB md で ~1.6M ノードの `Vec<u8>` 名は
+/// ~1.6M 回の malloc + memcpy を要し、parse 段のアロケーション収支（922MB 実測、
+/// alloc_probe 調査器）の主因だった。C は arena bump に積むだけ（0 malloc）。
+/// `Vec` のままでは言語の標準型に思考停止して性能を燃やすことになる。
+///
+/// 実装上の性質:
+/// - `Static`: タグ名等の `'static` バイト列（0 alloc。ELEMENT 名の既定経路）
+/// - `Inline`（≤ [`NAME_INLINE_CAP`]B）: 短いテキスト（0 alloc）
+/// - `Heap`: 長文（1 alloc。`Box<[u8]>` で 16B。二度縮めしない）
+///
+/// 読み側は `Deref<Target=[u8]>` で旧 `Vec<u8>` と同じインタフェース
+/// （`&node.name` で `&[u8]` 化、`.len()/.as_ptr()/[i]` 等は autoderef が解決）。
+#[derive(Clone, Debug)]
+pub struct NameStr(NameInner);
+
+#[derive(Clone, Debug)]
+enum NameInner {
+    Inline { len: u8, buf: [u8; NAME_INLINE_CAP] },
+    Static(&'static [u8]),
+    Heap(Box<[u8]>),
+}
+
+/// Inline 収容の上限（enum 全体を 24B = 旧 `Vec<u8>` と同サイズに収める境界）。
+pub const NAME_INLINE_CAP: usize = 22;
+
+impl NameStr {
+    /// 空。
+    pub fn empty() -> Self {
+        NameStr(NameInner::Inline {
+            len: 0,
+            buf: [0; NAME_INLINE_CAP],
+        })
+    }
+
+    /// スライスから構築（短ければ inline、長ければ 1 alloc）。
+    pub fn from_bytes(b: &[u8]) -> Self {
+        if b.len() <= NAME_INLINE_CAP {
+            let mut buf = [0u8; NAME_INLINE_CAP];
+            buf[..b.len()].copy_from_slice(b);
+            NameStr(NameInner::Inline {
+                len: b.len() as u8,
+                buf,
+            })
+        } else {
+            NameStr(NameInner::Heap(b.into()))
+        }
+    }
+
+    /// 静的バイト列から構築（0 alloc。タグ名等）。
+    pub fn from_static(b: &'static [u8]) -> Self {
+        NameStr(NameInner::Static(b))
+    }
+
+    /// 既存 `Vec<u8>` の確保をそのまま採用（再コピーなし）。
+    pub fn from_vec(v: Vec<u8>) -> Self {
+        if v.len() <= NAME_INLINE_CAP {
+            Self::from_bytes(&v)
+        } else {
+            NameStr(NameInner::Heap(v.into_boxed_slice()))
+        }
+    }
+}
+
+impl Default for NameStr {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl std::ops::Deref for NameStr {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.0 {
+            NameInner::Inline { len, buf } => &buf[..*len as usize],
+            NameInner::Static(s) => s,
+            NameInner::Heap(b) => b,
+        }
+    }
+}
+
+impl AsRef<[u8]> for NameStr {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for NameStr {
+    fn borrow(&self) -> &[u8] {
+        self
+    }
+}
+
+impl PartialEq for NameStr {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl Eq for NameStr {}
+
+/// `name == b"literal"` 形の旧 Vec 比較互換。
+impl<const N: usize> PartialEq<&[u8; N]> for NameStr {
+    fn eq(&self, other: &&[u8; N]) -> bool {
+        **self == other[..]
+    }
+}
+
+impl PartialEq<NameStr> for &[u8] {
+    fn eq(&self, other: &NameStr) -> bool {
+        *self == &**other
+    }
+}
+
 /// DOCTYPE 情報（C の `IfDoctype` 相当。`NodeKind::Doctype` のみ有意）。
 #[derive(Clone, Debug, Default)]
 pub struct Doctype {
@@ -79,7 +193,7 @@ pub struct Node {
     /// フラグ（`IF_NF_*`。当面未使用）。
     pub flags: u8,
     /// タグ名（ELEMENT）/ テキスト（TEXT, COMMENT）。
-    pub name: Vec<u8>,
+    pub name: NameStr,
     /// 属性列（ELEMENT）。
     pub attrs: Vec<Attr>,
     /// DOCTYPE 情報（`NodeKind::Doctype` のみ有意）。
@@ -106,7 +220,7 @@ impl Node {
             tag: tags::TAG_UNKNOWN,
             ns: Ns::Html,
             flags: 0,
-            name: Vec::new(),
+            name: NameStr::empty(),
             attrs: Vec::new(),
             doctype: None,
             pi_target: Vec::new(),
@@ -373,7 +487,7 @@ impl Dom {
             return;
         }
         let tn = self.alloc_node(NodeKind::Text);
-        self.nodes[tn as usize].name = t.to_vec();
+        self.nodes[tn as usize].name = NameStr::from_bytes(t);
         self.nodes[tn as usize].parent = Some(n);
         self.nodes[n as usize].first_child = Some(tn);
         self.nodes[n as usize].last_child = Some(tn);
@@ -392,7 +506,7 @@ impl Dom {
                     let node = self.node_mut(ttl);
                     node.tag = title_tag;
                     node.ns = Ns::Html;
-                    node.name = b"title".to_vec();
+                    node.name = NameStr::from_static(b"title");
                 }
                 // head の先頭へ挿入（C: parent=head / next_sibling=旧 first_child）
                 let head_first = self.nodes[head as usize].first_child;
@@ -911,7 +1025,7 @@ mod tests {
         {
             let node = dom.node_mut(n);
             node.tag = tag;
-            node.name = tags::tag_name(tag).unwrap_or("").as_bytes().to_vec();
+            node.name = NameStr::from_static(tags::tag_name(tag).unwrap_or("").as_bytes());
         }
         dom.append_child(parent, n);
         n
@@ -922,7 +1036,7 @@ mod tests {
         let n = dom.alloc_node(NodeKind::Text);
         {
             let node = dom.node_mut(n);
-            node.name = text.to_vec();
+            node.name = NameStr::from_bytes(text);
         }
         dom.append_child(parent, n);
         n
@@ -1066,7 +1180,7 @@ mod tests {
         let root = d.root;
         let html = make_elem(&mut d, root, tags::tag_id(b"html"));
         let custom = make_elem(&mut d, html, tags::TAG_UNKNOWN);
-        d.node_mut(custom).name = b"my-widget".to_vec();
+        d.node_mut(custom).name = NameStr::from_static(b"my-widget");
         let body = make_elem(&mut d, html, tags::tag_id(b"body"));
         let div = make_elem(&mut d, body, tags::tag_id(b"div"));
 
@@ -1100,7 +1214,7 @@ mod tests {
         assert_eq!(got.len(), 5);
         // 未知タグ名 CI
         let custom = make_elem(&mut d, body, tags::TAG_UNKNOWN);
-        d.node_mut(custom).name = b"x-foo".to_vec();
+        d.node_mut(custom).name = NameStr::from_static(b"x-foo");
         let (total, got) = d.elements_by_tag(root, b"x-foo", 1024);
         assert_eq!(total, 1);
         assert_eq!(got, vec![custom]);
