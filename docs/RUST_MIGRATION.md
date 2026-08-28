@@ -1933,3 +1933,12 @@ Box::leak 対処後も CMD 5 が exit 1。ログ末尾は `charset::tests::oracl
 なお前報で「ウォッチャ(gh run watch) exit 0 = 全緑確定」と書いたのは**誤り**。
 `gh run view` は conclusion=failure を返しており、行レベル（trigger/result.md）が
 唯一の正確な証跡。以後の CI 判定は result.md の CMD_RESULT 行のみを信用する。
+
+### 追補（同日・5 件目）: md 2-slice 3 テストを Miri 下 8KB 化 + Miri timeout 3000
+
+1500s でも到達点は `md::tests::twoslice_equals_serial` の途中（他の全ては通過。
+cfg(miri) 縮小は効いている）。C 相当の DOM 構築は Miri 解釈実行で数万倍級に
+なるため、64KB でも個別テストとして重すぎた。8KB（merge/remap 分岐は全て
+通る最小代表入力）に再縮小し、timeout は 1500 → **3000** へ（ジョブ上限
+120 分に対して toolchain+他 CMD と合わせても ~70 分見込みで余裕）。
+通常 test の 1MB 総掃引・差分 fuzz・ASan 側の網羅性には一切手を付けていない。

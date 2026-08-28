@@ -1788,10 +1788,10 @@ mod tests {
     #[test]
     fn twoslice_equals_serial() {
         let block: &[u8] = b"# t\n\npara with *em* and `code` and [x](/u) tail\n\n- a\n- b\n\n> q\n\n| h1 | h2 |\n| --- | --- |\n| 1 | 2 |\n\n```rust\ncode block\n```\n\n![alt](/i.png)\n\n---\n\n";
-        // Miri 下では 64KB に縮小（本テストは md_to_dom_2slice を直接呼ぶため
+        // Miri 下では 8KB に縮小（本テストは md_to_dom_2slice を直接呼ぶため
         // 1MB の dispatch 閾値は不関係。等価性を検査する論理経路は同一）。
         let target = if cfg!(miri) {
-            (1 << 16) + 12345
+            (1 << 13) + 12345
         } else {
             (1 << 20) + 12345
         };
@@ -1820,9 +1820,9 @@ mod tests {
     #[test]
     fn par_scan_rejects_footnote() {
         let mut big = Vec::new();
-        // Miri 下では 64KB に縮小（`[^` の大域拒否はサイズ不変の性質）。
+        // Miri 下では 8KB に縮小（`[^` の大域拒否はサイズ不変の性質）。
         let target = if cfg!(miri) {
-            (1 << 16) + 101
+            (1 << 13) + 101
         } else {
             (1 << 20) + 101
         };
@@ -1838,8 +1838,8 @@ mod tests {
     #[test]
     fn par_scan_never_splits_inside_fence() {
         let mut big = Vec::new();
-        // Miri 下では 64KB に縮小（fence 追跡・分割点条件の論理経路は同一）。
-        let bound: usize = if cfg!(miri) { 1 << 16 } else { 1 << 20 };
+        // Miri 下では 8KB に縮小（fence 追跡・分割点条件の論理経路は同一）。
+        let bound: usize = if cfg!(miri) { 1 << 13 } else { 1 << 20 };
         big.extend_from_slice(b"# head\n\n");
         while big.len() < bound / 2 {
             big.extend_from_slice(b"pre pad\n\n");
