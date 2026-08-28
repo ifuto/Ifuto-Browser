@@ -1265,17 +1265,19 @@ mod tests {
             }
             false
         }
-        let vt = Box::leak(Box::new(CAklHandleVTab {
+        // vtable は akl_free まで生存すればよい（C 契約どおり）。リークさせず
+        // テストフレームの Box で所有し、akl_free 後に drop する（Miri 漏洩検査適合）。
+        let vt = Box::new(CAklHandleVTab {
             tag: c"TestElem".as_ptr(),
             get: Some(t_get),
             set: None,
             call: None,
-        }));
+        });
 
         let rt = unsafe { akl_new() };
         // ハンドルをグローバル document に束縛
         let handle =
-            unsafe { akl_mkhandle(rt, vt as *const CAklHandleVTab, 0xdead as *mut c_void) };
+            unsafe { akl_mkhandle(rt, &*vt as *const CAklHandleVTab, 0xdead as *mut c_void) };
         assert!(unsafe { akl_is_handle(rt, handle) });
         let doc = CString::new("document").unwrap();
         assert!(unsafe { akl_global_set(rt, doc.as_ptr(), handle) });
