@@ -1174,3 +1174,120 @@ source: trigger/trigger.md @ 588cd7bfe4d5d89ec15128bef9dec83fc94828db
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-28T14:14:03Z) rc=0
+```
+==> ブランチ toolchain-bin にアーカイブ（9 分割）があります。取得して展開します
+==> 展開完了
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+```
+
+### clippy 実行 (2026-08-28T14:14:28Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+   Compiling ifuto-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-ffi)
+    Checking ifuto-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-core)
+    Checking akl-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-ffi)
+    Checking ifuto-cli v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.43s
+```
+
+### miri 実行 (2026-08-28T14:22:02Z)
+```
+            1: akl_core::bytecode::Runtime::run_loop
+                at akl-core/src/bytecode.rs:1625:33: 1625:71
+            2: akl_core::bytecode::Runtime::run_with_this_env
+                at akl-core/src/bytecode.rs:1014:15: 1014:53
+            3: akl_core::bytecode::Runtime::run_with_this
+                at akl-core/src/bytecode.rs:969:9: 969:65
+            4: akl_core::bytecode::Runtime::run
+                at akl-core/src/bytecode.rs:959:9: 959:58
+            5: akl_eval
+                at akl-ffi/src/lib.rs:446:11: 446:31
+            6: tests::eval
+                at akl-ffi/src/lib.rs:1085:27: 1085:61
+            7: tests::handle_roundtrip
+                at akl-ffi/src/lib.rs:1284:23: 1284:50
+            8: tests::handle_roundtrip::{closure#0}
+                at akl-ffi/src/lib.rs:1248:26: 1248:26
+
+ok
+test tests::native_register_and_call ... warning: integer-to-pointer cast
+   --> akl-ffi/src/lib.rs:199:19
+    |
+199 |     let wrapper = rt.host_ctx as *mut AklRT;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = note: this is on thread `tests::native_r`
+    = note: stack backtrace:
+            0: foreign_adapter
+                at akl-ffi/src/lib.rs:199:19: 199:44
+            1: akl_core::bytecode::Runtime::do_call
+                at akl-core/src/bytecode.rs:2122:21: 2122:48
+            2: akl_core::bytecode::Runtime::run_loop
+                at akl-core/src/bytecode.rs:1239:27: 1239:91
+            3: akl_core::bytecode::Runtime::run_with_this_env
+                at akl-core/src/bytecode.rs:1014:15: 1014:53
+            4: akl_core::bytecode::Runtime::run_with_this
+                at akl-core/src/bytecode.rs:969:9: 969:65
+            5: akl_core::bytecode::Runtime::run
+                at akl-core/src/bytecode.rs:959:9: 959:58
+            6: akl_eval
+                at akl-ffi/src/lib.rs:446:11: 446:31
+            7: tests::eval
+                at akl-ffi/src/lib.rs:1085:27: 1085:61
+            8: tests::native_register_and_call
+                at akl-ffi/src/lib.rs:1231:23: 1231:53
+            9: tests::native_register_and_call::{closure#0}
+                at akl-ffi/src/lib.rs:1223:34: 1223:34
+
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.86s
+
+error: memory leaked: alloc749089 (Rust heap, size: 32, align: 8), allocated here:
+    --> akl-ffi/src/lib.rs:1268:28
+     |
+1268 |           let vt = Box::leak(Box::new(CAklHandleVTab {
+     |  ____________________________^
+1269 | |             tag: c"TestElem".as_ptr(),
+1270 | |             get: Some(t_get),
+1271 | |             set: None,
+1272 | |             call: None,
+1273 | |         }));
+     | |__________^
+     |
+     = note: stack backtrace:
+             0: tests::handle_roundtrip
+                 at akl-ffi/src/lib.rs:1268:28: 1273:11
+             1: tests::handle_roundtrip::{closure#0}
+                 at akl-ffi/src/lib.rs:1248:26: 1248:26
+
+note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
+
+note: set `MIRIFLAGS=-Zmiri-ignore-leaks` to disable this check
+
+error: aborting due to 1 previous error; 4 warnings emitted
+
+error: test failed, to rerun pass `-p akl-ffi --lib`
+
+Caused by:
+  process didn't exit successfully: `/home/runner/akl-toolchain/rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin/cargo-miri runner /home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/target/miri/x86_64-unknown-linux-gnu/debug/build/akl-ffi/d1a0b609b8c5069e/out/akl_ffi-d1a0b609b8c5069e` (exit status: 1)
+note: test exited abnormally; to see the full output pass --no-capture to the harness.
+```
+# 実行結果 (2026-08-28T14:22:49Z)
+
+source: trigger/trigger.md @ 59189648946d7f27382adf67c9579f36db5100be
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [ ] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
