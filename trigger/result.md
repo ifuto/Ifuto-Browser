@@ -1291,3 +1291,119 @@ source: trigger/trigger.md @ 59189648946d7f27382adf67c9579f36db5100be
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-28T14:27:02Z) rc=0
+```
+==> ブランチ toolchain-bin にアーカイブ（9 分割）があります。取得して展開します
+==> 展開完了
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+```
+
+### clippy 実行 (2026-08-28T14:27:32Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+   Compiling ifuto-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-ffi)
+    Checking ifuto-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-core)
+    Checking akl-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-ffi)
+    Checking ifuto-cli v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.63s
+```
+
+### miri 実行 (2026-08-28T14:37:32Z)
+```
+                at akl-ffi/src/lib.rs:1248:26: 1248:26
+
+warning: integer-to-pointer cast
+   --> akl-ffi/src/lib.rs:254:13
+    |
+254 |             ptr as *mut c_void,
+    |             ^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = note: this is on thread `tests::handle_r`
+    = note: stack backtrace:
+            0: handle_get_adapter
+                at akl-ffi/src/lib.rs:254:13: 254:31
+            1: akl_core::bytecode::Runtime::run_loop
+                at akl-core/src/bytecode.rs:1625:33: 1625:71
+            2: akl_core::bytecode::Runtime::run_with_this_env
+                at akl-core/src/bytecode.rs:1014:15: 1014:53
+            3: akl_core::bytecode::Runtime::run_with_this
+                at akl-core/src/bytecode.rs:969:9: 969:65
+            4: akl_core::bytecode::Runtime::run
+                at akl-core/src/bytecode.rs:959:9: 959:58
+            5: akl_eval
+                at akl-ffi/src/lib.rs:446:11: 446:31
+            6: tests::eval
+                at akl-ffi/src/lib.rs:1085:27: 1085:61
+            7: tests::handle_roundtrip
+                at akl-ffi/src/lib.rs:1286:23: 1286:50
+            8: tests::handle_roundtrip::{closure#0}
+                at akl-ffi/src/lib.rs:1248:26: 1248:26
+
+ok
+test tests::native_register_and_call ... warning: integer-to-pointer cast
+   --> akl-ffi/src/lib.rs:199:19
+    |
+199 |     let wrapper = rt.host_ctx as *mut AklRT;
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^ integer-to-pointer cast
+    |
+    = note: this is on thread `tests::native_r`
+    = note: stack backtrace:
+            0: foreign_adapter
+                at akl-ffi/src/lib.rs:199:19: 199:44
+            1: akl_core::bytecode::Runtime::do_call
+                at akl-core/src/bytecode.rs:2122:21: 2122:48
+            2: akl_core::bytecode::Runtime::run_loop
+                at akl-core/src/bytecode.rs:1239:27: 1239:91
+            3: akl_core::bytecode::Runtime::run_with_this_env
+                at akl-core/src/bytecode.rs:1014:15: 1014:53
+            4: akl_core::bytecode::Runtime::run_with_this
+                at akl-core/src/bytecode.rs:969:9: 969:65
+            5: akl_core::bytecode::Runtime::run
+                at akl-core/src/bytecode.rs:959:9: 959:58
+            6: akl_eval
+                at akl-ffi/src/lib.rs:446:11: 446:31
+            7: tests::eval
+                at akl-ffi/src/lib.rs:1085:27: 1085:61
+            8: tests::native_register_and_call
+                at akl-ffi/src/lib.rs:1231:23: 1231:53
+            9: tests::native_register_and_call::{closure#0}
+                at akl-ffi/src/lib.rs:1223:34: 1223:34
+
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.96s
+
+warning: 4 warnings emitted
+
+     Running unittests src/main.rs (target/miri/x86_64-unknown-linux-gnu/debug/build/ifuto-cli/adbc917ba816c3f2/out/ifuto-adbc917ba816c3f2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/miri/x86_64-unknown-linux-gnu/debug/build/ifuto-core/63b5096aea252227/out/ifuto_core-63b5096aea252227)
+
+running 183 tests
+test charset::tests::oracle_bom_strip_rule ... ok
+test charset::tests::oracle_decode_euc ... ok
+test charset::tests::oracle_decode_sjis ... ok
+test charset::tests::oracle_label ... ok
+test charset::tests::oracle_sniff ... ok
+test charset::tests::oracle_sweep ... ```
+# 実行結果 (2026-08-28T14:38:19Z)
+
+source: trigger/trigger.md @ 75e7dbba1dd26269eb8d8fbdc08bfc8c5b5e9c70
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [ ] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
