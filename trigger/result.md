@@ -1523,3 +1523,120 @@ source: trigger/trigger.md @ 8473699966f007e9fc1848f685f1fb7f20598302
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-28T15:41:36Z) rc=0
+```
+==> ブランチ toolchain-bin にアーカイブ（9 分割）があります。取得して展開します
+==> 展開完了
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+```
+
+### clippy 実行 (2026-08-28T15:42:08Z)
+```
+   Compiling ifuto-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-ffi)
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+    Checking ifuto-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-core)
+    Checking akl-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-ffi)
+    Checking ifuto-cli v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 9.03s
+```
+
+### miri 実行 (2026-08-28T16:20:34Z)
+```
+test render::tests::rgba_to_ansi_grayscale ... ok
+test render::tests::simple_text ... ok
+test script::tests::get_prop_basic ... ok
+test script::tests::set_prop_basic ... ok
+test script::tests::set_prop_matches_c_quirks ... ok
+test store::tests::bookmarks_basic ... ok
+test store::tests::bookmarks_ignores_no_tab ... ok
+test store::tests::bookmarks_max_limit ... ok
+test store::tests::fuzz_invariants_and_determinism ... ok
+test store::tests::history_line_basic ... ok
+test store::tests::serialize_session_basic ... ok
+test store::tests::serialize_session_sanitizes ... ok
+test store::tests::serialize_session_skips_blank ... ok
+test store::tests::session_basic ... ok
+test store::tests::session_group_and_scroll ... ok
+test store::tests::session_id_overflow_rejected ... ok
+test store::tests::session_magic_mismatch ... ok
+test store::tests::session_no_tabs ... ok
+test store::tests::session_scroll_clamped ... ok
+test store::tests::session_tabs_max ... ok
+test store::tests::session_unknown_lines_ignored ... ok
+test store::tests::test_shrink_history ... ok
+test store::tests::test_toggle_bookmark ... ok
+test strutil::tests::ascii_lower_cases ... ok
+test strutil::tests::contains_matches ... ok
+test strutil::tests::str_eq_ci_matches ... ok
+test strutil::tests::trim_matches ... ok
+test tags::tests::exhaustive_roundtrip ... ok
+test tags::tests::flags_mutually_exclusive ... ok
+test tags::tests::table_length_and_first ... ok
+test tags::tests::tag_id_ci ... ok
+test tags::tests::tag_name_roundtrip ... ok
+test tags::tests::void_raw_rcdata ... ok
+test tls::tests::basic ... ok
+test tls::tests::ca_load_pem_extracts ... ok
+test tls::tests::nul_terminates ... ok
+test tls::tests::rejects_invalid ... ok
+test tls::tests::ta_add_rejects_garbage ... ok
+test tls::tests::ta_add_requires_dates ... ok
+test tls::tests::whitespace_ignored ... ok
+test utf8::tests::band_w2_implies_valid_wide ... ok
+test utf8::tests::band_w2_rejects_bad_continuation ... ok
+test utf8::tests::encode_roundtrip_all_codepoints ... ok
+test utf8::tests::oracle_mirrors_c ... ok
+
+test result: ok. 183 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 785.41s
+
+     Running unittests src/lib.rs (target/miri/x86_64-unknown-linux-gnu/debug/build/ifuto-ffi/102554b0a3185dfe/out/ifuto_ffi-102554b0a3185dfe)
+
+running 9 tests
+test net_sock::tests::bad_url ... ok
+test net_sock::tests::private_detection ... ok
+test net_sock::tests::url_too_long ... ok
+test tests::failure_isolation ... ok
+test tests::kill_switch_and_no_script ... ok
+test tests::skip_external_and_type ... ok
+test tests::style_and_tag_name_and_attr ... ok
+test tests::textcontent_mutation ... ok
+test tests::title_set_and_console ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.11s
+
+   Doc-tests akl_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests ifuto_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests ifuto_ffi
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+```
+# 実行結果 (2026-08-28T16:21:21Z)
+
+source: trigger/trigger.md @ dcefb595ffadc984295743c199f97bef3dbba908
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 3000 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
