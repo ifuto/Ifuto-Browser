@@ -1889,3 +1889,15 @@ Stacked Borrows ではこの grant に保護タグのポップが必要で UB。
 - Miri（要 crates.io で sysroot 構築）: 本砂箱は crates.io egress 遮断のため
   ローカル検証不可。**CI トリガで確認する**（下の「合法」を仮定した理屈が
   崩れた場合は同箇所で再失敗するので即判る）。
+
+### 追補（同日・2 件目）: `akl_native_register` の &str 往復による NUL 来歴喪失
+
+CI 再実行でアダプタ群は緑化（`handle_roundtrip` ok）。次に表面化したのは
+`akl_native_register` → `akl_global_set` 経路の別件: `cstr()` で得た `&str` を
+`as_ptr()` で生ポインタに戻す往復があり、SharedReadOnly retag の適用範囲が
+[0..len) のため、内側 `cstr()` の strlen が読む **NUL 終端（[len]）の来歴を殺す**
+（「tag does not exist in the borrow stack」）。同関数内では `&str` の中身は
+未使用だったため、呼び出し側の生ポインタをそのまま転送する形に削除。
+修正前コードは実害のある設計としては単純に不要だった（冗長の除去であり
+原型の維持ではない）。現行の残 `as_ptr()` サイトは生 `&str`+len 契約の
+コールバック受け渡しのみで strlen を踏まないことを全点検済み。

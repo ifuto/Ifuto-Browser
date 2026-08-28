@@ -905,14 +905,18 @@ pub unsafe extern "C" fn akl_native_register(
     if rt.is_null() {
         return false;
     }
-    // SAFETY: rt は akl_new 由来。name は NUL 終端。
+    // SAFETY: rt は akl_new 由来。
     let rt = unsafe { &mut *rt };
-    let name = unsafe { cstr(name) };
     let v = unsafe { akl_mknative(rt, fn_, udata) };
     if v == AklVal::UNDEF.bits() {
         return false;
     }
-    unsafe { akl_global_set(rt, name.as_ptr() as *const c_char, v) }
+    // name は **呼び出し側から受け取った生ポインタをそのまま転送** する。
+    // `cstr()` で &str に落として `as_ptr()` で戻す往復は、SharedReadOnly retag が
+    // [0..len) にしか及ばず、内側の strlen が読む NUL（[len]）の来歴を殺すため
+    // Stacked Borrows 違反（実機では偶発的に動く形式的 UB）になる。
+    // SAFETY: name は NUL 終端（akl.h 契約）。akl_global_set 内で cstr される。
+    unsafe { akl_global_set(rt, name, v) }
 }
 
 /// `akl_mknative`: C ネイティブの関数値を生成（束縛はしない）。
