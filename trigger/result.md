@@ -706,3 +706,120 @@ source: trigger/trigger.md @ 59de005816d1fa50c0f16784dd68a7c8cb62afae
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-28T05:29:11Z) rc=0
+```
+==> ブランチ toolchain-bin にアーカイブ（9 分割）があります。取得して展開します
+==> 展開完了
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+```
+
+### clippy 実行 (2026-08-28T05:29:34Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+   Compiling ifuto-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-ffi)
+    Checking ifuto-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-core)
+    Checking akl-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-ffi)
+    Checking ifuto-cli v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.49s
+```
+
+### miri 実行 (2026-08-28T05:37:38Z)
+```
+test lexer::tests::numbers_decimal ... FAILED
+test lexer::tests::numbers_radix ... ok
+test lexer::tests::punctuators_longest_match ... ok
+test lexer::tests::strings_and_escapes ... ok
+test lexer::tests::template_literals ... ok
+test lexer::tests::unterminated_string_errors ... ok
+test obj::tests::alloc_reuses_free_list ... ok
+test obj::tests::arr_map_basic ... ok
+test obj::tests::arr_map_snapshot_semantics ... ok
+test obj::tests::env_parent_chain ... ok
+test obj::tests::func_env_is_child ... ok
+test obj::tests::gc_preserves_reachable ... ok
+test obj::tests::gc_sweeps_unreachable_chain ... ok
+test obj::tests::get_bounds_safe ... ok
+test obj::tests::prop_name_is_child ... ok
+test obj::tests::prop_set_get_roundtrip ... ok
+test parser::tests::array_literal ... ok
+test parser::tests::binary_precedence ... ok
+test parser::tests::compound_assign_and_incdec ... ok
+test parser::tests::equality_and_relational ... ok
+test parser::tests::for_do_while_break_continue ... ok
+test parser::tests::func_decl_and_call ... ok
+test parser::tests::func_expr_and_switch ... ok
+test parser::tests::generator_and_async_decl ... ok
+test parser::tests::if_while_block ... ok
+test parser::tests::import_export ... ok
+test parser::tests::index_and_member_assign ... ok
+test parser::tests::literals ... ok
+test parser::tests::member_and_index_access ... ok
+test parser::tests::object_literal ... ok
+test parser::tests::regex_literal ... ok
+test parser::tests::ternary ... ok
+test parser::tests::this_and_arrow ... ok
+test parser::tests::unary ... ok
+test parser::tests::unsupported_errors ... ok
+test parser::tests::var_decl_and_assign ... ok
+test regex::tests::alternation_and_group ... ok
+test regex::tests::anchors ... ok
+test regex::tests::char_class ... ok
+test regex::tests::dot_star ... ok
+test regex::tests::ignore_case ... ok
+test regex::tests::literal_match ... ok
+test string::tests::intern_distinct ... ok
+test string::tests::intern_identity ... ok
+test string::tests::interned_is_heap_str ... ok
+test string::tests::len_tracks ... ok
+test string::tests::lookup_works ... ok
+test tests::f64_roundtrip ... ok
+test tests::int_add_known ... ok
+test tests::int_roundtrip_known ... ok
+test tests::nan_normalized ... ok
+test tests::obj_roundtrip_known ... ok
+test tests::tag_values ... ok
+
+failures:
+
+---- builtins::tests::math stdout ----
+
+thread 'builtins::tests::math' (1023) panicked at akl-core/src/builtins.rs:3486:9:
+assertion `left == right` failed
+  left: AklVal(4652218415073722362)
+ right: AklVal(4652218415073722368)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+note: in Miri, you may have to set `MIRIFLAGS=-Zmiri-env-forward=RUST_BACKTRACE` for the environment variable to have an effect
+
+---- lexer::tests::numbers_decimal stdout ----
+
+thread 'lexer::tests::numbers_decimal' (1090) panicked at akl-core/src/lexer.rs:936:9:
+assertion `left == right` failed
+  left: [Num(Float(0.015000000000000003)), Eof]
+ right: [Num(Float(0.015)), Eof]
+
+
+failures:
+    builtins::tests::math
+    lexer::tests::numbers_decimal
+
+test result: FAILED. 140 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 638.03s
+
+error: test failed, to rerun pass `-p akl-core --lib`
+```
+# 実行結果 (2026-08-28T05:38:24Z)
+
+source: trigger/trigger.md @ d168584489cd710cb9367e6719e429d800c140ae
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [ ] [CMD_RESULT 5] `cd rust && ../trigger/tc timeout 600 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — **exit 1**
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
