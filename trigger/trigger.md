@@ -70,3 +70,9 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 2026-08-29 実行: フェーズ 10-e（Node 痩身化 200B→80B）反映後の検証。特に CMD 5 Miri（副テーブル/merge_side_from/8KB化テスト群）と CMD 3 test=342 緑に注目。
 
 # 2026-08-29 実行: フェーズ 10-f（layout アロケーション段撲滅: ifc pieces/segs スクラッチ + Winner スクラッチ）反映後の検証。特に CMD 5 Miri（RefCell スクラッチ take/返却経路）と CMD 3 test 緑に注目。
+
+# 2026-08-29 実行: フェーズ 10-g（2-slice parse 実益化・既定ON転換）反映後の検証。特に CMD 5 Miri（drain ext drain/スレッド境界の新経路）と CMD 3 test 緑に注目。
+
+# 2026-08-29 実行: フェーズ 10-h（body shard 2-way 並列 layout 移植）反映後の検証。特に CMD 5 Miri（thread::scope + RefCell 専有 streams の新経路、shard_layout_equals_serial）と CMD 3 test=343 緑に注目。
+
+# 2026-08-29 実行: フェーズ 10-i（render 2-way 並列 sweep）反映後の検証。特に CMD 5 Miri（sweep range 分割スレッド）と CMD 3 test=344 緑に注目。
