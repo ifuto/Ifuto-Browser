@@ -76,3 +76,10 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 2026-08-29 実行: フェーズ 10-h（body shard 2-way 並列 layout 移植）反映後の検証。特に CMD 5 Miri（thread::scope + RefCell 専有 streams の新経路、shard_layout_equals_serial）と CMD 3 test=343 緑に注目。
 
 # 2026-08-29 実行: フェーズ 10-i（render 2-way 並列 sweep）反映後の検証。特に CMD 5 Miri（sweep range 分割スレッド）と CMD 3 test=344 緑に注目。
+
+# 2026-08-29 実行: フェーズ 11（テキストアリーナ: text pun fields + arena 予約）反映後の検証。特に CMD 5 Miri（text_of/pun 転用、splice の排他算術 remap）と CMD 3 test=345 緑に注目。
+
+# 【運用規約】trigger 発火後は run 完了（result.md 追記）まで trigger.md 以外の push を避けること。
+# 旧 append 実装は run 中の push で non-fast-forward となり結果ブロック喪失（10-e, 10-g/h/i で実績）。
+# 根治版（最新先頭取り直し+retry 化）の修正は .github/workflows 配下のため GitHub App トークンの
+# workflows スコープ不足で push 不可（2026-08-29 確認）。ローカル修正は /tmp/trigger.yml.proposed に退避。
