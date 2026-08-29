@@ -84,7 +84,7 @@ peak RSS 35,596 KB、nodes=206,290。
 
 min **1.40ms** / median **1.66ms** / p90 1.96ms。
 
-### C vs Rust 比較（2026-08-28e、移行フェーズ 10-e。`bench/bench_c_vs_rust.py` 実測）
+### C vs Rust 比較（2026-08-29、移行フェーズ 10-f。`bench/bench_c_vs_rust.py` 実測）
 
 paired interleaved A/B（対ごとに実行順を交互化）で C=`build/ifuto` /
 Rust=`rust/target/release/ifuto` を比較。
@@ -94,30 +94,34 @@ ldd: C = vdso/libm/libc/ld、Rust = 同 + libgcc_s（C は -static-libgcc 適用
 フェーズ 10-e = **Node 痩身化（200B → 80B。C IfNode 69B の 1.16 倍まで接近）**:
 属性 `Vec<Attr>` / doctype `Option<Doctype>`（80B）/ pi_target `Vec` を
 `Dom` 側の副テーブルへ隔離し 4B ハンドル化（0=無し・遅延割当）。
+フェーズ 10-f = **layout アロケーション段の撲滅**（backtrace 帰属計測で特定）:
+ifc ごとの `pieces`/`segs` 新規 Vec を深度スクラッチ借用+返却へ、css `compute_style`
+の要素ごと `Vec<Option<Winner>>`（1400B）都度確保を StyleCache スクラッチ再利用へ。
+**layout allocs 1.29M → 44k、段 bytes 340MB → 103MB（Node 痩身化後の残存分を含む）。**
 **環境騒音の注意書き**: 共有ホスト負荷で C の 16MB total が 117.6→140.6ms の帯で
 揺れている。倍率は paired 値として有効、絶対 ms の過去直較は ±20% 帯で読むこと。
 
 | 指標 | C | Rust | 倍率 (Rust÷C) |
 |---|---|---|---|
-| 16MB total（7 対 median） | 140.63ms | 443.18ms | **3.15×**（前回 3.88×） |
-| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 57.24 / 0.01 / 57.04 / 27.23 | 9.19 / 149.38 / 0.06 / 219.94 / 58.53 | — |
-| 16MB wall（7 対 median、外部計時） | 152.60ms | 525.23ms | 3.44× |
-| 16MB peak RSS | 212,856KB | 232,028KB | **1.09×**（前回 1.95×） |
-| 2MB total（13 対 median） | 16.74ms | 50.05ms | **2.99×**（前回 3.52×） |
-| 2MB 段別同上 ms | 0.02 / 6.64 / 0.01 / 6.74 / 3.10 | 0.82 / 17.51 / 0.03 / 24.04 / 7.13 | — |
-| 2MB wall | 19.20ms | 59.59ms | 3.10× |
-| 2MB peak RSS | 34,144KB | 33,680KB | **0.99×**（C より低い。前回 1.66×） |
-| ANSI 2MB total（7 対 median） | 45.72ms | 87.90ms | 1.92×（前回 2.18×） |
-| ANSI 2MB render 段（同上） | 26.90ms | 35.48ms | 1.32× |
-| ANSI 2MB peak RSS | 32,448KB | 46,704KB | 1.44×（前回 2.15×） |
-| 起動 wall（150 対 median） | 1.4700ms | 1.5475ms | 1.05×（符号 C:R = 116:34。帯騒音内） |
-| md fast-DOM 有無 total（slow÷fast、16MB） | 637.2÷128.0ms = 4.98× | 1,140.3÷393.0ms = 2.90× | — |
-| md fast-DOM 有無 total（slow÷fast、2MB） | 84.2÷19.9ms = 4.23× | 153.9÷58.4ms = 2.63× | — |
+| 16MB total（7 対 median） | 115.37ms | 359.72ms | **3.12×**（前回 3.15×） |
+| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 47.02 / 0.01 / 47.43 / 21.96 | 8.21 / 132.90 / 0.05 / 168.94 / 50.52 | — |
+| 16MB wall（7 対 median、外部計時） | 127.20ms | 434.18ms | 3.41× |
+| 16MB peak RSS | 212,852KB | 226,276KB | **1.06×**（前回 1.09×） |
+| 2MB total（13 対 median） | 15.62ms | 43.06ms | **2.76×**（前回 2.99×） |
+| 2MB 段別同上 ms | 0.02 / 6.46 / 0.01 / 6.20 / 2.90 | 0.81 / 16.43 / 0.03 / 20.81 / 5.54 | — |
+| 2MB wall | 17.66ms | 52.05ms | 2.95× |
+| 2MB peak RSS | 34,148KB | 32,684KB | **0.96×**（C より低い。前回 0.99×） |
+| ANSI 2MB total（7 対 median） | 36.55ms | 70.25ms | 1.92×（前回 1.92×） |
+| ANSI 2MB render 段（同上） | 24.10ms | 30.57ms | 1.27× |
+| ANSI 2MB peak RSS | 32,452KB | 45,676KB | 1.41×（前回 1.44×） |
+| 起動 wall（150 対 median） | 1.4695ms | 1.5425ms | 1.05×（符号 C:R = 122:28） |
+| md fast-DOM 有無 total（slow÷fast、16MB） | 573.9÷110.5ms = 5.19× | 1,096.1÷361.0ms = 3.04× | — |
+| md fast-DOM 有無 total（slow÷fast、2MB） | 70.9÷14.2ms = 5.01× | 132.2÷40.9ms = 3.23× | — |
 
-段別対比（16MB、median）: parse **2.61×**（前回 3.90×） / layout 3.86× / render **2.15×**（前回 2.97×） / read 計測限界。
-フェーズ 10-e の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
-多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260828e.html`
-（gitignore 対象の生成物。生データは `bench/data-20260828e.json`、再生成手順はレポート §3）。
+段別対比（16MB、median）: parse **2.83×** / layout **3.56×**（前回 3.86×） / render **2.30×**。
+フェーズ 10-e/10-f の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
+多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260829.html`
+（gitignore 対象の生成物。生データは `bench/data-20260829.json`、再生成手順はレポート §3）。
 
 #### 並列レイテンシーの正直な台帳（taskset ピン留めによる 1-HT / 2-HT A/B、2026-08-28 実測）
 

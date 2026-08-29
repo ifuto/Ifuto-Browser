@@ -1991,3 +1991,44 @@ doctype `Option<Doctype>` **80** + pi_target `Vec` 24 + リンク 5×8 + kind �
 2. **read 段 ~9.19ms vs C 0.02ms**（fs::read の余分な stat+確保走査疑い。要検証）。
 3. Link フィールドの `Option<NodeId>` 5×8B を u32 センチネル化すれば Node は
    80B → 60B（C 69B を越える小型化。ただし全リンクサイトの機械置換が要る）。
+
+## フェーズ 10-f: layout アロケーション段の撲滅（backtrace 帰属計測による特定）
+
+### 計測手法（本件の主題の半分）
+Node 痩身化後も layout 段に 1.29M allocs / 340MB が残っていた。`alloc_hist`
+（計数アロケータのサイズバケツ分布）で「**87,419 個が丁度 1400B**」「43,741 個が
+4-7B」と構造を特定し、`alloc_bt`（backtrace 帰属、example 限定・再帰ガード付き）
+で 2 つの正犯へ絞り込んだ:
+
+1. **ifc ごとの `pieces`/`segs` 新規 Vec**（10-c で導入した座標化の弱点）→
+   `Lc.pieces_scratch` / `Lc.segs_scratch` を新設し **借用→clear→終端返却** に。
+   深さ別スクラッチは計算せず、layout_ifc が入れ子不可・単一スレッドである検証を
+   根拠に単一スクラッチの take/return とした（C の `pieces_scratch` 発想の正当な写し）。
+2. **css `compute_style` の `Vec<Option<Winner>>`（P_N≈1400B）を要素ごとに新規
+   確保** → 引数でスクラッチを受け取る形に変更し、`StyleCache.win_scratch` /
+   eager sweep の 1 本で使い回す（実行が入れ重ならないことを DFS 構造で立証済み）。
+
+### 実測（alloc_probe。16MB、layout 段）
+| 指標 | 10-e 直後 | 10-f |
+|---|---|---|
+| allocs | 1,289,419 | **44,034** |
+| bytes | 340MB | **103MB** |
+
+bench 実測（paired median）: 16MB layout **3.86× → 3.56×**（219.94 → 168.94ms）、
+16MB total 3.15× → **3.12×**（環境が静かになり C 側も 140.63 → 115.37ms に復帰。
+同色条件での paired 有効値）、2MB total 2.99× → **2.76×**、16MB RSS 1.09× →
+**1.06×**、2MB RSS 0.99× → **0.96×**、ANSI 1.92× 維持。
+
+### 検証（全て緑）
+- cargo test 185（ifuto-core）緑、workspace release build/clippy/fmt 0 警告。
+- render 2 経路 + dump 5 モード × 2 コーパス = **18 通り byte-exact**、serial≡2-slice。
+
+### 残照準（照準の棚卸しを更新）
+1. **layout 3.56×**（168.94ms vs C 47.43）: 残 44k allocs の内 4-7B 約 43.7k 個は
+   `compute_style` 内の `decl.clone()`（約 1%。`DeclRef` 参照化で消えるが C と違い
+   sheet 寿命管理が要るため保留）。
+2. **render 段 2.30×**（50.52ms vs C 21.96）: セグメント走査の残 C 優位。
+3. C の 2-way 並列 layout（`layout_shard_run_body`）の Rust 採算を taskset A/B で
+   先に測る段（C も arena 共有前提の設計。HT 採算が立つか計測が先決）。
+4. **read 段 8.21ms vs C 0.02ms**（`fs::read` の余分な stat+確保走査疑い。小粒件。
+   要検証ラベル）。

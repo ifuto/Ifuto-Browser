@@ -266,6 +266,12 @@ struct Lc<'a> {
     deco: std::cell::RefCell<Vec<Deco>>,
     /// seg アリーナ（行確定時に `Wrap::segs` から移動する唯一の所有先）。
     seg_arena: std::cell::RefCell<Vec<Seg>>,
+    // --- per-IFC スクラッチ（C の `pieces_scratch` / wrap バッファ再利用に相当） ---
+    /// IFC ごとに「借用→clear→終端返却」で容量を引き継ぐ（per-IFC Vec 新規確保と
+    /// 倍増再配置の連鎖を消す。layout_ifc は入れ子不可・単一スレッド前提で検査済み）。
+    pieces_scratch: std::cell::RefCell<Vec<Piece>>,
+    /// 同上（`Wrap::segs` 用。行確定で seg_arena へ移しても容量は残る）。
+    segs_scratch: std::cell::RefCell<Vec<Seg>>,
 }
 
 /// `lc_st_of` の style 解決を display バイト + sid のみで返す版（値の 100B コピーを
@@ -1060,11 +1066,16 @@ fn layout_ifc(
 ) -> Option<NodeId> {
     // wrap 初期値は stab の field 直読み（値の 100B コピーを伴わない）。
     let (fs0, lh0, ws0, ta0) = lc_metrics(lc, base_sid);
+    // per-IFC スクラッチを借用（終端で返却 = 容量引き継ぎ。新規確保・倍増再配置を消す）。
+    let mut segs = std::mem::take(&mut *lc.segs_scratch.borrow_mut());
+    segs.clear();
+    let mut pieces = std::mem::take(&mut *lc.pieces_scratch.borrow_mut());
+    pieces.clear();
     let mut w = Wrap {
         content_x,
         content_w,
         y: *y,
-        segs: Vec::new(),
+        segs,
         line_w: 0,
         align_st: if lc.no_boxlink {
             None
@@ -1084,8 +1095,7 @@ fn layout_ifc(
     let mut max_lh = if lh0 > 0.0 { lh0 } else { fs0 * 1.2 };
     let pre = ws0 == WS_PRE;
 
-    // flatten（DOM をピース列へ）
-    let mut pieces = Vec::new();
+    // flatten（DOM をピース列へ。スクラッチ借用済み）
     let mut n_prec = 0u32; // ブロック内の <a> span 収集数（C の f->n_prec 写し）
     let mut c = Some(cur);
     while let Some(cid) = c {
@@ -1146,6 +1156,9 @@ fn layout_ifc(
         w.end_line(max_lh);
     }
     *y = w.y;
+    // スクラッチ返却（容量引き継ぎ。次の IFC が確保ゼロで使う）
+    *lc.segs_scratch.borrow_mut() = w.segs;
+    *lc.pieces_scratch.borrow_mut() = pieces;
     c
 }
 
@@ -1495,6 +1508,8 @@ fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32, no_boxlink: bool) -> L
         rlines: std::cell::RefCell::new(Vec::new()),
         deco: std::cell::RefCell::new(Vec::new()),
         seg_arena: std::cell::RefCell::new(Vec::new()),
+        pieces_scratch: std::cell::RefCell::new(Vec::new()),
+        segs_scratch: std::cell::RefCell::new(Vec::new()),
     };
 
     let mut body: Option<NodeId> = None;

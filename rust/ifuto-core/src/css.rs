@@ -1700,6 +1700,7 @@ fn compute_style(
     parent_st: Option<&Style>,
     root_fs: f32,
     sheets: &[&StyleSheet],
+    win: &mut Vec<Option<Winner>>,
 ) -> Style {
     // 1) 初期値 + 継承
     let mut st = Style {
@@ -1733,11 +1734,14 @@ fn compute_style(
         st.line_height = parent_st.unwrap().line_height;
     }
 
-    // 2) 勝者収集
-    let mut win: Vec<Option<Winner>> = (0..P_N).map(|_| None).collect();
+    // 2) 勝者収集（win は呼び出し側の再利用スクラッチ — 要素ごとの
+    // `Vec<Option<Winner>>(P_N≈1400B)` 都度確保を消す。DFS/遅延解決は実行が
+    // 入れ重ならないので単一スクラッチで安全）。
+    win.clear();
+    win.extend((0..P_N).map(|_| None));
     for (s, sh) in sheets.iter().enumerate() {
         let origin = if s == 0 { ORIGIN_UA } else { ORIGIN_AUTHOR };
-        collect_from_sheet(dom, n, sh, origin, &mut win);
+        collect_from_sheet(dom, n, sh, origin, win);
     }
 
     // 3) inline style
@@ -2260,6 +2264,8 @@ fn k2_of(kind: NodeKind, tag: Tag, name: &[u8]) -> u64 {
 struct StyleCache {
     tab: Vec<CacheEnt>,
     intern: StyleIntern,
+    /// `compute_style` へ渡す勝者列スクラッチ（要素ごとの 1400B 都度確保を消す）。
+    win_scratch: Vec<Option<Winner>>,
 }
 
 impl StyleCache {
@@ -2267,6 +2273,7 @@ impl StyleCache {
         StyleCache {
             tab: vec![EMPTY_ENT; STCACHE_SIZE],
             intern: StyleIntern::new(),
+            win_scratch: Vec::new(),
         }
     }
 
@@ -2307,12 +2314,12 @@ impl StyleCache {
             if e.pk == pk && e.k2 == k2 && e.k2 != 0 {
                 return e.st;
             }
-            let st = compute_style(dom, n, parent, rfs, sheets);
+            let st = compute_style(dom, n, parent, rfs, sheets, &mut self.win_scratch);
             let idx = self.intern.intern(&st);
             self.tab[h] = CacheEnt { k2, pk, st: idx };
             idx
         } else {
-            let st = compute_style(dom, n, parent, rfs, sheets);
+            let st = compute_style(dom, n, parent, rfs, sheets, &mut self.win_scratch);
             self.intern.intern(&st)
         }
     }
@@ -2403,7 +2410,14 @@ impl StyleLazy {
                 let st = {
                     let uar: &StyleSheet = &self.ua;
                     let sheets: &[&StyleSheet] = std::slice::from_ref(&uar);
-                    compute_style(dom, n, pst.as_ref(), rfs, sheets)
+                    compute_style(
+                        dom,
+                        n,
+                        pst.as_ref(),
+                        rfs,
+                        sheets,
+                        &mut self.cache.win_scratch,
+                    )
                 };
                 let idx = self.cache.intern.intern(&st);
                 self.cache.tab[h] = CacheEnt { k2, pk, st: idx };
@@ -2423,7 +2437,14 @@ impl StyleLazy {
             let st = {
                 let uar: &StyleSheet = &self.ua;
                 let sheets: &[&StyleSheet] = std::slice::from_ref(&uar);
-                compute_style(dom, n, pst.as_ref(), rfs, sheets)
+                compute_style(
+                    dom,
+                    n,
+                    pst.as_ref(),
+                    rfs,
+                    sheets,
+                    &mut self.cache.win_scratch,
+                )
             };
             self.cache.intern.intern(&st)
         }
@@ -2500,6 +2521,7 @@ fn compute_walk(
     sheets: &[&StyleSheet],
     out: &mut [Option<Style>],
     cache: &mut Option<StyleCache>,
+    win: &mut Vec<Option<Winner>>,
 ) {
     if dom.node(n).kind != NodeKind::Element {
         return;
@@ -2510,18 +2532,18 @@ fn compute_walk(
             let idx = c.resolve(dom, n, parent_st, root_fs, sheets);
             c.value(idx)
         }
-        None => compute_style(dom, n, parent_st, root_fs, sheets),
+        None => compute_style(dom, n, parent_st, root_fs, sheets, win),
     };
-    out[n as usize] = Some(st);
     let child_rfs = if dom.node(n).tag == tags::tag_id(b"html") {
         st.font_size
     } else {
         root_fs
     };
+    out[n as usize] = Some(st);
     let mut c = dom.node(n).first_child;
     while let Some(cid) = c {
         if dom.node(cid).kind == NodeKind::Element {
-            compute_walk(dom, cid, Some(&st), child_rfs, sheets, out, cache);
+            compute_walk(dom, cid, Some(&st), child_rfs, sheets, out, cache, win);
         }
         c = dom.node(cid).next_sibling;
     }
@@ -2550,7 +2572,11 @@ pub fn apply_styles(dom: &Dom) -> Vec<Option<Style>> {
         } else {
             None
         };
-        compute_walk(dom, html, None, 16.0, &sheets, &mut out, &mut cache);
+        // 勝者列スクラッチ（全走査で 1 本。compute_style は逐次で入れ重ならない）。
+        let mut win: Vec<Option<Winner>> = Vec::new();
+        compute_walk(
+            dom, html, None, 16.0, &sheets, &mut out, &mut cache, &mut win,
+        );
     }
     out
 }
