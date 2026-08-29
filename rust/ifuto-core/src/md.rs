@@ -1408,7 +1408,15 @@ pub fn md_to_dom_opts(input: &[u8], slim_attrs: bool) -> Option<Dom> {
     // 条件は `md_par_scan` が機械検査し、接合規約は C と同一 — 生成 DOM は
     // 単走査と逐語同値（C の oracle sha256 と同じ検証盤を差分 fuzz でも固定）。
     if input.len() >= (1 << 20) && md_par_on() && !input.contains(&b'\r') {
-        if let Some(split) = md_par_scan(input) {
+        let t_scan = std::time::Instant::now();
+        let sp = md_par_scan(input);
+        if std::env::var_os("IF_MD_PROF").is_some() {
+            eprintln!(
+                "[mdprof] scan={:.2}ms",
+                t_scan.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        if let Some(split) = sp {
             if split > 0 {
                 return md_to_dom_2slice(input, slim_attrs, split);
             }
@@ -1442,14 +1450,45 @@ pub fn md_to_dom(input: &[u8]) -> Option<Dom> {
     md_to_dom_opts(input, false)
 }
 
-/// 並列スイッチ。**既定 OFF**（C は既定 ON の殺しスイッチ `IF_MD_PAR=0` だが、本
-/// 検証環境（1 物理コア 2 HT）では 2-slice が中立〜負と実測確定したため、観測
-/// 挙動（byte 列）を変えない範囲で既定だけ逆転させる。有効化は `IF_MD_PAR=1`。
-/// 実コア環境では 1 推奨。`"0"`/`"1"` 以外の設定値も OFF 扱いで安全側）。
+/// `from` 以降で最初の `b` の位置（SWAR: 8B 語の zero-byte 検出。std 縛りで
+/// memchr crate / SIMD intrinsic が使えないための safe 代替。C の SIMD 走査相当）。
+fn find_byte(s: &[u8], from: usize, b: u8) -> Option<usize> {
+    const HIBITS: u64 = 0x8080_8080_8080_8080;
+    const LOBITS: u64 = 0x0101_0101_0101_0101;
+    let n = s.len();
+    let mut i = from;
+    let rep = u64::from_ne_bytes([b; 8]);
+    while i + 8 <= n {
+        let w = u64::from_ne_bytes(s[i..i + 8].try_into().unwrap());
+        let x = w ^ rep;
+        if x.wrapping_sub(LOBITS) & !x & HIBITS != 0 {
+            let mut j = i;
+            while j < i + 8 {
+                if s[j] == b {
+                    return Some(j);
+                }
+                j += 1;
+            }
+        }
+        i += 8;
+    }
+    while i < n {
+        if s[i] == b {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 並列スイッチ。既定は **論理 CPU ≥ 2 なら ON**（10-g の drain/scan 撲滅で 2HT
+/// 環境でも採算が黒字化したことを bench で固定。1 HT 環境では serial に落ちるので
+/// かつての大損（merge 税 +48ms）経路は踏まない）。殺しスイッチ `IF_MD_PAR=0`、
+/// 強制 ON は `IF_MD_PAR=1`（C の規約と同一）。観測挙動（byte 列）は不変。
 fn md_par_on() -> bool {
     match std::env::var_os("IF_MD_PAR") {
         Some(v) => v == "1",
-        None => false,
+        None => std::thread::available_parallelism().is_ok_and(|x| x.get() >= 2),
     }
 }
 
@@ -1465,9 +1504,8 @@ fn md_par_scan(s: &[u8]) -> Option<usize> {
     {
         let mut i = 1usize;
         while i < n {
-            match s[i..].iter().position(|&c| c == b'^') {
-                Some(k) => {
-                    let at = i + k;
+            match find_byte(s, i, b'^') {
+                Some(at) => {
                     if s[at - 1] == b'[' {
                         return None;
                     }
@@ -1482,10 +1520,7 @@ fn md_par_scan(s: &[u8]) -> Option<usize> {
     let mut prev_blank = false;
     let mut off = 0usize;
     while off < n {
-        let e = match s[off..].iter().position(|&c| c == b'\n') {
-            Some(k) => off + k,
-            None => n,
-        };
+        let e = find_byte(s, off, b'\n').unwrap_or(n);
         let l = &s[off..e];
         let blank = ln_blank(l);
         if in_fence {
@@ -1515,6 +1550,15 @@ fn md_par_scan(s: &[u8]) -> Option<usize> {
 /// 鎖の継ぎ目 2 書きで O(1) 接合する。NodeId は B 側全リンクをオフセット写像する。
 /// Fn（footnote 台帳）は側ごとに新規 = C と同一（`[^` 拒否済みのため観測差なし）。
 fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom> {
+    // 分解計測（設計判断用・IF_MD_PROF=1 のときのみ stderr。通常経路は無出力）
+    let prof = std::env::var_os("IF_MD_PROF").is_some();
+    let tp = |label: &str, t0: std::time::Instant| {
+        if prof {
+            eprintln!("[mdprof] {label}={:.2}ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+        std::time::Instant::now()
+    };
+    let mut t = std::time::Instant::now();
     let b_input = &input[split..];
     // scaffold の id 規約（DomOut::new と一致。root=0, html=1, head=2, body/stub=3、
     // 内容ノードは 4 以降が DFS 順で連続）。B 側の stub body 直下は parent=3 となって
@@ -1530,7 +1574,9 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
             (out.dom, out.tainted)
         });
         let mut out_a = DomOut::new(slim_attrs);
-        out_a.dom.nodes.reserve(split / 10);
+        // 10-g: 全文書係数で予約し、merge 時の成長（134MB 再確保+コピー）を構造消去
+        // する（serial と同じ ~10B/ノード見積。B 内容を接合しても capacity は足りる）。
+        out_a.dom.nodes.reserve(input.len() / 10);
         let mut fn_a = Fn::new();
         run_blocks(&mut out_a, &mut fn_a, &input[..split]);
         out_a.run_flush();
@@ -1541,6 +1587,7 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
         let tainted = out_a.tainted || j.1;
         (out_a.dom, j.0, tainted)
     });
+    t = tp("parse", t);
     let (mut dom_a, mut dom_b, tainted) = b_res;
     let total = dom_a.nodes.len() + dom_b.nodes.len() - SKIP as usize;
     if tainted || total >= MAX_DOM_NODES {
@@ -1552,21 +1599,44 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
     // 副テーブル（attrs / extra）も併合し、B 側ハンドルにデルタを足す
     // （ハンドル 0 は「無し」で不変。C の arena 共有 O(1) 接合に対応する部分）。
     let (d_attrs, d_extra) = dom_a.merge_side_from(&mut dom_b);
+    t = tp("side", t);
     let (bf0, bl0) = (dom_b.nodes[3].first_child, dom_b.nodes[3].last_child);
     if dom_b.nodes.len() > SKIP as usize {
-        for mut n in dom_b.nodes.drain(SKIP as usize..) {
-            n.parent = map_opt(n.parent, base, SKIP);
-            n.first_child = map_opt(n.first_child, base, SKIP);
-            n.next_sibling = map_opt(n.next_sibling, base, SKIP);
-            if n.attrs_idx != 0 {
-                n.attrs_idx += d_attrs;
-            }
-            if n.extra_idx != 0 {
-                n.extra_idx += d_extra;
-            }
-            dom_a.nodes.push(n);
-        }
+        // 10-g: 旧 per-item push（+ mid-loop 成長）を撲滅。capacity は入口の全文書
+        // 予約で保証済み → remap を移動ループに融合し B を 1 パスだけ読む。
+        // 分岐の内訳: first_child/next_sibling には scaffold id（0..4）が絶対に現れ得
+        // ない（scaffold は root/html/head/body で、内容ノードの子・兄弟にはならない
+        // = serial と同じ構造規約）ため stub 判定が要るのは parent のみ。
+        // 余計な中間確保（split_off）は作らない: unsafe なしで [SKIP..] をそのまま
+        // 流し込める最速の safe 経路は drain→extend（TrustedLen で予約は増分ゼロ。
+        // 実測: in-place remap+pure drain=38.5ms、split_off+append=77.6ms、fused は
+        // 30ms で 3 変種中最速。V3 は split_off の中間 65MB 確保+copy が致命）。
+        let d = base - SKIP;
+        const STUB: u32 = SKIP - 1;
+        // 迷走分岐の撲滅: parent==STUB（body 直子の割合は入力依存で予測不能）と
+        // attrs/extra の 0 判定（~38% 採取）は cmov 級の算術に置き換える。
+        dom_a
+            .nodes
+            .extend(dom_b.nodes.drain(SKIP as usize..).map(|mut n| {
+                if let Some(p) = n.parent {
+                    debug_assert!(p == STUB || p >= SKIP);
+                    n.parent = Some(p + d * u32::from(p != STUB));
+                }
+                n.first_child = n.first_child.map(|c| {
+                    debug_assert!(c >= SKIP);
+                    c + d
+                });
+                n.next_sibling = n.next_sibling.map(|s| {
+                    debug_assert!(s >= SKIP);
+                    s + d
+                });
+                n.attrs_idx += d_attrs * u32::from(n.attrs_idx != 0);
+                n.extra_idx += d_extra * u32::from(n.extra_idx != 0);
+                n
+            }));
     }
+    t = tp("drain", t);
+    t = tp("drain", t);
     let bf = map_opt(bf0, base, SKIP);
     let bl = map_opt(bl0, base, SKIP);
     match (dom_a.node(3).first_child, bf) {
@@ -1585,10 +1655,15 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
             dom_a.node_mut(3).last_child = bl;
         }
     }
+    tp("splice", t);
     dom_a.has_script |= dom_b.has_script;
     dom_a.has_style |= dom_b.has_style;
     dom_a.has_selectedcontent |= dom_b.has_selectedcontent;
     dom_a.md_ws_stripped = true;
+    // 10-h: layout shard の二分ヒント（C の `dom->md_body_mid` 写し。body 直下の
+    // B 側先頭子 = splice 境界。serial ≡ 2-slice の DOM 同値性を逸脱しない範囲の
+    // 純粋な性能ヒントで、DOM そのものの観測値には影響しない）
+    dom_a.md_body_mid = bf.unwrap_or(0);
     dom_a.n_nodes = dom_a.nodes.len() as u32;
     Some(dom_a)
 }

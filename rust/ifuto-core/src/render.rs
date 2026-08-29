@@ -241,27 +241,107 @@ struct Sweep<'a> {
     row: Vec<Cell>,
 }
 
+/// render 並列 sweep（2-way）の殺しスイッチ。C の `IF_RENDER_PAR` 写し（既定 ON）。
+fn render_par_on() -> bool {
+    !matches!(std::env::var_os("IF_RENDER_PAR"), Some(v) if v == "0")
+}
+
+/// 並列 sweep 発動の最小行数/幅閾（C の `my < 1024` / `n_lines < 256` 写し）。
+/// Miri ではテスト時間上限のため縮小（網羅性は C 規約の test が担保）。
+#[cfg(miri)]
+const RENDER_PAR_MIN_MY: i32 = 24;
+#[cfg(not(miri))]
+const RENDER_PAR_MIN_MY: i32 = 1024;
+#[cfg(miri)]
+const RENDER_PAR_MIN_LINES: usize = 4;
+#[cfg(not(miri))]
+const RENDER_PAR_MIN_LINES: usize = 256;
+
 /// レイアウトの行スイープ発行。C の `if_render_emit_rows_sweep`（直列 sweep_range）
 /// 相当。ansi=1 で 256 色 SGR、0 でプレーン。
+///
+/// 10-i: no-ansi 大文書は **2-way 並列 sweep**（C render_ansi.c 同名機構の写し）。
+/// 内容行 y で二等分し、[0,r_split) を主、[r_split,my) をワーカへ。B の deco active
+/// 集合は r_split 時点で追記順再構成（境界の状態一意性）。バイト列は行 0..my の
+/// 連結で直列 sweep と厳密一致。kill switch: `IF_RENDER_PAR=0`。
 pub fn render_emit_sweep(dom: &crate::dom::Dom, lay: &Layout, ansi: bool) -> Vec<u8> {
     let mx = lay.width.max(1);
     let my = lay.height.max(1);
+    if !ansi
+        && render_par_on()
+        && my >= RENDER_PAR_MIN_MY
+        && lay.lines.len() >= RENDER_PAR_MIN_LINES
+    {
+        let mid = lay.lines.len() / 2;
+        let r_split = lay.lines[mid].y;
+        if r_split > 0 && r_split < my {
+            // 同一 y の行は全て前半へ（C の lower_bound 規則写し）
+            let mut li_b = mid;
+            while li_b > 0 && lay.lines[li_b - 1].y == r_split {
+                li_b -= 1;
+            }
+            // B の deco 状態再構成: y > r_split の先頭 index と、r_split 時点で
+            // 生存（開始済みかつ未期限切れ）の active 集合を追記順で。deco 追記順は
+            // y 単調非減少（直列 sweep の di 前進が依存するのと同じ規約）。
+            let mut active_b = Vec::new();
+            let mut di_b = lay.deco.len();
+            for (i, d) in lay.deco.iter().enumerate() {
+                if d.y > r_split {
+                    di_b = i;
+                    break;
+                }
+                if r_split < d.y + d.h.max(1) {
+                    active_b.push(i);
+                }
+            }
+            let out = std::thread::scope(|sc| {
+                let hb = sc.spawn(|| {
+                    sweep_range_emit(dom, lay, r_split, my, false, li_b, active_b, di_b, mx)
+                });
+                let a = sweep_range_emit(dom, lay, 0, r_split, false, 0, Vec::new(), 0, mx);
+                let b = match hb.join() {
+                    Ok(v) => v,
+                    Err(e) => std::panic::resume_unwind(e),
+                };
+                let mut o = a;
+                o.extend_from_slice(&b);
+                o
+            });
+            return out;
+        }
+    }
+    sweep_range_emit(dom, lay, 0, my, ansi, 0, Vec::new(), 0, mx)
+}
+
+/// 行範囲 [r0, r1) の sweep 発行本体（C の `sweep_range` 写し）。
+#[allow(clippy::too_many_arguments)]
+fn sweep_range_emit(
+    dom: &crate::dom::Dom,
+    lay: &Layout,
+    r0: i32,
+    r1: i32,
+    ansi: bool,
+    li0: usize,
+    active0: Vec<usize>,
+    di0: usize,
+    mx: i32,
+) -> Vec<u8> {
     let mut s = Sweep {
         lay,
         dom,
         mx,
         // 出力は行×(幅+装飾) に比例するため重めに事前確保（再配置の削減のみ。
         // バイト列には無関係）
-        out: Vec::with_capacity((my as usize).saturating_mul(16).min(1 << 22)),
+        out: Vec::with_capacity(((r1 - r0) as usize).saturating_mul(16).min(1 << 22)),
         cur: PDEF,
-        active: Vec::new(),
-        di: 0,
-        li: 0,
+        active: active0,
+        di: di0,
+        li: li0,
         row: vec![Cell::default(); mx as usize],
     };
-    let mut r = 0i32;
-    while r < my {
-        r = s.emit_row(r, my, ansi);
+    let mut r = r0;
+    while r < r1 {
+        r = s.emit_row(r, r1, ansi);
     }
     s.out
 }
@@ -1048,5 +1128,38 @@ mod tests {
         assert!(s.contains("• a"), "got: {s:?}");
         assert!(s.contains("• b"), "got: {s:?}");
         assert!(s.contains("1. c"), "got: {s:?}");
+    }
+
+    /// 10-i: 2-way 並列 sweep が直列 sweep と byte 完全一致すること（境界の
+    /// deco 状態再構成・同一 y 行の前半寄せ・ギャップ一括充填の分割規約）。
+    #[test]
+    fn render_par_sweep_equals_serial() {
+        let n: usize = if cfg!(miri) { 10 } else { 600 };
+        let mut md = String::new();
+        for i in 0..n {
+            md.push_str(&format!(
+                "para {i} **bold** [lk](http://x/{i})\n\n## h{i}\n\n- ia {i}\n- ib {i}\n\n"
+            ));
+        }
+        let dom = crate::md::md_to_dom_opts(md.as_bytes(), true).expect("fast dom");
+        let lay = crate::layout::layout_build_lazy_linear(&dom, 100);
+        // 並列ゲートの発動を前提化（発動していなければこのテストは証拠にならない）
+        assert!(lay.height >= RENDER_PAR_MIN_MY, "ゲート閾 my");
+        assert!(lay.lines.len() >= RENDER_PAR_MIN_LINES, "ゲート閾 lines");
+        let par = render_emit_sweep(&dom, &lay, false);
+        // 直列相当は range 本体へ直で（`render_emit_sweep` のゲートを通さない）
+        let ser = sweep_range_emit(
+            &dom,
+            &lay,
+            0,
+            lay.height,
+            false,
+            0,
+            Vec::new(),
+            0,
+            lay.width.max(1),
+        );
+        assert_eq!(par.len(), ser.len(), "出力長");
+        assert_eq!(par, ser, "2-way 並列 sweep ≡ 直列 sweep");
     }
 }

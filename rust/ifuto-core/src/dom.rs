@@ -284,6 +284,9 @@ pub struct Dom {
     /// あった旧 DOM と逐語同じ」結果（相殺無効＝`prev_mb=0`）に補正する。
     /// 集合の定義は `layout::ws_sink_parent`（= C `md.c` の `mo_ws_sink` と同一）。
     pub md_ws_stripped: bool,
+    /// 2-slice parse の中点（body 直下 B 側先頭子。C の `dom->md_body_mid` 写し）。
+    /// 10-h body shard の二分ヒント。0 = 無し（serial parse / HTML 経路）。
+    pub md_body_mid: NodeId,
 }
 
 impl Dom {
@@ -305,6 +308,7 @@ impl Dom {
             has_style: false,
             has_selectedcontent: false,
             md_ws_stripped: false,
+            md_body_mid: 0,
         }
     }
 

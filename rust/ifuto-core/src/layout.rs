@@ -1275,6 +1275,8 @@ fn layout_element(
         content_y,
         g.content_w,
         &mut children,
+        None,
+        None,
     );
     let content_h = if g.height_spec >= 0 && g.height_spec > content_h {
         g.height_spec // 指定高はクリップせず拡張のみ
@@ -1392,6 +1394,10 @@ fn ws_sink_parent(tag: Tag) -> bool {
 }
 
 /// node の子を走査して配置し、content 高を返す。C の `layout_children` 相当。
+/// body 直下子の flow を [start, stop) で駆動する本体。`start` は `None` で
+/// `node` の first_child（serial 規約）、`stop` に達したらその子は処理せず終了
+/// （10-h body shard の範囲実行用に一般化。serial 経路は (None, None) で不変）。
+#[allow(clippy::too_many_arguments)]
 fn layout_children(
     lc: &Lc,
     node: NodeId,
@@ -1400,14 +1406,19 @@ fn layout_children(
     content_y: i32,
     content_w: i32,
     children: &mut Vec<BoxNode>,
+    start: Option<NodeId>,
+    stop: Option<NodeId>,
 ) -> i32 {
     let mut y = content_y;
     let mut prev_mb = 0;
     let mut li_ord = 0u32; // ol 番号: この親の LIST_ITEM li を出現順に数える（C の li_ord 写し）
                            // ws 相殺補正は親タグのみの関数 → ループ不変（C と同じ構成）
     let sinkp = lc.dom.md_ws_stripped && ws_sink_parent(lc.dom.node(node).tag);
-    let mut c = lc.dom.node(node).first_child;
+    let mut c = start.or_else(|| lc.dom.node(node).first_child);
     while let Some(cid) = c {
+        if stop == Some(cid) {
+            break;
+        }
         let cnode = lc.dom.node(cid);
         let (disp, csid) = if cnode.kind == NodeKind::Element {
             lc_resolve_disp(lc, cid, base_sid)
@@ -1451,6 +1462,32 @@ fn layout_children(
         c = cnode.next_sibling;
     }
     y - content_y
+}
+
+/// body shard 発動の最小ノード数（C の `n_nodes >= 4096` 写し）。
+/// Miri ではテスト時間上限のため縮小（経路の網羅性は不変、掃引は通常 test の責務）。
+#[cfg(miri)]
+const SHARD_MIN_NODES: u32 = 64;
+#[cfg(not(miri))]
+const SHARD_MIN_NODES: u32 = 4096;
+
+/// C `IF_LAYOUT_PAR` 写し: body shard（2-way 並列 layout）の殺しスイッチ。
+/// 既定 ON（C と同規約。条件を満たす大文書のみ発動）。観測 byte 列は serial と同値。
+fn lay_par_on() -> bool {
+    !matches!(std::env::var_os("IF_LAYOUT_PAR"), Some(v) if v == "0")
+}
+
+/// shard 1 側の産物（C `IfLayShard` の out 部写し）。
+struct ShardPart {
+    lines: Vec<RLine>,
+    deco: Vec<Deco>,
+    seg_arena: Vec<Seg>,
+    stab: Vec<Style>,
+    syn_text: Vec<u8>,
+    n_links: u32,
+    content_h: i32,
+    deco_bg: u32,
+    deco_bd: u32,
 }
 
 /// DOM + 計算済みスタイルからレイアウトを構築。C の `if_layout_build` 相当
@@ -1588,6 +1625,244 @@ fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32, no_boxlink: bool) -> L
     };
     let body_fs = bst.font_size;
     let body_mt = len_v(bst.margin[0], body_fs, 16.0, width_cells);
+
+    // 10-h: body shard（C の `layout_shard_run_body` 2-way 並列の写し）。線形モード・
+    // lazy・md fast-DOM 由来で `md_body_mid` ヒントを持つ大文書のみ発動。
+    // A=[first..mid) / B=[mid..) を独立 Lc で走らせ、整数セル幾何のため
+    // y += hA の平行移動接合が serial と厳密同値に成る（浮動小数の結合差は存在しない）。
+    let mid_hint = dom.md_body_mid;
+    if no_boxlink
+        && dom.md_ws_stripped
+        && mid_hint != 0
+        && dom.n_nodes >= SHARD_MIN_NODES
+        && matches!(&lc.st_src, StSrc::Lazy(_))
+        && lay_par_on()
+    {
+        let g = geom_cached(&lc, bsid, &bst, width_cells);
+        let bx = g.ml;
+        let by = body_mt;
+        let content_x = bx + g.bl + g.pl;
+        let content_y = by + g.bt + g.pt;
+        let box_w = g.bl + g.pl + g.content_w + g.pr + g.brd;
+        let lazy_rfs = lc.lazy_rfs;
+
+        // 各 shard 専有の Lc（streams/geom cache/syn arena を分離。C の shard 局所
+        // arena と同じ分離規約）。A 側のみ body 装飾を出す（C `bsides` 規約写し）。
+        let run = |emit_body_deco: bool, start: Option<NodeId>, stop: Option<NodeId>| {
+            let slc = Lc {
+                dom,
+                st_src: StSrc::Lazy(std::cell::RefCell::new(crate::css::StyleLazy::new())),
+                root_fs: 16.0,
+                lazy_rfs,
+                no_boxlink: true,
+                eager_intern: std::cell::RefCell::new(crate::css::StyleIntern::new()),
+                syn_pos: std::cell::Cell::new(0),
+                syn_text: std::cell::RefCell::new(Vec::new()),
+                geom_cache: std::cell::RefCell::new(vec![None; GCACHE_SIZE]),
+                pieces_cap: std::cell::Cell::new(0),
+                links_cap: std::cell::Cell::new(0),
+                n_links: std::cell::Cell::new(0),
+                prec_cap: std::cell::Cell::new(0),
+                rlines: std::cell::RefCell::new(Vec::new()),
+                deco: std::cell::RefCell::new(Vec::new()),
+                seg_arena: std::cell::RefCell::new(Vec::new()),
+                pieces_scratch: std::cell::RefCell::new(Vec::new()),
+                segs_scratch: std::cell::RefCell::new(Vec::new()),
+            };
+            // 外来の body 値を shard 局所 intern へ種蒔き（parent 値同一 ⇒
+            // 子孫の解決値も serial と逐語同値。sid 写像は表ごとに閉じる）。
+            let bsid_local = match &slc.st_src {
+                StSrc::Lazy(lzr) => lzr.borrow_mut().intern_value(&bst),
+                StSrc::Eager(_) => unreachable!("shard は lazy 専用"),
+            };
+            let deco_bg = if emit_body_deco && (bst.bg & 0xFF) >= 128 {
+                deco_push(
+                    &slc,
+                    Deco {
+                        kind: DecoKind::Bg,
+                        x: bx,
+                        y: by,
+                        w: box_w,
+                        h: 0, // 後埋め（join 後の総量で。layout_element と同値）
+                        argb: bst.bg,
+                        sides: 0,
+                        m_color: 0,
+                        m_bg: 0,
+                        m_flags: 0,
+                        text: [0; 12],
+                        tlen: 0,
+                    },
+                )
+            } else {
+                u32::MAX
+            };
+            let deco_bd = if emit_body_deco && (g.bl | g.brd | g.bt | g.bbo) != 0 {
+                let sides =
+                    ((g.bt & 1) | ((g.brd & 1) << 1) | ((g.bbo & 1) << 2) | ((g.bl & 1) << 3))
+                        as u8;
+                deco_push(
+                    &slc,
+                    Deco {
+                        kind: DecoKind::Border,
+                        x: bx,
+                        y: by,
+                        w: box_w,
+                        h: 0,
+                        argb: bst.border_color,
+                        sides,
+                        m_color: 0,
+                        m_bg: 0,
+                        m_flags: 0,
+                        text: [0; 12],
+                        tlen: 0,
+                    },
+                )
+            } else {
+                u32::MAX
+            };
+            let mut sink = Vec::new();
+            let h = layout_children(
+                &slc,
+                body,
+                bsid_local,
+                content_x,
+                content_y,
+                g.content_w,
+                &mut sink,
+                start,
+                stop,
+            );
+            let stab = match slc.st_src {
+                StSrc::Lazy(lzr) => lzr.into_inner().into_stab(),
+                StSrc::Eager(_) => unreachable!("shard は lazy 専用"),
+            };
+            ShardPart {
+                lines: slc.rlines.into_inner(),
+                deco: slc.deco.into_inner(),
+                seg_arena: slc.seg_arena.into_inner(),
+                stab,
+                syn_text: slc.syn_text.into_inner(),
+                n_links: slc.n_links.get(),
+                content_h: h,
+                deco_bg,
+                deco_bd,
+            }
+        };
+
+        let dom_first = dom.node(body).first_child;
+        let (mut a, mut b) = std::thread::scope(|sc| {
+            let hb = sc.spawn(|| run(false, Some(mid_hint), None));
+            let a = run(true, dom_first, Some(mid_hint));
+            let b = match hb.join() {
+                Ok(v) => v,
+                Err(e) => std::panic::resume_unwind(e),
+            };
+            (a, b)
+        });
+
+        let h_a = a.content_h;
+        let mut content_h = h_a + b.content_h;
+        if g.height_spec >= 0 && g.height_spec > content_h {
+            content_h = g.height_spec; // 指定高はクリップせず拡張のみ（layout_element 同値）
+        }
+        let bh_root = g.bt + g.pt + content_h + g.pb + g.bbo;
+        // body 装飾の h 後埋め（layout_element と同値の最終 h）
+        if a.deco_bg != u32::MAX {
+            a.deco[a.deco_bg as usize].h = bh_root;
+        }
+        if a.deco_bd != u32::MAX {
+            a.deco[a.deco_bd as usize].h = bh_root;
+        }
+
+        // stab 併合: A/B 各側の局所表の値を serial 経路と同じ順（intern seed →
+        // A 側初出順 → B 側初出順）で主 lazy へ値同定する（値同一 ⇒ sid 同一）。
+        let StSrc::Lazy(lz) = lc.st_src else {
+            unreachable!("shard 分岐は lazy のみ");
+        };
+        let mut map_a;
+        let mut map_b;
+        {
+            let mut z = lz.borrow_mut();
+            map_a = Vec::with_capacity(a.stab.len());
+            for st in &a.stab {
+                map_a.push(z.intern_value(st));
+            }
+            map_b = Vec::with_capacity(b.stab.len());
+            for st in &b.stab {
+                map_b.push(z.intern_value(st));
+            }
+        }
+        let stab = lz.into_inner().into_stab();
+
+        // streams 接合。syn_text は 8B アライン bump のため A 末尾を align8 まで
+        // 0 占位してからデルタを掛ける（syn_push の配置規約そのまま）。
+        // ※syn_text の占位合計は serial と一致し得ない: pieces/links/prec の cap
+        // doubling 由来の foreign 占位が shard 局所の cap リセットで再カウント
+        // されるため（C も per-shard arena + if_arena_absorb で同じ分岐を持つ。
+        // seg_text の解決は shard 局所オフセット+デルタで正しく、観測面
+        // （render/dump dump 出力）にこの差は現れない。観測同値性は
+        // shard_layout_equals_serial テストと diff fuzz が機械固定）。
+        let seg_delta = a.seg_arena.len() as u32;
+        let syn_gap = ((a.syn_text.len() + 7) & !7) - a.syn_text.len();
+        let syn_delta = (a.syn_text.len() + syn_gap) as u32;
+        let mut lines = a.lines;
+        let mut deco = a.deco;
+        let mut seg_arena = a.seg_arena;
+        let mut syn_text = a.syn_text;
+        // A 側 sid も主表の sid へ写像する（追記なしの pass は cache 順の読みだけ）。
+        for s in &mut seg_arena {
+            s.sid = map_a[s.sid as usize];
+        }
+        lines.reserve(b.lines.len());
+        for ln in &mut b.lines {
+            ln.y += h_a;
+            ln.seg_lo += seg_delta;
+            ln.seg_hi += seg_delta;
+        }
+        lines.append(&mut b.lines);
+        for d in &mut b.deco {
+            d.y += h_a;
+        }
+        deco.append(&mut b.deco);
+        for s in &mut b.seg_arena {
+            s.sid = map_b[s.sid as usize];
+            if s.src == SEG_SRC_SYN {
+                s.start += syn_delta;
+                s.end += syn_delta;
+            }
+        }
+        seg_arena.append(&mut b.seg_arena);
+        syn_text.resize(syn_text.len() + syn_gap, 0);
+        syn_text.extend_from_slice(&b.syn_text);
+        lc.n_links.set(lc.n_links.get() + a.n_links + b.n_links);
+
+        let root = BoxNode {
+            kind: BoxKind::Block,
+            node: Some(body),
+            st: bst,
+            seg_lo: 0,
+            seg_hi: 0,
+            x: bx,
+            y: by,
+            w: box_w,
+            h: bh_root,
+            text_align: 0,
+            direct: false,
+            children: Vec::new(),
+        };
+        let height = by + bh_root;
+        return Layout {
+            root,
+            width: width_cells,
+            height,
+            lines,
+            deco,
+            seg_arena,
+            stab,
+            syn_text,
+        };
+    }
+
     let root = layout_element(&lc, body, bst, bsid, 0, body_mt, width_cells);
     let height = root.y + root.h;
     let stab = match lc.st_src {
@@ -1669,6 +1944,114 @@ mod tests {
     use super::*;
     use crate::css::apply_styles;
     use crate::html_tree::parse_html;
+
+    /// 10-h: body shard（2-way 並列）が serial build と厳密同値であること。
+    /// ヒントは 2-slice splice 境界の等価物として手で設定する（body 直子なら
+    /// 任意位置で成り立つ性質。どの split 位置でも同値性が要る）。
+    #[test]
+    fn shard_layout_equals_serial() {
+        let n: usize = if cfg!(miri) { 80 } else { 5_000 };
+        let mut md = String::new();
+        for i in 0..n {
+            md.push_str(&format!(
+                "para {i} **bold** [lk](http://x/{i})\n\n# h{i}\n\n- ia {i}\n- ib {i}\n\n"
+            ));
+        }
+        let mut dom = crate::md::md_to_dom_opts(md.as_bytes(), true).expect("fast dom");
+        assert!(dom.n_nodes >= SHARD_MIN_NODES, "shard 発動の前提ノード数");
+        // body 探索（build_impl と同じ手順）
+        let mut body = None;
+        let mut c = dom.node(dom.root).first_child;
+        while let Some(cid) = c {
+            let cn = dom.node(cid);
+            if cn.kind == NodeKind::Element && cn.tag == TAG_HTML {
+                let mut g = cn.first_child;
+                while let Some(gid) = g {
+                    let gn = dom.node(gid);
+                    if gn.kind == NodeKind::Element && gn.tag == TAG_BODY {
+                        body = Some(gid);
+                        break;
+                    }
+                    g = gn.next_sibling;
+                }
+            }
+            if body.is_some() {
+                break;
+            }
+            c = cn.next_sibling;
+        }
+        let body = body.expect("body");
+        // body 直子の中央を mid ヒントに据える（splice 境界の等価物）
+        let mut cnt = 0usize;
+        let mut c = dom.node(body).first_child;
+        while let Some(cid) = c {
+            cnt += 1;
+            c = dom.node(cid).next_sibling;
+        }
+        assert!(cnt >= 16, "十分な body 直子が要る");
+        let mut c = dom.node(body).first_child;
+        for _ in 0..cnt / 2 {
+            c = c.and_then(|x| dom.node(x).next_sibling);
+        }
+        let mid = c.expect("中央の直子");
+        // serial（mid 無し → shard 不発の既存経路）
+        let lay_ser = layout_build_lazy_linear(&dom, 100);
+        dom.md_body_mid = mid;
+        let lay_par = layout_build_lazy_linear(&dom, 100);
+        assert_eq!(
+            (
+                lay_ser.width,
+                lay_ser.height,
+                lay_ser.root.x,
+                lay_ser.root.y,
+                lay_ser.root.w,
+                lay_ser.root.h
+            ),
+            (
+                lay_par.width,
+                lay_par.height,
+                lay_par.root.x,
+                lay_par.root.y,
+                lay_par.root.w,
+                lay_par.root.h
+            ),
+            "root 幾何"
+        );
+        assert_eq!(
+            format!("{:?}", lay_ser.stab),
+            format!("{:?}", lay_par.stab),
+            "stab"
+        );
+        assert_eq!(
+            format!("{:?}", lay_ser.deco),
+            format!("{:?}", lay_par.deco),
+            "deco"
+        );
+        // 観測同値の canonical 射影: 行ごとに (y, direct, seg(x,w,解決済みスタイル,
+        // 可読テキスト)) を展開する。seg の src/off/ sid が shard 局所 → 大域へ写像
+        // 済みかは問わない（内部モデル差は C の per-shard arena 写しの範囲で
+        // 観測不可能。同値性の主張対象はあくまで観測面）。
+        let canon = |lay: &Layout, dom: &Dom| -> Vec<u8> {
+            let mut out = Vec::new();
+            for l in &lay.lines {
+                out.extend_from_slice(format!("@{}:{};", l.y, l.direct as u8).as_bytes());
+                for s in &lay.seg_arena[l.seg_lo as usize..l.seg_hi as usize] {
+                    out.extend_from_slice(
+                        format!("[{},{}|{:?}|", s.x, s.w, lay.stab[s.sid as usize]).as_bytes(),
+                    );
+                    out.extend_from_slice(lay.seg_text(dom, s));
+                    out.push(b']');
+                }
+                out.push(b'\n');
+            }
+            out
+        };
+        assert_eq!(
+            canon(&lay_ser, &dom),
+            canon(&lay_par, &dom),
+            "観測同値（lines × seg 内容 × 解決スタイル）"
+        );
+    }
 
     fn build(html: &str, width: i32) -> (Dom, Layout) {
         let dom = parse_html(html.as_bytes());

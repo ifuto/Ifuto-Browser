@@ -55,8 +55,18 @@ static A: Bt = Bt;
 
 fn main() {
     let path = std::env::args().nth(1).unwrap();
+    let stage = std::env::args().nth(2).unwrap_or_else(|| "layout".into());
     let input = std::fs::read(path).unwrap();
+    if stage == "parse" {
+        ON.store(true, Ordering::Relaxed);
+    }
     let dom = ifuto_core::md::md_to_dom_opts(&input, true).expect("fast dom");
+    if stage == "parse" {
+        ON.store(false, Ordering::Relaxed);
+        eprintln!("nodes={}", dom.nodes.len());
+        dump_sites();
+        return;
+    }
     {
         let mut g = SITES.lock().unwrap();
         *g = Some(HashMap::new());
@@ -65,6 +75,10 @@ fn main() {
     let lay = ifuto_core::layout::layout_build_lazy_linear(&dom, 100);
     ON.store(false, Ordering::Relaxed);
     eprintln!("rlines={} segs={}", lay.lines.len(), lay.seg_arena.len());
+    dump_sites();
+}
+
+fn dump_sites() {
     let g = SITES.lock().unwrap();
     let m = g.as_ref().unwrap();
     let mut v: Vec<_> = m.iter().collect();

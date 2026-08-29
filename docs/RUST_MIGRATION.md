@@ -2032,3 +2032,162 @@ bench 実測（paired median）: 16MB layout **3.86× → 3.56×**（219.94 → 
    先に測る段（C も arena 共有前提の設計。HT 採算が立つか計測が先決）。
 4. **read 段 8.21ms vs C 0.02ms**（`fs::read` の余分な stat+確保走査疑い。小粒件。
    要検証ラベル）。
+
+## フェーズ 10-g: 2-slice parse の実益化（merge 分解計測 → scan SWAR / drain 撲滅 / 既定 ON 転換）
+
+### 計測ファースト（推測で設計しない）
+taskset ピン留め HT 採算（16MB、interleaved median n=9）で、10-e/10-f 後の
+2-slice が依然損益分岐（@2HT parse −3.5ms のみ、@1HT +48ms の大損）と確定。
+`IF_MD_PROF=1` の段別計測（設計判断用の一時計装を恒久化、env 未設定では
+無出力・ゼロコスト）で merge の内訳を撮った:
+
+| 内訳 | 旧 | 10-g |
+|---|---|---|
+| scan（`md_par_scan` 全走査） | 11.5ms | **3.5ms**（SWAR u64 zero-byte 検出。std 縛りで memchr crate / SIMD intrinsic 不可のための safe 代替） |
+| side（副テーブル連結） | 0.13ms | 0.13ms（無罪確定 — 前フェーズの疑いは誤報と訂正） |
+| drain（B 内容ノード転記+リンク写像） | 33ms | **30ms**（後述） |
+| parse 並走部（A+B）@2HT | 82ms | 77-87ms |
+
+### drain の設計比較（3 変種の実測対決）
+B 側局所 NodeId → 大域への写像は **index ベース arena の根本制約**で、C の
+「ポインタ恒等 = O(1) 接合」の完全な写しは safe では不可能（`forbid(unsafe)`
+維持）。安全側で取れる手を 3 変種ビルドして採った:
+
+- V1 **fused drain→extend**（remap を移動 closure に融合、B を 1 pass だけ読む）:
+  30.0ms ← **採択**
+- V2 in-place remap → pure drain 分離: 38.5ms
+- V3 in-place remap → `split_off` + `append`: 77.6ms（split_off の中間 65MB
+  確保+copy が致命。最初に試した版本がこれで、一旦 33→70ms に悪化させた —
+  嘘をつかない台帳として失敗も記す）
+
+併せて A 側を**全文書係数で事前予約**（merge 時の倍増再確保 + 134MB copy を
+構造消去）。residual ~30ms の律速は 80B/ノード × 81 万個の per-item move
+（Node は `NameStr(Box)` 内包で非 Copy → bulk memcpy 化は safe では不可能）と
+新規領域の初回 page-fault 税。C との構造差（残 ~20-25ms/16MB）として台帳に残す。
+
+### 既定値の転換
+`md_par_on`: 未設定時 `available_parallelism() >= 2 → ON`（1 HT では serial に
+自己降格 → かつての 1HT 大損経路を構造封殺）。殺しスイッチ `IF_MD_PAR=0`、
+強制 `IF_MD_PAR=1` は C 規約と同一。byte 出力は serial ≡ 2-slice で逐語同値。
+
+### 実測（paired interleaved median、data-20260829b.json）
+16MB parse **133.9 → 116.6ms**（auto@2HT vs serial@2HT。C は 47.1）、
+16MB total **2.72×**（127.53 / 346.21）、2MB total **2.63×**、
+2MB RSS **0.97×**、ANSI 1.93×維持、16MB RSS 1.06×維持。
+
+### 検証（全て緑）
+- cargo test **185**（ifuto-core）/ workspace 342 緑、release build/clippy/fmt 0 警告。
+- output oracle **21/21 byte-exact**（serial≡2-slice 含む。既定=ON 転換後の経路で）+ 
+  render 2 経路・dump 5 モード × 2 コーパス（前フェーズ同様の 18 通りも全緑）。
+- diff fuzz 3,019 件追加 → **累計 167,152 cases / 0 mismatch**。
+
+### 残照準（照準の棚卸しを更新）
+1. **parse serial 本体 128ms vs C serial 82ms（1.56×）**: 2-slice の天井は serial/2
+   に従属するため、ここが parse の本丸。alloc_bt 帰属で **764,744 allocs / 203MB**
+   = テキスト per-node heap コピー（blocks_str ~306k×6.3B / blocks_win ~153k×65B /
+   inline_span 65,544=21,848×3）と確定。C は arena bump（0 malloc）。根治=**text
+   の input 借用化**（Dom が入力バッファを所有し (off,len) 参照。ただし NameStr の
+   `Deref<Target=[u8]>` iface を破る大改造。フェーズ 11 級の設計案件）。
+2. **layout 3.07×**（162.91ms vs C 53.14）: C の layout shard（hint 有 80→45ms =
+   1.75× 実測）の Rust 移植が次の構造件。残 44k allocs の `decl.clone()`(4-7B) は
+   小粒（DeclRef 参照化は sheet 寿命管理が要るため棚上げ継続）。
+3. **render 段 2.25×**（49.09ms vs C 21.78）。
+4. **read 段 8.47ms vs C 0.02ms**（`fs::read` の初回 page-fault 税。C は mmap で
+   parse に課税転嫁。小粒件。要検証ラベル）。
+5. ANSI RSS 1.41→1.63×（要監視。ANSI 経路の何かが育っている。未分析）。
+
+## フェーズ 10-h: body shard（2-way 並列 layout）移植 — C `layout_shard_run_body` の写し
+
+### 設計判断記録（踏査の台帳）
+まず taskset 採算計測で C の同機構を分解した:
+- C layout shard は hint 有で **80.02 → 45.0ms（1.78×）**、hint 無しは body 直下の
+  全計数+中点ウォークに ~35ms を浪費（md.c コメント値 ~31ms+~31ms を実測裏付け）。
+- Rust 側の先行条件は揃っていた: `layout_children` が既に範囲実行可能な分離関数、
+  幾何は全て整数セル（`y: i32`。`y += hA` 平行移動に浮動小数の結合差は存在しない）、
+  sinkp 補正・prev_mb 相殺は C と同じ構造で境界安全性が成立（分割点は body 直子 =
+  部分木自足。li_ord は親スコープ、deco の開閉は部分木内閉鎖）。
+- C の shard≡serial byte 一致を本機で検証（`IF_LAYOUT_PAR=0` A/B、idm-2mb）して
+  から実装に入った（信頼の確認先行）。
+
+### 移植の構造
+1. **Dom に `md_body_mid` ヒント追加**（md 2-slice splice で記録。C の同名フィールド
+   写し。serial parse / HTML 経路は 0 = 不発）。
+2. **`layout_children` に [start, stop) を一般化**（serial 経路は (None,None) で不変）。
+3. **build_impl に shard 分岐**: 線形+lazy+md_ws_stripped+n_nodes≧4096+ヒント有りのみ。
+   独立 Lc（streams/geom cache/syn arena 専有 = C の shard 局所 arena 分離の写し）を
+   A/B で走らせる。A のみ body 装飾（`bsides` 規約写し）。StyleLazy は shard ごとに
+   new、外来の body 値は shard 局所 intern に種蒔き（parent 値同一 ⇒ 子孫値も逐語同値）。
+4. **接合**: `hA+hB`（height_spec 拡張規約同値）→ B の lines/deco `y+=hA`、
+   seg_arena/syn_text 参照デルタ接合（syn_text は 8B アライン bump のため A 末尾を
+   align8 占位）、**stab は A/B 両側の値を serial 順（seed→A 初出→B 初出）で主
+   intern に値同定**（値同一 ⇒ sid 同一の不変保持。C の arena ポインタ吸収に対する
+   Rust = sid 間接の価格として seg 写像 pass を払う）。deco h 後埋め規約も写し。
+
+### 検証の要点（内部モデル差の正直な記録）
+`shard_layout_equals_serial`（新規単体テスト）が最初 syn_text 完全 byte 一致で落ちた
+ —— pieces/links/prec の cap doubling 由来の foreign 占位が **shard 局所の cap
+リセットで再発火**するため。**これはバグではない**: C も per-shard arena +
+`if_arena_absorb` で同じ分岐を持ち、seg のテキスト解決は shard 局所オフセット+
+デルタで正しく、観測面（render/dump）には現れない。テストは観測同値の canonical
+射影（行幾何 × seg 内容 × 解決スタイル × deco × stab × root）比較に修正して緑。
+render 2 経路 + dump 5 モード + 21/21 オラクル + serial≡shard A/B は全て byte-exact。
+
+### 実測（paired interleaved median、data-20260829c.json）
+16MB layout **165.2 → 110.5ms（shard 1.50×。serial 済み）**〜 bench 環境では
+117.57ms（C 48.06 = **2.45×**、前回 3.07×）、16MB total **2.58×**（119.77/308.78）、
+2MB layout 3.36→**2.26×**、2MB total 2.63→**2.17×**。価格: 16MB RSS 1.06→1.13×、
+2MB RSS 0.97→1.09×（B 側 streams 一時保持の複製分。総計縮小 −37ms を優先して採択）。
+ANSI total 1.93→**1.69×**（layout shard が ANSI 経路にも効く）。
+
+### 検証（全て緑）
+- cargo test **186**（ifuto-core。+1: shard_layout_equals_serial）/ workspace 343 緑、
+  release build/clippy/fmt 0 警告。
+- output oracle **21/21 byte-exact**。serial≡shard A/B（`IF_LAYOUT_PAR=0`）byte 一致
+  を 2MB/16MB で確認。
+- diff fuzz 3,019 件追加 → **累計 170,171 cases / 0 mismatch**。
+
+### 残照準（照準の棚卸しを更新）
+1. **parse 2.50×**（123.95ms vs C 49.65。最大の残構造件に復帰）: alloc_bt 帰属で
+   **764,744 allocs / 203MB** = テキスト per-node heap コピー確定。根治 = **Dom による
+   入力所有 + text の (off,len) 参照化**（NameStr の `Deref` iface を破るフェーズ 11
+   級の大改造。設計立案段）。
+2. **layout 2.45× / render 2.46×**: layout の残差は shard 接合税（stab/remap pass）
+   と単一 HT あたりの演算差。render は C の 2-way 並列 sweep が未移植。
+3. **read 段 8.71ms vs C 0.02ms**（fs::read 初回 page-fault 税。小粒件。要検証ラベル）。
+4. **RSS 後退の取り戻し**: shard B streams 複製分（16MB +15MB）。接合後の早期解放 or
+   B を既存 capacity 借用にする設計余地。ANSI RSS 1.76×（要監視、未分析は継続明記）。
+
+## フェーズ 10-i: render 2-way 並列 sweep（C render_ansi.c 同名機構の写し）
+
+C の機構（no-ansi 限定。行 y で二等分、A=[0,r_split) 主 FILE 直 / B=[r_split,my)
+ワーカのメモリシンク、join 後 B を追記）を Rust へ写した。実装の要点:
+- `render_emit_sweep` を行範囲本体 `sweep_range_emit` に分離し、並列時は
+  A=[0,r_split) / B=[r_split,my) を `thread::scope` で同時進行して内容追記。
+- B の deco 状態一意性: `r_split` 時点で「開始済み（y<=r_split）かつ未期限切れ
+  （r_split < y+max(h,1)）」を追記順に再構成（deco 追記順=y 単調非減少は直列
+  sweep の di 前進と同じ規約）。同一 y の行は全て前半に寄せる lower_bound 規則も写し。
+- ゲートは C と同一: `!ansi && my >= 1024 && n_lines >= 256`（kill `IF_RENDER_PAR=0`。
+  Miri 検査では定数を縮小、掃引網羅は通常 test の責務の規約どおり）。
+
+### 実測（paired interleaved median、data-20260829d.json）
+16MB render **55.77 → 35.36ms（1.58×。C 22.42）**、16MB total **2.12×**
+（128.67/272.77。10-f 3.12× → 10-g 2.72× → 10-h 2.58× → **2.12×** 推移）、
+2MB render 5.58→3.90ms、2MB total **2.09×**、layout 2.45→**2.04×**。
+ANSI は C 規約により並列ゲート外（1.80×。render 段 1.37×）。
+
+### 検証（全て緑）
+- cargo test **187**（ifuto-core。+1: render_par_sweep_equals_serial）/ workspace 344 緑、
+  release build/clippy/fmt 0 警告。
+- output oracle **21/21 byte-exact**、2-way 並列 ≡ 直列 A/B（`IF_RENDER_PAR=0`）を
+  2MB/16MB で byte 一致確認。
+- diff fuzz 3,019 件追加 → **累計 173,190 cases / 0 mismatch**。
+
+### 残照準（照準の棚卸しを更新）
+1. **parse 2.32×**（119.84ms vs C 51.72。再び最大の残構造件）: alloc_bt 帰属で
+   **764,744 allocs / 203MB** = テキスト per-node heap コピー確定。根治 = Dom 入力
+   所有 + text (off,len) 参照化（フェーズ 11 級の `Deref` iface 改造。次の本丸）。
+2. **layout 2.04× / render 1.58×**: ともに並列境界まで来た。残差は単一 HT あたりの
+   演算効率（HashMap/Index 系の Rust 価格 vs C の arena+直配列）。読みの精度が要る段。
+3. **read 段 8.02ms vs C 0.01ms**（fs::read 初回 page-fault 税。小粒。要検証ラベル）。
+4. **RSS 1.13×/2MB 1.08×/ANSI 1.76×**: shard/render 並列のワーカ側バッファ複製価格。
+   ANSI RSS は未分析のまま継続台帳。

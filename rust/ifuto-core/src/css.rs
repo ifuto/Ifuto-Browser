@@ -2469,6 +2469,12 @@ impl StyleLazy {
     pub fn into_stab(self) -> Vec<Style> {
         self.cache.intern.into_values()
     }
+
+    /// 値を intern して sid を返す（10-h body shard の stab 併合 / shard 局所での
+    /// 外来 parent 値の種蒔き用。値同一 ⇒ sid 同一の不変は intern 表が保つ）。
+    pub(crate) fn intern_value(&mut self, st: &Style) -> u32 {
+        self.cache.intern.idx_of(st)
+    }
 }
 
 /// C の `if_md_style_lazy_ok` 写し: lazy は md fast-DOM（author シート無し）専用。
