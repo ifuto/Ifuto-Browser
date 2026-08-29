@@ -1942,3 +1942,52 @@ cfg(miri) 縮小は効いている）。C 相当の DOM 構築は Miri 解釈実
 通る最小代表入力）に再縮小し、timeout は 1500 → **3000** へ（ジョブ上限
 120 分に対して toolchain+他 CMD と合わせても ~70 分見込みで余裕）。
 通常 test の 1MB 総掃引・差分 fuzz・ASan 側の網羅性には一切手を付けていない。
+
+## フェーズ 10-e: Node の痩身化（200B → 80B）— parse/RSS の大幅改善
+
+### 動機
+`size_probe` 実測で Node は **200B** だった（NameStr 24 + attrs `Vec<Attr>` 24 +
+doctype `Option<Doctype>` **80** + pi_target `Vec` 24 + リンク 5×8 + kind 系 4）。
+これが 16MB md で ~1.6M 個並び、nodes 書き込み/走査・2-slice merge 転記・
+キャッシュ効率のすべてを腐らせていた（C IfNode は packed/IfStr 設計で **69B**）。
+
+### 設計（safe のまま C の「熱い構造体は小さく」を再現）
+- 属性・doctype・pi_target を **`Dom` 側の副テーブル**（`attrs_tab: Vec<Vec<Attr>>` /
+  `extra_tab: Vec<NodeExtra>`）へ隔離。ノード側は 4B ハンドル ×2（`attrs_idx` /
+  `extra_idx`、0 = 無し、**遅延割当**で属性無し文書はテーブル自体 0 確保）。
+- アクセサ: `attrs()` / `attrs_mut()` / `set_attrs()` / `attr()` / `attr_set()` /
+  `doctype()` / `set_doctype()` / `pi_target()` / `set_pi_target()`。
+  読みサイト（dom dump、html_tree の attrs_equal/clone_element/merge_attrs/
+  foreign adjust/sc_clone/sc_selected_option、md elem_store）を全置換。
+- 2-slice merge は `merge_side_from`（副テーブル末尾連結 + ハンドルへのデルタ
+  加算。0 は不変。C の arena 共有接合に対応）を追加して整合性を保持。
+- **ラチェット**: `node_size_ratchet`（`size_of::<Node>() <= 80` を機械固定）+
+  `side_tables_roundtrip`（遅延割当・置換・merge デルタの規約固定）。
+
+### 実測（paired median。環境騒音 ±20% 帯の中でも paired 比較として有意）
+| 指標 | 10-d → 10-e |
+|---|---|
+| 16MB total 倍率 | 3.88× → **3.15×** |
+| 16MB parse 倍率 | 3.90× → **2.61×**（229.3 → 149.4ms） |
+| 16MB render 倍率 | 2.97× → **2.15×** |
+| 16MB RSS 倍率 | 1.95× → **1.09×**（415 → 232MB） |
+| 2MB RSS 倍率 | 1.66× → **0.99×**（C より低い） |
+| 2MB total 倍率 | 3.52× → **2.99×** |
+| ANSI 2MB total 倍率 | 2.18× → **1.92×** |
+
+### 検証（全て緑）
+- cargo test **342 緑**（+2: ラチェット＋副テーブル規約）、clippy/fmt 0 警告。
+- render 4 経路 + 全 dump モード（dom/layout/styles/tokens/wptdom）× 2 コーパス
+  = **14 通り byte-exact**。
+- serial ≡ 2-slice（IF_MD_PAR=1）byte 一致（2MB/16MB）。
+- diff fuzz 3,000 件追加 → **累計 164,133 cases / 0 mismatch**。
+
+### 残照準
+1. **layout 3.86×**（219.94ms vs C 57.04）: 最大の残構造件。2-way 並列 layout
+   （C `layout_shard_run_body` + `md_body_mid`）は C も arena 共有前提のため、
+   まず taskset A/B で Rust layout の HT 採算を計測してから設計。
+   ifc ごとの pieces/segs Vec 新規成長（段別 alloc 計測値: layout 1.29M allocs）
+   を深さ別スクラッチ再利用で消す案が次の一手。
+2. **read 段 ~9.19ms vs C 0.02ms**（fs::read の余分な stat+確保走査疑い。要検証）。
+3. Link フィールドの `Option<NodeId>` 5×8B を u32 センチネル化すれば Node は
+   80B → 60B（C 69B を越える小型化。ただし全リンクサイトの機械置換が要る）。

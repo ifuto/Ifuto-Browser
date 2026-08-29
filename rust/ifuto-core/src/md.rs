@@ -314,11 +314,14 @@ impl DomOut {
         {
             let slim = self.slim_attrs;
             let pend_attrs = std::mem::take(&mut self.pend_attrs);
-            let n = self.dom.node_mut(nid);
-            n.tag = tag;
-            n.name = crate::dom::NameStr::from_bytes(self.pend_name.as_bytes());
+            let name = crate::dom::NameStr::from_bytes(self.pend_name.as_bytes());
+            {
+                let n = self.dom.node_mut(nid);
+                n.tag = tag;
+                n.name = name;
+            }
             if !pend_attrs.is_empty() {
-                n.attrs = pend_attrs
+                let filtered: Vec<Attr> = pend_attrs
                     .iter()
                     .filter(|(an, _)| {
                         // slim: レンダリング経路で読まれる属性のみ保持（C と同一規約）
@@ -329,6 +332,7 @@ impl DomOut {
                         value: av.clone(),
                     })
                     .collect();
+                self.dom.set_attrs(nid, filtered);
             }
         }
         if tag == TAG_STYLE {
@@ -1545,12 +1549,21 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
     // B 内容ノードの転記とリンク写像。parent==stub(3) は A 側 body=3 と同一数値で
     // 恒等に写る（first_child/next_sibling/parent の全 Option<NodeId> が対象）
     let base = dom_a.nodes.len() as u32;
+    // 副テーブル（attrs / extra）も併合し、B 側ハンドルにデルタを足す
+    // （ハンドル 0 は「無し」で不変。C の arena 共有 O(1) 接合に対応する部分）。
+    let (d_attrs, d_extra) = dom_a.merge_side_from(&mut dom_b);
     let (bf0, bl0) = (dom_b.nodes[3].first_child, dom_b.nodes[3].last_child);
     if dom_b.nodes.len() > SKIP as usize {
         for mut n in dom_b.nodes.drain(SKIP as usize..) {
             n.parent = map_opt(n.parent, base, SKIP);
             n.first_child = map_opt(n.first_child, base, SKIP);
             n.next_sibling = map_opt(n.next_sibling, base, SKIP);
+            if n.attrs_idx != 0 {
+                n.attrs_idx += d_attrs;
+            }
+            if n.extra_idx != 0 {
+                n.extra_idx += d_extra;
+            }
             dom_a.nodes.push(n);
         }
     }

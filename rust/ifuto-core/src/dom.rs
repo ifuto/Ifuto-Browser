@@ -181,7 +181,24 @@ pub struct Doctype {
     pub sys_id: Vec<u8>,
 }
 
+/// 稀データ（`NodeKind::Doctype` の doctype 情報 / COMMENT が PI のときの target）。
+/// ほぼ全ノードで不使用のため副テーブル（`Dom::extra_tab`）に隔離する。
+#[derive(Clone, Debug, Default)]
+pub struct NodeExtra {
+    /// DOCTYPE 情報。
+    pub doctype: Option<Doctype>,
+    /// PI ターゲット（C は attrs[0].name に保持）。
+    pub pi_target: Vec<u8>,
+}
+
 /// DOM ノード（C の `IfNode` 相当）。
+///
+/// 【痩身化（フェーズ 10-e）】200B → 80B。属性（`Vec<Attr>` 24B + ヒープ）と
+/// 稀データ（doctype `Option<Doctype>` 80B + pi_target `Vec` 24B）は走査が追う
+/// メモリ量を増やすだけで大多数のノードでは不使用なため、`Dom` 側の副テーブルへ
+/// 隔離し、ノードには 4B ハンドルのみ持たせる（0 = 無し）。C の arena/ポインタ
+/// 間接と同じ「熱い構造体を小さく」思想の safe 版。読み書きは `Dom::attrs` /
+/// `Dom::attrs_mut` / `Dom::doctype` / `Dom::pi_target` 等のアクセサ経由。
 #[derive(Clone, Debug)]
 pub struct Node {
     /// 種別。
@@ -194,12 +211,10 @@ pub struct Node {
     pub flags: u8,
     /// タグ名（ELEMENT）/ テキスト（TEXT, COMMENT）。
     pub name: NameStr,
-    /// 属性列（ELEMENT）。
-    pub attrs: Vec<Attr>,
-    /// DOCTYPE 情報（`NodeKind::Doctype` のみ有意）。
-    pub doctype: Option<Doctype>,
-    /// PI ターゲット（COMMENT が処理命令のときのみ非空。C は attrs[0].name に保持）。
-    pub pi_target: Vec<u8>,
+    /// 属性副テーブル index（0 = 属性なし。N → `Dom::attrs_tab[N]`）。
+    pub(crate) attrs_idx: u32,
+    /// 稀データ副テーブル index（0 = 稀データなし。N → `Dom::extra_tab[N]`）。
+    pub(crate) extra_idx: u32,
     /// 親。
     pub parent: Option<NodeId>,
     /// 先頭の子。
@@ -221,9 +236,8 @@ impl Node {
             ns: Ns::Html,
             flags: 0,
             name: NameStr::empty(),
-            attrs: Vec::new(),
-            doctype: None,
-            pi_target: Vec::new(),
+            attrs_idx: 0,
+            extra_idx: 0,
             parent: None,
             first_child: None,
             last_child: None,
@@ -238,6 +252,11 @@ impl Node {
 pub struct Dom {
     /// 全ノード（`NodeId` はここへの index）。
     pub nodes: Vec<Node>,
+    /// 属性副テーブル（`Node::attrs_idx` 指し先。index 0 は未割当の placeholder）。
+    /// 遅延割当（属性を持つノードが初出の瞬間まで 0 確保）。
+    pub(crate) attrs_tab: Vec<Vec<Attr>>,
+    /// 稀データ副テーブル（`Node::extra_idx` 指し先。index 0 は placeholder）。
+    pub(crate) extra_tab: Vec<NodeExtra>,
     /// ルート（DOCUMENT ノード）。
     pub root: NodeId,
     /// クイークスモード（DOCTYPE 完全表で判定。limited-quirks は false）。
@@ -276,6 +295,8 @@ impl Dom {
         Dom {
             nodes,
             root,
+            attrs_tab: Vec::new(),
+            extra_tab: Vec::new(),
             quirks: false,
             title: Vec::new(),
             n_nodes: 1,
@@ -363,11 +384,127 @@ impl Dom {
         self.nodes[child as usize].next_sibling = None;
     }
 
+    /// 属性副テーブル index を確保（未割当なら遅延で slot を作る）。
+    fn ensure_attrs_idx(&mut self, id: NodeId) -> usize {
+        let cur = self.nodes[id as usize].attrs_idx;
+        if cur != 0 {
+            return cur as usize;
+        }
+        if self.attrs_tab.is_empty() {
+            self.attrs_tab.push(Vec::new()); // slot 0 = placeholder
+        }
+        self.attrs_tab.push(Vec::new());
+        let idx = (self.attrs_tab.len() - 1) as u32;
+        self.nodes[id as usize].attrs_idx = idx;
+        idx as usize
+    }
+
+    /// 稀データ副テーブル index を確保（`ensure_attrs_idx` と同じ遅延規約）。
+    fn ensure_extra_idx(&mut self, id: NodeId) -> usize {
+        let cur = self.nodes[id as usize].extra_idx;
+        if cur != 0 {
+            return cur as usize;
+        }
+        if self.extra_tab.is_empty() {
+            self.extra_tab.push(NodeExtra::default()); // slot 0 = placeholder
+        }
+        self.extra_tab.push(NodeExtra::default());
+        let idx = (self.extra_tab.len() - 1) as u32;
+        self.nodes[id as usize].extra_idx = idx;
+        idx as usize
+    }
+
+    /// 属性列の参照（属性なし = 空スライス）。
+    pub fn attrs(&self, id: NodeId) -> &[Attr] {
+        let i = self.nodes[id as usize].attrs_idx as usize;
+        if i == 0 {
+            &[]
+        } else {
+            &self.attrs_tab[i]
+        }
+    }
+
+    /// 属性列の可変参照（必要なら副テーブル slot を遅延割当）。
+    pub fn attrs_mut(&mut self, id: NodeId) -> &mut Vec<Attr> {
+        let i = self.ensure_attrs_idx(id);
+        &mut self.attrs_tab[i]
+    }
+
+    /// 属性列をまるごと差し替え（空を渡すと副テーブル slot は作らない）。
+    pub fn set_attrs(&mut self, id: NodeId, attrs: Vec<Attr>) {
+        if attrs.is_empty() && self.nodes[id as usize].attrs_idx == 0 {
+            return;
+        }
+        let i = self.ensure_attrs_idx(id);
+        self.attrs_tab[i] = attrs;
+    }
+
+    /// DOCTYPE 情報の参照（`NodeKind::Doctype` で無い / 未設定なら `None`）。
+    pub fn doctype(&self, id: NodeId) -> Option<&Doctype> {
+        let i = self.nodes[id as usize].extra_idx as usize;
+        if i == 0 {
+            None
+        } else {
+            self.extra_tab[i].doctype.as_ref()
+        }
+    }
+
+    /// DOCTYPE 情報の設定（slot 遅延割当）。
+    pub fn set_doctype(&mut self, id: NodeId, d: Doctype) {
+        let i = self.ensure_extra_idx(id);
+        self.extra_tab[i].doctype = Some(d);
+    }
+
+    /// PI ターゲットの参照（未設定 = 空スライス）。
+    pub fn pi_target(&self, id: NodeId) -> &[u8] {
+        let i = self.nodes[id as usize].extra_idx as usize;
+        if i == 0 {
+            &[]
+        } else {
+            &self.extra_tab[i].pi_target
+        }
+    }
+
+    /// PI ターゲットの設定（slot 遅延割当。空なら slot は作らない）。
+    pub(crate) fn set_pi_target(&mut self, id: NodeId, v: Vec<u8>) {
+        if v.is_empty() {
+            return;
+        }
+        let i = self.ensure_extra_idx(id);
+        self.extra_tab[i].pi_target = v;
+    }
+
+    /// 2-slice 計の結合補助: `src` の副テーブルを末尾に連結し、`src` 側ノードの
+    /// ハンドルに加算すべきデルタ `(attrs, extra)` を返す（0 は 0 のまま保つこと。
+    /// `src` のテーブルは消費される。C の arena 差分接続に相当）。
+    pub(crate) fn merge_side_from(&mut self, src: &mut Self) -> (u32, u32) {
+        let attrs_delta = if src.attrs_tab.len() > 1 {
+            if self.attrs_tab.is_empty() {
+                self.attrs_tab.push(Vec::new());
+            }
+            let d = self.attrs_tab.len() as u32 - 1;
+            self.attrs_tab.extend(src.attrs_tab.drain(1..));
+            d
+        } else {
+            0
+        };
+        let extra_delta = if src.extra_tab.len() > 1 {
+            if self.extra_tab.is_empty() {
+                self.extra_tab.push(NodeExtra::default());
+            }
+            let d = self.extra_tab.len() as u32 - 1;
+            self.extra_tab.extend(src.extra_tab.drain(1..));
+            d
+        } else {
+            0
+        };
+        (attrs_delta, extra_delta)
+    }
+
     /// 属性値を返す（大文字小文字無視の名前一致。無ければ `None`）。
     /// C の `if_dom_attr` 相当。
     pub fn attr(&self, n: NodeId, name_ci: &[u8]) -> Option<&[u8]> {
-        let node = &self.nodes[n as usize];
-        node.attrs
+        self.attrs(n)
             .iter()
             .find(|a| str_eq_ci(&a.name, name_ci))
             .map(|a| a.value.as_slice())
@@ -460,14 +597,13 @@ impl Dom {
         if name.is_empty() {
             return;
         }
-        let node = &mut self.nodes[n as usize];
-        for a in node.attrs.iter_mut() {
+        for a in self.attrs_mut(n).iter_mut() {
             if str_eq_ci(&a.name, name) {
                 a.value = value.to_vec();
                 return;
             }
         }
-        node.attrs.push(Attr {
+        self.attrs_mut(n).push(Attr {
             name: name.to_vec(),
             value: value.to_vec(),
         });
@@ -650,9 +786,10 @@ impl Dom {
             NodeKind::Comment => {
                 out.extend_from_slice(b"| ");
                 Self::ser_indent(out, depth);
-                if !node.pi_target.is_empty() {
+                let pi = self.pi_target(n);
+                if !pi.is_empty() {
                     out.extend_from_slice(b"<?");
-                    out.extend_from_slice(&node.pi_target);
+                    out.extend_from_slice(pi);
                     out.push(b' ');
                     out.extend_from_slice(&node.name);
                     out.extend_from_slice(b"?>\n");
@@ -665,7 +802,7 @@ impl Dom {
             NodeKind::Doctype => {
                 out.extend_from_slice(b"| ");
                 Self::ser_indent(out, depth);
-                match node.doctype.as_ref() {
+                match self.doctype(n) {
                     None
                     | Some(Doctype {
                         has_name: false, ..
@@ -698,9 +835,10 @@ impl Dom {
                 }
                 out.extend_from_slice(&node.name);
                 out.extend_from_slice(b">\n");
-                if !node.attrs.is_empty() {
+                let attrs = self.attrs(n);
+                if !attrs.is_empty() {
                     // 属性は名前の辞書順（バイト比較）で出力（C の attr_name_cmp + qsort）
-                    let mut sorted: Vec<&Attr> = node.attrs.iter().collect();
+                    let mut sorted: Vec<&Attr> = attrs.iter().collect();
                     sorted.sort_by(|a, b| a.name.cmp(&b.name));
                     for a in sorted {
                         out.extend_from_slice(b"| ");
@@ -776,7 +914,7 @@ impl Dom {
                 }
                 out.extend_from_slice(b"\"\n");
             }
-            NodeKind::Doctype => match &node.doctype {
+            NodeKind::Doctype => match self.doctype(n) {
                 Some(d) if d.has_name => {
                     out.extend_from_slice(b"<!DOCTYPE ");
                     out.extend_from_slice(&d.name);
@@ -785,9 +923,10 @@ impl Dom {
                 _ => out.extend_from_slice(b"<!DOCTYPE >\n"),
             },
             NodeKind::Comment => {
-                if !node.pi_target.is_empty() {
+                let pi = self.pi_target(n);
+                if !pi.is_empty() {
                     out.extend_from_slice(b"<?");
-                    out.extend_from_slice(&node.pi_target);
+                    out.extend_from_slice(pi);
                     out.push(b' ');
                     out.extend_from_slice(&node.name);
                     out.extend_from_slice(b"?>\n");
@@ -804,7 +943,7 @@ impl Dom {
                 } else {
                     out.extend_from_slice(&node.name);
                 }
-                for a in &node.attrs {
+                for a in self.attrs(n) {
                     out.push(b' ');
                     out.extend_from_slice(&a.name);
                     out.extend_from_slice(b"=\"");
@@ -1262,5 +1401,47 @@ mod tests {
             s.ends_with("; nodes=4 errors=3 title=\"T\"\n"),
             "got: {s:?}"
         );
+    }
+
+    /// 痩身化ラチェット（フェーズ 10-e）: Node は属性・稀データの副テーブル化で
+    /// 200B → 80B（C IfNode ~40B の 2 倍）。これ以上の肥大化は機械的に拒否する。
+    #[test]
+    fn node_size_ratchet() {
+        assert!(
+            std::mem::size_of::<super::Node>() <= 80,
+            "Node が痩身化ラチェット(80B)超過: {}",
+            std::mem::size_of::<super::Node>()
+        );
+    }
+
+    /// 副テーブルの読み書き・遅延割当・merge デルタ写像の規約を固定。
+    #[test]
+    fn side_tables_roundtrip() {
+        let mut d = Dom::new();
+        let a = d.alloc_node(NodeKind::Element);
+        let b = d.alloc_node(NodeKind::Element);
+        assert!(d.attrs(a).is_empty() && d.attrs(b).is_empty()); // 0 確保
+        assert!(d.doctype(a).is_none() && d.pi_target(a).is_empty());
+        d.attr_set(a, b"href", b"/x");
+        d.attr_set(a, b"HREF", b"/y"); // 既存置換（case-insensitive）
+        assert_eq!(d.attrs(a).len(), 1);
+        assert_eq!(d.attr(a, b"href"), Some(&b"/y"[..]));
+        assert!(d.attrs(b).is_empty()); // 他ノードに漏れない
+        let mut e = Dom::new();
+        let _ = e.alloc_node(NodeKind::Element);
+        let n2 = e.alloc_node(NodeKind::Element);
+        e.attr_set(n2, b"alt", b"z");
+        e.set_doctype(
+            n2,
+            Doctype {
+                name: b"html".to_vec(),
+                has_name: true,
+                ..Default::default()
+            },
+        );
+        let (da, _dx) = d.merge_side_from(&mut e);
+        assert_eq!(d.attrs_tab.len() - 1, 2); // 本体 1 + 合併 1
+        assert_eq!(d.extra_tab.len() - 1, 1);
+        assert_eq!(da, 1); // d 側に既存 1 slot → B ハンドルは +1
     }
 }

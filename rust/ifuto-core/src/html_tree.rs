@@ -226,7 +226,9 @@ impl<'a> TreeBuilder<'a> {
                     has_style = true;
                 }
             }
-            node.attrs = tok.attrs.clone();
+        }
+        if !tok.attrs.is_empty() {
+            self.dom.set_attrs(n, tok.attrs.clone());
         }
         if has_script {
             self.dom.has_script = true;
@@ -997,8 +999,8 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn attrs_equal(&self, a: NodeId, b: NodeId) -> bool {
-        let na = &self.dom.node(a).attrs;
-        let nb = &self.dom.node(b).attrs;
+        let na = self.dom.attrs(a);
+        let nb = self.dom.attrs(b);
         if na.len() != nb.len() {
             return false;
         }
@@ -1114,15 +1116,15 @@ impl<'a> TreeBuilder<'a> {
         let n = self.dom.alloc_node(NodeKind::Element);
         let (tag, ns, name, attrs) = {
             let s = self.dom.node(src);
-            (s.tag, s.ns, s.name.clone(), s.attrs.clone())
+            (s.tag, s.ns, s.name.clone(), self.dom.attrs(src).to_vec())
         };
         {
             let node = self.dom.node_mut(n);
             node.tag = tag;
             node.ns = ns;
             node.name = name;
-            node.attrs = attrs;
         }
+        self.dom.set_attrs(n, attrs);
         n
     }
 
@@ -1546,12 +1548,15 @@ impl<'a> TreeBuilder<'a> {
                 self.dom.quirks = Self::doctype_is_quirks(&tok);
                 self.mode = Mode::BeforeHtml;
                 let d = self.dom.alloc_node(NodeKind::Doctype);
-                self.dom.node_mut(d).doctype = Some(Doctype {
-                    name: tok.text.clone(),
-                    has_name: tok.dt_has_name,
-                    pub_id: tok.dt_pub.clone(),
-                    sys_id: tok.dt_sys.clone(),
-                });
+                self.dom.set_doctype(
+                    d,
+                    Doctype {
+                        name: tok.text.clone(),
+                        has_name: tok.dt_has_name,
+                        pub_id: tok.dt_pub.clone(),
+                        sys_id: tok.dt_sys.clone(),
+                    },
+                );
                 self.dom.append_child(self.dom.root, d);
             }
             TokKind::Comment => {
@@ -1582,7 +1587,7 @@ impl<'a> TreeBuilder<'a> {
         let n = self.dom.alloc_node(NodeKind::Comment);
         self.dom.node_mut(n).name = crate::dom::NameStr::from_bytes(&tok.text);
         if tok.is_pi && !tok.pi_target.is_empty() {
-            self.dom.node_mut(n).pi_target = tok.pi_target.clone();
+            self.dom.set_pi_target(n, tok.pi_target.clone());
         }
         n
     }
@@ -1999,18 +2004,12 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn merge_attrs(&mut self, dst: NodeId, tok: &Tok) {
-        let existing: Vec<Vec<u8>> = self
-            .dom
-            .node(dst)
-            .attrs
-            .iter()
-            .map(|a| a.name.clone())
-            .collect();
+        let existing: Vec<Vec<u8>> = self.dom.attrs(dst).iter().map(|a| a.name.clone()).collect();
         for a in &tok.attrs {
             if existing.iter().any(|n| str_eq_ci(n, &a.name)) {
                 continue;
             }
-            self.dom.node_mut(dst).attrs.push(a.clone());
+            self.dom.attrs_mut(dst).push(a.clone());
         }
     }
 
@@ -3337,7 +3336,7 @@ impl<'a> TreeBuilder<'a> {
             ("xmlns:xlink", "xmlns xlink"),
         ];
         let ns = self.dom.node(n).ns;
-        let attrs = self.dom.node(n).attrs.clone();
+        let attrs = self.dom.attrs(n).to_vec();
         let adjusted: Vec<Attr> = attrs
             .into_iter()
             .map(|mut a| {
@@ -3361,7 +3360,7 @@ impl<'a> TreeBuilder<'a> {
                 a
             })
             .collect();
-        self.dom.node_mut(n).attrs = adjusted;
+        self.dom.set_attrs(n, adjusted);
     }
 
     fn foreign_insert(&mut self, tok: &Tok) {
@@ -3731,9 +3730,9 @@ fn sc_clone(dom: &mut Dom, s: NodeId) -> NodeId {
             sn.ns,
             sn.flags,
             sn.name.clone(),
-            sn.attrs.clone(),
-            sn.doctype.clone(),
-            sn.pi_target.clone(),
+            dom.attrs(s).to_vec(),
+            dom.doctype(s).cloned(),
+            dom.pi_target(s).to_vec(),
         )
     };
     {
@@ -3742,10 +3741,12 @@ fn sc_clone(dom: &mut Dom, s: NodeId) -> NodeId {
         node.ns = ns;
         node.flags = flags;
         node.name = name;
-        node.attrs = attrs;
-        node.doctype = doctype;
-        node.pi_target = pi_target;
     }
+    dom.set_attrs(n, attrs);
+    if let Some(d) = doctype {
+        dom.set_doctype(n, d);
+    }
+    dom.set_pi_target(n, pi_target);
     let children: Vec<NodeId> = {
         let mut v = Vec::new();
         let mut c = dom.node(s).first_child;
@@ -3785,7 +3786,11 @@ fn sc_selected_option(dom: &Dom, sel: NodeId) -> Option<NodeId> {
             if first.is_none() {
                 first = Some(cid);
             }
-            if node.attrs.iter().any(|a| str_eq_ci(&a.name, b"selected")) {
+            if dom
+                .attrs(cid)
+                .iter()
+                .any(|a| str_eq_ci(&a.name, b"selected"))
+            {
                 chosen = Some(cid);
             }
         }
