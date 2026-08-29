@@ -66,3 +66,5 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 2026-08-28 再実行: Miri time kill 対策（掃引 cfg(miri) 縮小 + timeout 1500）反映後。CMD 5 Miri の full green を result.md 行レベルで確認する。
 
 # 2026-08-28 再実行: md 2-slice Miri 8KB 化 + timeout 3000 反映後。CMD 5 Miri の full green を result.md 行レベルで確認する。
+
+# 2026-08-29 実行: フェーズ 10-e（Node 痩身化 200B→80B）反映後の検証。特に CMD 5 Miri（副テーブル/merge_side_from/8KB化テスト群）と CMD 3 test=342 緑に注目。
