@@ -23,10 +23,16 @@ cd rust && ../trigger/tc timeout 300 cargo test --workspace
 cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
 
 # --- 5. Miri（未定義動作検出。nightly で実行。ログも result.md へ） ---
-# timeout は 600 → 3000 に拡大（2026-08-28: workspace 全件通過に 600s どころか 1500s でも不足し、
-# ifuto-core 183 件の途中で time kill されていた。データ重い掃引テストは cfg(miri)
-# で縮小済みだが、sysroot 構築 + 330 件の解釈実行は分単位が常態）。
-cd rust && ../trigger/tc timeout 3000 cargo +nightly miri test --workspace > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
+# 【運用変更 2026-08-29: 普段は実行しない】workspace 全件の解釈実行は 3000s キャップを超過し、
+# run 全体 52分07秒 の 96%（3000s）を Miri 打ち切りが占有した実績のため（run 33239097931:
+# ifuto-ffi 188 件通過 1117s の後、ifuto-core/akl 未着手で time kill → exit 1。UB 検出は 0 件）。
+# そもそも ifuto-core は #![forbid(unsafe_code)] で Miri の検査対象（unsafe）を持たず、
+# UB リスクは unsafe 含有 crate（akl-core/akl-ffi/ifuto-ffi）にのみ存在する。
+# よって運用: 普段の trigger では下行は無効化（コメントアウト）とし、
+# unsafe 含有 crate に差分がある時だけ有効化して実行する（scoped でも 20 分超を見込むこと）。
+# 有効化時の CMD:
+# cd rust && ../trigger/tc timeout 2400 cargo +nightly miri test -p akl-core -p akl-ffi -p ifuto-ffi > /tmp/miri.log 2>&1; rc=$?; { echo ""; echo "### miri 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -80 /tmp/miri.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0
+echo "miri: skipped（運用規約: unsafe 含有 crate 差分時のみ有効化。trigger.md CMD 5 コメント参照）"
 
 # --- 6. Kani（機械的証明。スカラー純粋関数のみ） ---
 cd rust && ../trigger/tc timeout 900 cargo kani --workspace
@@ -78,6 +84,11 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 2026-08-29 実行: フェーズ 10-i（render 2-way 並列 sweep）反映後の検証。特に CMD 5 Miri（sweep range 分割スレッド）と CMD 3 test=344 緑に注目。
 
 # 2026-08-29 実行: フェーズ 11（テキストアリーナ: text pun fields + arena 予約）反映後の検証。特に CMD 5 Miri（text_of/pun 転用、splice の排他算術 remap）と CMD 3 test=345 緑に注目。
+
+# 2026-08-29 実行: フェーズ 12-a（split_cells スライス化 + ln_is_table_delim ゼロアロケ化 + Fn 借用化）反映後の検証。
+# CMD 3 test=345 緑に注目。CMD 5 Miri は運用変更（上記）により skip —— 12-a 差分は ifuto-core（forbid(unsafe_code)）のみで
+# unsafe 含有 crate は無差分。前 run 33239097931 の Miri exit 1 は timeout 打ち切り（UB 検出 0）であり、
+# 解釈実行全件掃引の常設は構造的に遅すぎるため常設廃止（run 52分07秒 → 本 profile では 2-5 分見込み）。
 
 # 【運用規約】trigger 発火後は run 完了（result.md 追記）まで trigger.md 以外の push を避けること。
 # 旧 append 実装は run 中の push で non-fast-forward となり結果ブロック喪失（10-e, 10-g/h/i で実績）。

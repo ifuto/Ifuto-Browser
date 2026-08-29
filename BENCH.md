@@ -181,7 +181,7 @@ median n=9、16MB）+ layout shard A/B（16MB、median n=3+7）:
 | Rust ワークスペース（`cargo test --offline` / `--release`） | **345 passed / 0 failed**（akl-core 142 + akl-ffi 6 + ifuto-core 188 + ifuto-cli 9。2026-08-29、フェーズ 11 で +1: text_arena_representation） |
 | 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **21/21 × 両バイナリ**（+4 = Shift_JIS/EUC-JP E2E、+1 = 変換表再生成一致。idm コーパスは gen_idm.py 再生成で復元） |
 | golden（`tests/run_golden.sh`） | 1/1 × 両バイナリ |
-| C↔Rust 差分 fuzz（`tools/diff_fuzz_cli.py`） | **累計 176,209 cases / 0 mismatch**（seed 20260824/1/777/424242/999/31337/20260828/555/4242/20260829/314159/271828/8888×他。stdout/stderr/rc byte 突合、--stats は計測値 scrub・決定値比較。2026-08-29 追加分を含む） |
+| C↔Rust 差分 fuzz（`tools/diff_fuzz_cli.py`） | **累計 179,228 cases / 0 mismatch**（seed 20260824/1/777/424242/999/31337/20260828/555/4242/20260829/314159/271828/8888/7777×他。stdout/stderr/rc byte 突合、--stats は計測値 scrub・決定値比較。2026-08-29 追加分を含む） |
 | chrome 純粋部 C↔Rust 差分 fuzz（`tools/zz_chrome_diff.py`） | **累計 240,000 cases / 0 mismatch**（seed 1/7/42/999/777/424242/20260826。1 入力行=1 出行 byte 突合、両 driver の rc≠0 も不一致扱い。ASan+UBSan 30,000 ×2 で rc=0/stderr 空。2026-08-26） |
 | GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | PASS（C のみ。X 不在環境の proxi、GUI 実機は未検証と明記。Rust 側 --shot は未移植拒否形状のみ fuzz 検証） |
 | 拡張 smoke（`tests/ext_smoke.py`） | **12 checks**（C のみ。console.log 凍結 v1 含む） |
