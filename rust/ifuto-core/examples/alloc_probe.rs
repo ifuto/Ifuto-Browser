@@ -37,6 +37,7 @@ fn main() {
     let t2 = snap();
     let out = ifuto_core::render::render_emit_sweep(&dom, &lay, false);
     let t3 = snap();
+    eprintln!("text_arena_bytes={}", dom.text_arena_bytes());
     eprintln!("nodes={}", dom.nodes.len());
     eprintln!("parse : allocs={} bytes={}", t1.0 - t0.0, t1.1 - t0.1);
     eprintln!("layout: allocs={} bytes={}", t2.0 - t1.0, t2.1 - t1.1);

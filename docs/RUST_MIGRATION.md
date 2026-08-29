@@ -2191,3 +2191,59 @@ ANSI は C 規約により並列ゲート外（1.80×。render 段 1.37×）。
 3. **read 段 8.02ms vs C 0.01ms**（fs::read 初回 page-fault 税。小粒。要検証ラベル）。
 4. **RSS 1.13×/2MB 1.08×/ANSI 1.76×**: shard/render 並列のワーカ側バッファ複製価格。
    ANSI RSS は未分析のまま継続台帳。
+
+## フェーズ 11: テキストアリーナ（Text pun fields）— per-node `Box` 交通の構造消去
+
+10-i 残照準 #1（parse = 最大構造件）に対する着手。alloc_bt 帰属では parse
+764,744 allocs の全体像は「テキスト per-node heap コピー」と読んでいたが、
+同時取得の粒度（blocks_str 直下 305,885×6.3B / blocks_win 152,941×64.8B /
+blocks_str 深層 87,401×96B / inline_span 65,544×21B ≈ 611k）を突き合わせると、
+**テキスト `Box` 本体は ~109k で、残り ~611k は md 行/ブロック機構**だった
+（10-i 残照準の帰属解釈は部分誤り。本節で訂正する）。
+
+### 設計判断記録（却下経路を含む）
+1. `NameStr` 第 4 態 `Range` + `Deref` 撤去案: 消費者 94 サイトの機械移行が
+   必要で爆発半径が最大。**代替として Text ノードのスペアフィールド転用を採択**:
+   Text は属性も稀データも持たないため `attrs_idx`/`extra_idx` が常に空き。
+   >22B 本文は `name=空, attrs_idx=off, extra_idx=len` で `Dom.text_arena`
+   （bump）を指す。発見規則は `extra_idx != 0` 一つ、読み口は `Dom::text_of` 1 本、
+   書き口は `Dom::set_node_text` 1 本。`Deref` は無傷、要素名比較など ~80 サイトは
+   完全非侵略。C の union 流儀と同型で、転用規約はフィールドコメントに明記。
+2. html_tree（HTML 経路）は 11-a では従来表現のまま（`text_of` が両表現を吸収
+   するため混在が型安全に動く）。md fastdom 経路のみが arena に書く。
+3. 2-slice splice: B 側 arena 連結 + pun remap は 10-g の drain 算術 remap に
+   排他項を足すだけ（`t = is_arena_text` で `+=arena_delta*t + d_attrs*(1-t)*…`。
+   分岐を入れない規約を維持）。
+4. arena 予約: md 本文の ~48% が arena に入る実測（2MB: 1,019,337B / 16MB:
+   8,078,755B ≒ 入力×0.48）から `input.len()/2` を serial/A/B で各 1 回予約し、
+   bump 倍増の realloc コピー税を構造消去（未タッチ予約は RSS 不感）。
+
+### 構造実測（alloc_probe 同一器具・16MB。bytes は要求量計）
+| | allocs | bytes |
+|---|---|---|
+| 10-i（実施前） | 764,792 | 270.8MB |
+| arena のみ | 655,585 | 297.6MB |
+| arena + 予約（採択形） | **655,552（−14.3%）** | **275.3MB** |
+
+### 実測（paired interleaved median、data-20260829f.json）
+16MB total **1.991×**（121.28/241.44。**倍率の環境帯を 1.99–2.37× に更新**。
+C 121ms は高騒音側、R 絶対値は e と等しい帯）、parse 段 111.0→**107.0ms**
+（単発 3-way interleaved n=15 でも b1−6.06ms を確認。環境 23ms ドリフトの
+向こう側で符号が揃う）。**RSS 16MB 1.129→1.120（240,324→238,516KB。決定的
+改善）**、2MB 1.080、ANSI 1.753。2MB parse 12.6→11.11ms。
+startup は 77:73 で引き続き同値。全ペア stdout byte 一致。
+
+### 検証（全て緑）
+- cargo test **345**（ifuto-core 188。+1: `text_arena_representation` で pun 表現
+  そのものを機械固定）/ workspace release 全緑、clippy/fmt 0 警告。
+- byte-exact: serial/auto/forced/@1HT × 2 コーパス + C==R × 2 コーパス、
+  oracle **21/21**。
+- alloc_probe による構造証明（上表。nodes 数 1,616,804 で前後一致）。
+
+### 残照準（照準の棚卸しを更新）
+1. **parse ~2.3× 残 = md 行/ブロック機構 ~611k allocs**（blocks_str/blocks_win。
+   テキスト `Box` を消して残った真の大山。Ln ゼロコピー化 + ブロック分類の
+   バッファ再利用が照準。フェーズ 12 候補の本命）。
+2. layout / render: 単 HT 演算効率の読み合い（C arena+直配列 vs Rust 価格）。
+3. read 段 ~7.4ms vs C 0.02ms（page-fault 税。小粒）。
+4. RSS 残差（shard/render 並列のワーカ複製。ANSI 1.75× は未分析継続）。

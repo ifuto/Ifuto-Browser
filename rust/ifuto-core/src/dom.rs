@@ -212,8 +212,15 @@ pub struct Node {
     /// タグ名（ELEMENT）/ テキスト（TEXT, COMMENT）。
     pub name: NameStr,
     /// 属性副テーブル index（0 = 属性なし。N → `Dom::attrs_tab[N]`）。
+    ///
+    /// 【フェーズ 11 転用規約】`NodeKind::Text` のみ本 2 フィールドの意味が変わる:
+    /// テキストが `NAME_INLINE_CAP` を超えるとき `name` は空に倒し、
+    /// `attrs_idx` = `Dom::text_arena` へのオフセット、`extra_idx` = テキスト長
+    /// （≠ 0）として使う。Text は属性も稀データも持たないため `attrs_idx` /
+    /// `extra_idx` は常に空き。解決は必ず `Dom::text_of` 経由（直接参照禁止）。
     pub(crate) attrs_idx: u32,
     /// 稀データ副テーブル index（0 = 稀データなし。N → `Dom::extra_tab[N]`）。
+    /// Text では上記の転用規約によりテキスト長として使われる。
     pub(crate) extra_idx: u32,
     /// 親。
     pub parent: Option<NodeId>,
@@ -257,6 +264,12 @@ pub struct Dom {
     pub(crate) attrs_tab: Vec<Vec<Attr>>,
     /// 稀データ副テーブル（`Node::extra_idx` 指し先。index 0 は placeholder）。
     pub(crate) extra_tab: Vec<NodeExtra>,
+    /// テキスト bump アリーナ（フェーズ 11）。`NodeKind::Text` の >22B 本文の
+    /// 置き場。1 ノード 1 `Box`（md 16MB で ~60 万 malloc）を撲滅するため、
+    /// C の arena bump と同じ「1 本の連続バッファ + (off,len)」に倒す。
+    /// Text ノード側は `attrs_idx=off / extra_idx=len` に転用（`Node` の
+    /// フィールドコメント参照）。読みは必ず `text_of`。
+    pub(crate) text_arena: Vec<u8>,
     /// ルート（DOCUMENT ノード）。
     pub root: NodeId,
     /// クイークスモード（DOCTYPE 完全表で判定。limited-quirks は false）。
@@ -300,6 +313,7 @@ impl Dom {
             root,
             attrs_tab: Vec::new(),
             extra_tab: Vec::new(),
+            text_arena: Vec::new(),
             quirks: false,
             title: Vec::new(),
             n_nodes: 1,
@@ -548,7 +562,7 @@ impl Dom {
         while let Some(cid) = c {
             let node = &self.nodes[cid as usize];
             if node.kind == NodeKind::Text {
-                out.extend_from_slice(&node.name);
+                out.extend_from_slice(self.text_of(cid));
             } else {
                 self.text_content_rec(cid, out);
             }
@@ -627,10 +641,59 @@ impl Dom {
             return;
         }
         let tn = self.alloc_node(NodeKind::Text);
-        self.nodes[tn as usize].name = NameStr::from_bytes(t);
+        self.set_node_text(tn, t);
         self.nodes[tn as usize].parent = Some(n);
         self.nodes[n as usize].first_child = Some(tn);
         self.nodes[n as usize].last_child = Some(tn);
+    }
+
+    /// Text ノードの本文を設定（フェーズ 11 の唯一の書き口）。
+    /// ≤ `NAME_INLINE_CAP` なら従来どおり `name` に inline 収容（0 コピー完結）。
+    /// 超える場合は `text_arena` へ bump 追記し、`name` を空 + `attrs_idx=off /
+    /// extra_idx=len` に倒す（1 ノード 1 `Box` の malloc 交通を構造消去。
+    /// C の arena bump と同型）。呼び出し時点で同フィールドは 0 前提
+    /// （fresh ノード。再設定は `set_text` の切替経路のみ）。
+    pub(crate) fn set_node_text(&mut self, n: NodeId, t: &[u8]) {
+        debug_assert_eq!(self.nodes[n as usize].kind, NodeKind::Text);
+        debug_assert_eq!(self.nodes[n as usize].attrs_idx, 0);
+        debug_assert_eq!(self.nodes[n as usize].extra_idx, 0);
+        if t.len() <= NAME_INLINE_CAP {
+            self.nodes[n as usize].name = NameStr::from_bytes(t);
+            return;
+        }
+        let off = self.text_arena.len() as u32;
+        self.text_arena.extend_from_slice(t);
+        let node = &mut self.nodes[n as usize];
+        node.name = NameStr::empty();
+        node.attrs_idx = off;
+        node.extra_idx = t.len() as u32;
+    }
+
+    /// Text ノードの本文を読む（フェーズ 11 の唯一の読み口）。
+    /// inline 収容なら `name`、arena 転用なら `text_arena` を解決する。
+    /// COMMENT/Doctype 等の name 保持は従来どおり `node.name` を直接読むこと
+    /// （本関数は Text 専用）。
+    pub fn text_of(&self, n: NodeId) -> &[u8] {
+        let node = &self.nodes[n as usize];
+        debug_assert_eq!(node.kind, NodeKind::Text);
+        let len = node.extra_idx as usize;
+        if len != 0 {
+            let off = node.attrs_idx as usize;
+            &self.text_arena[off..off + len]
+        } else {
+            &node.name
+        }
+    }
+
+    /// 計測器用: text_arena の現在バイト数（観測のみ。挙動には無関係）。
+    pub fn text_arena_bytes(&self) -> usize {
+        self.text_arena.len()
+    }
+
+    /// text_arena を予約（md parse が入力係数で一度だけ呼ぶ。bump 倍増の
+    /// realloc コピー税を構造消去するための時間軸最適化。観測バイト不変）。
+    pub(crate) fn reserve_text_arena(&mut self, additional: usize) {
+        self.text_arena.reserve(additional);
     }
 
     /// `<title>` を設定（無ければ head 先頭に生成）。`self.title` も更新。
@@ -784,7 +847,7 @@ impl Dom {
                 out.extend_from_slice(b"| ");
                 Self::ser_indent(out, depth);
                 out.push(b'"');
-                out.extend_from_slice(&node.name);
+                out.extend_from_slice(self.text_of(n));
                 out.extend_from_slice(b"\"\n");
             }
             NodeKind::Comment => {
@@ -902,9 +965,10 @@ impl Dom {
         let node = self.node(n);
         match node.kind {
             NodeKind::Text => {
-                let shown = node.name.len().min(48);
+                let t = self.text_of(n);
+                let shown = t.len().min(48);
                 out.extend_from_slice(b"#text \"");
-                for &c in &node.name[..shown] {
+                for &c in &t[..shown] {
                     if c == b'\n' {
                         out.extend_from_slice(b"\\n");
                     } else if c == b'"' {
@@ -913,7 +977,7 @@ impl Dom {
                         out.push(c);
                     }
                 }
-                if node.name.len() > 48 {
+                if t.len() > 48 {
                     out.extend_from_slice("…".as_bytes());
                 }
                 out.extend_from_slice(b"\"\n");

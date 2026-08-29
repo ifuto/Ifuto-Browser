@@ -266,15 +266,15 @@ impl DomOut {
             self.run.clear();
             return;
         }
-        // from_bytes + clear で run の確保量を再利用（take → from_vec だと
-        // 次の run が 0 から倍増し直し、テキストノード 1 枚ごとに 2-3 alloc
-        // 払っていた。デッドコピーは載るが alloc 回数の方が支配的）。
-        let name = crate::dom::NameStr::from_bytes(&self.run);
-        self.run.clear();
+        // フェーズ 11: 本文は Dom::set_node_text に集約（>22B は Dom の text_arena
+        // へ bump 追記 + (off,len) 転用。旧 path はテキストノード 1 枚ごとに
+        // 1 malloc = 16MB md で ~60 万回の alloc 交通だった。run の確保量は
+        // clear で再利用するのは従来どおり）。
         let Some(nid) = self.mnew(NodeKind::Text) else {
             return;
         };
-        self.dom.node_mut(nid).name = name;
+        self.dom.set_node_text(nid, &self.run);
+        self.run.clear();
         let cur = self.cur;
         self.attach(cur, nid);
     }
@@ -1432,6 +1432,10 @@ fn md_to_dom_opts_serial(input: &[u8], slim_attrs: bool) -> Option<Dom> {
     // （最終量の ~2 倍コピー）を 1 回の予約で消す。余剰時の無駄を抑えるため
     // 保守的な係数（~10B/ノード）を使う。
     out.dom.nodes.reserve(input.len() / 10);
+    // フェーズ 11: text_arena も予約（実測で md 本文 ~48% が >22B の長文として
+    // arena に入る = 入力の ~1/2。bump 倍増の realloc コピー税を 1 回の予約で
+    // 構造消去。不足時は従来どおり倍増、過剰分は未タッチで RSS 無害）。
+    out.dom.reserve_text_arena(input.len() / 2);
     let mut fn_ = Fn::new();
     run_blocks(&mut out, &mut fn_, input);
     out.run_flush();
@@ -1568,6 +1572,7 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
         let hb = sc.spawn(|| {
             let mut out = DomOut::new(slim_attrs);
             out.dom.nodes.reserve(b_input.len() / 10);
+            out.dom.reserve_text_arena(b_input.len() / 2);
             let mut fn_ = Fn::new();
             run_blocks(&mut out, &mut fn_, b_input);
             out.run_flush();
@@ -1577,6 +1582,9 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
         // 10-g: 全文書係数で予約し、merge 時の成長（134MB 再確保+コピー）を構造消去
         // する（serial と同じ ~10B/ノード見積。B 内容を接合しても capacity は足りる）。
         out_a.dom.nodes.reserve(input.len() / 10);
+        // 11: B の arena を吸収する A 側は全文書係数で 1 回予約（splice 時の
+        // concat 倍増を消す。実測係数 ~1/2）。
+        out_a.dom.reserve_text_arena(input.len() / 2);
         let mut fn_a = Fn::new();
         run_blocks(&mut out_a, &mut fn_a, &input[..split]);
         out_a.run_flush();
@@ -1613,6 +1621,13 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
         // 30ms で 3 変種中最速。V3 は split_off の中間 65MB 確保+copy が致命）。
         let d = base - SKIP;
         const STUB: u32 = SKIP - 1;
+        // フェーズ 11: B 側 text_arena を連結し、B の Text 転用 pun
+        // （kind==Text && extra_idx!=0 のとき attrs_idx=arena off / extra_idx=len）
+        // は off に arena_delta を足す（len は平行不変）。pun ノードには
+        // attrs_tab/extra_tab の remap を効かせてはいけないため算術で排他化
+        // （t=1: +=arena_delta のみ / t=0: 従来 remap。分岐は入れない）。
+        let arena_delta = dom_a.text_arena.len() as u32;
+        dom_a.text_arena.extend_from_slice(&dom_b.text_arena);
         // 迷走分岐の撲滅: parent==STUB（body 直子の割合は入力依存で予測不能）と
         // attrs/extra の 0 判定（~38% 採取）は cmov 級の算術に置き換える。
         dom_a
@@ -1630,12 +1645,13 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
                     debug_assert!(s >= SKIP);
                     s + d
                 });
-                n.attrs_idx += d_attrs * u32::from(n.attrs_idx != 0);
-                n.extra_idx += d_extra * u32::from(n.extra_idx != 0);
+                let t = u32::from(n.kind == NodeKind::Text && n.extra_idx != 0);
+                let s = 1 - t;
+                n.attrs_idx += arena_delta * t + d_attrs * s * u32::from(n.attrs_idx != 0);
+                n.extra_idx += d_extra * s * u32::from(n.extra_idx != 0);
                 n
             }));
     }
-    t = tp("drain", t);
     t = tp("drain", t);
     let bf = map_opt(bf0, base, SKIP);
     let bl = map_opt(bl0, base, SKIP);
@@ -1942,5 +1958,41 @@ mod tests {
             // 分割が見つかる場合、それは fence の外でなければならない
             assert!(p >= big.len() || p <= bound / 2, "fence 内分割は禁物");
         }
+    }
+
+    /// フェーズ 11 ラチェット: >22B テキストは Dom の text_arena 転用
+    /// （name=空, attrs_idx=off, extra_idx=len）で保持され `text_of` が解決
+    /// する。短いテキストは従来どおり inline。機構が黙って退行しないよう
+    /// 表現形式そのものを機械固定する（観測バイトの同値は oracle/fuzz が保証）。
+    #[test]
+    fn text_arena_representation() {
+        let long = "x".repeat(64);
+        let src = format!("# t\n\n{}\n\n短い\n", long);
+        let dom = md_to_dom_opts(src.as_bytes(), true).expect("fastdom");
+        let mut saw_arena = 0usize;
+        let mut saw_inline = 0usize;
+        let mut arena_payload = 0usize;
+        for (i, n) in dom.nodes.iter().enumerate() {
+            if n.kind != NodeKind::Text {
+                continue;
+            }
+            let t = dom.text_of(i as u32);
+            if n.extra_idx != 0 {
+                saw_arena += 1;
+                assert!(n.name.is_empty(), "arena 転用時 name は空規約");
+                arena_payload += t.len();
+                assert_eq!(n.extra_idx as usize, t.len(), "len 一致");
+            } else {
+                saw_inline += 1;
+                assert_eq!(&*n.name, t, "inline は name に収容");
+            }
+            if t.len() == 64 {
+                assert_eq!(t, long.as_bytes(), "本文 byte 一致");
+                assert_ne!(n.extra_idx, 0, "64B は必ず arena 転用");
+            }
+        }
+        assert!(saw_arena >= 1, "長文テキストが arena 転用されていること");
+        assert!(saw_inline >= 1, "短文テキストが inline 収容であること");
+        assert_eq!(dom.text_arena.len(), arena_payload, "arena に無駄がない");
     }
 }

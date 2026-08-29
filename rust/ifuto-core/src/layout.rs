@@ -212,7 +212,7 @@ impl Layout {
         match s.src {
             SEG_SRC_SYN => &self.syn_text[s.start as usize..s.end as usize],
             SEG_SRC_STATIC => b" ",
-            n => &dom.node(n).name[s.start as usize..s.end as usize],
+            n => &dom.text_of(n)[s.start as usize..s.end as usize],
         }
     }
 
@@ -614,7 +614,7 @@ impl<'a> Wrap<'a> {
         match s.src {
             SEG_SRC_SYN => self.syn.borrow()[i],
             SEG_SRC_STATIC => b' ',
-            n => self.dom.node(n).name[i],
+            n => self.dom.text_of(n)[i],
         }
     }
 
@@ -969,7 +969,7 @@ fn flatten_into(pieces: &mut Vec<Piece>, n_prec: &mut u32, lc: &Lc, n: NodeId, s
                 Piece {
                     prov: Prov::Src(n),
                     start: 0,
-                    end: node.name.len() as u32,
+                    end: lc.dom.text_of(n).len() as u32,
                     sid,
                     br: false,
                 },
@@ -1134,7 +1134,7 @@ fn layout_ifc(
         let (fs, plh, ws, _ta) = lc_metrics(lc, piece.sid);
         let ppre = ws == WS_PRE || pre;
         let bytes: &[u8] = match piece.prov {
-            Prov::Src(nid) => &lc.dom.node(nid).name[..],
+            Prov::Src(nid) => lc.dom.text_of(nid),
             Prov::Syn => &syn[piece.start as usize..piece.end as usize],
             Prov::Never => unreachable!("br 以外の Never ピースは生成されない"),
         };
