@@ -474,13 +474,19 @@ impl Emit for DomOut {
 
 // ================= 脚注 =================
 
-/// 脚注テーブル（C の `Fn` 相当。文字列 backend は malloc/free。Rust は所有 `Vec`）。
-struct Fn {
-    defs: Vec<(Vec<u8>, Vec<u8>)>, // (id, text)
-    refs: Vec<Vec<u8>>,            // 参照順（unique）
+/// 脚注テーブル（C の `Fn` 相当。文字列 backend は malloc/free）。
+/// フェーズ 12-a の表現規約:
+/// - **id は `NameStr`**（≤22B は inline で 0 alloc）。脚注 id は実測 ~6.5B
+///   で、1 参照 1 Vec（16MB md で ~30.6 万 malloc、alloc_bt 帰属）が主犯
+///   だった。合成 buffer 由来の id もコピーなので寿命問題を持たない。
+/// - **def text は `&'a [u8]`**（`ln_fndef` が単一行スライスを返す規約により
+///   常に入力/`'\r'` 正規化 buffer 由来。1 def 1 Vec のコピー ~4.4 万も消す）。
+struct Fn<'a> {
+    defs: Vec<(crate::dom::NameStr, &'a [u8])>, // (id, text)
+    refs: Vec<crate::dom::NameStr>,             // 参照順（unique）
 }
 
-impl Fn {
+impl<'a> Fn<'a> {
     fn new() -> Self {
         Fn {
             defs: Vec::new(),
@@ -489,23 +495,23 @@ impl Fn {
     }
 
     fn find_def(&self, id: &[u8]) -> Option<usize> {
-        self.defs.iter().position(|(d, _)| d == id)
+        self.defs.iter().position(|(d, _)| &**d == id)
     }
 
     /// 参照番号（1-based、初出順）。既出なら初出 index+1、未出なら追記して長さ。
     fn ref_number(&mut self, id: &[u8]) -> u32 {
-        if let Some(i) = self.refs.iter().position(|r| r == id) {
+        if let Some(i) = self.refs.iter().position(|r| &**r == id) {
             return (i + 1) as u32;
         }
-        self.refs.push(id.to_vec());
+        self.refs.push(crate::dom::NameStr::from_bytes(id));
         self.refs.len() as u32
     }
 
-    fn add_def(&mut self, id: &[u8], text: &[u8]) {
+    fn add_def(&mut self, id: &[u8], text: &'a [u8]) {
         if self.find_def(id).is_some() {
             return;
         }
-        self.defs.push((id.to_vec(), text.to_vec()));
+        self.defs.push((crate::dom::NameStr::from_bytes(id), text));
     }
 }
 
@@ -662,7 +668,11 @@ fn ln_fndef<'a>(l: Ln<'a>) -> Option<(&'a [u8], &'a [u8])> {
 }
 
 /// `|` 区切りセル分割（trim、末尾空セル除去）。C の `split_cells` 相当。
-fn split_cells(l: Ln, cells: &mut Vec<Vec<u8>>) -> usize {
+/// GFM 表のセル分割（C 同名相当）。フェーズ 12-a: セルは行のトリム済み
+/// スライスを保持する（旧実装は 1 セル 1 `to_vec` で 16MB md 合計 ~35 万
+/// malloc の主犯だった。cells は呼び出し側で再利用して Vec 自体の確保も
+/// 償却する。C の arena スライス規約に safe のまま写る）。
+fn split_cells<'a>(l: Ln<'a>, cells: &mut Vec<&'a [u8]>) -> usize {
     cells.clear();
     let mut i = 0;
     while i < l.len() && (l[i] == b' ' || l[i] == b'\t') {
@@ -676,7 +686,7 @@ fn split_cells(l: Ln, cells: &mut Vec<Vec<u8>>) -> usize {
     for j in i..=l.len() {
         if j == l.len() || l[j] == b'|' {
             let cell = trim(&l[st..j]);
-            cells.push(cell.to_vec());
+            cells.push(cell);
             n += 1;
             st = j + 1;
         }
@@ -701,32 +711,59 @@ fn trim(s: &[u8]) -> &[u8] {
     &s[a..b]
 }
 
+/// 表区切り行の受理判定（C 同名相当）。ゼロアロケーションの単一パススキャナ:
+/// 旧実装は `split_cells` の結果 Vec を 1 ブロック先読みごとに新規確保して
+/// いた（16MB md で ~6.6 万 malloc）。受理規約は旧実装と逐語同値（各セルが
+/// `:`? `-`{3,} `:`? のみで構成される）。
 fn ln_is_table_delim(l: Ln) -> bool {
-    let mut cells = Vec::new();
-    let n = split_cells(l, &mut cells);
-    if n == 0 {
-        return false;
+    // split_cells と同じ境界規約でセルを走査（Vec を作らない）。
+    let mut i = 0;
+    while i < l.len() && (l[i] == b' ' || l[i] == b'\t') {
+        i += 1;
     }
-    for cell in cells {
-        let mut j = 0;
-        if j < cell.len() && cell[j] == b':' {
-            j += 1;
-        }
-        let ds = j;
-        while j < cell.len() && cell[j] == b'-' {
-            j += 1;
-        }
-        if j - ds < 3 {
-            return false;
-        }
-        if j < cell.len() && cell[j] == b':' {
-            j += 1;
-        }
-        if j != cell.len() {
-            return false;
-        }
+    if i < l.len() && l[i] == b'|' {
+        i += 1;
     }
-    true
+    let mut st = i;
+    let mut n = 0;
+    let mut j = i;
+    loop {
+        if j > l.len() || (j == l.len() && st == l.len() && l.is_empty()) {
+            break;
+        }
+        if j == l.len() || l[j] == b'|' {
+            let cell = trim(&l[st..j]);
+            n += 1;
+            // 末尾空セルは split_cells が pop する（受理対象外）
+            let is_last_empty = j == l.len() && cell.is_empty();
+            if !is_last_empty {
+                let mut k = 0;
+                if k < cell.len() && cell[k] == b':' {
+                    k += 1;
+                }
+                let ds = k;
+                while k < cell.len() && cell[k] == b'-' {
+                    k += 1;
+                }
+                if k - ds < 3 {
+                    return false;
+                }
+                if k < cell.len() && cell[k] == b':' {
+                    k += 1;
+                }
+                if k != cell.len() {
+                    return false;
+                }
+            }
+            st = j + 1;
+        }
+        if j == l.len() {
+            break;
+        }
+        j += 1;
+    }
+    // 末尾空セル 1 個は pop されるので、それだけの行は n==0 扱い
+    n > 1 || (n == 1 && !trim(&l[i..]).is_empty())
 }
 
 fn ln_indent(l: Ln) -> usize {
@@ -794,7 +831,7 @@ fn find_close(s: &[u8], from: usize, delim: &[u8]) -> Option<usize> {
 
 /// `[text](dest)` / `![alt](dest)` / `[^id]` / `<http://>` の判定。C の `try_link`。
 /// 成功時は出力して `adv`（消費バイト数）を返す。
-fn try_link<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], i: usize) -> Option<usize> {
+fn try_link<E: Emit>(out: &mut E, fn_: &mut Fn<'_>, s: &[u8], i: usize) -> Option<usize> {
     // footnote ref: [^id]
     if i + 1 < s.len() && s[i + 1] == b'^' {
         let mut j = i + 2;
@@ -808,7 +845,7 @@ fn try_link<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], i: usize) -> Option<us
         if id.is_empty() {
             return None;
         }
-        let seen = fn_.refs.iter().filter(|r| r.as_slice() == id).count();
+        let seen = fn_.refs.iter().filter(|r| &***r == id).count();
         let num = fn_.ref_number(id);
         let idv = if seen > 0 {
             format!("fr-{}-2", String::from_utf8_lossy(id))
@@ -863,7 +900,7 @@ fn try_link<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], i: usize) -> Option<us
     Some(k + 1)
 }
 
-fn inline_span<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8]) {
+fn inline_span<E: Emit>(out: &mut E, fn_: &mut Fn<'_>, s: &[u8]) {
     let mut i = 0;
     while i < s.len() {
         let sp0 = scan_special(s, i);
@@ -1093,7 +1130,14 @@ fn emit_para_lines<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi:
     out.text_ch(b'\n');
 }
 
-fn blocks_win<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usize, depth: usize) {
+fn blocks_win<'a, E: Emit>(
+    out: &mut E,
+    fn_: &mut Fn<'a>,
+    ls: &[Ln<'a>],
+    lo: usize,
+    hi: usize,
+    depth: usize,
+) {
     let mut i = lo;
     while i < hi {
         let l = ls[i];
@@ -1289,7 +1333,10 @@ fn blocks_win<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usiz
             }
         }
         if is_table {
-            let mut heads = Vec::new();
+            // フェーズ 12-a: cells は行スライスの塊をループ外で再利用
+            // （split_cells が clear 済み。旧来の行ごと Vec::new + 1 セル 1
+            // to_vec は消滅）。inline_span の呼出し形状は不変。
+            let mut heads: Vec<&[u8]> = Vec::new();
             let nh = split_cells(l, &mut heads).min(32);
             out.open_push(TAG_TABLE, "table");
             out.text_ch(b'\n');
@@ -1306,11 +1353,11 @@ fn blocks_win<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usiz
             out.open_push(TAG_TBODY, "tbody");
             out.text_ch(b'\n');
             i += 2;
+            let mut cells: Vec<&[u8]> = Vec::new();
             while i < hi && !ln_blank(ls[i]) {
                 if !ls[i].contains(&b'|') {
                     break;
                 }
-                let mut cells = Vec::new();
                 let nc = split_cells(ls[i], &mut cells).min(32);
                 out.open_push(TAG_TR, "tr");
                 for cell in &cells[..nc] {
@@ -1361,7 +1408,7 @@ fn blocks_win<E: Emit>(out: &mut E, fn_: &mut Fn, ls: &[Ln], lo: usize, hi: usiz
     }
 }
 
-fn blocks_str<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], depth: usize) {
+fn blocks_str<'a, E: Emit>(out: &mut E, fn_: &mut Fn<'a>, s: &'a [u8], depth: usize) {
     // 行配列へ分割（ゼロコピー切片）
     let mut ls: Vec<Ln> = Vec::new();
     let mut st = 0usize;
@@ -1385,8 +1432,7 @@ fn blocks_str<E: Emit>(out: &mut E, fn_: &mut Fn, s: &[u8], depth: usize) {
 /// Markdown → HTML 変換。C の `if_md_to_html`（string backend）相当。
 pub fn md_to_html(input: &[u8]) -> Vec<u8> {
     let mut out = StrOut::new();
-    let mut fn_ = Fn::new();
-    run_blocks(&mut out, &mut fn_, input);
+    run_blocks(&mut out, input);
     out.buf
 }
 
@@ -1436,8 +1482,7 @@ fn md_to_dom_opts_serial(input: &[u8], slim_attrs: bool) -> Option<Dom> {
     // arena に入る = 入力の ~1/2。bump 倍増の realloc コピー税を 1 回の予約で
     // 構造消去。不足時は従来どおり倍増、過剰分は未タッチで RSS 無害）。
     out.dom.reserve_text_arena(input.len() / 2);
-    let mut fn_ = Fn::new();
-    run_blocks(&mut out, &mut fn_, input);
+    run_blocks(&mut out, input);
     out.run_flush();
     if out.tainted {
         return None;
@@ -1573,8 +1618,7 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
             let mut out = DomOut::new(slim_attrs);
             out.dom.nodes.reserve(b_input.len() / 10);
             out.dom.reserve_text_arena(b_input.len() / 2);
-            let mut fn_ = Fn::new();
-            run_blocks(&mut out, &mut fn_, b_input);
+            run_blocks(&mut out, b_input);
             out.run_flush();
             (out.dom, out.tainted)
         });
@@ -1585,9 +1629,7 @@ fn md_to_dom_2slice(input: &[u8], slim_attrs: bool, split: usize) -> Option<Dom>
         // 11: B の arena を吸収する A 側は全文書係数で 1 回予約（splice 時の
         // concat 倍増を消す。実測係数 ~1/2）。
         out_a.dom.reserve_text_arena(input.len() / 2);
-        let mut fn_a = Fn::new();
-        run_blocks(&mut out_a, &mut fn_a, &input[..split]);
-        out_a.run_flush();
+        run_blocks(&mut out_a, &input[..split]);
         let j = match hb.join() {
             Ok(v) => v,
             Err(e) => std::panic::resume_unwind(e),
@@ -1696,10 +1738,13 @@ fn map_opt(id: Option<NodeId>, base: u32, skip: u32) -> Option<NodeId> {
     })
 }
 
-fn run_blocks<E: Emit>(out: &mut E, fn_: &mut Fn, input: &[u8]) {
+fn run_blocks<E: Emit>(out: &mut E, input: &[u8]) {
     // CR/CRLF → LF 正規化（'\r' が無ければゼロコピー）
+    // フェーズ 12-a: def text は `s` への借用で保持する（Fn<'s>）。Fn<'s> は
+    // Vec 格納の関係で 's 不変なので、Fn は呼出し側から渡すのではなく本関数の
+    // 各枝で「その場の s と同じ領域」に固有化して生成する。
     let normalized: Vec<u8>;
-    let s: &[u8] = if input.contains(&b'\r') {
+    if input.contains(&b'\r') {
         normalized = {
             let mut v = Vec::with_capacity(input.len());
             let mut i = 0;
@@ -1717,10 +1762,15 @@ fn run_blocks<E: Emit>(out: &mut E, fn_: &mut Fn, input: &[u8]) {
             }
             v
         };
-        &normalized
+        let mut fn_ = Fn::new();
+        run_blocks_inner(out, &mut fn_, &normalized);
     } else {
-        input
-    };
+        let mut fn_ = Fn::new();
+        run_blocks_inner(out, &mut fn_, input);
+    }
+}
+
+fn run_blocks_inner<'s, E: Emit>(out: &mut E, fn_: &mut Fn<'s>, s: &'s [u8]) {
     blocks_str(out, fn_, s, 0);
 
     // 脚注セクション（参照されたものだけ、参照順）
@@ -1733,16 +1783,20 @@ fn run_blocks<E: Emit>(out: &mut E, fn_: &mut Fn, input: &[u8]) {
         out.text_ch(b'\n');
         out.open_push(TAG_OL, "ol");
         out.text_ch(b'\n');
-        let refs = fn_.refs.clone();
-        for id in refs {
+        // フェーズ 12-a: refs/defs の要素はいずれも Copy な `&'a [u8]`。
+        // index 経由で取り出せば借用は即座に切れるため、全体 clone（旧実装は
+        // refs 全要素 Vec + def 文の 1 枚 1 Vec、alloc_bt 帰属クラス）を廃止する。
+        for ri in 0..fn_.refs.len() {
+            // id の clone は ≤22B inline で 0 alloc（借用を即座に切るための局面複写）。
+            let id = fn_.refs[ri].clone();
             let di = fn_.find_def(&id);
             let idv = format!("fn-{}", String::from_utf8_lossy(&id));
             let hrv = format!("#fr-{}", String::from_utf8_lossy(&id));
             out.open_pend(TAG_LI, "li");
             out.attr("id", idv.as_bytes());
             out.open_end();
-            let txt = di.map_or(Vec::new(), |d| fn_.defs[d].1.clone());
-            inline_span(out, fn_, &txt);
+            let txt: &[u8] = di.map_or(&[], |d| fn_.defs[d].1);
+            inline_span(out, fn_, txt);
             out.text_ch(b' ');
             out.open_pend(TAG_A, "a");
             out.attr("href", hrv.as_bytes());

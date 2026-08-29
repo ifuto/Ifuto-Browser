@@ -28,7 +28,7 @@ unsafe impl GlobalAlloc for Bt {
                 for frame in txt
                     .lines()
                     .filter(|ln| ln.contains("ifuto_core"))
-                    .skip(2)
+                    .skip(0)
                     .take(9)
                 {
                     key.push_str(frame.trim());

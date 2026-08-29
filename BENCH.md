@@ -84,7 +84,7 @@ peak RSS 35,596 KB、nodes=206,290。
 
 min **1.40ms** / median **1.66ms** / p90 1.96ms。
 
-### C vs Rust 比較（2026-08-29、移行フェーズ 11。`bench/bench_c_vs_rust.py` 実測）
+### C vs Rust 比較（2026-08-29、移行フェーズ 12-a。`bench/bench_c_vs_rust.py` 実測）
 
 paired interleaved A/B（対ごとに実行順を交互化）で C=`build/ifuto` /
 Rust=`rust/target/release/ifuto` を比較。
@@ -106,31 +106,36 @@ A=[first..mid)/B=[mid..) を独立 Lc で走らせ、整数セル幾何の `y+=h
 extra_idx=len` 転用へ。parse allocs **764,792→655,552（−14.3%）**。書き口
 `set_node_text` / 読み口 `text_of` 各 1 本に集約、`Deref` 無傷（要素名系 ~80 サイト
 非侵略）。arena は入力×~1/2 を 1 回予約（実測係数 0.48）。
+フェーズ 12-a = **md ブロック機構のゼロコピー化**: `split_cells` を `Vec<&[u8]>`
+スライス化 + `ln_is_table_delim` ゼロアロケスキャナ化（テーブル処理が真の主犯
+~415k/655k。parse allocs **655,552→262,270（−60.0%）**）+ `Fn<'a>` 借用化
+（脚注機構の衛生リファクタ。コーパス脚注 0 件で効果ゼロ、perf 主張なし同梱）。
 **環境騒音の注意書き**: 共有ホスト負荷で C 16MB total が 115-141ms の帯で揺れる。
 倍率は paired 値として有効、絶対 ms の過去直較は ±20% 帯で読むこと。
 
 | 指標 | C | Rust | 倍率 (Rust÷C) |
 |---|---|---|---|
-| 16MB total（7 対 median） | 121.28ms | 241.44ms | **1.99×**（前回 2.12×。環境帯 1.99–2.37×） |
-| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 50.97 / 0.01 / 50.74 / 19.49 | 7.43 / 107.00 / 0.04 / 93.93 / 33.57 | — |
-| 16MB wall（7 対 median、外部計時） | 127.88ms | 304.73ms | 2.38× |
-| 16MB peak RSS | 212,896KB | 238,516KB | 1.12×（前回 1.13×。**arena で決定的改善 −1.8MB**） |
-| 2MB total（13 対 median） | 12.56ms | 28.39ms | **2.26×**（前回 2.09×） |
-| 2MB 段別同上 ms | 0.01 / 5.22 / 0.00 / 4.75 / 2.53 | 0.68 / 11.11 / 0.03 / 12.45 / 3.56 | — |
-| 2MB wall | 14.60ms | 34.99ms | 2.40× |
-| 2MB peak RSS | 34,080KB | 36,800KB | 1.08×（前回 1.08×） |
-| ANSI 2MB total（7 対 median） | 34.88ms | 56.20ms | 1.61×（前回 1.80×。render par は ANSI ゲート外=C 規約） |
-| ANSI 2MB render 段（同上） | 22.18ms | 29.02ms | 1.31× |
-| ANSI 2MB peak RSS | 32,448KB | 56,892KB | 1.75×（要監視継続。前回 1.76× → 微改善） |
-| 起動 wall（150 対 median） | 1.6450ms | 1.6275ms | 0.99×（符号 C:R = 77:73。統計的に同値） |
-| md fast-DOM 有無 total（slow÷fast、16MB） | 519.8÷106.3ms = 4.89× | 956.7÷249.1ms = 3.84× | — |
-| md fast-DOM 有無 total（slow÷fast、2MB） | 59.5÷12.9ms = 4.63× | 102.3÷28.5ms = 3.59× | — |
+| 16MB total（7 対 median） | 119.90ms | 273.85ms | **2.28×**（g ランは R 側が騒音区間を被弾。**仲裁 n=21: parse −7.11ms・total −3.99ms で帯 1.99–2.28×**） |
+| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 50.03 / 0.01 / 48.85 / 21.32 | 8.63 / 118.58 / 0.06 / 110.72 / 37.96 | — |
+| 16MB wall（7 対 median、外部計時） | 131.20ms | 346.77ms | 2.64× |
+| 16MB peak RSS | 212,884KB | 238,240KB | 1.12×（前回 1.12×。決定的指標で横這い） |
+| 2MB total（13 対 median） | 12.70ms | 27.10ms | **2.13×**（前回 2.26×） |
+| 2MB 段別同上 ms | 0.01 / 5.35 / 0.00 / 4.75 / 2.53 | 0.69 / 10.85 / 0.03 / 11.99 / 3.66 | — |
+| 2MB wall | 14.68ms | 33.68ms | 2.30× |
+| 2MB peak RSS | 34,176KB | 36,468KB | 1.07×（前回 1.08×。**12-a で決定的改善**） |
+| ANSI 2MB total（7 対 median） | 38.02ms | 72.31ms | 1.90×（前回 1.61×。g ラン騒音区間被弾。render par は ANSI ゲート外=C 規約） |
+| ANSI 2MB render 段（同上） | 23.71ms | 36.35ms | 1.53× |
+| ANSI 2MB peak RSS | 32,392KB | 56,596KB | 1.75×（要監視継続。微改善傾向） |
+| 起動 wall（150 対 median） | 1.3790ms | 1.3855ms | 1.005×（符号 C:R = 75:74。統計的に同値） |
+| md fast-DOM 有無 total（slow÷fast、16MB） | 520.3÷104.2ms = 4.99× | 1,084.4÷260.1ms = 4.17× | — |
+| md fast-DOM 有無 total（slow÷fast、2MB） | 61.6÷13.4ms = 4.58× | 123.5÷31.2ms = 3.96× | — |
 
-段別対比（16MB、median）: parse **2.10×**（前回 2.32×。テキストアリーナが直撃） /
-layout **1.85×**（前回 2.04×） / render **1.72×**（前回 1.58×）。
-フェーズ 10-e〜11 の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
-多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260829f.html`
-（gitignore 対象の生成物。生データは `bench/data-20260829f.json`、再生成手順はレポート §3）。
+段別対比（16MB、median。g ラン）: parse 2.16× / layout 2.27× / render 1.78×
+（**g ランの 16MB R は騒音区間被弾。仲裁 3-way n=21 interleaved: parse
+104.60→97.49ms（−7.11ms）**、layout/render は等価内変動）。
+フェーズ 10-e〜12-a の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
+多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260829g.html`
+（gitignore 対象の生成物。生データは `bench/data-20260829g.json`、再生成手順はレポート §3）。
 **再構成検証（2026-08-29、同一ツリー再計測 data-20260829e.json）**: 砂箱リセットで
 ローカル履歴が消失し working tree から再構成後、同一バイナリで全量ベンチを再採。
 16MB **2.37×**（239.70/101.07。d 値 2.12× より見かけ悪化するが、静寂化で C 側が

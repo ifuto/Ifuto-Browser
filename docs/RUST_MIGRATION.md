@@ -2247,3 +2247,54 @@ startup は 77:73 で引き続き同値。全ペア stdout byte 一致。
 2. layout / render: 単 HT 演算効率の読み合い（C arena+直配列 vs Rust 価格）。
 3. read 段 ~7.4ms vs C 0.02ms（page-fault 税。小粒）。
 4. RSS 残差（shard/render 並列のワーカ複製。ANSI 1.75× は未分析継続）。
+
+## フェーズ 12-a: md ブロック機構のゼロコピー化（split_cells スライス化 + Fn 借用化）— parse allocs −60%
+
+フェーズ 11 残照準 #1（行/ブロック機構 ~611k allocs）への着手。**帰属は 3 連続で
+誤りを踏んだ**: (1) alloc_bt の fn フレーム名は LTO inline 潰れで親名しか出ず、
+(2) 「blocks_str 直下 305,885×6.3B」を**脚注 id と推定して Fn 借用化を実装**したが、
+コーパスの脚亲民合計は **0 件**で効果ゼロと判明、(3) 計測器の `.skip(2)` が最深
+2 フレーム＝真の発生点を捨てていたと気付き alloc_bt 自体を修正。真の帰属は
+**`split_cells` 系 ~415k（全 parse allocs の 63%）**だった（テーブル処理:
+`ln_is_table_delim` の先読み Vec 新規確保 ~6.6 万 + split 1 セル 1 `to_vec` ~35 万）。
+
+### 設計（採択形）
+1. **`split_cells<'a>` → `Vec<&'a [u8]>`**: セルは行のトリム済みスライス。
+   cells Vec は呼び出し側で再利用（clear→再充填）。35 万 malloc を構造消去。
+2. **`ln_is_table_delim` をゼロアロケ単一パススキャナに書き換え**（旧実装は
+   受理判定のために `split_cells` の Vec を毎回新規確保していた）。
+   受理規約は旧実装と逐語同値（`:`? `-`{3,} `:`?。空行・`|`・`---|`・`---||` ・
+   ws 行で逐語整合を検証）。
+3. **Fn<'a> 借用化（12-a 同梱、perf 主張なしの衛生リファクタ）**: 誤帰属の過程で
+   構築。脚注 id を `NameStr`（≤22B inline ゼロアロケ）+ def text を `&'a [u8]`
+   化し、refs/defs 全体 clone を廃止。ベンチコーパスでは脚注 0 件のため効果
+   ゼロ（成果に数えない）。byte-exact 検証済みで C 規約と同型のため同梱する。
+   ※ Fn<'s> は Vec 格納の関係で 's 不変なため、`run_blocks` を wrapper（\r 正規化
+   buffer 所有）/ inner（Fn<'s> 固有化）に分割する構造になった。
+
+### 構造実測（alloc_probe 同一器具、16MB parse）
+| | allocs | bytes |
+|---|---|---|
+| 11（実施前） | 655,552 | 275.3MB |
+| 12-a（採択形） | **262,270（−60.0%）** | **266.1MB** |
+
+差 −393,282 は全量 split_cells 系（Fn はコーパス上ゼロ影響）。11 開始前
+764,792 からの累計で **−65.7%**。
+
+### 実測（system bench data-20260829g.json + 仲裁 A/B）
+g ランの 16MB R 側は n=7 ペアが騒音区間を踏み +32ms に膨れた（fastdom 値も
+全域高い傍証）。**仲裁: 3-way interleaved n=21 で parse 104.60→97.49ms
+（−7.11ms）・total −3.99ms を確認**。paired 値としては 2MB **2.260→2.134×**、
+**RSS 2MB 1.080→1.067（決定的改善）**、ANSI RSS 1.753→1.747、16MB RSS 1.119
+維持。startup 75:74 で同値継続。
+
+### 検証（全て緑）
+- byte-exact: C==R/auto/forced/@1HT × 2 コーパス、oracle **21/21**。
+- cargo test **345** 緑、release build/clippy/fmt 0 警告。
+
+### 残照準
+1. **parse 残 ~262k**: attr 機構 ~65-87k（`elem_store` の name/value Vec。12-b）、
+   cells Vec 成長 22k、pend_attrs 系。attr 値の arena/(off,len) 化は Attr struct
+   共有（html 経路）のため別設計が要る。
+2. layout / render: 単 HT 演算効率（不変の棚卸し）。
+3. read 段 ~7.4ms、ANSI RSS 1.75×（未分析継続）。
