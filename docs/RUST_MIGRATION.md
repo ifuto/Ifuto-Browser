@@ -2456,3 +2456,42 @@ cargo test 345 緑（release）、clippy/fmt 0、差分 fuzz +3,019（seed 27182
    子配列化（Drepper §2.2 教義）の設計踏査。
 3. inline_span 群 ~65k allocs（12-b 残、時間見返りは小）。
 4. read 段（構造確定済み・凍結）。
+
+## フェーズ 12-e: layout 形状解剖（per-atom 照準確定 + ASCII ラン SWAR 化の検証棄却）
+
+layout gap（最大の絶対差）の解剖フェーズ。コード差分はドキュメントコメントのみ
+（後述の検証棄却記録）。
+
+### 形状マトリクス（合成 16MB パターン別、layout 段 interleaved n=7 median）
+| pattern（DOM 形状） | C layout | R layout | R/C |
+|---|---|---|---|
+| fence（pre/code 生テキスト大量行） | 18.03ms | 39.49ms | **2.19×** |
+| blocks（混合ブロック） | 46.67ms | 82.24ms | **1.76×** |
+| head（見出し大量） | 30.18ms | 47.05ms | **1.56×** |
+| table | 146.74ms | 193.64ms | 1.32× |
+| plain | 23.54ms | 28.71ms | 1.22× |
+| list | 53.24ms | 62.08ms | 1.17× |
+| quote | 26.59ms | 29.28ms | 1.10× |
+
+### 検証棄却の記録（ASCII 可視ラン SWAR 化）
+被疑: C は `lw_ascii_run_end` で SSE2/AVX2 一括分類、R は range 判定をバイト毎
+に回す差（layout.rs「アトム切り出し」）。haszero 系 u64 SWAR（範囲 3 検査和集合、
+擬陰性ゼロ設計 + scalar 正確確認）で置換を試みたが **interleaved A/B n=9 で
+fence +2.1%・plain +7.2% の微増悪を計測し棄却・revert**。原因は設計誤り:
+アトムは実コーパスで平均 5-7B と短く、SWAR 窓の立ち上げ費が短ランで利く
+（pcmeqb 展開で敗れた scan_special 12-c 棄却に続く haszero 系 2 連敗。
+**バイト分類は layout 時間の主犯ではなかった**）。証左コメントを local 残置。
+
+### 照準確定（次フェーズ）
+layout の真の主犯は **per-atom / per-row 固定費**（push_seg・ProvSpan 生成・
+push_merge 併合判定・end_line 行組立・deco 追記）。Seg は 24B 痩身済み、
+push_merge も精読ずみで構造上の無駄なし。C IfSeg との処理量差を行/atom 視点で
+再度帰属分解する器具（行/atom カウンタ付き layout 分解例）を設計中。
+render 段も形状別で R/C 1.1-2.0 と横並びに悪い（fence 1.53 等）ため同時照準。
+
+### 実測（system bench data-20260829k.json）
+16MB 2.314× / 2MB 2.032× / ANSI 1.589×。RSS16 1.116・RSS2 1.063・ANSI 1.748
+（決定的指標で横這い）。startup 符号 **118:31**（median C 1.5485/R 1.6410ms、
++92μs。系列 75:74→87:63→112:37→50:100→118:31 と両方向に揺れる jitter 帯だが
+直近 2 run で分裂が大きい。次 run で追跡明記）。byte-exact 16MB OK・test 345 緑・
+clippy/fmt 0。コード不変のため fuzz 累計は 185,266 据置き。

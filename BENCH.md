@@ -84,7 +84,7 @@ peak RSS 35,596 KB、nodes=206,290。
 
 min **1.40ms** / median **1.66ms** / p90 1.96ms。
 
-### C vs Rust 比較（2026-08-29、移行フェーズ 12-d。`bench/bench_c_vs_rust.py` 実測）
+### C vs Rust 比較（2026-08-29、移行フェーズ 12-e（layout 解剖フェーズ）。`bench/bench_c_vs_rust.py` 実測）
 
 paired interleaved A/B（対ごとに実行順を交互化）で C=`build/ifuto` /
 Rust=`rust/target/release/ifuto` を比較。
@@ -122,35 +122,41 @@ total 238.56→236.14ms（−1.0%）。byte-exact ×6・oracle 21/21・test 345 
 0・差分 fuzz +3,019（seed 31415）で 0 mismatch。残 = split_cells 成長 22,024 +
 inline_span 群 ~65k（12-c 照準）。
 フェーズ 12-d = **blocks 機構の再スキャン削減**: table 事前検査の `|` memchr
-先行化（純粋述語の AND 交換で意味不変。`| 無し行での ln_is_table_delim 全走査を
-構造消去）+ fence/list の二重走査 1 回化。仲裁 3-way n=21: **parse −3.03%・
+先行化 + fence/list の二重走査 1 回化。仲裁 3-way n=21: **parse −3.03%・
 total −2.95%**。対 C 精読値 parse 2.048×・total 1.970×。
+フェーズ 12-e = **layout 解剖フェーズ**（コード不変）: 形状マトリクス測定・
+ASCII ラン SWAR 化の検証棄却・照準を per-atom/per-row 固定費に確定。
 **環境騒音の注意書き**: 共有ホスト負荷で C 16MB total が 90-223ms の帯で揺れる。
-j ランは ambient 崩壊帯（C 側 total 223.4ms）で paired 値は帯外ノイズ。
-**跨 run 直較は不可。精読値は同日 3-way 仲裁 n=21 を正とする**。
+倍率は paired 値として有効、絶対 ms の過去直較は ±20% 帯で読むこと。
+跨 run 直較は不可。精読値は同日 3-way 仲裁 n=21 を正とする。
 
 | 指標 | C | Rust | 倍率 (Rust÷C) |
 |---|---|---|---|
-| 16MB total（7 対 median） | 223.41ms | 399.96ms | 1.79×（j ラン激重・帯外。**仲裁 n=21: 12-c→12-d で −2.95%、対 C 1.970×**。実測帯 1.99–2.49×） |
-| 16MB 段別 read/parse/style/layout/render ms | 0.03 / 89.51 / 0.02 / 90.86 / 47.11 | 10.98 / 173.43 / 0.06 / 166.73 / 60.05 | — |
-| 16MB wall（7 対 median、外部計時） | 231.15ms | 491.38ms | 2.13× |
-| 16MB peak RSS | 212,900KB | 237,788KB | 1.12×（決定的指標で横這い） |
-| 2MB total（13 対 median） | 29.95ms | 65.35ms | 2.18×（j ラン高負荷帯の帯内変動） |
-| 2MB 段別同上 ms | 0.03 / 11.91 / 0.01 / 12.48 / 5.44 | 1.38 / 21.81 / 0.06 / 31.49 / 7.78 | — |
-| 2MB wall | 33.67ms | 81.65ms | 2.43× |
-| 2MB peak RSS | 34,160KB | 36,296KB | 1.06× |
-| ANSI 2MB total（7 対 median） | 61.65ms | 96.53ms | 1.57×（render par は ANSI ゲート外=C 規約） |
-| ANSI 2MB render 段（同上） | 39.15ms | 45.19ms | 1.15×（j ラン高負荷帯。帯内で読む） |
-| ANSI 2MB peak RSS | 32,380KB | 56,648KB | 1.75×（要監視継続） |
-| 起動 wall（150 対 median） | 2.6090ms | 2.4880ms | 0.954×（符号 C:R = 50:100、j ラン jitter で帯外れ。系列 median 同値維持） |
-| md fast-DOM 有無 total（slow÷fast、16MB） | 713.6÷167.2ms = 4.27× | 1,253.1÷344.1ms = 3.64× | — |
-| md fast-DOM 有無 total（slow÷fast、2MB） | 115.0÷29.9ms = 3.85× | 156.8÷60.9ms = 2.57×（j ラン後半特に高負荷。帯内で読む） | — |
+| 16MB total（7 対 median） | 124.56ms | 288.23ms | 2.31×（k ラン中程度 ambient。実測帯 1.99–2.49× 内） |
+| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 51.50 / 0.01 / 50.53 / 22.09 | 8.22 / 117.14 / 0.05 / 125.99 / 36.22 | — |
+| 16MB wall（7 対 median、外部計時） | 136.92ms | 351.40ms | 2.57× |
+| 16MB peak RSS | 212,944KB | 237,684KB | 1.12×（決定的指標で横這い） |
+| 2MB total（13 対 median） | 17.75ms | 36.07ms | **2.03×** |
+| 2MB 段別同上 ms | 0.02 / 7.22 / 0.01 / 7.06 / 3.20 | 0.88 / 14.08 / 0.03 / 16.69 / 4.37 | — |
+| 2MB wall | 20.39ms | 45.44ms | 2.23× |
+| 2MB peak RSS | 34,212KB | 36,356KB | 1.06× |
+| ANSI 2MB total（7 対 median） | 43.24ms | 68.70ms | 1.59×（render par は ANSI ゲート外=C 規約） |
+| ANSI 2MB render 段（同上） | 28.36ms | 36.66ms | 1.29× |
+| ANSI 2MB peak RSS | 32,424KB | 56,676KB | 1.75×（要監視継続） |
+| 起動 wall（150 対 median） | 1.5485ms | 1.6410ms | 1.060×（符号 C:R = 118:31。+92μs。系列 jitter 帯だが直近 2 run で分裂大、追跡明記） |
+| md fast-DOM 有無 total（slow÷fast、16MB） | 636.9÷132.3ms = 4.81× | 1,189.2÷280.8ms = 4.23× | — |
+| md fast-DOM 有無 total（slow÷fast、2MB） | 80.5÷17.3ms = 4.65× | 148.2÷36.0ms = 4.12× | — |
 
-段別対比（16MB、median。j ラン激重・帯外）: parse 1.94× / layout 1.83× / render 1.27×
-—— ambient 崩壊時に HT 並列の R が構造的に相対有利になる傾向の観測例。
-フェーズ 10-e〜12-d の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
-多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260829j.html`
-（gitignore 対象の生成物。生データは `bench/data-20260829j.json`、再生成手順はレポート §3）。
+段別対比（16MB、median。k ラン）: parse 2.27× / layout 2.49× / render 1.64×。
+フェーズ 12-e = layout 解剖: 形状マトリクス（fence 2.19×・blocks 1.76×・head
+1.56× が最悪、quote 1.10×/list 1.17×/plain 1.22× は拮抗）+ ASCII ラン SWAR 化
+棄却（haszero 系 2 連敗）+ 照準を per-atom/per-row 固定費に確定。
+フェーズ 10-e〜12-e の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
+多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260829k.html`
+（gitignore 対象の生成物。生データは `bench/data-20260829k.json`、再生成手順はレポート §3）。
+
+※ 併記レポート（同日の連続フェーズ）: 12-c=`report-20260829i.html`、
+12-d=`report-20260829j.html`（いずれも data JSON は git 管理）。
 **再構成検証（2026-08-29、同一ツリー再計測 data-20260829e.json）**: 砂箱リセットで
 ローカル履歴が消失し working tree から再構成後、同一バイナリで全量ベンチを再採。
 16MB **2.37×**（239.70/101.07。d 値 2.12× より見かけ悪化するが、静寂化で C 側が

@@ -840,6 +840,10 @@ fn wrap_text(
         let mut atom_w;
         if (0x21..=0x7E).contains(&b0) {
             // ASCII 可視ラン
+            // ※ 12-e で SWAR 一括分類（haszero 系範囲検査）を試みたが棄却:
+            // アトムは平均 5-7B と短く、SWAR 窓立ち上げ費が短ランで食う
+            // （fence +2.1%/plain +7.2% の微増悪、interleaved A/B n=9）。
+            // バイト分類は時間の主犯ではなかった。スカラを維持する。
             let mut j = i + 1;
             while j < n && (0x21..=0x7E).contains(&s[j]) {
                 j += 1;
