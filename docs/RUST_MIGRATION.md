@@ -2360,3 +2360,62 @@ alloc 単発 A/B の教訓（前フェーズ）通り −65k allocs の時間見
 4. CI 運用: Miri 常設廃止（run 52分07秒→2分05秒の実績）。unsafe 含有 crate
    （akl-core/akl-ffi/ifuto-ffi）差分時のみ scoped Miri を有効化（trigger.md
    CMD 5 コメントの運用規約）。12-b 差分は unsafe 非含有のため非実施で正しい。
+
+## フェーズ 12-c: 計測フェーズ（parse 機能分解 + read 診断 + 海外研究棚卸し）
+
+コード変更なし（コメント整備のみ）の計測・調査フェーズ。次フェーズの手術点を
+データで固定するのが目的。
+
+### 海外高速化研究の棚卸し
+`docs/RESEARCH_SPEED.md` に 13 系統の一次情報（simdjson / Mison / Pison / DP-FSM /
+Keiser&Lemire UTF-8 / Lemire&Muła transcoding / Mimalloc / Drepper / DOD / Servo /
+Bodik 並列ブラウザ / Hyperscan / mmap 対比研究 / BOLT）を、プロジェクト制約
+（依存ゼロ・forbid(unsafe_code)・SIMD intrinsic 禁止→SWAR 代替）との適合性
+マトリクスつきで整理。優先度高は: 構造索引先行+分岐レス化（simdjson 設計原則）、
+Mison 的ビットマップ索引、arena/bump 継続（Mimalloc 局所性理論）、逐次アクセス・
+子配列化（Drepper）、read 段の安全範囲の改善近似。
+
+### parse 機能分解（examples/parse_breakdown.rs 新設。/tmp 合成 16MB×4 クラス）
+| pattern（内訳） | C parse（--stats med n=5） | R md_to_dom（n=7 med） | R/C |
+|---|---|---|---|
+| plain（scan+text 素通し系） | 12.76ms | 19.69ms | 1.5× |
+| table（split_cells 系） | 141.92ms | 253.65ms | 1.8× |
+| blocks（ブロック機構系） | 33.20ms | 72.46ms | 2.1× |
+| inline 過密（参考外） | 863.74ms | None 早期脱出 292ms | — |
+
+C も inline 過密は 863ms と病むため両者同様の非線形点。実コーパス比 2.2× は
+plain/blocks 優位の混合と整合。**次の手術点は blocks（2.1×）と table（1.8×）**。
+
+### read 段診断（R ~7.7-9.3ms vs C ~0.02ms の構造確定）
+- C は `mmap(MAP_PRIVATE)` 遅延マップで、read 段 0.02ms は見せかけ（16MB の
+  fault 税は parse 段で支払う設計。tok は mmap 上を直接参照するゼロコピー）。
+- Rust は `std::fs::read`（fstat 容量予約 + 1 回 read。std 安全範囲の最適形）。
+  費用内訳【推定】: 匿名 16MB の ZFOD fault ~4,096 発 + カーネル copy_user。
+  THP は `madvise` モードで匿名既定非適用（MADV_HUGEPAGE = libc = unsafe 禁止領域）。
+- ユーザー提案「バッファリング」は逆効果と診断: BufReader 8KB 経路にすると
+  syscall が 2,048 発に増え一貫して悪化。`std::fs::read` はすでに単発 read。
+- mmap 化は std に API がなく libc 直接呼出＝ unsafe+依存禁止で棄却。
+  残差 ~+5ms（C が parse 内で払う soft fault 相当を差し引いた正味）は構造的。
+- Rust read+parse 合算（111.7ms級） vs C 合算（40.7ms級）の比較が公平な姿。
+
+### 検証棄却の記録（scan_special 算術判定化）
+simdjson の vectorized classification を SWAR 規約で真似、`IS_SPECIAL_LUT` の
+LUT 参照を == OR 連鎖へ書換え auto-vectorize を誘導 → **interleaved A/B（n=11）
+で plain 19.69→26.20ms の 1.33× 退化を計測し棄却・revert**。理由: LLVM は
+pcmpeqb+pmovmskb+test を 10 クラス分展開する形になり、L1 常駐 LUT のスカラ走査に
+敵わなかった。論文の形の模倣は計測で裏付けなければ採用しない（証左コメントを
+scan_special に明記）。
+
+### 実測（system bench data-20260829i.json）
+機能差分ゼロ（md.rs はコメントのみ）のため h 値と同世代。i ランは全域高負荷帯
+（C 16MB total 131.29ms）で、paired: 16MB 2.31× / 2MB 2.19× / ANSI 1.71×、
+RSS 16MB 1.117・2MB 1.061・ANSI 1.747（決定的指標で横這い）、startup 符号
+112:37（median 1.7505 vs 1.8220ms、重帯 run の帯内変動。系列では同値維持）。
+byte-exact OK・test 全緑。fuzz 累計 182,247（コード不変のため追加分なし）。
+
+### 残照準（12-d 以降）
+1. **blocks 機構（合成比 2.1×）**: blocks_win 行毎処理の内訳分解→削除点の特定。
+2. **table 機構（合成比 1.8×）**: split_cells Vec 成長 22,024 + 呼出経路。
+3. inline_span 群 ~65k allocs（12-b 残）。
+4. layout gap（R ~94-125ms vs C ~39-53ms、最大の絶対差）。子配列化（Drepper §2.2）。
+5. read 段 mmap 代替の将来検討（依存解禁がない限り凍結）。

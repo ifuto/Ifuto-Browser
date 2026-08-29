@@ -789,7 +789,10 @@ fn ln_indent(l: Ln) -> usize {
 fn scan_special(s: &[u8], from: usize) -> usize {
     let mut i = from;
     let n = s.len();
-    // 32B チャンク: 特殊文字が無ければ一括で進める（本文の大部分）
+    // 32B チャンク: 特殊文字が無ければ一括で進める（本文の大部分）。
+    // ※ 算術判定（== OR 連鎖）による auto-vectorize 化はフェーズ 12-c で計測の上
+    // 棄却（interleaved A/B で 1.33× 退化: pcmpeqb/pmovmskb/test を 10 クラス分
+    // 展開し L1 常駐 LUT に敵わず）。LUT スカラを維持する。
     while i + 32 <= n {
         let mut any = false;
         for &b in &s[i..i + 32] {
