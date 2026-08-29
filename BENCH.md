@@ -84,7 +84,7 @@ peak RSS 35,596 KB、nodes=206,290。
 
 min **1.40ms** / median **1.66ms** / p90 1.96ms。
 
-### C vs Rust 比較（2026-08-29、移行フェーズ 12-a。`bench/bench_c_vs_rust.py` 実測）
+### C vs Rust 比較（2026-08-29、移行フェーズ 12-b。`bench/bench_c_vs_rust.py` 実測）
 
 paired interleaved A/B（対ごとに実行順を交互化）で C=`build/ifuto` /
 Rust=`rust/target/release/ifuto` を比較。
@@ -110,32 +110,46 @@ extra_idx=len` 転用へ。parse allocs **764,792→655,552（−14.3%）**。�
 スライス化 + `ln_is_table_delim` ゼロアロケスキャナ化（テーブル処理が真の主犯
 ~415k/655k。parse allocs **655,552→262,270（−60.0%）**）+ `Fn<'a>` 借用化
 （脚注機構の衛生リファクタ。コーパス脚注 0 件で効果ゼロ、perf 主張なし同梱）。
-**環境騒音の注意書き**: 共有ホスト負荷で C 16MB total が 115-141ms の帯で揺れる。
+フェーズ 12-b = **属性機構のゼロアロケ化**: `Attr.name/value: Vec<u8>` を 10-d の
+`NameStr`（24B、≤22B inline 収容）へ。md 経路は属性 1 件 3 確保（pend `to_vec` +
+name `to_vec` + `clone`）だったのを、name=`from_static` 無コピー・value=pend
+`NameStr` を move で **0〜1 確保**（≤22B 値は inline で 0、長い href 等 1）。共通
+`Attr`（html_tok）ごと差し替えたため HTML 経路の短名/短値も inline 化。
+副次: `merge_attrs` の borrow 回避用 全属性名 clone Vec を消去（逐次借用で実は不要
+だった無駄）。parse allocs **262,270→196,710（−25.0%）**、11 前 764,792 から累計
+**−74.3%**。仲裁 3-way n=21 interleaved: parse 104.74→**101.71ms（−2.9%）**、
+total 238.56→236.14ms（−1.0%）。byte-exact ×6・oracle 21/21・test 345 緑・clippy
+0・差分 fuzz +3,019（seed 31415）で 0 mismatch。残 = split_cells 成長 22,024 +
+inline_span 群 ~65k（12-c 照準）。
+**環境騒音の注意書き**: 共有ホスト負荷で C 16MB total が 90-141ms の帯で揺れる。
 倍率は paired 値として有効、絶対 ms の過去直較は ±20% 帯で読むこと。
+h ランは g ランより両側静寂気味（C 側 total 119.9→97.7ms）で、跨 run 直較は不可。
+同日 3-way 仲裁（C/R12-a/R12-b、n=21）の精読値を正とする。
 
 | 指標 | C | Rust | 倍率 (Rust÷C) |
 |---|---|---|---|
-| 16MB total（7 対 median） | 119.90ms | 273.85ms | **2.28×**（g ランは R 側が騒音区間を被弾。**仲裁 n=21: parse −7.11ms・total −3.99ms で帯 1.99–2.28×**） |
-| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 50.03 / 0.01 / 48.85 / 21.32 | 8.63 / 118.58 / 0.06 / 110.72 / 37.96 | — |
-| 16MB wall（7 対 median、外部計時） | 131.20ms | 346.77ms | 2.64× |
-| 16MB peak RSS | 212,884KB | 238,240KB | 1.12×（前回 1.12×。決定的指標で横這い） |
-| 2MB total（13 対 median） | 12.70ms | 27.10ms | **2.13×**（前回 2.26×） |
-| 2MB 段別同上 ms | 0.01 / 5.35 / 0.00 / 4.75 / 2.53 | 0.69 / 10.85 / 0.03 / 11.99 / 3.66 | — |
-| 2MB wall | 14.68ms | 33.68ms | 2.30× |
-| 2MB peak RSS | 34,176KB | 36,468KB | 1.07×（前回 1.08×。**12-a で決定的改善**） |
-| ANSI 2MB total（7 対 median） | 38.02ms | 72.31ms | 1.90×（前回 1.61×。g ラン騒音区間被弾。render par は ANSI ゲート外=C 規約） |
-| ANSI 2MB render 段（同上） | 23.71ms | 36.35ms | 1.53× |
-| ANSI 2MB peak RSS | 32,392KB | 56,596KB | 1.75×（要監視継続。微改善傾向） |
-| 起動 wall（150 対 median） | 1.3790ms | 1.3855ms | 1.005×（符号 C:R = 75:74。統計的に同値） |
-| md fast-DOM 有無 total（slow÷fast、16MB） | 520.3÷104.2ms = 4.99× | 1,084.4÷260.1ms = 4.17× | — |
-| md fast-DOM 有無 total（slow÷fast、2MB） | 61.6÷13.4ms = 4.58× | 123.5÷31.2ms = 3.96× | — |
+| 16MB total（7 対 median） | 97.69ms | 242.81ms | 2.49×（h ランは両側静寂気味で跨 run 直較不可。**同日仲裁 3-way n=21: 対 C 2.16×、12-a→12-b で −1.0%**。実測帯 1.99–2.49×） |
+| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 40.63 / 0.01 / 39.05 / 17.98 | 7.73 / 103.97 / 0.04 / 93.95 / 32.80 | — |
+| 16MB wall（7 対 median、外部計時） | 103.67ms | 300.99ms | 2.90× |
+| 16MB peak RSS | 212,904KB | 238,184KB | 1.12×（前々回 1.12×。決定的指標で横這い） |
+| 2MB total（13 対 median） | 14.46ms | 31.26ms | 2.16×（前回 2.13×。h/g で C 側 +13% の ambient 変位あり、帯内変動） |
+| 2MB 段別同上 ms | 0.01 / 5.90 / 0.01 / 5.29 / 2.79 | 0.74 / 12.05 / 0.03 / 13.81 / 4.08 | — |
+| 2MB wall | 16.56ms | 38.54ms | 2.33× |
+| 2MB peak RSS | 34,184KB | 36,480KB | 1.07×（**12-a 改善値を維持**） |
+| ANSI 2MB total（7 対 median） | 34.00ms | 58.35ms | 1.72×（g ラン 1.90× は騒音区間被弾。render par は ANSI ゲート外=C 規約） |
+| ANSI 2MB render 段（同上） | 22.03ms | 31.77ms | 1.44× |
+| ANSI 2MB peak RSS | 32,444KB | 56,616KB | 1.75×（要監視継続。attr NameStr 化でも横這い） |
+| 起動 wall（150 対 median） | 1.4110ms | 1.4160ms | 1.004×（符号 C:R = 87:63。median 同値。帯内変動） |
+| md fast-DOM 有無 total（slow÷fast、16MB） | 603.4÷133.5ms = 4.52× | 991.1÷250.4ms = 3.96× | — |
+| md fast-DOM 有無 total（slow÷fast、2MB） | 66.1÷15.3ms = 4.32× | 119.3÷34.3ms = 3.48× | — |
 
-段別対比（16MB、median。g ラン）: parse 2.16× / layout 2.27× / render 1.78×
-（**g ランの 16MB R は騒音区間被弾。仲裁 3-way n=21 interleaved: parse
-104.60→97.49ms（−7.11ms）**、layout/render は等価内変動）。
-フェーズ 10-e〜12-a の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
-多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260829g.html`
-（gitignore 対象の生成物。生データは `bench/data-20260829g.json`、再生成手順はレポート §3）。
+段別対比（16MB、median。h ラン）: parse 2.56× / layout 2.41× / render 1.82×
+（h ランは ambient 静寂気味で C 側が速い帯。**仲裁 3-way n=21 interleaved 精読:
+parse 104.74→101.71ms（−3.03ms、−2.9%）**・total −2.42ms（−1.0%）、layout/render
+段は 12-a 非直接比較）。
+フェーズ 10-e〜12-b の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
+多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260829h.html`
+（gitignore 対象の生成物。生データは `bench/data-20260829h.json`、再生成手順はレポート §3）。
 **再構成検証（2026-08-29、同一ツリー再計測 data-20260829e.json）**: 砂箱リセットで
 ローカル履歴が消失し working tree から再構成後、同一バイナリで全量ベンチを再採。
 16MB **2.37×**（239.70/101.07。d 値 2.12× より見かけ悪化するが、静寂化で C 側が
@@ -181,7 +195,7 @@ median n=9、16MB）+ layout shard A/B（16MB、median n=3+7）:
 | Rust ワークスペース（`cargo test --offline` / `--release`） | **345 passed / 0 failed**（akl-core 142 + akl-ffi 6 + ifuto-core 188 + ifuto-cli 9。2026-08-29、フェーズ 11 で +1: text_arena_representation） |
 | 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **21/21 × 両バイナリ**（+4 = Shift_JIS/EUC-JP E2E、+1 = 変換表再生成一致。idm コーパスは gen_idm.py 再生成で復元） |
 | golden（`tests/run_golden.sh`） | 1/1 × 両バイナリ |
-| C↔Rust 差分 fuzz（`tools/diff_fuzz_cli.py`） | **累計 179,228 cases / 0 mismatch**（seed 20260824/1/777/424242/999/31337/20260828/555/4242/20260829/314159/271828/8888/7777×他。stdout/stderr/rc byte 突合、--stats は計測値 scrub・決定値比較。2026-08-29 追加分を含む） |
+| C↔Rust 差分 fuzz（`tools/diff_fuzz_cli.py`） | **累計 182,247 cases / 0 mismatch**（seed 20260824/1/777/424242/999/31337/20260828/555/4242/20260829/314159/271828/8888/7777/31415×他。stdout/stderr/rc byte 突合、--stats は計測値 scrub・決定値比較。2026-08-29 追加分を含む） |
 | chrome 純粋部 C↔Rust 差分 fuzz（`tools/zz_chrome_diff.py`） | **累計 240,000 cases / 0 mismatch**（seed 1/7/42/999/777/424242/20260826。1 入力行=1 出行 byte 突合、両 driver の rc≠0 も不一致扱い。ASan+UBSan 30,000 ×2 で rc=0/stderr 空。2026-08-26） |
 | GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | PASS（C のみ。X 不在環境の proxi、GUI 実機は未検証と明記。Rust 側 --shot は未移植拒否形状のみ fuzz 検証） |
 | 拡張 smoke（`tests/ext_smoke.py`） | **12 checks**（C のみ。console.log 凍結 v1 含む） |

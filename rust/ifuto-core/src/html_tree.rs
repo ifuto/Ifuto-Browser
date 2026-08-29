@@ -2004,9 +2004,15 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn merge_attrs(&mut self, dst: NodeId, tok: &Tok) {
-        let existing: Vec<Vec<u8>> = self.dom.attrs(dst).iter().map(|a| a.name.clone()).collect();
+        // 旧来は borrow 回避に全属性名の clone Vec を作っていたが、参照は逐次で
+        // 競合しない（tok.attrs は dom 外）。重複検査は attrs(dst) を直接読む。
         for a in &tok.attrs {
-            if existing.iter().any(|n| str_eq_ci(n, &a.name)) {
+            if self
+                .dom
+                .attrs(dst)
+                .iter()
+                .any(|n| str_eq_ci(&n.name, &a.name))
+            {
                 continue;
             }
             self.dom.attrs_mut(dst).push(a.clone());
@@ -3341,19 +3347,19 @@ impl<'a> TreeBuilder<'a> {
             .into_iter()
             .map(|mut a| {
                 if ns == Ns::Mathml && str_eq_ci(&a.name, b"definitionurl") {
-                    a.name = b"definitionURL".to_vec();
+                    a.name = crate::dom::NameStr::from_static(b"definitionURL");
                 } else if ns == Ns::Svg {
                     if let Some(pos) = SVG_ATTR_LC
                         .iter()
                         .position(|&lc| str_eq_ci(&a.name, lc.as_bytes()))
                     {
-                        a.name = SVG_ATTR_CANON[pos].as_bytes().to_vec();
+                        a.name = crate::dom::NameStr::from_static(SVG_ATTR_CANON[pos].as_bytes());
                     }
                 }
                 // foreign attr（接頭辞系は case-sensitive）
                 for &(from, to) in FOREIGN_ATTR {
-                    if a.name == from.as_bytes() {
-                        a.name = to.as_bytes().to_vec();
+                    if a.name.as_slice() == from.as_bytes() {
+                        a.name = crate::dom::NameStr::from_static(to.as_bytes());
                         break;
                     }
                 }

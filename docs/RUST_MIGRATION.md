@@ -2298,3 +2298,65 @@ g ランの 16MB R 側は n=7 ペアが騒音区間を踏み +32ms に膨れた�
    共有（html 経路）のため別設計が要る。
 2. layout / render: 単 HT 演算効率（不変の棚卸し）。
 3. read 段 ~7.4ms、ANSI RSS 1.75×（未分析継続）。
+
+## フェーズ 12-b: 属性機構のゼロアロケ化（Attr の NameStr 化）— parse allocs −25.0%
+
+12-a 残照準 #1（attr 機構 ~65-87k）の処理。md 経路では属性 1 件につき **3 確保**
+（`attr()` の pend `to_vec` + `elem_store` の name `to_vec` + value `clone`）が
+掛かっていた（16MB コーパスでリンク 21,848 要素級）。C は pend 固定配列
+`MoPend.an/av[4]` で確保ゼロ。
+
+### 設計（採択形）
+1. **`Attr.name/value: Vec<u8>` → `NameStr`**（10-d の既存 24B inline 文字列。
+   ≤22B は inline 収容でヒープ確保ゼロ、長大は Heap 1 確保=旧 Vec 同世代）。
+   共通 `Attr`（html_tok.rs）ごと差し替えのため **HTML 経路の短名/短値も
+   inline 化**される（グローバルな副作用として黒字）。
+2. md `DomOut`: pend_attrs を `(&'static str, NameStr)` 化し `attr()` 時点で
+   from_bytes（短値はここでも確保ゼロ）。`elem_store` は into_iter で所有権ごと
+   流し、name は `from_static` 無コピー・value は move（旧 2 確保を両方消去）。
+3. 副次: `html_tree::merge_attrs` の borrow 回避用 全属性名 clone Vec を消去
+   （逐次借用で実は不要だった無駄。車輪の撤去）。foreign 属性名調整は全ソース
+   が `'static` なため from_static 化。
+4. `NameStr` に `as_slice`・`Ord/PartialOrd` を追加（`Attr` ソート互換）。
+   `Deref<[u8]>` 無傷のため消費側 ~20 サイトは無侵略（書き換えは eq 系 4 箇所）。
+
+※ 検討して棄却: attr 値の `(off,len)` 借用化は DOM がソースバッファに寿命を
+   依存させる設計になり、HTML 経路（所有値が本質）と attr 表現が分岐する。
+   inline 22B (+Heap 1) で実用上の確保はほぼ消えるため、所有権の明瞭さに軍配。
+
+### 構造実測（alloc_probe 同一器具、16MB parse）
+| | allocs | bytes |
+|---|---|---|
+| 12-a | 262,270 | 266.1MB |
+| 12-b（採択形） | **196,710（−25.0%）** | **265.3MB** |
+
+差 −65,560 は予測帯 ~65-87k の中央（attr 1 件 3 確保 → href 長値の 1 確保のみ
+残存）。11 開始前 764,792 からの累計で **−74.3%**。alloc_bt で attr 系バケットは
+上位から消滅。残 = split_cells Vec 成長 22,024@64B + inline_span 群 ~65k（12-c 照準）。
+
+### 実測（system bench data-20260829h.json + 仲裁 A/B）
+h/g 両ランは ambient 速度レベルが変位（C 16MB total 119.9→97.7ms）しており跨 run
+直較は不可。**仲裁: 3-way interleaved n=21（C / R12-a / R12-b、stdout 全一致検証
+付き）で parse 104.74→101.71ms（−3.03ms、−2.9%）・total 238.56→236.14ms
+（−2.42ms、−1.0%）、対 C 精読値 parse 2.23× / total 2.16×**。決定的指標:
+RSS16 1.119 維持、RSS2 1.067 維持、ANSI RSS 1.745。startup 符号 87:63（median
+1.4110 vs 1.4160 で同値、n=150 帯内変動）。16MB 実測帯は 1.99–2.49×。
+
+alloc 単発 A/B の教訓（前フェーズ）通り −65k allocs の時間見返りは parse −2.9%
+級。glibc tcache + 2 スレッド分散で確保原価は既に低い。構造消去の主眼は
+「C の pend 固定配列 = 確保ゼロ」への構造追従であり、時間は副産物として淡々と積む。
+
+### 検証（全て緑）
+- byte-exact: C==R/auto/forced/@1HT × 2 コーパス（6/6、3 モード全て同一 hash
+  = 並列度非依存の出力決定性）。oracle **21/21**。
+- cargo test **345** 緑、release build/clippy 0 警告。
+- 差分 fuzz +3,019（seed 31415）0 mismatch → 累計 **182,247**。
+
+### 残照準
+1. **parse 残 ~197k**: split_cells Vec 成長 22,024@64B + inline_span 群 ~65k
+   （span バッファ系。12-c 照準）。その他小粒。
+2. layout / render: 単 HT 演算効率（不変の棚卸し）。
+3. read 段 ~7.4-7.7ms、ANSI RSS 1.75×（未分析継続）。
+4. CI 運用: Miri 常設廃止（run 52分07秒→2分05秒の実績）。unsafe 含有 crate
+   （akl-core/akl-ffi/ifuto-ffi）差分時のみ scoped Miri を有効化（trigger.md
+   CMD 5 コメントの運用規約）。12-b 差分は unsafe 非含有のため非実施で正しい。

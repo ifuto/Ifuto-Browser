@@ -90,6 +90,10 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # unsafe 含有 crate は無差分。前 run 33239097931 の Miri exit 1 は timeout 打ち切り（UB 検出 0）であり、
 # 解釈実行全件掃引の常設は構造的に遅すぎるため常設廃止（run 52分07秒 → 本 profile では 2-5 分見込み）。
 
+# 2026-08-29 実行: フェーズ 12-b（属性機構ゼロアロケ化: Attr NameStr 化 + elem_store move 化 + merge_attrs 一時Vec消去）反映後の
+# 検証。CMD 3 test=345 緑に注目。CMD 5 Miri は引き続き skip が正（12-b 差分も unsafe 非含有 crate のみ。
+# html_tok/dom/md/html_tree の Attr 表現変更だが全て ifuto-core: forbid(unsafe_code)）。
+
 # 【運用規約】trigger 発火後は run 完了（result.md 追記）まで trigger.md 以外の push を避けること。
 # 旧 append 実装は run 中の push で non-fast-forward となり結果ブロック喪失（10-e, 10-g/h/i で実績）。
 # 根治版（最新先頭取り直し+retry 化）の修正は .github/workflows 配下のため GitHub App トークンの

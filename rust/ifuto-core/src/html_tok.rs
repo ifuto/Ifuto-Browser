@@ -46,12 +46,14 @@ pub enum TokKind {
 }
 
 /// 属性（名前は ASCII lowercase 正規化済み、値は文字参照デコード済み）。
+/// 【フェーズ 12-b】name/value を `NameStr` 化: 短い属性名（href/alt/class/id/src 等 ≤22B）は
+/// inline 収容でヒープ確保ゼロ、長い値のみ Heap 1 確保（旧 Vec と同世代）。
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Attr {
     /// 属性名（lowercase）。
-    pub name: Vec<u8>,
+    pub name: crate::dom::NameStr,
     /// 属性値（文字参照デコード済み）。
-    pub value: Vec<u8>,
+    pub value: crate::dom::NameStr,
 }
 
 /// トークン（C の `IfTok` 相当。所有 `Vec<u8>` で表現）。
@@ -648,7 +650,7 @@ impl<'a> Tokenizer<'a> {
             }
 
             // 重複属性: first-wins
-            if attrs.iter().any(|a| a.name == aname_lc) {
+            if attrs.iter().any(|a| a.name[..] == aname_lc[..]) {
                 self.errors += 1;
                 continue;
             }
@@ -658,8 +660,8 @@ impl<'a> Tokenizer<'a> {
                 continue;
             }
             attrs.push(Attr {
-                name: aname_lc,
-                value: aval,
+                name: crate::dom::NameStr::from_vec(aname_lc),
+                value: crate::dom::NameStr::from_vec(aval),
             });
         }
     }
@@ -1210,6 +1212,6 @@ mod tests {
             .chain(b"y")
             .copied()
             .collect();
-        assert_eq!(toks[0].attrs[0].value, expect);
+        assert_eq!(toks[0].attrs[0].value.as_slice(), expect.as_slice());
     }
 }

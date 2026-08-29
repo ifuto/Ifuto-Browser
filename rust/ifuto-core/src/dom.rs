@@ -117,6 +117,23 @@ impl NameStr {
             NameStr(NameInner::Heap(v.into_boxed_slice()))
         }
     }
+
+    /// スライス参照（旧 `Vec::as_slice` 互換）。
+    pub fn as_slice(&self) -> &[u8] {
+        self
+    }
+}
+
+impl PartialOrd for NameStr {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NameStr {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (**self).cmp(&**other)
+    }
 }
 
 impl Default for NameStr {
@@ -617,13 +634,13 @@ impl Dom {
         }
         for a in self.attrs_mut(n).iter_mut() {
             if str_eq_ci(&a.name, name) {
-                a.value = value.to_vec();
+                a.value = NameStr::from_bytes(value);
                 return;
             }
         }
         self.attrs_mut(n).push(Attr {
-            name: name.to_vec(),
-            value: value.to_vec(),
+            name: NameStr::from_bytes(name),
+            value: NameStr::from_bytes(value),
         });
     }
 

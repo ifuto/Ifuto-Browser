@@ -191,7 +191,7 @@ struct DomOut {
     /// pend（`g_pend` 相当。attr 呼出で最大 4 件まで蓄積）。
     pend_tag: Tag,
     pend_name: &'static str,
-    pend_attrs: Vec<(&'static str, Vec<u8>)>,
+    pend_attrs: Vec<(&'static str, crate::dom::NameStr)>,
 }
 
 impl DomOut {
@@ -321,15 +321,18 @@ impl DomOut {
                 n.name = name;
             }
             if !pend_attrs.is_empty() {
+                // フェーズ 12-b: into_iter で所有権ごと流す。name は &'static str を
+                // from_static で無コピー採用、value は pend 済み NameStr をそのまま
+                // move（旧来の to_vec + clone の 2 確保を両方消去）。
                 let filtered: Vec<Attr> = pend_attrs
-                    .iter()
+                    .into_iter()
                     .filter(|(an, _)| {
                         // slim: レンダリング経路で読まれる属性のみ保持（C と同一規約）
                         !slim || (tag == TAG_A && *an == "href") || (tag == TAG_IMG && *an == "alt")
                     })
                     .map(|(an, av)| Attr {
-                        name: an.as_bytes().to_vec(),
-                        value: av.clone(),
+                        name: crate::dom::NameStr::from_static(an.as_bytes()),
+                        value: av,
                     })
                     .collect();
                 self.dom.set_attrs(nid, filtered);
@@ -408,8 +411,11 @@ impl Emit for DomOut {
 
     fn attr(&mut self, name: &'static str, value: &[u8]) {
         if self.pend_attrs.len() < 4 {
-            // C `MoPend.an/av[4]` の切り詰め（超過分は黙って捨てる）
-            self.pend_attrs.push((name, value.to_vec()));
+            // C `MoPend.an/av[4]` の切り詰め（超過分は黙って捨てる）。
+            // フェーズ 12-b: 値を NameStr で受ける——短い値（alt/class/id 等 ≤22B）は
+            // inline 収容でこの時点でのヒープ確保も消える。
+            self.pend_attrs
+                .push((name, crate::dom::NameStr::from_bytes(value)));
         }
     }
 
