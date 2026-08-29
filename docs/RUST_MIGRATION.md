@@ -2419,3 +2419,40 @@ byte-exact OK・test 全緑。fuzz 累計 182,247（コード不変のため追�
 3. inline_span 群 ~65k allocs（12-b 残）。
 4. layout gap（R ~94-125ms vs C ~39-53ms、最大の絶対差）。子配列化（Drepper §2.2）。
 5. read 段 mmap 代替の将来検討（依存解禁がない限り凍結）。
+
+## フェーズ 12-d: blocks 機構の再スキャン削減（table 事前検査順序 + 二重走査一回化）— parse −3.03%
+
+12-c で特定した blocks 2.1× / table 1.8× の第 1 弾。構文クラス別計測の深化:
+**微行（5B）では R が 3.2× 速い**（C head_tiny 993.79ms vs R 309.81ms、C の行固定費
+が巨大）のに対し、可変部支配の実コーパス域で R が負ける構造。allocs は既に
+両クラス ~58 で無関係（arena 化が効いている）。残杠杆は per-byte のパス数。
+
+### 設計（採択形。全て純粋述語の評価順最適化で意味不変）
+1. **table 事前検査の `|` memchr 先行化**: 従来は全行で次行の
+   `ln_is_table_delim`（O(len) 全走査）を評価してから当行の `|` 有無を見ていた。
+   AND の純粋述語交換として `l.contains(&b'|')`（auto-vec memchr）を先行させ、
+   `|` 無し行（実コーパス多数派）での is_table_delim 走査を構造消去。
+2. **fence/list の is_some+unwrap 二重走査を 1 回化**（ln_fence/ln_list_item）。
+研究根拠: Drepper「HW prefetcher は順次アクセスに最適・間接参照に無力」に基づく
+パス統合、および simdjson「同じバイトを二度なめるな」原則の逐語適用。
+
+### 実測（仲裁 3-way n=21 interleaved、stdout 全一致検証付き）
+12-c → 12-d: **parse −3.03%・total −2.95%**（ambient 高負荷時で parse −3.88ms）。
+対 C 精読値: **parse 2.048×・total 1.970×**（実測帯 1.99–2.49 の下端へ）。
+system bench data-20260829j.json は激重 run（C 16MB total 223.41ms、ambient
+崩壊帯）で paired 1.790× は帯外ノイズ —— **精読値は仲裁を正**と台帺記する。
+RSS16 1.117 / RSS2 1.063 / ANSI RSS 1.749（決定的指標で横這い）、startup 符号
+50:100（median C 2.609/R 2.488ms、同じ高負荷帯の jitter。系列 median 同値維持）。
+
+### 検証（全て緑）
+byte-exact 6/6（C==R × auto/forced/@1HT × 2 コーパス）、oracle 21/21、
+cargo test 345 緑（release）、clippy/fmt 0、差分 fuzz +3,019（seed 2718281）
+0 mismatch → 累計 **185,266**。
+
+### 残照準
+1. **blocks/table 深層**: 段落継続バッテリーの更なる統合、split_cells 周辺、
+   quote の ln_quote 二重評価（短run で軽微）。
+2. **layout gap**（最大の絶対差。bench 帯 R 94-167ms vs C 39-91ms）:
+   子配列化（Drepper §2.2 教義）の設計踏査。
+3. inline_span 群 ~65k allocs（12-b 残、時間見返りは小）。
+4. read 段（構造確定済み・凍結）。

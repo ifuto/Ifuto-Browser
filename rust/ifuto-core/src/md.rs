@@ -1210,9 +1210,13 @@ fn blocks_win<'a, E: Emit>(
             i += 1;
             continue;
         }
-        // fence
-        if (cs == b'`' || cs == b'~' || cs == b'\t') && ln_fence(l).is_some() {
-            let fsym = ln_fence(l).unwrap().0;
+        // fence（12-d: is_some+unwrap の二重走査を 1 回化）
+        let fence_m = if cs == b'`' || cs == b'~' || cs == b'\t' {
+            ln_fence(l)
+        } else {
+            None
+        };
+        if let Some((fsym, _)) = fence_m {
             let mut k = 0;
             while k < l.len() && l[k] == fsym {
                 k += 1;
@@ -1287,11 +1291,13 @@ fn blocks_win<'a, E: Emit>(
             i = j;
             continue;
         }
-        // list
-        if (cs == b'-' || cs == b'*' || cs == b'+' || cs.is_ascii_digit())
-            && ln_list_item(l).is_some()
-        {
-            let mk = ln_list_item(l).unwrap();
+        // list（12-d: is_some+unwrap の二重走査を 1 回化）
+        let list_m = if cs == b'-' || cs == b'*' || cs == b'+' || cs.is_ascii_digit() {
+            ln_list_item(l)
+        } else {
+            None
+        };
+        if let Some(mk) = list_m {
             let ordered = mk.ordered;
             let base = mk.indent;
             out.open_push(
@@ -1331,14 +1337,16 @@ fn blocks_win<'a, E: Emit>(
             while dsp < dl.len() && (dl[dsp] == b' ' || dl[dsp] == b'\t') {
                 dsp += 1;
             }
+            // フェーズ 12-d: 先行ゲートに当行の `|` memchr（~1B/step の auto-vec
+            // 走査）を置き、`| 無し行での ln_is_table_delim 全走査（O(len)）を
+            // 構造消去する。両者は純粋述語で AND の評価順交換は意味に無関係
+            // （byte-exact で機械確認）。
             if dsp < dl.len()
                 && (dl[dsp] == b'|' || dl[dsp] == b'-' || dl[dsp] == b':')
+                && l.contains(&b'|')
                 && ln_is_table_delim(dl)
             {
-                let has_pipe = l.contains(&b'|');
-                if has_pipe {
-                    is_table = true;
-                }
+                is_table = true;
             }
         }
         if is_table {

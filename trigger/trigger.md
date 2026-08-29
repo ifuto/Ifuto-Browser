@@ -97,6 +97,10 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 2026-08-29 実行: フェーズ 12-c（計測フェーズ: parse 機能分解例 parse_breakdown 新設・read 段診断・海外研究棚卸し・
 # scan_special SIMD化の検証棄却）反映。コード差分は md.rs のコメントのみ（機能は 12-b と同一）。CMD 3 test=345 緑を確認。
 
+# 2026-08-29 実行: フェーズ 12-d（blocks 再スキャン削減: table 事前検査の | memchr 先行化 + fence/list 二重走査1回化、
+# 全て純粋述語順序最適化で意味不変）反映後の検証。仲裁 n=21 で parse −3.03%。CMD 3 test=345 緑に注目。
+# CMD 5 Miri は引き続き skip が正（差分は ifuto-core のみ・unsafe 非含有）。
+
 # 【運用規約】trigger 発火後は run 完了（result.md 追記）まで trigger.md 以外の push を避けること。
 # 旧 append 実装は run 中の push で non-fast-forward となり結果ブロック喪失（10-e, 10-g/h/i で実績）。
 # 根治版（最新先頭取り直し+retry 化）の修正は .github/workflows 配下のため GitHub App トークンの

@@ -58,18 +58,65 @@ fn main() {
         _ => v.extend_from_slice(b"normal paragraph line for blocks class\n"),
     });
 
+    // 5. head: 見出しのみ
+    let hd = mb_pattern("head", |v, n| {
+        v.extend_from_slice(b"## heading number seven with some words\n");
+        if n % 3 == 2 {
+            v.push(b'\n');
+        }
+    });
+    // 6. quote: 引用のみ
+    let qt = mb_pattern("quote", |v, n| {
+        v.extend_from_slice(b"> quoted prose content with enough words to be a real line\n");
+        if n % 8 == 7 {
+            v.push(b'\n');
+        }
+    });
+    // 7. list: 非順序リストのみ
+    let li = mb_pattern("list", |v, n| {
+        v.extend_from_slice(b"- list item with a bunch of plain words inside\n");
+        if n % 10 == 9 {
+            v.push(b'\n');
+        }
+    });
+    // 8. fence: コード塊のみ（raw text 経路）
+    let fc = mb_pattern("fence", |v, n| match n % 9 {
+        0 => v.extend_from_slice(b"```\n"),
+        8 => v.extend_from_slice(b"```\n\n"),
+        _ => v.extend_from_slice(b"let variable_name = compute(something, another, 42);\n"),
+    });
+
+    // 9. head_tiny: 微行見出し（行固定費の剥き出し）
+    let ht = mb_pattern("head_tiny", |v, _n| {
+        v.extend_from_slice(b"## t\n");
+    });
+    // 10. para1: 微行段落 1 行 1 段落（段落機構の行固定費）
+    let p1 = mb_pattern("para1", |v, _n| {
+        v.extend_from_slice(b"x\n\n");
+    });
+
     for (name, buf) in [
         ("plain", &plain),
         ("inline", &inl),
         ("table", &tab),
         ("blocks", &blk),
+        ("head", &hd),
+        ("quote", &qt),
+        ("list", &li),
+        ("fence", &fc),
+        ("head_tiny", &ht),
+        ("para1", &p1),
     ] {
         let mut ts = Vec::new();
         for _ in 0..7 {
             let t0 = Instant::now();
             match ifuto_core::md::md_to_dom(buf) {
-                Some(dom) => { std::hint::black_box(dom.n_nodes); }
-                None => eprintln!("{name}: md_to_dom = None（taint 拒否。CLI 出力は空規約のはず、C と要突合）"),
+                Some(dom) => {
+                    std::hint::black_box(dom.n_nodes);
+                }
+                None => eprintln!(
+                    "{name}: md_to_dom = None（taint 拒否。CLI 出力は空規約のはず、C と要突合）"
+                ),
             }
             ts.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
