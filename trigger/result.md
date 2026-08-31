@@ -2038,3 +2038,36 @@ source: trigger/trigger.md @ 60262c41d32b0cd82b7357085d3258456b8d755c
 - [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
 - [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
+
+### toolchain 実行 (2026-08-31T06:35:42Z) rc=0
+```
+==> ブランチ toolchain-bin にアーカイブ（9 分割）があります。取得して展開します
+==> 展開完了
+rustc 1.98.0 (88d9e12ae 2026-08-18)
+```
+
+### clippy 実行 (2026-08-31T06:36:10Z)
+```
+    Checking akl-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-core)
+   Compiling ifuto-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-ffi)
+    Checking ifuto-core v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-core)
+    Checking akl-ffi v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/akl-ffi)
+    Checking ifuto-cli v0.1.0 (/home/runner/work/Ifuto-Browser/Ifuto-Browser/rust/ifuto-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 6.80s
+```
+# 実行結果 (2026-08-31T06:36:51Z)
+
+source: trigger/trigger.md @ 475e9842b5369c20cb6d70148ee05790a57a9dc8
+
+- [x] [CMD_RESULT 1] `bash trigger/toolchain.sh > /tmp/tc.log 2>&1; rc=$?; { echo ""; echo "### toolchain 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ)) rc=$rc"; echo '```'; tail -80 /tmp/tc.log; echo '```'; } >> trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 2] `cd rust && ../trigger/tc timeout 300 cargo build --workspace` — exit 0
+- [x] [CMD_RESULT 3] `cd rust && ../trigger/tc timeout 300 cargo test --workspace` — exit 0
+- [x] [CMD_RESULT 4] `cd rust && ../trigger/tc timeout 300 cargo clippy --workspace -- -D warnings > /tmp/clippy.log 2>&1; rc=$?; { echo ""; echo "### clippy 実行 ($(date -u +%Y-%m-%dT%H:%M:%SZ))"; echo '```'; tail -50 /tmp/clippy.log; echo '```'; } >> ../trigger/result.md; test $rc -eq 0` — exit 0
+- [x] [CMD_RESULT 5] `echo "miri: skipped（運用規約: unsafe 含有 crate 差分時のみ有効化。trigger.md CMD 5 コメント参照）"` — exit 0
+- [x] [CMD_RESULT 6] `cd rust && ../trigger/tc timeout 900 cargo kani --workspace` — exit 0
+- [x] [CMD_RESULT 7] `cd rust && (../trigger/tc timeout 300 cargo geiger --workspace 2>/dev/null || true)` — exit 0
+- [x] [CMD_RESULT 8] `cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -12 || true)` — exit 0
+- [x] [CMD_RESULT 9] `../trigger/tc cargo fuzz --version 2>/dev/null || echo "cargo-fuzz not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 10] `../trigger/tc flux --version 2>/dev/null || echo "flux not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 11] `../trigger/tc mirai --version 2>/dev/null || echo "mirai not installed (skipped)"` — exit 0
+- [x] [CMD_RESULT 12] `../trigger/tc cargo prusti --version 2>/dev/null || ../trigger/tc prusti-rustc --version 2>/dev/null || echo "prusti not installed (skipped)"` — exit 0
