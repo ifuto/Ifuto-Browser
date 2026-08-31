@@ -2495,3 +2495,75 @@ render 段も形状別で R/C 1.1-2.0 と横並びに悪い（fence 1.53 等）�
 +92μs。系列 75:74→87:63→112:37→50:100→118:31 と両方向に揺れる jitter 帯だが
 直近 2 run で分裂が大きい。次 run で追跡明記）。byte-exact 16MB OK・test 345 緑・
 clippy/fmt 0。コード不変のため fuzz 累計は 185,266 据置き。
+
+## フェーズ 12-f: seg 二重書き消去（seg_arena 直接確定 + RefMut IFC 保持 + pm_key 痩身）— layout 形状別 −0.3〜−10.9%
+
+12-e で確定した照準（per-atom/per-row 固定費）への本手術フェーズ。
+
+### 帰属（新器具 `examples/layout_probe.rs` での計数。合成 16MB 各形状）
+| shape | lines | segs | 二重書き量 |
+|---|---|---|---|
+| fence | 353,205 | 309,054 | 7.4MB |
+| blocks | 426,902 | 384,212 | 9.2MB |
+| head | 415,965 | 415,965 | 10.0MB |
+| plain | 177,852 | 177,852 | 4.3MB |
+| table | 1,449,884 | 1,449,884 | 34.8MB |
+
+C は seg を arena bump に**直接確定**（`wrap_push_seg` = ポインタ加算 + 4 フィールド
+書きのみ、行末コピー無し、`wrap_end_line` は RLine 値レコード追記で O(1)）。
+旧 Rust は scratch `Vec<Seg>` へ push 後、行末に `seg_arena` へ `append` する
+設計だったため **全 seg が二度書き**（上表の memcpy 量）+ 行ごとの RefCell
+borrow_mut ×2 が載っていた。
+
+### 変更（意味不変の構造修正。C `IfWrap` 機構への忠実化）
+1. `Wrap.segs` 廃止 → `seg_arena` 末尾へ直接 push + `line_lo: u32` で現行行の
+   始端を区切る（現行行 = `seg_arena[line_lo..]`。行末 append を消去）。
+   行の排他条件は `len > line_lo`（C `n_segs != 0`・旧 `!segs.is_empty()` と同値）。
+2. `rlines` / `seg_arena` の `&RefCell` 参照を **IFC 期間中 `RefMut` で保持** へ
+   （borrow 税 per-line → per-IFC。IFC は入れ子不可・同時借用なしを監査済。
+   `grow_model` は Cell のみで Vec に触れない）。
+3. `pm_key: Option<(Prov, usize)>`（16B 比較）→ `Option<(u32, u32)>`（8B 比較 1 発）。
+   由来 id は `Seg::src` 列と同じ写像（`prov_src_id`）。
+4. `segs_scratch` スクラッチ機構を廃止（直接 push で不要になった）。
+
+### 手術で踏んだ罠と修復（嘘をつかない台帳: fuzz 検出・設計失敗の記録）
+一時値寿命の Rust 落とし穴を 1 件・不変条件の監査漏れを 1 件踏んだ:
+
+- `Wrap { line_lo: lc.seg_arena.borrow().len(), .., seg_arena: lc.seg_arena.borrow_mut() }`
+  は構造体式フィールドの一時 `Ref` が**文末まで生存**するため実行時に
+  `RefCell already borrowed` で即死（`--no-ansi` 全滅で即検出。`RefMut` を先に
+  文として切る形に修正）。
+- **重大**: diff fuzz seed 55555 が 3 mismatch（`--no-style` 経路で R 側パニック
+  `slice index starts at 4 but ends at 3`）を検出。旧構造では scratch Vec が
+  「現行行の seg 列」を構造的に表現していたが、直接 push 化でそれを失い、
+  wrap 時の行尾空白 trim が **現行行が空の時に確定済み前行の seg を pop/縮小**
+  し RLine 区間を逆転させた。発火条件: `<br>` ピース直後は C 規約で
+  `w.line_w` が前行の値のまま残り（C も同じ stale 動作で byte-exact は保たれる）、
+  空白のみの行で `cx>0` のまま次アトムが幅超過すると trim 経路に来る。
+  C は `w->n_segs > 0`（現行行限定）ガードで防いでいた → **同値の明示ガード
+  `len > line_lo` を trim 経路にも追加** して修復。106B 最小再現
+  （`a  <br>` + `b`*99、--no-style）を `oracle/fuzz-br-trim.html` として
+  `tools/chk_oracle.sh` に 3 モード（noansi/dump-layout/dump-dom）pinning 登録
+  （oracle 21→24）。**監査の教訓: 不変条件「cx>0 ⇒ 現行行に seg あり」は
+  scratch 構造が保っていた暗黙条件で、br stale line_w 経路で偽になる。構造を
+  取り払う時は暗黙の担保を全て明示化せよ**。
+
+### 効果（仲裁 3-way n=21 interleaved median、16MB IDM）
+- layout 段: 136.78 → **132.13ms（−3.40%、−4.65ms）**（NEW/C 2.210×）。
+- 形状別 layout 段（n=15 interleaved、ΔBASE）: fence −2.70% / head −5.26% /
+  blocks −0.32% / table **−10.90%** / plain −4.27%。**5/5 全形状が改善方向** で、
+  幅度は二重書き量の順位（table 34.8MB > head 10MB > blocks 9.2MB > fence
+  7.4MB > plain 4.3MB）と整合 — 機構が帰属通りであることの裏付け。
+- total は −0.46%（parse +2.77% は無変更コードで ambient ノイズ。±20% 帯内）。
+
+### 検証バッテリー（全緑）
+byte-exact 6/6（2 コーパス × auto/forced/ht1）・oracle 24/24（C/R 両バイナリ）・
+cargo test 345 緑・clippy/fmt 0・diff fuzz +10,000（seed 55555、不具合検出→修復→
+再投で **0 mismatch**。累計 **195,266**）。
+
+### 実測（system bench data-20260829l.json）
+16MB 2.207× / 2MB 2.059× / ANSI 1.659×。RSS16 1.112・RSS2 1.064・ANSI 1.744
+（決定的指標で横這い〜微改善）。startup 符号 **61:89**（median C 1.8010/R
+1.7585ms、**R が −42.5μs 速い**。系列 75:74→87:63→112:37→50:100→118:31→61:89
+と両方向に揺れ、前回の R 不利分裂は jitter 帯内の変動と判断 = 追跡結論）。
+byte-exact 16MB OK・test 345 緑・clippy/fmt 0・fuzz 累計 195,266。

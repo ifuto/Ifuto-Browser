@@ -19,6 +19,12 @@ chk b501bebfcfef89e421f99fe6dcd3ffc9a5ca39a028db5ea87ae1d96a05217181 forged.w40 
 chk 8c624e83ca99a57bee92dd87573f4a9264352310e2ff2a6ed08acc3a3316840d forged.w160   "$BIN" --no-ansi --width 160 "$F"
 chk 063da21263a078b9f9329eb68b169ade9216803ea76812f6c121709a8f3f13af forged.dom    "$BIN" --dump-dom "$F"
 chk d011c95a98e3b757ab3e94a7fa6b8d1bbd1fcb38dc9a6f4fc87229c830e37a2f forged.links  "$BIN" --no-ansi --links "$F"
+# 12-f 回帰（fuzz seed 55555 case 7292 検出）: <br> 直後の stale line_w で折返し
+# オーバーした際、確定済み前行の空白 seg を誤 trim する経路。no-style で発現。
+B=oracle/fuzz-br-trim.html
+chk 000470b4338b533edcdf49dd15a945d98402dc540035bfa83309cfa49f4f7b7d brtrim.noansi "$BIN" --no-style --no-ansi "$B"
+chk 4e6152cb86cefa4362aa1fed19489f2ce7672b98203b6d4e46c437fcc25fa0bc brtrim.layout "$BIN" --no-style --dump-layout "$B"
+chk d3dde2d0492e5d0bd10b0ea35d469e8af490dce69e0f4a052409aa331774db11 brtrim.dom    "$BIN" --no-style --dump-dom "$B"
 chk c092c35dcdcc1c1c17379748fb418c3d303ec65c2345152a54cee20fa0230116 idm-2mb.out   "$BIN" --no-ansi "$M2"
 chk d11680089da0fc6e58308fa19622865b19919e261b9caafa484baf4bc7321ab4 idm-16mb.out  "$BIN" --no-ansi "$M16"
 chk ba03f18e5e1bedfd0c5b054be798a32fb888e3e91bdc4e1dd48f8e1298c8e9a0 idm-2mb.w40  "$BIN" --no-ansi --width 40 "$M2"

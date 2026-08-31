@@ -270,8 +270,6 @@ struct Lc<'a> {
     /// IFC ごとに「借用→clear→終端返却」で容量を引き継ぐ（per-IFC Vec 新規確保と
     /// 倍増再配置の連鎖を消す。layout_ifc は入れ子不可・単一スレッド前提で検査済み）。
     pieces_scratch: std::cell::RefCell<Vec<Piece>>,
-    /// 同上（`Wrap::segs` 用。行確定で seg_arena へ移しても容量は残る）。
-    segs_scratch: std::cell::RefCell<Vec<Seg>>,
 }
 
 /// `lc_st_of` の style 解決を display バイト + sid のみで返す版（値の 100B コピーを
@@ -565,11 +563,20 @@ fn geom_cached(lc: &Lc, sid: u32, st: &Style, avail_w: i32) -> Geom {
 }
 
 /// 折り返し文脈（C の `IfWrap` 相当）。
+///
+/// seg の管理は C の arena bump 直接確定の写し: 行ごとの scratch Vec を持たず、
+/// `seg_arena` へ直接 push し `line_lo` で現行行の始端を区切る（現行行 =
+/// `seg_arena[line_lo..]`）。pop（行尾空白 trim）は現行行末の truncate、
+/// merge 判定の排他条件「現行行に seg が存在」は `len > line_lo` で判定する
+/// （C `n_segs != 0` / 旧 scratch `!segs.is_empty()` と厳密同値）。
+/// 旧実装の「scratch push → 行末で arena へ append」は全 seg の二度書き
+/// （16MB で 4-35MB の余分 memcpy）+ 行ごとの RefCell borrow ×2 だった。
 struct Wrap<'a> {
     content_x: i32,
     content_w: i32,
     y: i32,
-    segs: Vec<Seg>,
+    /// 現行行の `seg_arena` 内始端（半開 [line_lo, len) が現行行の seg 列）。
+    line_lo: u32,
     line_w: i32,
     /// LINE box / text-align の出処（tree モードのみ Some。linear では LINE box を
     /// 構築しないため値を持たない = 100B 値コピーの消去）。
@@ -580,9 +587,12 @@ struct Wrap<'a> {
     /// 値同一 ⇒ sid 一意なので sid 比較はポインタ比較と厳密に同値。旧実装の
     /// Style 値比較（word ごとの field 比較連鎖）を O(1) 化する）。
     pm_sid: Option<u32>,
-    /// 直前 seg の由来位置キー（由来クラス, 終端オフセット。merge 判定用。
-    /// C `pm_end`（ポインタ）の追跡モデル。`Prov::Never` の push では `None`）。
-    pm_key: Option<(Prov, usize)>,
+    /// 直前 seg の由来位置キー（由来 id, 終端オフセット。merge 判定用。
+    /// C `pm_end`（ポインタ）の追跡モデル。由来 id は `Seg::src` 列と同じ写像
+    /// （`Prov::Src(n)`→n / `Prov::Syn`→[`SEG_SRC_SYN`]）。8B 1 比較に痩身するため
+    /// `usize` ではなく `u32` で保持（seg オフセットは全経路で `as u32` 済み）。
+    /// `Prov::Never` の push では `None`）。
+    pm_key: Option<(u32, u32)>,
     /// 現行ラインの全グリフが `IF_LF_DIRECT_BYTES` 条件を満たす（C の同名。次行は
     /// `end_line` で `true` に再初期化 — kill が現行にだけ効く C の規約をそのまま持つ）。
     direct_all: bool,
@@ -593,13 +603,27 @@ struct Wrap<'a> {
     /// LINE ボックスの出力先（親ボックスの子列。`no_boxlink` では `None` = 構築しない）。
     lines: Option<&'a mut Vec<BoxNode>>,
     /// 行スイープ用フラット行列（C の行確定時 IfRLine 追記と同点で記録）。
-    rlines: &'a std::cell::RefCell<Vec<RLine>>,
-    /// seg の最終所有先（行確定時に `self.segs` を drain して移す）。
-    seg_arena: &'a std::cell::RefCell<Vec<Seg>>,
+    /// IFC 期間中は `RefMut` を保持し borrow 税を行ごと → IFC ごとに下げる
+    /// （IFC は入れ子不可・同時に他の借用は存在しない。終端で Drop）。
+    rlines: std::cell::RefMut<'a, Vec<RLine>>,
+    /// seg の唯一の所有先。seg はここへ直接 push する（C の arena bump 写し。
+    /// borrow 保持は `rlines` と同じ規約）。
+    seg_arena: std::cell::RefMut<'a, Vec<Seg>>,
 }
 
 fn is_ws(c: u8) -> bool {
     c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == b'\x0c'
+}
+
+/// `Prov` の `Seg::src` 列への写像（merge キーの 8B 比較化に共用）。
+/// `Prov::Src(n)` の n が `SEG_SRC_SYN`/`SEG_SRC_STATIC` sentinel と衝突しない
+/// ことは `Seg::src` の既存前提に同じ（DOM ノード数は u32 全域を使わない）。
+fn prov_src_id(prov: Prov) -> u32 {
+    match prov {
+        Prov::Src(n) => n,
+        Prov::Syn => SEG_SRC_SYN,
+        Prov::Never => SEG_SRC_STATIC,
+    }
 }
 
 /// グリフ幅（C の `lw_glyph_width` 相当。高速レンジ先出しは `glyph_width` と同値）。
@@ -620,16 +644,13 @@ impl<'a> Wrap<'a> {
 
     /// 新規 seg を push（merge なし）。C の `wrap_push_seg` 相当。
     /// テキストはコピーせず出処座標のみを保持する（C のポインタ保持と同値）。
+    /// seg は `seg_arena` の bump 端へ直接確定する（C の arena bump と同じ置き方）。
     fn push_seg(&mut self, prov: Prov, start: usize, end: usize, x: i32, width: i32, sid: u32) {
         if start >= end {
             return;
         }
-        let src = match prov {
-            Prov::Src(n) => n,
-            Prov::Syn => SEG_SRC_SYN,
-            Prov::Never => SEG_SRC_STATIC,
-        };
-        self.segs.push(Seg {
+        let src = prov_src_id(prov);
+        self.seg_arena.push(Seg {
             src,
             start: start as u32,
             end: end as u32,
@@ -641,33 +662,36 @@ impl<'a> Wrap<'a> {
         self.pm_key = if prov == Prov::Never {
             None
         } else {
-            Some((prov, end))
+            Some((src, end as u32))
         };
     }
 
     /// 直前 seg と style・由来が同じで位置上連続なら拡張する合体 push。
     /// C の `wrap_push_merge`（`pm_st == st && pm_end == p` のポインタ比較）の写し。
+    /// 「現行行に seg あり」の排他条件は `len > line_lo`（C `n_segs != 0` と同値。
+    /// これが無いと行確定直後の先頭 seg が前行末 seg に跨行 merge される）。
     fn push_merge(&mut self, sp: ProvSpan, x: i32, width: i32, sid: u32) {
         if sp.start >= sp.end {
             return;
         }
-        if !self.segs.is_empty()
+        if (self.seg_arena.len() as u32) > self.line_lo
             && self.pm_sid == Some(sid)
             && sp.prov != Prov::Never
-            && self.pm_key == Some((sp.prov, sp.start))
+            && self.pm_key == Some((prov_src_id(sp.prov), sp.start as u32))
         {
-            let last = self.segs.last_mut().unwrap();
+            let last = self.seg_arena.last_mut().unwrap();
             last.end = sp.end as u32;
             last.w += width;
-            self.pm_key = Some((sp.prov, sp.end));
+            self.pm_key = Some((prov_src_id(sp.prov), sp.end as u32));
             return;
         }
         self.push_seg(sp.prov, sp.start, sp.end, x, width, sid);
     }
 
     /// 行尾の折り畳み空白 pop（C の `wrap_pop_last_seg` 相当）。
+    /// 現行行の最新端 = arena の bump 端にあることが規約（巻き戻し = truncate）。
     fn pop_last_seg(&mut self) {
-        self.segs.pop();
+        self.seg_arena.pop();
         self.pm_sid = None; // 陳腐化防止（次 push は必ず push_seg 経由で再設定）
         self.pm_key = None;
     }
@@ -707,25 +731,21 @@ impl<'a> Wrap<'a> {
         } else if align == TA_RIGHT && self.line_w < self.content_w {
             shift = self.content_w - self.line_w;
         }
-        if !self.segs.is_empty() && shift != 0 {
-            for s in &mut self.segs {
+        let lo = self.line_lo as usize;
+        if self.seg_arena.len() > lo && shift != 0 {
+            for s in &mut self.seg_arena[lo..] {
                 s.x += shift;
             }
         }
         let direct = self.direct_all;
         self.direct_all = true; // 次行は既定で有効（無効化は note_direct で畳む）
-                                // seg を共有アリーナへ移し、box と RLine の両方に区間を配る
-                                // （C の `w->seg_base` が line box と IfRLine に共有される構造の写し）。
-        let seg_lo;
-        let seg_hi;
-        {
-            let mut arena = self.seg_arena.borrow_mut();
-            seg_lo = arena.len() as u32;
-            arena.append(&mut self.segs);
-            seg_hi = arena.len() as u32;
-        }
-        // C は行確定時に y 加算「前」の w->y を IfRLine に記録する（box y と同値）。
-        self.rlines.borrow_mut().push(RLine {
+                                // seg は arena 直接確定済み（無コピー。C の `w->seg_base` が
+                                // line box と IfRLine に共有される構造の写し）。
+        let seg_lo = self.line_lo;
+        let seg_hi = self.seg_arena.len() as u32;
+        self.line_lo = seg_hi; // 次行の始端（C の n_segs リセットに相当）
+                               // C は行確定時に y 加算「前」の w->y を IfRLine に記録する（box y と同値）。
+        self.rlines.push(RLine {
             y: self.y,
             direct,
             seg_lo,
@@ -887,15 +907,24 @@ fn wrap_text(
 
         // 折り返し判定（pre 以外）
         if !pre && cx > 0 && cx + atom_w > w.content_w {
-            // 行尾の折り畳み空白を除く
-            let trail_ws = match w.segs.last() {
-                Some(last) if w.last_byte(last) == b' ' => Some(last.end - last.start),
-                _ => None,
+            // 行尾の折り畳み空白を除く。
+            // 排他条件「現行行に seg あり」（C `n_segs > 0` と同値）は必須:
+            // br ピース直後は w.line_w が前行の値のまま残り cx>0 でここへ来るが、
+            // 現行行にはまだ seg が無い。ここで無条件に arena.last() を見ると
+            // **確定済み前行の seg を pop/縮小して RLine 区間を破壊する**
+            // （fuzz seed 55555 case 7292 で検出: dump_box の seg_lo=4 > seg_hi=3 逆転）。
+            let trail_ws = if (w.seg_arena.len() as u32) > w.line_lo {
+                match w.seg_arena.last() {
+                    Some(last) if w.last_byte(last) == b' ' => Some(last.end - last.start),
+                    _ => None,
+                }
+            } else {
+                None
             };
             if let Some(slen) = trail_ws {
                 if slen == 1 {
                     w.pop_last_seg();
-                } else if let Some(last) = w.segs.last_mut() {
+                } else if let Some(last) = w.seg_arena.last_mut() {
                     last.end -= 1;
                     last.w -= 1;
                 }
@@ -1071,15 +1100,19 @@ fn layout_ifc(
     // wrap 初期値は stab の field 直読み（値の 100B コピーを伴わない）。
     let (fs0, lh0, ws0, ta0) = lc_metrics(lc, base_sid);
     // per-IFC スクラッチを借用（終端で返却 = 容量引き継ぎ。新規確保・倍増再配置を消す）。
-    let mut segs = std::mem::take(&mut *lc.segs_scratch.borrow_mut());
-    segs.clear();
     let mut pieces = std::mem::take(&mut *lc.pieces_scratch.borrow_mut());
     pieces.clear();
+    // seg_arena / rlines は IFC 期間中 RefMut で保持（borrow 税を行ごと → IFC ごとに。
+    // IFC は入れ子せず同時借用も無い = 過剰チェックの構造的消去）。
+    // seg は arena 直接確定: line_lo はこの IFC 開始時点の bump 位置。
+    // （構造体式内で borrow() すると一時値が文末まで生存して borrow_mut と衝突する
+    //   ため、RefMut を先に文として切る）
+    let arena = lc.seg_arena.borrow_mut();
     let mut w = Wrap {
         content_x,
         content_w,
         y: *y,
-        segs,
+        line_lo: arena.len() as u32,
         line_w: 0,
         align_st: if lc.no_boxlink {
             None
@@ -1093,8 +1126,8 @@ fn layout_ifc(
         dom: lc.dom,
         syn: &lc.syn_text,
         lines,
-        rlines: &lc.rlines,
-        seg_arena: &lc.seg_arena,
+        rlines: lc.rlines.borrow_mut(),
+        seg_arena: arena,
     };
     let mut max_lh = if lh0 > 0.0 { lh0 } else { fs0 * 1.2 };
     let pre = ws0 == WS_PRE;
@@ -1156,12 +1189,11 @@ fn layout_ifc(
         );
     }
     drop(syn);
-    if !w.segs.is_empty() || any_text {
+    if (w.seg_arena.len() as u32) != w.line_lo || any_text {
         w.end_line(max_lh);
     }
     *y = w.y;
     // スクラッチ返却（容量引き継ぎ。次の IFC が確保ゼロで使う）
-    *lc.segs_scratch.borrow_mut() = w.segs;
     *lc.pieces_scratch.borrow_mut() = pieces;
     c
 }
@@ -1550,7 +1582,6 @@ fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32, no_boxlink: bool) -> L
         deco: std::cell::RefCell::new(Vec::new()),
         seg_arena: std::cell::RefCell::new(Vec::new()),
         pieces_scratch: std::cell::RefCell::new(Vec::new()),
-        segs_scratch: std::cell::RefCell::new(Vec::new()),
     };
 
     let mut body: Option<NodeId> = None;
@@ -1671,7 +1702,6 @@ fn build_impl(dom: &Dom, st_src: StSrc, width_cells: i32, no_boxlink: bool) -> L
                 deco: std::cell::RefCell::new(Vec::new()),
                 seg_arena: std::cell::RefCell::new(Vec::new()),
                 pieces_scratch: std::cell::RefCell::new(Vec::new()),
-                segs_scratch: std::cell::RefCell::new(Vec::new()),
             };
             // 外来の body 値を shard 局所 intern へ種蒔き（parent 値同一 ⇒
             // 子孫の解決値も serial と逐語同値。sid 写像は表ごとに閉じる）。

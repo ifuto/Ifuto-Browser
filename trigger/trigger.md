@@ -104,6 +104,12 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 2026-08-29 実行: フェーズ 12-e（layout 解剖フェーズ: 形状マトリクス測定 + ASCII ラン SWAR 化の検証棄却。
 # コード差分は layout.rs の証左コメントのみで機能は 12-d と同一）。CMD 3 test=345 緑を確認。
 
+# 2026-08-29 実行: フェーズ 12-f（seg 二重書き消去: Wrap.segs 廃止→seg_arena 直接確定+line_lo 区切り、
+# rlines/seg_arena の RefMut IFC 保持化、pm_key (u32,u32) 痩身、segs_scratch 廃止。
+# fuzz seed 55555 検出の --no-style trim 経路破壊を C n_segs>0 同値ガードで修復、oracle 21→24 登録。
+# 仲裁 n=21 layout −3.40%、形状別 5/5 改善）。CMD 3 test=345 緑に注目。
+# CMD 5 Miri は引き続き skip が正（差分は ifuto-core のみ・unsafe 非含有。examples/layout_probe.rs は検査対象外）。
+
 # 【運用規約】trigger 発火後は run 完了（result.md 追記）まで trigger.md 以外の push を避けること。
 # 旧 append 実装は run 中の push で non-fast-forward となり結果ブロック喪失（10-e, 10-g/h/i で実績）。
 # 根治版（最新先頭取り直し+retry 化）の修正は .github/workflows 配下のため GitHub App トークンの
