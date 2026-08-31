@@ -110,6 +110,11 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 仲裁 n=21 layout −3.40%、形状別 5/5 改善）。CMD 3 test=345 緑に注目。
 # CMD 5 Miri は引き続き skip が正（差分は ifuto-core のみ・unsafe 非含有。examples/layout_probe.rs は検査対象外）。
 
+# 2026-08-31 実行: フェーズ 12-g（Winner 座標化: Winner.decl: Decl → (sheet,rule,decl) 添字 20B Copy 化で
+# decl.clone() の Vec 確保嵐を構造消去。blocks layout allocs 128,946→43,544（−66%）。
+# 併せて size_probe に Style/BoxNode/RLine/Deco/Seg サイズ計測を追加）。
+# CMD 3 test=345 緑に注目。CMD 5 Miri は引き続き skip が正（差分は ifuto-core css.rs + examples のみ・unsafe 非含有）。
+
 # 【運用規約】trigger 発火後は run 完了（result.md 追記）まで trigger.md 以外の push を避けること。
 # 旧 append 実装は run 中の push で non-fast-forward となり結果ブロック喪失（10-e, 10-g/h/i で実績）。
 # 根治版（最新先頭取り直し+retry 化）の修正は .github/workflows 配下のため GitHub App トークンの

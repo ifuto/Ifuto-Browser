@@ -2567,3 +2567,55 @@ cargo test 345 緑・clippy/fmt 0・diff fuzz +10,000（seed 55555、不具合�
 1.7585ms、**R が −42.5μs 速い**。系列 75:74→87:63→112:37→50:100→118:31→61:89
 と両方向に揺れ、前回の R 不利分裂は jitter 帯内の変動と判断 = 追跡結論）。
 byte-exact 16MB OK・test 345 緑・clippy/fmt 0・fuzz 累計 195,266。
+
+## フェーズ 12-g: Winner 座標化（decl.clone の Vec 確保嵐を消去）— blocks layout −2.8%・layout allocs −66%（同セッション成果 + ASCII ラン auto-vectorize の検証棄却 3 連敗記録）
+
+### 帰属（alloc_bt バックトレース集計で特定）
+blocks 形状（混合ブロック = memo miss 多発）の layout 段で **128,946 allocs/83MB**
+を計数（head は 827 allocs のみ）。主犯は `StyleLazy::get_id` miss 時の
+`compute_style` — 勝者スロット `Winner` が **宣言を `decl.clone()` で値保持**して
+おり、命中ルールの宣言ごとに `Vec<u8>` を個別確保していた（~5B alloc × 大量 miss。
+C は `const IfDecl*` ポインタ保持で確保ゼロ）。head 形状は memo ヒットで経路外
+（= 形状感度の説明がつく）。
+
+### 変更（意味不変の構造修正。C `IfDecl*` 保持の写し）
+`Winner.decl: Decl` → **`(src_sheet: u16, rule: u32, decl: u32)` 添字化**
+（20B `Copy` 型。`WIN_SRC_INLINE = u16::MAX` sentinel で inline 宣言は局所
+`inline_decls` Vec を別槽参照）。勝者比較は spec/order/important/origin のみで
+完結するため参照解決は適用段の 1 回のみ。`collect_from_sheet` にルール添字を
+持たせ、宣言本体は sheet 所有のまま読む。**確保は構造的にゼロ**。
+
+### 効果
+- blocks layout allocs: **128,946 → 43,544（−66.2%）**（head 827→820 = memo 経路は不変）。
+- 仲裁（interleaved、符号検定）: blocks layout −2.81%・total −1.47%（n=21、共に
+  15:6）。独立 2 測定（n=15/n=21）の layout・total 両指標で全て同向き
+  （layout −3.25%/−2.81%、total −4.85%/−1.47%）= 機構一致。
+- 他形状は符号同数〜帯内（fence +0.45% 11:10、head +1.96% 9:12、list +1.77% 5:16）。
+  table は本日の ambient 崩壊（BASE 中央値が run ごとに 182→716ms に揺れる）で
+  −19.97%/+2.77%/−8.88% と読みが暴れたため不採用。**妥協のない記録として、本日の
+  環境騒音では ±2% 級の配対ですら由来不明の揺れに溶けることを明記する**。
+- 採択規則適用: 機構的に厳密優位（確保削除）かつ byte-exact かつメモリ増ゼロ。
+- **偽警報の記録**: 3-way 仲裁（C/BASE/NEW、n=21）で render 段が一見 +7.17% と
+  読めたが、render は本変更の経路外（stab の `Vec<Style>` をそのまま読む）であり
+  機構的に不可能。render 単独の符号検定は 9:12 で有意差なく、中央値は外れ値
+  （92.7/95.5ms 級）への偏りと結論。**中央値だけで裁くと経路不変の差も
+  「回帰」に見える。配対符号と機構可能性を先に見る**、を再確認した。
+
+### 検証棄却の記録（haszero/SIMD 模倣 3 連敗）
+12-e SWAR（fence +2.1%/plain +7.2%）、12-c 算術判定化（1.33× 退化）に続き:
+**32B チャンク `iter().all()` 化（12-g V1）は LLVM が auto-vectorize せず**
+（新旧バイナリの xmm 命令総数が完全一致 14,389 = ベクトル化ゼロを objdump で確認。
+単に 32 比較へ静的展開された）。効果は帯内ノイズと読み分けられず棄却・revert。
+教訓の一般化: **early-exit を含む find-first/all 系は本環境の LLVM では
+ベクトル化されない。C AVX2 の形は intrinsic 禁止下では引けない**。
+fence 形状の ASCII ラン差は構造差として存置（次の照準は per-block / render 側）。
+
+### 検証バッテリー（全緑）
+byte-exact 6/6・oracle 24/24（C/R 両バイナリ）・cargo test 345 緑・clippy/fmt 0・
+diff fuzz +10,000（seed 12344321）で 0 mismatch。累計 **205,266**。
+
+### 実測（system bench data-20260831a.json）
+16MB **2.011×** / 2MB 2.075× / ANSI 1.527×。RSS16 1.111・RSS2 1.063・ANSI 1.737
+（決定的指標で横這い〜微改善傾向継続）。startup 符号 **83:67**（median C
+1.9020/R 1.9615ms、+59μs。系列 75:74→87:63→112:37→50:100→118:31→61:89→83:67
+と両方向反転を継続 = jitter 帯内と確定）。byte-exact 16MB OK・test 345 緑。

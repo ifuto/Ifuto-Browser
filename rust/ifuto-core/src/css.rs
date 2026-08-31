@@ -1565,12 +1565,26 @@ pub struct Style {
     pub strike: bool,
 }
 
+/// 勝者スロット（**宣言の値コピーを持たない座標化**。C の `IfDecl*` 保持と同値:
+/// decl 実体は sheet 側が所有し、Winner は (sheet, rule, decl) 添字で指す）。
+/// 旧実装は勝者確定の度に `decl.clone()` で `Vec<u8>` を個別確保していた
+/// （memo miss ごとの ~5B alloc 嵐。blocks 形状で layout 段 128,946 allocs/83MB
+/// の主犯と alloc_bt で特定）。添字化で collect/適用時の参照解決に変え、
+/// 確保を構造的にゼロにする（勝者比較は spec/order/important/origin のみで完結）。
+const WIN_SRC_INLINE: u16 = u16::MAX;
+
+#[derive(Clone, Copy)]
 struct Winner {
     spec: u32,
     order: u32,
     important: bool,
     origin: u8,
-    decl: Decl,
+    /// 宣言の出処: sheets 添字。[`WIN_SRC_INLINE`] は inline style（局所 Vec 側）。
+    src_sheet: u16,
+    /// ルール添字（inline では未使用 = 0）。
+    rule: u32,
+    /// 宣言添字（inline では局所 decls Vec の添字）。
+    decl: u32,
 }
 
 fn winner_beats(w: &Winner, cur: &Option<Winner>) -> bool {
@@ -1594,11 +1608,12 @@ fn winner_beats(w: &Winner, cur: &Option<Winner>) -> bool {
 fn collect_from_sheet(
     dom: &Dom,
     n: NodeId,
+    src_sheet: u16,
     sh: &StyleSheet,
     origin: u8,
     win: &mut [Option<Winner>],
 ) {
-    for rule in &sh.rules {
+    for (ri, rule) in sh.rules.iter().enumerate() {
         let mut best_spec = 0u32;
         let mut matched = false;
         for sel in &rule.sels {
@@ -1618,7 +1633,9 @@ fn collect_from_sheet(
                 order: rule.order + d as u32,
                 important: decl.important,
                 origin,
-                decl: decl.clone(),
+                src_sheet,
+                rule: ri as u32,
+                decl: d as u32,
             };
             let p = decl.prop as usize;
             if winner_beats(&w, &win[p]) {
@@ -1741,20 +1758,24 @@ fn compute_style(
     win.extend((0..P_N).map(|_| None));
     for (s, sh) in sheets.iter().enumerate() {
         let origin = if s == 0 { ORIGIN_UA } else { ORIGIN_AUTHOR };
-        collect_from_sheet(dom, n, sh, origin, win);
+        collect_from_sheet(dom, n, s as u16, sh, origin, win);
     }
 
-    // 3) inline style
+    // 3) inline style（Winner は座標のみ: decls は局所 Vec を別槽として保持し
+    // 添字で指す。`decl.clone()` の Vec 確保は旧実装の無駄だった）
+    let mut inline_decls: Vec<Decl> = Vec::new();
     if let Some(style_attr) = dom.attr(n, b"style") {
         if !style_attr.is_empty() {
-            let decls = parse_decls(style_attr);
-            for d in decls {
+            inline_decls = parse_decls(style_attr);
+            for (di, d) in inline_decls.iter().enumerate() {
                 let w = Winner {
                     spec: 0xFFFFFF,
                     order: 0xFFFFFF,
                     important: d.important,
                     origin: ORIGIN_INLINE,
-                    decl: d.clone(),
+                    src_sheet: WIN_SRC_INLINE,
+                    rule: 0,
+                    decl: di as u32,
                 };
                 let p = d.prop as usize;
                 if winner_beats(&w, &win[p]) {
@@ -1771,7 +1792,12 @@ fn compute_style(
             Some(w) => w,
             None => continue,
         };
-        let d = &w.decl;
+        // Winner 座標 → 宣言参照の解決（C の `w->decl` ポインタ読みと同値）。
+        let d: &Decl = if w.src_sheet == WIN_SRC_INLINE {
+            &inline_decls[w.decl as usize]
+        } else {
+            &sheets[w.src_sheet as usize].rules[w.rule as usize].decls[w.decl as usize]
+        };
         match p {
             P_FONT_SIZE => {
                 let mut v = -1.0f32;
