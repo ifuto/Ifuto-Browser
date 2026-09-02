@@ -120,6 +120,13 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # alloc_bt の帰属フィルタ拡張 + gen_report.py の出力親 makedirs 追加（results 消失再発の根治）も同梱）。
 # CMD 3 test=345 緑に注目。CMD 5 Miri は引き続き skip が正（差分は ifuto-core + 器具のみ・unsafe 非含有）。
 
+# 2026-09-02 実行: フェーズ 12-i（render 行スイープの sink streaming 化 = C IfBB FILE 直書き写し。
+# cold 時の出力 Vec 初回ページ割当 ~13ms を構造消去。仲裁 n=21: render −26.0%（符号 21:0）、
+# 段 R/C 1.78→1.32、RSS16 236,716→229,260KB / ANSI 56,668→34,412KB。
+# 帰属器具 render_probe（cold/温身分離 + minflt 計数）追加。alloc_bt の .skip(0)
+# と alloc_hist の既存 clippy 警告も併せて解消）。
+# CMD 3 test=345 緑に注目。CMD 5 Miri は引き続き skip が正（差分は ifuto-core/ifuto-cli + 器具・unsafe 非含有）。
+
 # 【運用規約】trigger 発火後は run 完了（result.md 追記）まで trigger.md 以外の push を避けること。
 # 旧 append 実装は run 中の push で non-fast-forward となり結果ブロック喪失（10-e, 10-g/h/i で実績）。
 # 根治版（最新先頭取り直し+retry 化）の修正は .github/workflows 配下のため GitHub App トークンの

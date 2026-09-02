@@ -593,8 +593,16 @@ fn main() {
     // grid=0.00 表記を C の CLI と同一にする）。
     let acc_grid = 0.0f64; // C の CLI sweep 経路は grid=0.00 固定（観測一致）
     let tg1 = Instant::now();
-    let out = render::render_emit_sweep(&dom, &lay, ansi);
-    std::io::stdout().write_all(&out).unwrap();
+    // sink 版: 出力 Vec を全文書分 materialize せず行末単位で stdout へ流す
+    // （C の IfBB FILE 直書き構造の写し。cold 実行時の初回ページ割当 ~26MB 分を
+    // 構造的に消失させる。バイト列は Vec 一括版と厳密一致）。
+    {
+        let so = std::io::stdout();
+        let mut lk = so.lock();
+        render::render_emit_sweep_to(&dom, &lay, ansi, &mut |b: &[u8]| {
+            lk.write_all(b).expect("stdout write");
+        });
+    }
     let acc_emit = tg1.elapsed().as_secs_f64() * 1000.0;
     let t5 = Instant::now();
     // C の CLI は linear build（no_boxlink: 子 BLOCK を木にリンクしない）のため、

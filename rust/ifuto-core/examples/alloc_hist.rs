@@ -111,7 +111,7 @@ fn main() {
     eprintln!("out_bytes={}", out.len());
     eprintln!("size-histogram (2^b..2^(b+1)-1 bytes):");
     let mut base = 1u64;
-    for (_b, c) in HIST.iter().enumerate() {
+    for c in HIST.iter() {
         let n = c.load(Ordering::Relaxed);
         if n > 0 {
             eprintln!(

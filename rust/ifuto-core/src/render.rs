@@ -264,7 +264,34 @@ const RENDER_PAR_MIN_LINES: usize = 256;
 /// 内容行 y で二等分し、[0,r_split) を主、[r_split,my) をワーカへ。B の deco active
 /// 集合は r_split 時点で追記順再構成（境界の状態一意性）。バイト列は行 0..my の
 /// 連結で直列 sweep と厳密一致。kill switch: `IF_RENDER_PAR=0`。
+///
+/// 全量 Vec 返却版（sink 版 [`render_emit_sweep_to`] の薄い wrapper）。
 pub fn render_emit_sweep(dom: &crate::dom::Dom, lay: &Layout, ansi: bool) -> Vec<u8> {
+    let my = lay.height.max(1);
+    let mut v = Vec::with_capacity((my as usize).saturating_mul(16).min(1 << 22));
+    render_emit_sweep_to(dom, lay, ansi, &mut |b: &[u8]| v.extend_from_slice(b));
+    v
+}
+
+/// 行境界 flush 閾値（sink 版の A/直列区間のページ足跡上限。C の IfBB が FILE へ
+/// 逐次流す構造の写し。発行バイト列には無関係 — 分割は行末でのみ）。
+///
+/// 帰属（12-i, plain 16MB を「プロセス起動後 1 回」の cold 条件で実測）: 出力
+/// Vec の初回ページ割当（minflt +6,546 ≈ 26MB 分）が cold sweep 16.5ms のうち
+/// 温身（3.0ms）との差分 ~13ms を占める。C は IfBB streaming でこの会費が
+/// 構造的に存在しないため、sink 版で同型に寄せる。
+const ROW_FLUSH_THRESH: usize = 256 * 1024;
+
+/// 行スイープ発行を sink へ逐次流す版（C の IfBB FILE 直書き構造の写し）。
+/// sink への引き渡し順は `render_emit_sweep` の Vec 内容と厳密一致
+/// （分割は行末のみ）。分割規則・並列ゲートは同一: A 区間は行末 flush、
+/// B 区間は join 後に一括（C の「後半メモリシンク → join 後 fwrite」の写し）。
+pub fn render_emit_sweep_to(
+    dom: &crate::dom::Dom,
+    lay: &Layout,
+    ansi: bool,
+    sink: &mut dyn FnMut(&[u8]),
+) {
     let mx = lay.width.max(1);
     let my = lay.height.max(1);
     if !ansi
@@ -294,26 +321,25 @@ pub fn render_emit_sweep(dom: &crate::dom::Dom, lay: &Layout, ansi: bool) -> Vec
                     active_b.push(i);
                 }
             }
-            let out = std::thread::scope(|sc| {
+            std::thread::scope(|sc| {
                 let hb = sc.spawn(|| {
                     sweep_range_emit(dom, lay, r_split, my, false, li_b, active_b, di_b, mx)
                 });
-                let a = sweep_range_emit(dom, lay, 0, r_split, false, 0, Vec::new(), 0, mx);
+                sweep_range_sink(dom, lay, 0, r_split, false, 0, Vec::new(), 0, mx, sink);
                 let b = match hb.join() {
                     Ok(v) => v,
                     Err(e) => std::panic::resume_unwind(e),
                 };
-                let mut o = a;
-                o.extend_from_slice(&b);
-                o
+                if !b.is_empty() {
+                    sink(&b);
+                }
             });
-            return out;
+            return;
         }
     }
-    sweep_range_emit(dom, lay, 0, my, ansi, 0, Vec::new(), 0, mx)
+    sweep_range_sink(dom, lay, 0, my, ansi, 0, Vec::new(), 0, mx, sink);
 }
 
-/// 行範囲 [r0, r1) の sweep 発行本体（C の `sweep_range` 写し）。
 #[allow(clippy::too_many_arguments)]
 fn sweep_range_emit(
     dom: &crate::dom::Dom,
@@ -326,13 +352,45 @@ fn sweep_range_emit(
     di0: usize,
     mx: i32,
 ) -> Vec<u8> {
+    // 出力は行×(幅+装飾) に比例するため重めに事前確保（再配置の削減のみ。
+    // バイト列には無関係）
+    let mut v = Vec::with_capacity(((r1 - r0) as usize).saturating_mul(16).min(1 << 22));
+    sweep_range_sink(
+        dom,
+        lay,
+        r0,
+        r1,
+        ansi,
+        li0,
+        active0,
+        di0,
+        mx,
+        &mut |b: &[u8]| v.extend_from_slice(b),
+    );
+    v
+}
+
+/// 行範囲 [r0, r1) の sweep 発行を sink へ流す版（本体。`sweep_range_emit` は
+/// これの Vec collect wrapper）。flush は行末のみ — 発行バイト列は直列一括版と
+/// 厳密一致（行途中では切らない）。
+#[allow(clippy::too_many_arguments)]
+fn sweep_range_sink(
+    dom: &crate::dom::Dom,
+    lay: &Layout,
+    r0: i32,
+    r1: i32,
+    ansi: bool,
+    li0: usize,
+    active0: Vec<usize>,
+    di0: usize,
+    mx: i32,
+    sink: &mut dyn FnMut(&[u8]),
+) {
     let mut s = Sweep {
         lay,
         dom,
         mx,
-        // 出力は行×(幅+装飾) に比例するため重めに事前確保（再配置の削減のみ。
-        // バイト列には無関係）
-        out: Vec::with_capacity(((r1 - r0) as usize).saturating_mul(16).min(1 << 22)),
+        out: Vec::with_capacity(ROW_FLUSH_THRESH.min(1 << 22)),
         cur: PDEF,
         active: active0,
         di: di0,
@@ -342,8 +400,14 @@ fn sweep_range_emit(
     let mut r = r0;
     while r < r1 {
         r = s.emit_row(r, r1, ansi);
+        if s.out.len() >= ROW_FLUSH_THRESH {
+            sink(&s.out); // 行末点（発行バイト列には無関係）
+            s.out.clear();
+        }
     }
-    s.out
+    if !s.out.is_empty() {
+        sink(&s.out);
+    }
 }
 
 impl<'a> Sweep<'a> {

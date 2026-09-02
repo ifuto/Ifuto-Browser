@@ -2659,3 +2659,50 @@ diff fuzz +10,000（seed 987654）で 0 mismatch。累計 **215,266**。
 （決定的指標で横這い）。startup 符号 **92:58**（median C 1.6880/R 1.7310ms、
 +43μs。系列 75:74→87:63→112:37→50:100→118:31→61:89→83:67→92:58 と
 両方向反転を継続 = jitter 帯）。byte-exact 16MB OK・test 345 緑。
+
+## フェーズ 12-i: render 行スイープを sink streaming 化 — cold render −26%、段 R/C 1.78→1.32（16MB）
+
+### 帰属（解剖プローブ render_probe を新造して分離）
+形状別 render 段の R/C を --stats で走査: no-ansi が 1.60–2.04・ANSI が 1.26–1.61
+で全面後れ。だが in-process（温身）で同一 sweep を計ると **R serial 3.9–4.9ms /
+parallel 3.0ms で C serial 3.5–4.3ms と同等**。CLI cold（一切れの新プロセスで
+1 回）と温身の差分こそが本体だった。/proc/self/stat の minflt 計数で確定:
+**cold sweep 16.5ms のうち温身 3.0ms との差 ~13ms は出力 Vec 初回ページ割当
+（minflt +6,546 ≈ 26MB 分）**。C は IfBB が FILE へ逐次流す streaming 構造のため
+この会費が構造的に存在しない。R の render_emit_sweep は全量 Vec を materialize
+してから一括 write していた（sweep_range_emit の doubler 確保×2 スレッドで
+peak も悪化）。枠組み教訓: **このツール群の計測は「1 プロセス 1 回」の cold が
+本番条件。in-process の中央値ループは温身を測るため、page 確保系の帰属には
+/proc/self/stat の fault 計数を必ず添えよ**。
+
+### 変更（意味不変。C の構造写し）
+- `render_emit_sweep_to(dom, lay, ansi, sink)` を新設し、行末単位で sink へ流す
+  （flush 閾値 `ROW_FLUSH_THRESH=256KB`、分割は行末のみ = C IfBB の FILE 直書き
+  写し。並列時は「A 区間 = sink 逐次 / B 区間 = join 後一括」で C の
+  「後半メモリシンク → join 後 fwrite」と同型）。
+- 既存 `render_emit_sweep` は sink 版の Vec collect wrapper に一本化（行ループの
+  二重実装は残さない。発行バイト列は sink 引き渡し順で厳密一致）。
+- CLI は sweep + `write_all(17MB)` を sink 直接 stdout lock へ切替。
+
+### 効果（同日 3-way 仲裁 n=21、16MB）
+- render: BASE 38.76 → NEW 28.70ms（**−26.0%、符号 21:0**）。段 R/C 1.782→**1.320**。
+- total: 284.71 → 272.16ms（−4.4%、符号 15:6）。total R/C 2.058→1.967。
+- **peak RSS 16MB: 236,716 → 229,260KB（−7.3MB。対 C 比 1.112→1.077）**。
+  ANSI 2MB RSS は 56,668→34,412KB（対 C 比 1.748→**1.061**）= ANSI 出力の
+  巨大 out Vec materialize 消失が効いた（決定的指標で明確な改善）。
+- plain 形状の cold render: 15.7 → ~9.0ms で C（7.7–8.4ms）帯に突入。
+- 残: head_tiny/para1 の微行形状は行固定費支配で依然 R/C ~1.9–2.0（微行は
+  実コーパスの総量には効かない別課題として台帳化）。
+
+### 検証バッテリー（全緑）
+byte-exact 6/6（auto/forced/ht1 × 2 コーパス）・oracle 24/24 × 両バイナリ・
+test 345 緑・clippy/fmt 0（ alloc_hist の既存警告1件も併せて解消）。
+diff fuzz: **手続きミスを記録** — 当初 seed 424242 で +10,000 を回したが同 seed は
+既往で同コーパスの単なる再実行（新規網羅なし・0 mismatch）。新 seed 20260902 で
++10,000 を別途実行し 0 mismatch。**累計 distinct 225,266**。
+
+### 実測（system bench data-20260902a.json）
+16MB **2.137×**（render 1.226）/ 2MB 2.007×（render 1.061）/ ANSI 1.485×
+（render 1.050）。RSS16 1.077・RSS2 1.063・ANSI 1.061。startup 符号 68:82
+（median C 1.7350/R 1.7320ms、−3μs。系列 …→92:58→**68:82** と両方向反転継続
+= jitter 帯）。fastdom 16MB slow÷fast: C 4.71× / R 4.14×。byte-exact 16MB OK。

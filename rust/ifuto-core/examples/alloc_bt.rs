@@ -34,7 +34,6 @@ unsafe impl GlobalAlloc for Bt {
                             || ln.contains("hashbrown")
                             || ln.contains("HashMap")
                     })
-                    .skip(0)
                     .take(12)
                 {
                     key.push_str(frame.trim());
