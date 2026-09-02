@@ -2619,3 +2619,43 @@ diff fuzz +10,000（seed 12344321）で 0 mismatch。累計 **205,266**。
 （決定的指標で横這い〜微改善傾向継続）。startup 符号 **83:67**（median C
 1.9020/R 1.9615ms、+59μs。系列 75:74→87:63→112:37→50:100→118:31→61:89→83:67
 と両方向反転を継続 = jitter 帯内と確定）。byte-exact 16MB OK・test 345 緑。
+
+## フェーズ 12-h: ol マーカーの String 確保消去（序数をスタック itoa 化）— blocks layout allocs 43,544 → 854（−98%）
+
+### 帰属（alloc_bt フィルタ拡張で特定）
+12-g 後の blocks 残存 43,544 allocs（8B×~21.3k×2 shard）の正体を追跡。初期の
+バックトレース集計は ifuto_core フレームのみ抽出していたため inline 化された
+呼出元が見えず、`alloc::vec`/`alloc::raw_vec` をフィルタに追加して再帰属:
+**`deco_marker_push` の `format!("{}.", li_ord)` が ol の <li> ごとに String
+（u8 Vec の MIN_NON_ZERO_CAP=8B）を 1 発確保**していた（C は snprintf で
+スタック書き込み。8B 一律×42,690 という観測形状と厳密一致）。枠組み教訓:
+**inline 化で型フレームが消えるため、帰属器は std 汎用フレームも拾う設計に
+しておけ**（器具を恒久改修）。
+
+### 変更（意味不変）
+序数をスタック `[u8; 10]` に逆順構築して `'.'` を付記（u32 最大 10 桁 + '.' =
+11B ≤ 12 で C の不トランケート規約と同値）。確保は構造的にゼロ。
+`deco_marker_push` 内の ul 側は元々無確保。
+
+### 効果（決定的指標が主。時間は帯内）
+- blocks layout allocs: 43,544 → **854（−98.0%）**。list も同 854。残存 854 は
+  UA シート parse（build/shard ごとの定数 ~387×2）+ 主要 Vec の amortized 成長
+  = head 形状と同水準。**12-g 累計で 128,946 → 854（−99.3%）**。
+- 時間（interleaved n=15）: blocks +0.51%（5:10）・list −0.22%（7:8）・
+  table −5.25%（10:5）= 全て帯内・符号中立。glibc tcache の 8B 確保は ~5-15ns
+  で ~0.2-0.6ms 規模のため本環境のノイズに溶ける。**採択は「機構的に厳密優位
+  （確保構造消去）かつ byte-exact かつメモリ増ゼロ」の規則適用**であり、
+  時間の主張は行わない（嘘をつかない）。
+- 併せて根治: `bench/gen_report.py` が出力親ディレクトリを `makedirs(exist_ok=True)`
+  するように改修（gitignore 配下の bench/results が砂箱リセットで消え HTML 生成が
+  FileNotFoundError になる再発を防止。本セッションで 2 回踏んだ）。
+
+### 検証バッテリー（全緑）
+byte-exact 6/6・oracle 24/24・cargo test 345 緑・clippy/fmt 0・
+diff fuzz +10,000（seed 987654）で 0 mismatch。累計 **215,266**。
+
+### 実測（system bench data-20260831b.json）
+16MB 2.148× / 2MB 2.105× / ANSI 1.774×。RSS16 1.112・RSS2 1.063・ANSI 1.748
+（決定的指標で横這い）。startup 符号 **92:58**（median C 1.6880/R 1.7310ms、
++43μs。系列 75:74→87:63→112:37→50:100→118:31→61:89→83:67→92:58 と
+両方向反転を継続 = jitter 帯）。byte-exact 16MB OK・test 345 緑。

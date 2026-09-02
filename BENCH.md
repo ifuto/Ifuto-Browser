@@ -84,7 +84,7 @@ peak RSS 35,596 KB、nodes=206,290。
 
 min **1.40ms** / median **1.66ms** / p90 1.96ms。
 
-### C vs Rust 比較（2026-08-31、移行フェーズ 12-g（Winner 座標化フェーズ）。`bench/bench_c_vs_rust.py` 実測）
+### C vs Rust 比較（2026-08-31、移行フェーズ 12-h（マーカー確保消去フェーズ）。`bench/bench_c_vs_rust.py` 実測）
 
 paired interleaved A/B（対ごとに実行順を交互化）で C=`build/ifuto` /
 Rust=`rust/target/release/ifuto` を比較。
@@ -149,45 +149,44 @@ scratch `Vec` へ push →行末 `seg_arena` append していた旧構造（= �
 **環境騒音の注意書き**: 共有ホスト負荷で C 16MB total が 90-223ms の帯で揺れる
 （2026-08-31 は BASE 中央値が run ごとに 182→716ms に崩れる日で、±2% 級の配対は
 由来不明の揺れに溶ける。table 形状の読みは暴れたため不採用とした）。
+フェーズ 12-h = **ol マーカーの String 確保消去**: `format!("{}.", li_ord)` が
+<li> ごとに 8B String を確保していたのをスタック itoa 化（C snprintf 写し。
+帰属は alloc_bt のフィルタ拡張で特定 — inline 化で消える型フレームを拾う恒久改修）。
+blocks layout allocs 43,544 → **854（−98%）**、12-g からの累計 128,946 → 854
+（**−99.3%**。残存は UA シート parse 定数 + amortized Vec 成長 = head 水準）。
+時間は帯内（glibc tcache が速く ~0.2-0.6ms 規模）のため確保指標のみを主張する。
+併せて `bench/gen_report.py` に出力親の makedirs を追加（results 消失再発の根治）。
 倍率は paired 値として有効、絶対 ms の過去直較は ±20% 帯で読むこと。
 跨 run 直較は不可。精読値は同日 3-way 仲裁 n=21 を正とする。
 
 | 指標 | C | Rust | 倍率 (Rust÷C) |
 |---|---|---|---|
-| 16MB total（7 対 median） | 156.26ms | 314.21ms | **2.01×**（a ラン中程度 ambient。実測帯 1.99–2.49× 内） |
-| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 63.83 / 0.02 / 62.29 / 24.34 | 9.04 / 123.85 / 0.05 / 139.24 / 39.92 | — |
-| 16MB wall（7 対 median、外部計時） | 169.66ms | 393.42ms | 2.32× |
-| 16MB peak RSS | 212,916KB | 236,652KB | 1.11×（決定的指標で横這い〜微改善） |
-| 2MB total（13 対 median） | 22.14ms | 45.94ms | **2.07×** |
-| 2MB 段別同上 ms | 0.02 / 8.83 / 0.01 / 8.93 / 4.61 | 1.10 / 18.34 / 0.06 / 20.60 / 5.83 | — |
-| 2MB wall | 24.90ms | 58.36ms | 2.35× |
-| 2MB peak RSS | 34,108KB | 36,276KB | 1.06× |
-| ANSI 2MB total（7 対 median） | 51.83ms | 79.12ms | 1.53×（render par は ANSI ゲート外=C 規約） |
-| ANSI 2MB render 段（同上） | 32.78ms | 40.07ms | 1.22× |
-| ANSI 2MB peak RSS | 32,436KB | 56,360KB | 1.74×（要監視継続。1.745→1.737 と微改善傾向） |
-| 起動 wall（150 対 median） | 1.9020ms | 1.9615ms | 1.031×（符号 C:R = 83:67。+59μs。系列 75:74→87:63→112:37→50:100→118:31→61:89→83:67 と両方向反転を継続 = jitter 帯内と確定） |
-| md fast-DOM 有無 total（slow÷fast、16MB） | 767.8÷149.2ms = 5.15× | 1,680.9÷330.7ms = 5.08× | — |
-| md fast-DOM 有無 total（slow÷fast、2MB） | 91.7÷21.3ms = 4.31× | 159.8÷44.6ms = 3.58× | — |
+| 16MB total（7 対 median） | 130.80ms | 280.95ms | 2.15×（b ラン中程度 ambient。実測帯 1.99–2.49× 内） |
+| 16MB 段別 read/parse/style/layout/render ms | 0.02 / 53.35 / 0.01 / 53.41 / 22.74 | 8.93 / 116.41 / 0.06 / 113.06 / 39.19 | — |
+| 16MB wall（7 対 median、外部計時） | 137.33ms | 352.46ms | 2.57× |
+| 16MB peak RSS | 212,888KB | 236,708KB | 1.11×（決定的指標で横這い） |
+| 2MB total（13 対 median） | 17.35ms | 36.53ms | **2.11×** |
+| 2MB 段別同上 ms | 0.02 / 7.27 / 0.01 / 6.59 / 3.32 | 0.97 / 15.41 / 0.04 / 15.03 / 4.88 | — |
+| 2MB wall | 20.12ms | 46.56ms | 2.31× |
+| 2MB peak RSS | 34,196KB | 36,320KB | 1.06× |
+| ANSI 2MB total（7 対 median） | 38.69ms | 68.65ms | 1.77×（render par は ANSI ゲート外=C 規約。C が帯下振れで見かけ悪化） |
+| ANSI 2MB render 段（同上） | 25.38ms | 37.40ms | 1.47× |
+| ANSI 2MB peak RSS | 32,408KB | 56,668KB | 1.75×（要監視継続） |
+| 起動 wall（150 対 median） | 1.6880ms | 1.7310ms | 1.025×（符号 C:R = 92:58。+43μs。系列 75:74→87:63→112:37→50:100→118:31→61:89→83:67→92:58 と両方向反転を継続 = jitter 帯） |
+| md fast-DOM 有無 total（slow÷fast、16MB） | 590.7÷126.4ms = 4.67× | 1,094.5÷283.5ms = 3.86× | — |
+| md fast-DOM 有無 total（slow÷fast、2MB） | 72.3÷15.4ms = 4.70× | 136.1÷35.4ms = 3.84× | — |
 
-段別対比（16MB、median。a ラン）: parse 1.94× / layout 2.24× / render 1.64×。
-フェーズ 12-g = Winner 座標化: blocks layout allocs **−66%**（128,946→43,544）、
-blocks layout −2.81%・total −1.47%（n=21 符号 15:6、独立 2 測定で同向き）。
-32B `iter().all()` auto-vectorize 誘導はベクトル化ゼロを objdump 確認し棄却（3 連敗）。
-フェーズ 10-e〜12-g の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
-多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260831a.html`
-（gitignore 対象の生成物。生データは `bench/data-20260831a.json`、再生成手順はレポート §3）。
+段別対比（16MB、median。b ラン）: parse 2.18× / layout 2.12× / render 1.72×。
+フェーズ 12-h = ol マーカー確保消去: blocks layout allocs **43,544→854（−98%）**、
+12-g 累計 128,946→854（−99.3%）。時間は帯内のため採択規則（機構厳密優位・
+byte-exact・メモリ増ゼロ）の確保指標を主張。gen_report.py の makedirs 根治も同梱。
+フェーズ 10-e〜12-h の内容と残照準は `docs/RUST_MIGRATION.md` を参照。
+多角レポート全量（環境・手法・ゲート・生 JSON）: `bench/results/report-20260831b.html`
+（gitignore 対象の生成物。生データは `bench/data-20260831b.json`、再生成手順はレポート §3）。
 
 ※ 併記レポート（同日の連続フェーズ）: 12-c=`report-20260829i.html`、
-12-d=`report-20260829j.html`、12-e=`report-20260829k.html`、12-f=`report-20260829l.html`
-（いずれも data JSON は git 管理）。
-**再構成検証（2026-08-29、同一ツリー再計測 data-20260829e.json）**: 砂箱リセットで
-ローカル履歴が消失し working tree から再構成後、同一バイナリで全量ベンチを再採。
-16MB **2.37×**（239.70/101.07。d 値 2.12× より見かけ悪化するが、静寂化で C 側が
-−27.6ms 伸びた帯内変動。**16MB 倍率は帯として記録する。フェーズ 11 適用後の
-現行帯は 1.99–2.37×**）。RSS 比は 16MB **1.129 / 1.129 で両 run 完全一致**（環境
-非依存の決定的指標 = 再構成正当性の硬い証拠）、2MB 1.081、ANSI 1.765。起動 wall
-**1.003（符号 C:R = 74:75、149 決定対で二項同値。静寂環境では起動差は誤差に消える。
-フェーズ 11 計測でも 77:73 で同値を維持）**。全ペア stdout byte 一致を再確認。
+12-d=`report-20260829j.html`、12-e=`report-20260829k.html`、12-f=`report-20260829l.html`、
+12-g=`report-20260831a.html`（いずれも data JSON は git 管理）。
 
 #### 並列レイテンシーの正直な台帳（taskset ピン留め 1-HT / 2-HT A/B、2026-08-29 更新）
 
@@ -225,7 +224,7 @@ median n=9、16MB）+ layout shard A/B（16MB、median n=3+7）:
 | Rust ワークスペース（`cargo test --offline` / `--release`） | **345 passed / 0 failed**（akl-core 142 + akl-ffi 6 + ifuto-core 188 + ifuto-cli 9。2026-08-29、フェーズ 11 で +1: text_arena_representation） |
 | 出力 byte-exact oracle（`tools/chk_oracle.sh`） | **24/24 × 両バイナリ**（+4 = Shift_JIS/EUC-JP E2E、+1 = 変換表再生成一致、+3 = 12-f fuzz 回帰 `oracle/fuzz-br-trim.html`（--no-style trim 経路 3 モード）。idm コーパスは gen_idm.py 再生成で復元） |
 | golden（`tests/run_golden.sh`） | 1/1 × 両バイナリ |
-| C↔Rust 差分 fuzz（`tools/diff_fuzz_cli.py`） | **累計 205,266 cases / 0 mismatch**（seed 20260824/1/777/424242/999/31337/20260828/555/4242/20260829/314159/271828/8888/7777/31415/2718281/55555/12344321×他。stdout/stderr/rc byte 突合、--stats は計測値 scrub・決定値比較。2026-08-31 追加分を含む。seed 55555 は 12-f 手術の不具合（--no-style trim 経路）を検出 → 修復後 0） |
+| C↔Rust 差分 fuzz（`tools/diff_fuzz_cli.py`） | **累計 215,266 cases / 0 mismatch**（seed 20260824/1/777/424242/999/31337/20260828/555/4242/20260829/314159/271828/8888/7777/31415/2718281/55555/12344321/987654×他。stdout/stderr/rc byte 突合、--stats は計測値 scrub・決定値比較。2026-08-31 追加分（12-g + 12-h）を含む。seed 55555 は 12-f 手術の不具合（--no-style trim 経路）を検出 → 修復後 0） |
 | chrome 純粋部 C↔Rust 差分 fuzz（`tools/zz_chrome_diff.py`） | **累計 240,000 cases / 0 mismatch**（seed 1/7/42/999/777/424242/20260826。1 入力行=1 出行 byte 突合、両 driver の rc≠0 も不一致扱い。ASan+UBSan 30,000 ×2 で rc=0/stderr 空。2026-08-26） |
 | GUI smoke（`tests/gui_smoke.py`、`--shot` 決定ラスタ） | PASS（C のみ。X 不在環境の proxi、GUI 実機は未検証と明記。Rust 側 --shot は未移植拒否形状のみ fuzz 検証） |
 | 拡張 smoke（`tests/ext_smoke.py`） | **12 checks**（C のみ。console.log 凍結 v1 含む） |

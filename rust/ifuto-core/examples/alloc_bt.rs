@@ -27,9 +27,15 @@ unsafe impl GlobalAlloc for Bt {
                 let mut key = String::with_capacity(256);
                 for frame in txt
                     .lines()
-                    .filter(|ln| ln.contains("ifuto_core"))
+                    .filter(|ln| {
+                        ln.contains("ifuto_core")
+                            || ln.contains("alloc::raw_vec")
+                            || ln.contains("alloc::vec")
+                            || ln.contains("hashbrown")
+                            || ln.contains("HashMap")
+                    })
                     .skip(0)
-                    .take(9)
+                    .take(12)
                 {
                     key.push_str(frame.trim());
                     key.push('\n');

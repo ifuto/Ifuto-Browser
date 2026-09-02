@@ -115,6 +115,11 @@ cd rust && (../trigger/tc timeout 300 cargo tarpaulin --workspace 2>&1 | tail -1
 # 併せて size_probe に Style/BoxNode/RLine/Deco/Seg サイズ計測を追加）。
 # CMD 3 test=345 緑に注目。CMD 5 Miri は引き続き skip が正（差分は ifuto-core css.rs + examples のみ・unsafe 非含有）。
 
+# 2026-08-31 実行: フェーズ 12-h（deco_marker_push の format!("{}.") String 確保をスタック itoa 化で消去。
+# blocks layout allocs 43,544→854（−98%、12-g 累計 128,946→854 = −99.3%）。
+# alloc_bt の帰属フィルタ拡張 + gen_report.py の出力親 makedirs 追加（results 消失再発の根治）も同梱）。
+# CMD 3 test=345 緑に注目。CMD 5 Miri は引き続き skip が正（差分は ifuto-core + 器具のみ・unsafe 非含有）。
+
 # 【運用規約】trigger 発火後は run 完了（result.md 追記）まで trigger.md 以外の push を避けること。
 # 旧 append 実装は run 中の push で non-fast-forward となり結果ブロック喪失（10-e, 10-g/h/i で実績）。
 # 根治版（最新先頭取り直し+retry 化）の修正は .github/workflows 配下のため GitHub App トークンの

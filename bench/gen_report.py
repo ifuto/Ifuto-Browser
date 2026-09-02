@@ -442,6 +442,10 @@ bump 確保の結果子要素 placeholder が物理隣接で 1 seg 化する現�
 （再生成可能なため）。現行値の台帳は BENCH.md、移行記録は docs/RUST_MIGRATION.md。</footer>
 </main></body></html>""" % esc(os.path.basename(data_path)))
 
+    # 出力先の親は gitignore 配下のため環境リセットで消える。都度作る（再発防止）。
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "w") as f:
         f.write("".join(H))
     print("WROTE %s (%d B)" % (out_path, os.path.getsize(out_path)))

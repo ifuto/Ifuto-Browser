@@ -1380,15 +1380,27 @@ fn deco_marker_push(
         t[..4].copy_from_slice(b"\xE2\x80\xA2 "); // "• "
         (mx, 2, t, 4u8)
     } else {
-        // C snprintf("%u.") 相当（u32 最大 10 桁 + '.' = 11B ≤ 12 で truncate しない）
-        let nb = format!("{}.", li_ord);
-        let m = nb.len();
+        // C snprintf("%u.") 相当（u32 最大 10 桁 + '.' = 11B ≤ 12 で truncate しない）。
+        // 旧実装は format!("{}.") で li ごとに String を 8B 確保していた
+        // （blocks/list 形状で layout 段 allocs の主犯。alloc_bt で特定）。
+        // 序数はスタック上に逆順構築してコピーする（確保ゼロで出力同一）。
+        let mut tmp = [0u8; 10];
+        let mut k = tmp.len();
+        let mut v = *li_ord; // この時点で ≥1（呼び出し直前に += 1 済み）
+        while v > 0 {
+            k -= 1;
+            tmp[k] = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        let ds = &tmp[k..];
+        let m = ds.len() + 1; // digits + '.'
         let mut mx = bx - (m as i32 + 1);
         if mx < 0 {
             mx = 0; // ol は 0 clamp（ul と非対称。C どおり）
         }
         let mut t = [0u8; 12];
-        t[..m].copy_from_slice(nb.as_bytes());
+        t[..ds.len()].copy_from_slice(ds);
+        t[ds.len()] = b'.';
         (mx, m as i32, t, m as u8)
     };
     deco_push(
